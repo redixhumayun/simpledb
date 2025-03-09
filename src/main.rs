@@ -1,5 +1,7 @@
+#![allow(dead_code)]
+
 use std::{
-    collections::{btree_map::Entry, HashMap},
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::PathBuf,
@@ -31,14 +33,14 @@ impl BlockId {
     }
 }
 
-struct Page {
-    contents: Vec<u8>,
+pub struct Page {
+    pub contents: Vec<u8>,
 }
 
 impl Page {
     const INT_BYTES: usize = 4;
 
-    fn new(blocksize: usize) -> Self {
+    pub fn new(blocksize: usize) -> Self {
         Self {
             contents: vec![0; blocksize],
         }
@@ -85,6 +87,33 @@ impl Page {
     }
 }
 
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    #[test]
+    fn test_page_int_operations() {
+        let mut page = Page::new(4096);
+        page.set_int(100, 4000);
+        assert_eq!(page.get_int(100), 4000);
+
+        page.set_int(200, -67890);
+        assert_eq!(page.get_int(200), -67890);
+
+        page.set_int(200, 1);
+        assert_eq!(page.get_int(200), 1);
+    }
+
+    #[test]
+    fn test_page_string_operations() {
+        let mut page = Page::new(4096);
+        page.set_string(100, "Hello");
+        assert_eq!(page.get_string(100), "Hello");
+
+        page.set_string(200, "World");
+        assert_eq!(page.get_string(200), "World");
+    }
+}
+
 struct Buffer {
     file_manager: FileManager,
     contents: Page,
@@ -117,7 +146,7 @@ struct FileManager {
 impl FileManager {
     fn new(db_directory: impl AsRef<PathBuf>, blocksize: usize) -> io::Result<Self> {
         let db_path = db_directory.as_ref().to_path_buf();
-        fs::create_dir(&db_path)?;
+        fs::create_dir_all(&db_path)?;
 
         //  remove all existing files in the directory
         for entry in fs::read_dir(&db_path)? {
@@ -186,6 +215,56 @@ impl FileManager {
             })
             .try_clone()
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod file_manager_tests {
+    use std::path::{Path, PathBuf};
+
+    use crate::FileManager;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new<P>(path: P) -> Self
+        where
+            P: AsRef<Path>,
+        {
+            let path = path.as_ref().to_path_buf();
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).unwrap();
+        }
+    }
+
+    impl AsRef<PathBuf> for TestDir {
+        fn as_ref(&self) -> &PathBuf {
+            &self.path
+        }
+    }
+
+    fn setup() -> (TestDir, FileManager) {
+        let dir = TestDir::new("/tmp/test_db");
+        let file_manger = FileManager::new(&dir, 400).unwrap();
+        (dir, file_manger)
+    }
+
+    #[test]
+    fn test_file_creation() {
+        let (_temp_dir, mut file_manager) = setup();
+
+        let filename = "test_file";
+        file_manager.get_file(filename.to_string());
+
+        assert!(file_manager.open_files.contains_key(filename));
     }
 }
 
