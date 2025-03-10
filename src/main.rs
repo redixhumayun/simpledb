@@ -7,9 +7,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-
-use test_utils::TestDir;
 mod test_utils;
+#[cfg(test)]
+use test_utils::TestDir;
 
 /// The database struct
 struct SimpleDB {
