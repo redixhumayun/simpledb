@@ -2,10 +2,12 @@
 
 use std::{
     collections::HashMap,
+    error::Error,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 mod test_utils;
 #[cfg(test)]
@@ -15,23 +17,34 @@ use test_utils::TestDir;
 struct SimpleDB {
     db_directory: PathBuf,
     file_manager: Arc<Mutex<FileManager>>,
-    log_manager: LogManager,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_manager: Arc<Mutex<BufferManager>>,
 }
 
 impl SimpleDB {
     const LOG_FILE: &str = "simpledb.log";
 
-    fn new<P: AsRef<Path>>(path: P, block_size: usize) -> Self {
+    fn new<P: AsRef<Path>>(path: P, block_size: usize, num_buffers: usize) -> Self {
         let file_manager = Arc::new(Mutex::new(FileManager::new(&path, block_size).unwrap()));
+        let log_manager = Arc::new(Mutex::new(LogManager::new(
+            Arc::clone(&file_manager),
+            Self::LOG_FILE,
+        )));
+        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            num_buffers,
+        )));
         Self {
             db_directory: path.as_ref().to_path_buf(),
-            log_manager: LogManager::new(Arc::clone(&file_manager), Self::LOG_FILE),
+            log_manager,
             file_manager,
+            buffer_manager,
         }
     }
 
     #[cfg(test)]
-    fn new_for_test(block_size: usize) -> (Self, TestDir) {
+    fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -40,13 +53,13 @@ impl SimpleDB {
             .as_millis();
         let thread_id = std::thread::current().id();
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
-        let db = Self::new(&test_dir, block_size);
+        let db = Self::new(&test_dir, block_size, num_buffers);
         (db, test_dir)
     }
 }
 
 /// The block id container that contains a specific block number for a specific file
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 struct BlockId {
     filename: String,
     block_num: usize,
@@ -152,24 +165,256 @@ mod page_tests {
 
 struct Buffer {
     file_manager: Arc<Mutex<FileManager>>,
+    log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
     block_id: Option<BlockId>,
     pins: usize,
-    txn: isize,
-    lsn: isize,
+    txn: Option<usize>,
+    lsn: Option<usize>,
 }
 
 impl Buffer {
-    fn new(file_manager: Arc<Mutex<FileManager>>) -> Self {
+    fn new(file_manager: Arc<Mutex<FileManager>>, log_manager: Arc<Mutex<LogManager>>) -> Self {
         let size = file_manager.lock().unwrap().blocksize;
         Self {
             file_manager,
+            log_manager,
             contents: Page::new(size),
             block_id: None,
             pins: 0,
-            txn: 0,
-            lsn: 0,
+            txn: None,
+            lsn: None,
         }
+    }
+
+    /// Mark that this buffer has been modified and set associated metadata for the modifying transaction
+    fn set_modified(&mut self, txn_num: usize, lsn: usize) {
+        self.txn = Some(txn_num);
+        self.lsn = Some(lsn);
+    }
+
+    /// Check whether the buffer is pinned in memory
+    fn is_pinned(&self) -> bool {
+        self.pins > 0
+    }
+
+    /// Modify this buffer to hold the contents of a different block
+    /// This requires flushing the existing page contents, if any, to disk if dirty
+    fn assign_to_block(&mut self, block_id: &BlockId) {
+        self.flush();
+        self.block_id = Some(block_id.clone());
+        self.file_manager
+            .lock()
+            .unwrap()
+            .read(self.block_id.as_ref().unwrap(), &mut self.contents);
+        self.reset_pins();
+    }
+
+    /// Write the current buffer contents to disk if dirty
+    fn flush(&mut self) {
+        if let Some(_) = &self.txn {
+            self.log_manager
+                .lock()
+                .unwrap()
+                .flush_lsn(self.lsn.unwrap());
+            self.file_manager
+                .lock()
+                .unwrap()
+                .write(self.block_id.as_ref().unwrap(), &mut self.contents);
+        }
+    }
+
+    /// Increment the pin count for this buffer
+    fn pin(&mut self) {
+        self.pins += 1;
+    }
+
+    /// Decrement the pin count for this buffer
+    fn unpin(&mut self) {
+        assert!(self.pins > 0); //  sanity check to know that it will not become negative
+        self.pins -= 1;
+    }
+
+    /// Reset the pin count for this buffer
+    fn reset_pins(&mut self) {
+        self.pins = 0;
+    }
+}
+
+struct BufferManager {
+    file_manager: Arc<Mutex<FileManager>>,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_pool: Vec<Arc<Mutex<Buffer>>>,
+    num_available: Mutex<usize>,
+    cond: Condvar,
+}
+
+impl BufferManager {
+    const MAX_TIME: u64 = 10; //  10 seconds
+    fn new(
+        file_manager: Arc<Mutex<FileManager>>,
+        log_manager: Arc<Mutex<LogManager>>,
+        num_buffers: usize,
+    ) -> Self {
+        let buffer_pool = (0..num_buffers)
+            .map(|_| {
+                Arc::new(Mutex::new(Buffer::new(
+                    Arc::clone(&file_manager),
+                    Arc::clone(&log_manager),
+                )))
+            })
+            .collect();
+        Self {
+            file_manager,
+            log_manager,
+            buffer_pool,
+            num_available: Mutex::new(num_buffers),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Returns the number of unpinned buffers, that is buffers with no pages pinned to them
+    fn available(&self) -> usize {
+        *self.num_available.lock().unwrap()
+    }
+
+    /// Flushes the dirty buffers modified by this specific transaction
+    fn flush_all(&mut self, txn_num: usize) {
+        for buffer in &mut self.buffer_pool {
+            let mut buffer = buffer.lock().unwrap();
+            if buffer.txn.is_some() && *buffer.txn.as_ref().unwrap() == txn_num {
+                buffer.flush();
+            }
+        }
+    }
+
+    /// Pin the buffer associated with the provided block_id
+    fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
+        let start = Instant::now();
+        let mut num_available = self.num_available.lock().unwrap();
+        loop {
+            match self.try_to_pin(block_id) {
+                Some(buffer) => {
+                    {
+                        let mut buffer_guard = buffer.lock().unwrap();
+                        if !buffer_guard.is_pinned() {
+                            buffer_guard.pin();
+                            *num_available -= 1;
+                        }
+                    }
+                    return Ok(buffer);
+                }
+                None => {
+                    num_available = self.cond.wait(num_available).unwrap();
+                    if start.elapsed() > Duration::from_secs(Self::MAX_TIME) {
+                        return Err("Timed out waiting for buffer".into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find a buffer to pin this block to
+    /// First check to see if there is an existing buffer for this block
+    /// If not, try to find an unpinned buffer
+    /// If both cases above fail, return None
+    /// Update matadata for the assigned buffer before returning
+    fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
+        let buffer = match self.find_existing_buffer(block_id) {
+            Some(buffer) => buffer,
+            None => match self.choose_unpinned_buffer() {
+                Some(buffer) => {
+                    buffer.lock().unwrap().assign_to_block(block_id);
+                    buffer
+                }
+                None => return None,
+            },
+        };
+        return Some(buffer);
+    }
+
+    /// Decrement the pin count for the provided buffer
+    /// If all of the pins have been removed, managed metadata & notify waiting threads
+    fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
+        let mut buffer_guard = buffer.lock().unwrap();
+        buffer_guard.unpin();
+        if !buffer_guard.is_pinned() {
+            *self.num_available.lock().unwrap() += 1;
+            self.cond.notify_all();
+        }
+    }
+
+    /// Look for a buffer associated with this specific [`BlockId`]
+    fn find_existing_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
+        for buffer in &self.buffer_pool {
+            let buffer_guard = buffer.lock().unwrap();
+            if buffer_guard.block_id.is_some()
+                && buffer_guard.block_id.as_ref().unwrap() == block_id
+            {
+                return Some(Arc::clone(&buffer));
+            }
+        }
+        None
+    }
+
+    /// Try to find an unpinned buffer and return pointer to that, if present
+    fn choose_unpinned_buffer(&self) -> Option<Arc<Mutex<Buffer>>> {
+        for buffer in &self.buffer_pool {
+            let buffer_guard = buffer.lock().unwrap();
+            if !buffer_guard.is_pinned() {
+                return Some(Arc::clone(&buffer));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod buffer_manager_tests {
+    use crate::{BlockId, Page, SimpleDB};
+
+    /// This test will assert that when the buffer pool swaps out a page from the buffer pool, it properly flushes those contents to disk
+    /// and can then correctly read them back later
+    #[test]
+    fn test_buffer_replacement() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3); // use 3 buffer slots
+        let buffer_manager = db.buffer_manager;
+
+        //  Initialize the file with enough data
+        let block_id = BlockId::new("testfile".to_string(), 1);
+        let mut page = Page::new(400);
+        page.set_int(80, 1);
+        db.file_manager.lock().unwrap().write(&block_id, &mut page);
+
+        let buffer_manager_guard = buffer_manager.lock().unwrap();
+
+        //  Create a buffer for block 1 and modify it
+        let buffer_1 = buffer_manager_guard
+            .pin(&BlockId::new("testfile".to_string(), 1))
+            .unwrap();
+        buffer_1.lock().unwrap().contents.set_int(80, 100);
+        buffer_1.lock().unwrap().set_modified(1, 0);
+        buffer_manager_guard.unpin(buffer_1);
+
+        //  force buffer replacement by pinning 3 new blocks
+        let buffer_2 = buffer_manager_guard
+            .pin(&BlockId::new("testfile".to_string(), 2))
+            .unwrap();
+        buffer_manager_guard
+            .pin(&BlockId::new("testfile".to_string(), 3))
+            .unwrap();
+        buffer_manager_guard
+            .pin(&BlockId::new("testfile".to_string(), 4))
+            .unwrap();
+
+        //  remove one of the buffers so block 1 can be read back in
+        buffer_manager_guard.unpin(buffer_2);
+
+        //  Read block 1 back from disk and verify it is the same
+        let buffer_2 = buffer_manager_guard
+            .pin(&BlockId::new("testfile".to_string(), 1))
+            .unwrap();
+        assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
     }
 }
 
@@ -217,7 +462,13 @@ impl FileManager {
             (block_id.block_num * self.blocksize) as u64,
         ))
         .unwrap();
-        file.read_exact(&mut page.contents).unwrap();
+        match file.read_exact(&mut page.contents) {
+            Ok(_) => (),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                page.contents = vec![0; self.blocksize];
+            }
+            Err(e) => panic!("Failed to read from file {}", e),
+        }
     }
 
     /// Write the page to the block provided by the block_id
@@ -470,7 +721,10 @@ impl IntoIterator for LogManager {
 
 #[cfg(test)]
 mod log_manager_tests {
-    use std::io::Write;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
 
     use crate::{LogManager, Page, SimpleDB};
 
@@ -487,19 +741,19 @@ mod log_manager_tests {
         record
     }
 
-    fn create_log_records(log_manager: &mut LogManager, start: usize, end: usize) {
+    fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
         println!("creating records");
         for i in start..=end {
             let record = create_log_record(&format!("record{i}"), i + 100);
-            let lsn = log_manager.append(record);
+            let lsn = log_manager.lock().unwrap().append(record);
             print!("{lsn} ");
         }
         println!("");
     }
 
-    fn print_log_records(log_manager: &mut LogManager, message: &str) {
+    fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str) {
         println!("{message}");
-        let iter = log_manager.iterator();
+        let iter = log_manager.lock().unwrap().iterator();
 
         for record in iter {
             let length = i32::from_be_bytes(record[..4].try_into().unwrap());
@@ -511,15 +765,18 @@ mod log_manager_tests {
 
     #[test]
     fn test_log_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400);
-        let mut log_manager = db.log_manager;
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 0);
+        let log_manager = db.log_manager;
 
-        print_log_records(&mut log_manager, "The initial empty log file: ");
-        create_log_records(&mut log_manager, 1, 35);
-        print_log_records(&mut log_manager, "The log file now has these records:");
-        create_log_records(&mut log_manager, 36, 70);
-        log_manager.flush_lsn(65);
-        print_log_records(&mut log_manager, "The log file now has these records:");
+        print_log_records(Arc::clone(&log_manager), "The initial empty log file: ");
+        create_log_records(Arc::clone(&log_manager), 1, 35);
+        print_log_records(
+            Arc::clone(&log_manager),
+            "The log file now has these records:",
+        );
+        create_log_records(Arc::clone(&log_manager), 36, 70);
+        log_manager.lock().unwrap().flush_lsn(65);
+        print_log_records(log_manager, "The log file now has these records:");
     }
 }
 
