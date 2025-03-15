@@ -58,22 +58,6 @@ impl SimpleDB {
     }
 }
 
-/// The block id container that contains a specific block number for a specific file
-#[derive(Debug, Eq, PartialEq, Clone)]
-struct BlockId {
-    filename: String,
-    block_num: usize,
-}
-
-impl BlockId {
-    fn new(filename: String, block_num: usize) -> Self {
-        Self {
-            filename,
-            block_num,
-        }
-    }
-}
-
 struct Buffer {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -550,6 +534,22 @@ impl LogManager {
             Arc::clone(&self.file_manager),
             BlockId::new(self.log_file.clone(), self.current_block.block_num),
         )
+    }
+}
+
+/// The block id container that contains a specific block number for a specific file
+#[derive(Debug, Eq, PartialEq, Clone)]
+struct BlockId {
+    filename: String,
+    block_num: usize,
+}
+
+impl BlockId {
+    fn new(filename: String, block_num: usize) -> Self {
+        Self {
+            filename,
+            block_num,
+        }
     }
 }
 
