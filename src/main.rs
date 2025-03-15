@@ -74,95 +74,6 @@ impl BlockId {
     }
 }
 
-/// The page struct that contains the contents of a page
-pub struct Page {
-    pub contents: Vec<u8>,
-}
-
-impl Page {
-    const INT_BYTES: usize = 4;
-
-    pub fn new(blocksize: usize) -> Self {
-        Self {
-            contents: vec![0; blocksize],
-        }
-    }
-
-    /// Create a new page from the given bytes
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { contents: bytes }
-    }
-
-    /// Get an integer from the page at the given offset
-    fn get_int(&self, offset: usize) -> i32 {
-        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
-            .try_into()
-            .unwrap();
-        i32::from_be_bytes(bytes)
-    }
-
-    /// Set an integer at the given offset
-    fn set_int(&mut self, offset: usize, n: i32) {
-        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
-    }
-
-    /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
-    fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
-        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
-            .try_into()
-            .unwrap();
-        let length = u32::from_be_bytes(bytes) as usize;
-        offset = offset + Self::INT_BYTES;
-        self.contents[offset..offset + length].to_vec()
-    }
-
-    /// Set a slice of bytes at the given offset. Write the length and then the bytes
-    fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
-        let length = bytes.len() as u32;
-        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
-        offset = offset + Self::INT_BYTES;
-        self.contents[offset..offset + bytes.len()].copy_from_slice(&bytes);
-    }
-
-    /// Get a string from the page at the given offset
-    fn get_string(&self, offset: usize) -> String {
-        let bytes = self.get_bytes(offset);
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// Set a string at the given offset
-    fn set_string(&mut self, offset: usize, string: &str) {
-        self.set_bytes(offset, string.as_bytes());
-    }
-}
-
-#[cfg(test)]
-mod page_tests {
-    use super::*;
-    #[test]
-    fn test_page_int_operations() {
-        let mut page = Page::new(4096);
-        page.set_int(100, 4000);
-        assert_eq!(page.get_int(100), 4000);
-
-        page.set_int(200, -67890);
-        assert_eq!(page.get_int(200), -67890);
-
-        page.set_int(200, 1);
-        assert_eq!(page.get_int(200), 1);
-    }
-
-    #[test]
-    fn test_page_string_operations() {
-        let mut page = Page::new(4096);
-        page.set_string(100, "Hello");
-        assert_eq!(page.get_string(100), "Hello");
-
-        page.set_string(200, "World");
-        assert_eq!(page.get_string(200), "World");
-    }
-}
-
 struct Buffer {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -639,6 +550,95 @@ impl LogManager {
             Arc::clone(&self.file_manager),
             BlockId::new(self.log_file.clone(), self.current_block.block_num),
         )
+    }
+}
+
+/// The page struct that contains the contents of a page
+pub struct Page {
+    pub contents: Vec<u8>,
+}
+
+impl Page {
+    const INT_BYTES: usize = 4;
+
+    pub fn new(blocksize: usize) -> Self {
+        Self {
+            contents: vec![0; blocksize],
+        }
+    }
+
+    /// Create a new page from the given bytes
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { contents: bytes }
+    }
+
+    /// Get an integer from the page at the given offset
+    fn get_int(&self, offset: usize) -> i32 {
+        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
+            .try_into()
+            .unwrap();
+        i32::from_be_bytes(bytes)
+    }
+
+    /// Set an integer at the given offset
+    fn set_int(&mut self, offset: usize, n: i32) {
+        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
+    }
+
+    /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
+    fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
+        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
+            .try_into()
+            .unwrap();
+        let length = u32::from_be_bytes(bytes) as usize;
+        offset = offset + Self::INT_BYTES;
+        self.contents[offset..offset + length].to_vec()
+    }
+
+    /// Set a slice of bytes at the given offset. Write the length and then the bytes
+    fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
+        let length = bytes.len() as u32;
+        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
+        offset = offset + Self::INT_BYTES;
+        self.contents[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    /// Get a string from the page at the given offset
+    fn get_string(&self, offset: usize) -> String {
+        let bytes = self.get_bytes(offset);
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Set a string at the given offset
+    fn set_string(&mut self, offset: usize, string: &str) {
+        self.set_bytes(offset, string.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    #[test]
+    fn test_page_int_operations() {
+        let mut page = Page::new(4096);
+        page.set_int(100, 4000);
+        assert_eq!(page.get_int(100), 4000);
+
+        page.set_int(200, -67890);
+        assert_eq!(page.get_int(200), -67890);
+
+        page.set_int(200, 1);
+        assert_eq!(page.get_int(200), 1);
+    }
+
+    #[test]
+    fn test_page_string_operations() {
+        let mut page = Page::new(4096);
+        page.set_string(100, "Hello");
+        assert_eq!(page.get_string(100), "Hello");
+
+        page.set_string(200, "World");
+        assert_eq!(page.get_string(200), "World");
     }
 }
 
