@@ -3,15 +3,18 @@
 use std::{
     collections::HashMap,
     error::Error,
+    fmt::Display,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 mod test_utils;
 #[cfg(test)]
 use test_utils::TestDir;
+
+type LSN = usize;
 
 /// The database struct
 struct SimpleDB {
@@ -58,6 +61,539 @@ impl SimpleDB {
     }
 }
 
+/// The container for the recovery manager - a [`Transaction`] uses a unique instance of this to
+/// manage writing records to WAL
+struct RecoveryManager {
+    tx_num: usize,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_manager: Arc<Mutex<BufferManager>>,
+}
+
+impl RecoveryManager {
+    fn new(
+        tx_num: usize,
+        log_manager: Arc<Mutex<LogManager>>,
+        buffer_manager: Arc<Mutex<BufferManager>>,
+    ) -> Self {
+        Self {
+            tx_num,
+            log_manager,
+            buffer_manager,
+        }
+    }
+
+    /// Commit the [`Transaction`]
+    /// It flushes all the buffers associated with this transaction
+    /// It creates and writes a new [`LogRecord::Commit`] record to the WAL
+    /// It then forces a flush on the WAL to ensure logs are committed
+    fn commit(&self) {
+        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        let record = LogRecord::Commit(self.tx_num);
+        let lsn = record
+            .write_log_record(Arc::clone(&self.log_manager))
+            .unwrap();
+        self.log_manager.lock().unwrap().flush_lsn(lsn);
+    }
+
+    /// Rollback the [`Transaction`] associated with this [`RecoveryManager`] instance
+    /// Iterate over the WAL records in reverse order and undo any modifications done for this [`Transaction`]
+    /// Flush all data associated with this transaction
+    /// Create, write and flush a [`LogRecord::Checkpoint`] record
+    fn rollback(&self, tx: &mut dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+        //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
+        let log_iter = self.log_manager.lock().unwrap().iterator();
+        for log in log_iter {
+            let record = LogRecord::from_bytes(log)?;
+            if record.get_tx_num() != self.tx_num {
+                continue;
+            }
+            if let LogRecord::Start(_) = record {
+                return Ok(());
+            }
+            record.undo(tx);
+        }
+        //  Flush all data associated with this transaction
+        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        //  Write a checkpoint record and flush it
+        let checkpoint_record = LogRecord::Checkpoint;
+        let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
+        self.log_manager.lock().unwrap().flush_lsn(lsn);
+        Ok(())
+    }
+
+    /// Recover the database from the last [`LogRecord::Checkpoint`]
+    /// Find all the incomplete transactions and undo their operations
+    /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
+    fn recover(&self, tx: &mut dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+        //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
+        let log_iter = self.log_manager.lock().unwrap().iterator();
+        let mut finished_txns: Vec<usize> = Vec::new();
+        for log in log_iter {
+            let record = LogRecord::from_bytes(log)?;
+            match record {
+                LogRecord::Checkpoint => return Ok(()),
+                LogRecord::Commit(_) | LogRecord::Rollback(_) => {
+                    finished_txns.push(record.get_tx_num());
+                }
+                _ => {
+                    if !finished_txns.contains(&record.get_tx_num()) {
+                        record.undo(tx);
+                    }
+                }
+            }
+        }
+        //  Flush all data associated with this transaction
+        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        //  Write a checkpoint record and flush it
+        let checkpoint_record = LogRecord::Checkpoint;
+        let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
+        self.log_manager.lock().unwrap().flush_lsn(lsn);
+        Ok(())
+    }
+
+    fn set_int(
+        &self,
+        buffer: Buffer,
+        offset: usize,
+        _new_value: usize,
+    ) -> Result<LSN, Box<dyn Error>> {
+        let old_value = buffer.contents.get_int(offset);
+        let block_id = buffer.block_id.unwrap();
+        let record = LogRecord::SetInt {
+            txnum: self.tx_num,
+            block_id,
+            offset,
+            old_val: old_value,
+        };
+        record.write_log_record(Arc::clone(&self.log_manager))
+    }
+
+    fn set_string(
+        &self,
+        buffer: Buffer,
+        offset: usize,
+        _new_valu: usize,
+    ) -> Result<LSN, Box<dyn Error>> {
+        let old_value = buffer.contents.get_string(offset);
+        let block_id = buffer.block_id.unwrap();
+        let record = LogRecord::SetString {
+            txnum: self.tx_num,
+            block_id,
+            offset,
+            old_val: old_value,
+        };
+        record.write_log_record(Arc::clone(&self.log_manager))
+    }
+}
+
+trait TransactionOperations {
+    fn pin(&self, block_id: &BlockId);
+    fn unpin(&self, block_id: &BlockId);
+    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool);
+    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool);
+}
+
+/// The timestamp oracle which will generate unique timestamps for each transaction
+/// in a monotonically increasing fashion
+struct TxIdGenerator {
+    next_id: AtomicU64,
+}
+
+impl TxIdGenerator {
+    fn next_id(&self) -> u64 {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
+
+struct Transaction {
+    file_manager: Arc<Mutex<FileManager>>,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_manager: Arc<Mutex<BufferManager>>,
+    tx_num: u64,
+}
+
+impl Transaction {
+    fn new(
+        file_manager: Arc<Mutex<FileManager>>,
+        log_manager: Arc<Mutex<LogManager>>,
+        buffer_manager: Arc<Mutex<BufferManager>>,
+    ) -> Self {
+        let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
+            next_id: AtomicU64::new(0),
+        });
+        Self {
+            file_manager,
+            log_manager,
+            buffer_manager,
+            tx_num: generator.next_id(),
+        }
+    }
+
+    fn commit(&self) {}
+
+    fn rollback(&self) {}
+
+    fn recover(&self) {}
+
+    fn pin(&self, block_id: &BlockId) {}
+
+    fn unpin(&self, block_id: &BlockId) {}
+
+    fn get_int(&self, block_id: &BlockId, offset: usize) -> i32 {
+        todo!()
+    }
+
+    fn set_int(&self, block_id: &BlockId, offset: usize, value: i32, log: bool) {}
+
+    fn get_string(&self, block_id: &BlockId, offset: usize) -> String {
+        todo!()
+    }
+
+    fn set_string(&self, block_id: &BlockId, offset: usize, value: &str, log: bool) {}
+
+    fn available_buffs(&self) -> usize {
+        todo!()
+    }
+
+    fn size(&self, file_name: &str) -> usize {
+        todo!()
+    }
+
+    fn append(&self, file_name: &str) -> BlockId {
+        todo!()
+    }
+
+    fn block_size(&self) -> usize {
+        todo!()
+    }
+}
+
+/// The container for all the different types of log records that are written to the WAL
+#[derive(Clone)]
+enum LogRecord {
+    Start(usize),
+    Commit(usize),
+    Rollback(usize),
+    Checkpoint,
+    SetInt {
+        txnum: usize,
+        block_id: BlockId,
+        offset: usize,
+        old_val: i32,
+    },
+    SetString {
+        txnum: usize,
+        block_id: BlockId,
+        offset: usize,
+        old_val: String,
+    },
+}
+
+impl Display for LogRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogRecord::Start(txnum) => write!(f, "Start({})", txnum),
+            LogRecord::Commit(txnum) => write!(f, "Commit({})", txnum),
+            LogRecord::Rollback(txnum) => write!(f, "Rollback({})", txnum),
+            LogRecord::Checkpoint => write!(f, "Checkpoint"),
+            LogRecord::SetInt {
+                txnum,
+                block_id,
+                offset,
+                old_val,
+            } => write!(
+                f,
+                "SetInt({}, {:?}, {}, {})",
+                txnum, block_id, offset, old_val
+            ),
+            LogRecord::SetString {
+                txnum,
+                block_id,
+                offset,
+                old_val,
+            } => write!(
+                f,
+                "SetString({}, {:?}, {}, {})",
+                txnum, block_id, offset, old_val
+            ),
+        }
+    }
+}
+
+impl TryInto<Vec<u8>> for &LogRecord {
+    type Error = Box<dyn Error>;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        let int_value = self.discriminant();
+        let mut bytes = vec![];
+        bytes.write_all(&int_value.to_be_bytes())?;
+        match self {
+            LogRecord::Start(txnum) => {
+                bytes.write_all(&txnum.to_be_bytes())?;
+            }
+            LogRecord::Commit(txnum) => {
+                bytes.write_all(&txnum.to_be_bytes())?;
+            }
+            LogRecord::Rollback(txnum) => {
+                bytes.write_all(&txnum.to_be_bytes())?;
+            }
+            LogRecord::Checkpoint => {}
+            LogRecord::SetInt {
+                txnum,
+                block_id,
+                offset,
+                old_val,
+            } => {
+                bytes.write_all(&txnum.to_be_bytes())?;
+                bytes.write_all(&block_id.filename.len().to_be_bytes())?;
+                bytes.write_all(&block_id.filename.as_bytes())?;
+                bytes.write_all(&block_id.block_num.to_be_bytes())?;
+                bytes.write_all(&offset.to_be_bytes())?;
+                bytes.write_all(&old_val.to_be_bytes())?;
+            }
+            LogRecord::SetString {
+                txnum,
+                block_id,
+                offset,
+                old_val,
+            } => {
+                bytes.write_all(&txnum.to_be_bytes())?;
+                bytes.write_all(&block_id.filename.len().to_be_bytes())?;
+                bytes.write_all(&block_id.filename.as_bytes())?;
+                bytes.write_all(&block_id.block_num.to_be_bytes())?;
+                bytes.write_all(&offset.to_be_bytes())?;
+                bytes.write_all(&old_val.as_bytes())?;
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+impl TryFrom<Vec<u8>> for LogRecord {
+    type Error = Box<dyn Error>;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        let page = Page::from_bytes(value);
+        let mut pos = 0;
+        let discriminant = page.get_int(pos);
+        pos += 4;
+
+        match discriminant {
+            0 => Ok(LogRecord::Start(page.get_int(pos) as usize)),
+            1 => Ok(LogRecord::Commit(page.get_int(pos) as usize)),
+            2 => Ok(LogRecord::Rollback(page.get_int(pos) as usize)),
+            3 => Ok(LogRecord::Checkpoint),
+            4 => {
+                let txnum = page.get_int(pos) as usize;
+                pos += 4;
+                let filename = page.get_string(pos);
+                pos += 4 + filename.len();
+                let block_num = page.get_int(pos) as usize;
+                pos += 4;
+                let offset = page.get_int(pos) as usize;
+                pos += 4;
+                let old_val = page.get_int(pos);
+
+                return Ok(LogRecord::SetInt {
+                    txnum,
+                    block_id: BlockId::new(filename, block_num),
+                    offset,
+                    old_val,
+                });
+            }
+            5 => {
+                let txnum = page.get_int(pos) as usize;
+                pos += 4;
+                let filename = page.get_string(pos);
+                pos += 4 + filename.len();
+                let block_num = page.get_int(pos) as usize;
+                pos += 4;
+                let offset = page.get_int(pos) as usize;
+                pos += 4;
+                let old_val = page.get_string(pos);
+
+                return Ok(LogRecord::SetString {
+                    txnum,
+                    block_id: BlockId::new(filename, block_num),
+                    offset,
+                    old_val,
+                });
+            }
+            _ => Err("Invalid log record type".into()),
+        }
+    }
+}
+
+impl LogRecord {
+    /// Get the discriminant value for the log record
+    fn discriminant(&self) -> u32 {
+        match self {
+            LogRecord::Start(_) => 0,
+            LogRecord::Commit(_) => 1,
+            LogRecord::Rollback(_) => 2,
+            LogRecord::Checkpoint => 3,
+            LogRecord::SetInt { .. } => 4,
+            LogRecord::SetString { .. } => 5,
+        }
+    }
+
+    /// Get the transaction number associated with this log record
+    /// Will panic for certain log records
+    fn get_tx_num(&self) -> usize {
+        match self {
+            LogRecord::Start(txnum) => *txnum,
+            LogRecord::Commit(txnum) => *txnum,
+            LogRecord::Checkpoint => panic!("Checkpoint does not have a transaction number"),
+            LogRecord::Rollback(txnum) => *txnum,
+            LogRecord::SetInt { txnum, .. } => *txnum,
+            LogRecord::SetString { txnum, .. } => *txnum,
+        }
+    }
+
+    /// Undo the operation performed by this log record
+    /// This is used by the [`RecoveryManager`] when performing a recovery
+    fn undo(&self, tx: &mut dyn TransactionOperations) {
+        match self {
+            LogRecord::Start(_) => (),    //  no-op
+            LogRecord::Commit(_) => (),   //  no-op
+            LogRecord::Rollback(_) => (), //  no-op
+            LogRecord::Checkpoint => (),  //  no-op
+            LogRecord::SetInt {
+                block_id,
+                offset,
+                old_val,
+                ..
+            } => {
+                tx.pin(block_id);
+                tx.set_int(block_id, *offset, *old_val, false);
+                tx.unpin(block_id);
+            }
+            LogRecord::SetString {
+                block_id,
+                offset,
+                old_val,
+                ..
+            } => {
+                tx.pin(block_id);
+                tx.set_string(block_id, *offset, old_val, false);
+                tx.unpin(block_id);
+            }
+        }
+    }
+
+    /// Serialize the log record to bytes and write it to the log file
+    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<LSN, Box<dyn Error>> {
+        let bytes: Vec<u8> = self.try_into()?;
+        Ok(log_manager.lock().unwrap().append(bytes))
+    }
+
+    /// Read the log record from the log file and deserialize it
+    fn from_bytes(bytes: Vec<u8>) -> Result<LogRecord, Box<dyn Error>> {
+        bytes.try_into()
+    }
+}
+
+/// Wrapper for the value contained in the hash map of the [`BufferList`]
+struct HashMapValue {
+    buffer: Arc<Mutex<Buffer>>,
+    count: usize,
+}
+
+/// A wrapper to maintain the list of [`Buffer`] being used by the [`Transaction`]
+/// It uses the [`BufferManager`] internally to maintain metadata
+struct BufferList {
+    buffers: HashMap<BlockId, HashMapValue>,
+    buffer_manager: Arc<Mutex<BufferManager>>,
+}
+
+impl BufferList {
+    fn new(buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
+        Self {
+            buffers: HashMap::new(),
+            buffer_manager,
+        }
+    }
+
+    /// Get the buffer associated with the provided block_id
+    fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
+        self.buffers
+            .get(block_id)
+            .and_then(|v| Some(Arc::clone(&v.buffer)))
+    }
+
+    /// Pin the buffer associated with the provided [`BlockId`]
+    fn pin(&mut self, block_id: &BlockId) {
+        let buffer = self.buffer_manager.lock().unwrap().pin(block_id).unwrap();
+        self.buffers
+            .entry(block_id.clone())
+            .and_modify(|v| v.count += 1)
+            .or_insert(HashMapValue { buffer, count: 1 });
+    }
+
+    /// Unpin the buffer associated with the provided [`BlockId`]
+    fn unpin(&mut self, block_id: &BlockId) {
+        assert!(self.buffers.contains_key(block_id));
+        let buffer = Arc::clone(&self.buffers.get(block_id).unwrap().buffer);
+        self.buffer_manager.lock().unwrap().unpin(buffer);
+        let should_remove = {
+            let v = self.buffers.get_mut(block_id).unwrap();
+            v.count -= 1;
+            v.count == 0
+        };
+        if should_remove {
+            self.buffers.remove(block_id);
+        }
+    }
+
+    /// Unpin all the buffers in this [`BufferList`]
+    fn unpin_all(&mut self) {
+        for buffer_with_meta in self.buffers.values() {
+            self.buffer_manager
+                .lock()
+                .unwrap()
+                .unpin(Arc::clone(&buffer_with_meta.buffer));
+        }
+        self.buffers.clear();
+    }
+}
+
+#[cfg(test)]
+mod buffer_list_tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::{test_utils::TestDir, BlockId, BufferList, BufferManager, FileManager, LogManager};
+
+    #[test]
+    fn test_buffer_list_functionality() {
+        let dir = TestDir::new("buffer_list_tests");
+        let file_manager = Arc::new(Mutex::new(FileManager::new(&dir, 400).unwrap()));
+        let log_manager = Arc::new(Mutex::new(LogManager::new(
+            Arc::clone(&file_manager),
+            "buffer_list_tests_log_file",
+        )));
+        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(file_manager, log_manager, 4)));
+        let mut buffer_list = BufferList::new(buffer_manager);
+
+        //  check that there are no buffers in the buffer list initially
+        let block_id = BlockId {
+            filename: "testfile".to_string(),
+            block_num: 1,
+        };
+        assert!(buffer_list.get_buffer(&block_id).is_none());
+
+        //  pinning a buffer and then attempting to fetch it should return the correct one
+        buffer_list.pin(&block_id);
+        assert!(buffer_list.get_buffer(&block_id).is_some());
+
+        //  unpinning all buffers will empty the buffer list
+        buffer_list.unpin_all();
+        assert!(buffer_list.buffers.is_empty());
+    }
+}
+
 struct Buffer {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -65,7 +601,7 @@ struct Buffer {
     block_id: Option<BlockId>,
     pins: usize,
     txn: Option<usize>,
-    lsn: Option<usize>,
+    lsn: Option<LSN>,
 }
 
 impl Buffer {
@@ -184,6 +720,8 @@ impl BufferManager {
     }
 
     /// Pin the buffer associated with the provided block_id
+    /// It depends on [`BufferManager::try_to_pin`] to get a buffer back
+    /// Once the buffer has been retrieved, it will handle metadata operations
     fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
         let mut num_available = self.num_available.lock().unwrap();
@@ -473,7 +1011,7 @@ impl LogManager {
     }
 
     /// Determine if this LSN has been flushed to disk, and flush it if it hasn't
-    fn flush_lsn(&mut self, lsn: usize) {
+    fn flush_lsn(&mut self, lsn: LSN) {
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -492,7 +1030,7 @@ impl LogManager {
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
-    fn append(&mut self, log_record: Vec<u8>) -> usize {
+    fn append(&mut self, log_record: Vec<u8>) -> LSN {
         let mut boundary = self.log_page.get_int(0) as usize;
         let bytes_needed = log_record.len() + Page::INT_BYTES;
         if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
@@ -538,7 +1076,7 @@ impl LogManager {
 }
 
 /// The block id container that contains a specific block number for a specific file
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
 struct BlockId {
     filename: String,
     block_num: usize,
