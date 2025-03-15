@@ -418,6 +418,230 @@ mod buffer_manager_tests {
     }
 }
 
+struct LogIterator {
+    file_manager: Arc<Mutex<FileManager>>,
+    current_block: BlockId,
+    page: Page,
+    current_pos: usize,
+    boundary: usize,
+}
+
+impl LogIterator {
+    fn new(file_manager: Arc<Mutex<FileManager>>, current_block: BlockId) -> Self {
+        let block_size = file_manager.lock().unwrap().blocksize;
+        let mut page = Page::new(block_size);
+        file_manager.lock().unwrap().read(&current_block, &mut page);
+        let boundary = page.get_int(0) as usize;
+
+        Self {
+            file_manager,
+            current_block,
+            page,
+            current_pos: boundary,
+            boundary,
+        }
+    }
+
+    fn move_to_block(&mut self) {
+        self.file_manager
+            .lock()
+            .unwrap()
+            .read(&self.current_block, &mut self.page);
+        self.boundary = self.page.get_int(0) as usize;
+        self.current_pos = self.boundary;
+    }
+}
+
+impl Iterator for LogIterator {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_pos >= self.file_manager.lock().unwrap().blocksize {
+            if self.current_block.block_num == 0 {
+                return None; //  no more blocks
+            }
+            self.current_block = BlockId {
+                filename: self.current_block.filename.to_string(),
+                block_num: self.current_block.block_num - 1,
+            };
+            self.move_to_block();
+        }
+        //  Read the record
+        let record = self.page.get_bytes(self.current_pos);
+        self.current_pos += Page::INT_BYTES + record.len();
+        Some(record)
+    }
+}
+
+impl IntoIterator for LogManager {
+    type Item = Vec<u8>;
+    type IntoIter = LogIterator;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        self.iterator()
+    }
+}
+
+#[cfg(test)]
+mod log_manager_tests {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{LogManager, Page, SimpleDB};
+
+    fn create_log_record(s: &str, n: usize) -> Vec<u8> {
+        let string_bytes = s.as_bytes();
+        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
+        let mut record = Vec::with_capacity(total_size);
+
+        record
+            .write_all(&(string_bytes.len() as i32).to_be_bytes())
+            .unwrap();
+        record.write_all(&string_bytes).unwrap();
+        record.write_all(&n.to_be_bytes()).unwrap();
+        record
+    }
+
+    fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
+        println!("creating records");
+        for i in start..=end {
+            let record = create_log_record(&format!("record{i}"), i + 100);
+            let lsn = log_manager.lock().unwrap().append(record);
+            print!("{lsn} ");
+        }
+        println!("");
+    }
+
+    fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str) {
+        println!("{message}");
+        let iter = log_manager.lock().unwrap().iterator();
+
+        for record in iter {
+            let length = i32::from_be_bytes(record[..4].try_into().unwrap());
+            let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
+            let n = usize::from_be_bytes(record[4 + (length as usize)..].try_into().unwrap());
+            println!("{string} {n}");
+        }
+    }
+
+    #[test]
+    fn test_log_manager() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 0);
+        let log_manager = db.log_manager;
+
+        print_log_records(Arc::clone(&log_manager), "The initial empty log file: ");
+        create_log_records(Arc::clone(&log_manager), 1, 35);
+        print_log_records(
+            Arc::clone(&log_manager),
+            "The log file now has these records:",
+        );
+        create_log_records(Arc::clone(&log_manager), 36, 70);
+        log_manager.lock().unwrap().flush_lsn(65);
+        print_log_records(log_manager, "The log file now has these records:");
+    }
+}
+
+struct LogManager {
+    file_manager: Arc<Mutex<FileManager>>,
+    log_file: String,
+    log_page: Page,
+    current_block: BlockId,
+    latest_lsn: usize,
+    last_saved_lsn: usize,
+}
+
+impl LogManager {
+    fn new(file_manager: Arc<Mutex<FileManager>>, log_file: &str) -> Self {
+        let bytes = vec![0; file_manager.lock().unwrap().blocksize];
+        let mut log_page = Page::from_bytes(bytes);
+        let log_size = file_manager.lock().unwrap().length(log_file.to_string());
+        let current_block = if log_size == 0 {
+            LogManager::append_new_block(&file_manager, log_file, &mut log_page)
+        } else {
+            let block = BlockId {
+                filename: log_file.to_string(),
+                block_num: log_size - 1,
+            };
+            file_manager.lock().unwrap().read(&block, &mut log_page);
+            block
+        };
+        Self {
+            file_manager,
+            log_file: log_file.to_string(),
+            log_page,
+            current_block,
+            latest_lsn: 0,
+            last_saved_lsn: 0,
+        }
+    }
+
+    /// Determine if this LSN has been flushed to disk, and flush it if it hasn't
+    fn flush_lsn(&mut self, lsn: usize) {
+        if self.last_saved_lsn >= lsn {
+            return;
+        }
+        self.flush_to_disk();
+    }
+
+    /// Write the bytes from log_page to disk for the current_block
+    /// Update the last_saved_lsn before returning
+    fn flush_to_disk(&mut self) {
+        self.file_manager
+            .lock()
+            .unwrap()
+            .write(&self.current_block, &mut self.log_page);
+        self.last_saved_lsn = self.latest_lsn;
+    }
+
+    /// Write the log_record to the log page
+    /// First, check if there is enough space
+    fn append(&mut self, log_record: Vec<u8>) -> usize {
+        let mut boundary = self.log_page.get_int(0) as usize;
+        let bytes_needed = log_record.len() + Page::INT_BYTES;
+        if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
+            self.flush_to_disk();
+            self.current_block = LogManager::append_new_block(
+                &mut self.file_manager,
+                &self.log_file,
+                &mut self.log_page,
+            );
+            boundary = self.log_page.get_int(0) as usize;
+        }
+
+        let record_pos = boundary - bytes_needed;
+        self.log_page.set_bytes(record_pos, &log_record);
+        self.log_page.set_int(0, record_pos as i32);
+        self.latest_lsn += 1;
+        self.latest_lsn
+    }
+
+    /// Append a new block to the file maintained by the log manager
+    /// This involves initializing a new block, writing a boundary pointer to it and writing the block to disk
+    fn append_new_block(
+        file_manager: &Arc<Mutex<FileManager>>,
+        log_file: &str,
+        log_page: &mut Page,
+    ) -> BlockId {
+        let block_id = file_manager.lock().unwrap().append(log_file.to_string());
+        log_page.set_int(
+            0,
+            file_manager.lock().unwrap().blocksize.try_into().unwrap(),
+        );
+        file_manager.lock().unwrap().write(&block_id, log_page);
+        block_id
+    }
+
+    fn iterator(&mut self) -> LogIterator {
+        self.flush_to_disk();
+        LogIterator::new(
+            Arc::clone(&self.file_manager),
+            BlockId::new(self.log_file.clone(), self.current_block.block_num),
+        )
+    }
+}
+
 /// The file manager struct that manages the files in the database
 struct FileManager {
     db_directory: PathBuf,
@@ -553,230 +777,6 @@ mod file_manager_tests {
         let block_id_2 = file_manager.append(filename.clone());
         assert_eq!(block_id_2.block_num, 1);
         assert_eq!(file_manager.length(filename), 2);
-    }
-}
-
-struct LogManager {
-    file_manager: Arc<Mutex<FileManager>>,
-    log_file: String,
-    log_page: Page,
-    current_block: BlockId,
-    latest_lsn: usize,
-    last_saved_lsn: usize,
-}
-
-impl LogManager {
-    fn new(file_manager: Arc<Mutex<FileManager>>, log_file: &str) -> Self {
-        let bytes = vec![0; file_manager.lock().unwrap().blocksize];
-        let mut log_page = Page::from_bytes(bytes);
-        let log_size = file_manager.lock().unwrap().length(log_file.to_string());
-        let current_block = if log_size == 0 {
-            LogManager::append_new_block(&file_manager, log_file, &mut log_page)
-        } else {
-            let block = BlockId {
-                filename: log_file.to_string(),
-                block_num: log_size - 1,
-            };
-            file_manager.lock().unwrap().read(&block, &mut log_page);
-            block
-        };
-        Self {
-            file_manager,
-            log_file: log_file.to_string(),
-            log_page,
-            current_block,
-            latest_lsn: 0,
-            last_saved_lsn: 0,
-        }
-    }
-
-    /// Determine if this LSN has been flushed to disk, and flush it if it hasn't
-    fn flush_lsn(&mut self, lsn: usize) {
-        if self.last_saved_lsn >= lsn {
-            return;
-        }
-        self.flush_to_disk();
-    }
-
-    /// Write the bytes from log_page to disk for the current_block
-    /// Update the last_saved_lsn before returning
-    fn flush_to_disk(&mut self) {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .write(&self.current_block, &mut self.log_page);
-        self.last_saved_lsn = self.latest_lsn;
-    }
-
-    /// Write the log_record to the log page
-    /// First, check if there is enough space
-    fn append(&mut self, log_record: Vec<u8>) -> usize {
-        let mut boundary = self.log_page.get_int(0) as usize;
-        let bytes_needed = log_record.len() + Page::INT_BYTES;
-        if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
-            self.flush_to_disk();
-            self.current_block = LogManager::append_new_block(
-                &mut self.file_manager,
-                &self.log_file,
-                &mut self.log_page,
-            );
-            boundary = self.log_page.get_int(0) as usize;
-        }
-
-        let record_pos = boundary - bytes_needed;
-        self.log_page.set_bytes(record_pos, &log_record);
-        self.log_page.set_int(0, record_pos as i32);
-        self.latest_lsn += 1;
-        self.latest_lsn
-    }
-
-    /// Append a new block to the file maintained by the log manager
-    /// This involves initializing a new block, writing a boundary pointer to it and writing the block to disk
-    fn append_new_block(
-        file_manager: &Arc<Mutex<FileManager>>,
-        log_file: &str,
-        log_page: &mut Page,
-    ) -> BlockId {
-        let block_id = file_manager.lock().unwrap().append(log_file.to_string());
-        log_page.set_int(
-            0,
-            file_manager.lock().unwrap().blocksize.try_into().unwrap(),
-        );
-        file_manager.lock().unwrap().write(&block_id, log_page);
-        block_id
-    }
-
-    fn iterator(&mut self) -> LogIterator {
-        self.flush_to_disk();
-        LogIterator::new(
-            Arc::clone(&self.file_manager),
-            BlockId::new(self.log_file.clone(), self.current_block.block_num),
-        )
-    }
-}
-
-struct LogIterator {
-    file_manager: Arc<Mutex<FileManager>>,
-    current_block: BlockId,
-    page: Page,
-    current_pos: usize,
-    boundary: usize,
-}
-
-impl LogIterator {
-    fn new(file_manager: Arc<Mutex<FileManager>>, current_block: BlockId) -> Self {
-        let block_size = file_manager.lock().unwrap().blocksize;
-        let mut page = Page::new(block_size);
-        file_manager.lock().unwrap().read(&current_block, &mut page);
-        let boundary = page.get_int(0) as usize;
-
-        Self {
-            file_manager,
-            current_block,
-            page,
-            current_pos: boundary,
-            boundary,
-        }
-    }
-
-    fn move_to_block(&mut self) {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .read(&self.current_block, &mut self.page);
-        self.boundary = self.page.get_int(0) as usize;
-        self.current_pos = self.boundary;
-    }
-}
-
-impl Iterator for LogIterator {
-    type Item = Vec<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos >= self.file_manager.lock().unwrap().blocksize {
-            if self.current_block.block_num == 0 {
-                return None; //  no more blocks
-            }
-            self.current_block = BlockId {
-                filename: self.current_block.filename.to_string(),
-                block_num: self.current_block.block_num - 1,
-            };
-            self.move_to_block();
-        }
-        //  Read the record
-        let record = self.page.get_bytes(self.current_pos);
-        self.current_pos += Page::INT_BYTES + record.len();
-        Some(record)
-    }
-}
-
-impl IntoIterator for LogManager {
-    type Item = Vec<u8>;
-    type IntoIter = LogIterator;
-
-    fn into_iter(mut self) -> Self::IntoIter {
-        self.iterator()
-    }
-}
-
-#[cfg(test)]
-mod log_manager_tests {
-    use std::{
-        io::Write,
-        sync::{Arc, Mutex},
-    };
-
-    use crate::{LogManager, Page, SimpleDB};
-
-    fn create_log_record(s: &str, n: usize) -> Vec<u8> {
-        let string_bytes = s.as_bytes();
-        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
-        let mut record = Vec::with_capacity(total_size);
-
-        record
-            .write_all(&(string_bytes.len() as i32).to_be_bytes())
-            .unwrap();
-        record.write_all(&string_bytes).unwrap();
-        record.write_all(&n.to_be_bytes()).unwrap();
-        record
-    }
-
-    fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
-        println!("creating records");
-        for i in start..=end {
-            let record = create_log_record(&format!("record{i}"), i + 100);
-            let lsn = log_manager.lock().unwrap().append(record);
-            print!("{lsn} ");
-        }
-        println!("");
-    }
-
-    fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str) {
-        println!("{message}");
-        let iter = log_manager.lock().unwrap().iterator();
-
-        for record in iter {
-            let length = i32::from_be_bytes(record[..4].try_into().unwrap());
-            let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
-            let n = usize::from_be_bytes(record[4 + (length as usize)..].try_into().unwrap());
-            println!("{string} {n}");
-        }
-    }
-
-    #[test]
-    fn test_log_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 0);
-        let log_manager = db.log_manager;
-
-        print_log_records(Arc::clone(&log_manager), "The initial empty log file: ");
-        create_log_records(Arc::clone(&log_manager), 1, 35);
-        print_log_records(
-            Arc::clone(&log_manager),
-            "The log file now has these records:",
-        );
-        create_log_records(Arc::clone(&log_manager), 36, 70);
-        log_manager.lock().unwrap().flush_lsn(65);
-        print_log_records(log_manager, "The log file now has these records:");
     }
 }
 
