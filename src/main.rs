@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
@@ -89,6 +89,8 @@ impl TransactionOperations for Transaction {
     }
 }
 
+type TransactionID = u64;
+
 /// The timestamp oracle which will generate unique timestamps for each transaction
 /// in a monotonically increasing fashion
 struct TxIdGenerator {
@@ -96,7 +98,7 @@ struct TxIdGenerator {
 }
 
 impl TxIdGenerator {
-    fn next_id(&self) -> u64 {
+    fn next_id(&self) -> TransactionID {
         self.next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
@@ -110,7 +112,7 @@ struct Transaction {
     buffer_manager: Arc<Mutex<BufferManager>>,
     recovery_manager: RecoveryManager,
     buffer_list: BufferList,
-    tx_num: u64,
+    tx_id: TransactionID,
 }
 
 impl Transaction {
@@ -122,11 +124,11 @@ impl Transaction {
         let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
             next_id: AtomicU64::new(0),
         });
-        let tx_num = generator.next_id();
+        let tx_id = generator.next_id();
         Self {
-            tx_num,
+            tx_id,
             recovery_manager: RecoveryManager::new(
-                tx_num as usize,
+                tx_id as usize,
                 Arc::clone(&log_manager),
                 Arc::clone(&buffer_manager),
             ),
@@ -205,7 +207,7 @@ impl Transaction {
         };
         let mut guard = buffer.lock().unwrap();
         guard.contents.set_int(offset, value);
-        guard.set_modified(self.tx_num as usize, lsn);
+        guard.set_modified(self.tx_id as usize, lsn);
     }
 
     /// Get a string value in a [`Buffer`] associated with this transaction
@@ -231,7 +233,7 @@ impl Transaction {
         };
         let mut guard = buffer.lock().unwrap();
         guard.contents.set_string(offset, value);
-        guard.set_modified(self.tx_num as usize, lsn);
+        guard.set_modified(self.tx_id as usize, lsn);
     }
 
     /// Get the available buffers for this transaction
@@ -326,6 +328,249 @@ mod transaction_tests {
         assert_eq!(t4.get_int(&block_id, 80), 2);
         assert_eq!(t4.get_string(&block_id, 40), "two");
         t4.commit();
+    }
+}
+
+struct LockState {
+    readers: HashSet<TransactionID>, //  keep track of which transaction id's have a reader lock here
+    writer: Option<TransactionID>,   //  keep track of the transaction writing to a specific block
+    upgrade_request: Option<TransactionID>, //  keep track of upgrade requests to prevent writer starvation
+}
+
+/// Global struct used by all transactions to keep track of locks
+struct LockTable {
+    lock_table: Mutex<HashMap<BlockId, LockState>>,
+    cond_var: Condvar,
+}
+
+impl LockTable {
+    const TIMEOUT: u64 = 10_000; //  timeout in ms
+    fn new() -> Self {
+        Self {
+            lock_table: Mutex::new(HashMap::new()),
+            cond_var: Condvar::new(),
+        }
+    }
+
+    fn acquire_shared_lock(
+        &self,
+        tx_id: TransactionID,
+        block_id: &BlockId,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut lock_table_guard = self.lock_table.lock().unwrap();
+        lock_table_guard
+            .entry(block_id.clone())
+            .or_insert(LockState {
+                readers: vec![tx_id].into_iter().collect(),
+                writer: None,
+                upgrade_request: None,
+            });
+
+        //  Do an early return if the txn already has an SLock on this block
+        if lock_table_guard
+            .get(block_id)
+            .unwrap()
+            .readers
+            .contains(&tx_id)
+        {
+            return Ok(());
+        }
+
+        //  Loop until either
+        //  1. There are no more writers or pending writers on this block
+        //  2. The timeout expires
+        let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+        loop {
+            let state = lock_table_guard.get_mut(block_id).unwrap();
+            let should_wait = state.writer.is_some() || state.upgrade_request.is_some();
+
+            if !should_wait {
+                break;
+            }
+
+            lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
+
+            if Instant::now() >= deadline {
+                return Err("Timeout while waiting for lock".into());
+            }
+        }
+        lock_table_guard
+            .get_mut(block_id)
+            .unwrap()
+            .readers
+            .insert(tx_id);
+        Ok(())
+    }
+
+    fn acquire_write_lock(
+        &self,
+        tx_id: TransactionID,
+        block_id: &BlockId,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut lock_table_guard = self.lock_table.lock().unwrap();
+        lock_table_guard
+            .entry(block_id.clone())
+            .or_insert(LockState {
+                readers: HashSet::new(),
+                writer: Some(tx_id),
+                upgrade_request: None,
+            });
+
+        //  Do an early return if this txn already has an xlock on the buffer
+        if lock_table_guard
+            .get(block_id)
+            .unwrap()
+            .writer
+            .map_or(false, |id| id == tx_id)
+        {
+            return Ok(());
+        }
+
+        //  Maintain the invariant that any transaction that wants an xlock must first have an slock
+        assert!(lock_table_guard
+            .get(block_id)
+            .unwrap()
+            .readers
+            .contains(&tx_id));
+
+        let is_upgrade = lock_table_guard
+            .get(block_id)
+            .unwrap()
+            .readers
+            .contains(&tx_id);
+        if is_upgrade {
+            if lock_table_guard
+                .get(block_id)
+                .unwrap()
+                .upgrade_request
+                .is_some()
+            {
+                return Err("Upgrade request already exists".into());
+            }
+            lock_table_guard.get_mut(block_id).unwrap().upgrade_request = Some(tx_id);
+            let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+            loop {
+                let state = lock_table_guard.get_mut(block_id).unwrap();
+                let should_wait = state.readers.len() > 1 || state.writer.is_some();
+
+                if !should_wait {
+                    break;
+                }
+                lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
+
+                if Instant::now() > deadline {
+                    return Err("Timeout while waiting for lock".into());
+                }
+            }
+            let state = lock_table_guard.get_mut(block_id).unwrap();
+            assert_eq!(state.readers.len(), 1);
+            assert_eq!(state.readers.contains(&tx_id), true);
+            state.readers.remove(&tx_id);
+            state.writer = Some(tx_id);
+            state.upgrade_request = None;
+            return Ok(());
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+            loop {
+                let state = lock_table_guard.get_mut(block_id).unwrap();
+                let should_wait = state.readers.len() > 0 || state.writer.is_some();
+
+                if !should_wait {
+                    break;
+                }
+                lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
+
+                if Instant::now() > deadline {
+                    return Err("Timeout while waiting for lock".into());
+                }
+            }
+            lock_table_guard.get_mut(block_id).unwrap().writer = Some(tx_id);
+            return Ok(());
+        }
+    }
+
+    fn release_locks(
+        &self,
+        tx_id: TransactionID,
+        block_id: &BlockId,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut lock_table_guard = self.lock_table.lock().unwrap();
+        if let Some(state) = lock_table_guard.get_mut(block_id) {
+            state.readers.remove(&tx_id);
+            if let Some(writer_tx_id) = state.writer {
+                if writer_tx_id == tx_id {
+                    state.writer = None;
+                }
+            }
+            if let Some(upgrade_req_tx_id) = state.upgrade_request {
+                if upgrade_req_tx_id == tx_id {
+                    state.upgrade_request = None;
+                }
+            }
+        }
+        self.cond_var.notify_all();
+        return Ok(());
+    }
+}
+
+static LOCK_TABLE_GENERATOR: OnceLock<Arc<LockTable>> = OnceLock::new();
+
+enum LockType {
+    Shared,
+    Exclusive,
+}
+
+struct ConcurrencyManager {
+    lock_table: Arc<LockTable>,
+    locks: RefCell<HashMap<BlockId, LockType>>,
+}
+
+impl ConcurrencyManager {
+    fn new() -> Self {
+        Self {
+            lock_table: LOCK_TABLE_GENERATOR
+                .get_or_init(|| Arc::new(LockTable::new()))
+                .clone(),
+            locks: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn slock(&self, tx_id: TransactionID, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
+        let mut locks = self.locks.borrow_mut();
+        if locks.contains_key(block_id) {
+            return Ok(());
+        }
+        self.lock_table.acquire_shared_lock(tx_id, block_id)?;
+        locks.insert(block_id.clone(), LockType::Shared);
+        Ok(())
+    }
+
+    fn xlock(&self, tx_id: TransactionID, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
+        let mut locks = self.locks.borrow_mut();
+        match locks.get(block_id) {
+            Some(lock) => match lock {
+                LockType::Shared => {
+                    self.lock_table.acquire_write_lock(tx_id, block_id)?;
+                    locks.insert(block_id.clone(), LockType::Exclusive).unwrap();
+                }
+                LockType::Exclusive => return Ok(()),
+            },
+            None => {
+                self.slock(tx_id, block_id)?;
+                self.lock_table.acquire_write_lock(tx_id, block_id)?;
+                locks.insert(block_id.clone(), LockType::Exclusive);
+            }
+        }
+        return Ok(());
+    }
+
+    fn release(&self, tx_id: TransactionID) -> Result<(), Box<dyn Error>> {
+        let mut locks = self.locks.borrow_mut();
+        for block in locks.keys() {
+            self.lock_table.release_locks(tx_id, block)?;
+        }
+        locks.clear();
+        Ok(())
     }
 }
 
