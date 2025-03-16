@@ -151,6 +151,7 @@ impl RecoveryManager {
         Ok(())
     }
 
+    /// Write the [`LogRecord`] to set the value of an integer in a [`Buffer`]
     fn set_int(
         &self,
         buffer: Buffer,
@@ -168,6 +169,7 @@ impl RecoveryManager {
         record.write_log_record(Arc::clone(&self.log_manager))
     }
 
+    /// Write the [`LogRecord`] to set the value of a String in a [`Buffer`]
     fn set_string(
         &self,
         buffer: Buffer,
@@ -186,11 +188,154 @@ impl RecoveryManager {
     }
 }
 
+#[cfg(test)]
+mod recovery_manager_tests {
+    use std::sync::Arc;
+
+    use crate::{BlockId, LogRecord, RecoveryManager, SimpleDB, TransactionOperations};
+
+    struct MockTransaction {
+        pinned_blocks: Vec<BlockId>,
+        modified_ints: Vec<(BlockId, usize, i32)>,
+        modified_strings: Vec<(BlockId, usize, String)>,
+    }
+
+    impl MockTransaction {
+        fn new() -> Self {
+            Self {
+                pinned_blocks: Vec::new(),
+                modified_ints: Vec::new(),
+                modified_strings: Vec::new(),
+            }
+        }
+
+        fn verify_int_was_reset(
+            &self,
+            block_id: &BlockId,
+            offset: usize,
+            expected_val: i32,
+        ) -> bool {
+            self.modified_ints
+                .iter()
+                .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
+        }
+
+        fn verify_string_was_reset(
+            &self,
+            block_id: &BlockId,
+            offset: usize,
+            expected_val: String,
+        ) -> bool {
+            self.modified_strings
+                .iter()
+                .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
+        }
+    }
+
+    impl TransactionOperations for MockTransaction {
+        fn pin(&self, block_id: &BlockId) {
+            println!("Pinning block {:?}", block_id);
+        }
+
+        fn unpin(&self, block_id: &BlockId) {
+            println!("Unpinning block {:?}", block_id);
+        }
+
+        fn set_int(&mut self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
+            println!(
+                "Setting int at block {:?} offset {} to {}",
+                block_id, offset, val
+            );
+            self.modified_ints.push((block_id.clone(), offset, val));
+        }
+
+        fn set_string(&mut self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
+            println!(
+                "Setting string at block {:?} offset {} to {}",
+                block_id, offset, val
+            );
+            self.modified_strings
+                .push((block_id.clone(), offset, val.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_rollback_with_int() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+
+        let recovery_manager = RecoveryManager::new(
+            1,
+            Arc::clone(&db.log_manager),
+            Arc::clone(&db.buffer_manager),
+        );
+
+        let mut mock_tx = MockTransaction::new();
+        let test_block = BlockId::new("test.txt".to_string(), 1);
+
+        // Write some log records that will need to be rolled back
+        let set_int_record = LogRecord::SetInt {
+            txnum: 1,
+            block_id: test_block.clone(),
+            offset: 0,
+            old_val: 100, // Original value before modification
+        };
+        set_int_record
+            .write_log_record(Arc::clone(&db.log_manager))
+            .unwrap();
+
+        // Perform rollback
+        recovery_manager.rollback(&mut mock_tx).unwrap();
+
+        // Verify that the value was reset to the original value
+        assert!(mock_tx.verify_int_was_reset(&test_block, 0, 100));
+        assert_eq!(
+            mock_tx.modified_ints.len(),
+            1,
+            "Should have exactly one modification"
+        );
+    }
+
+    #[test]
+    fn test_rollback_with_string() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let recovery_manager = RecoveryManager::new(
+            1,
+            Arc::clone(&db.log_manager),
+            Arc::clone(&db.buffer_manager),
+        );
+
+        let mut mock_tx = MockTransaction::new();
+        let test_block = BlockId::new("test.txt".to_string(), 1);
+
+        //  Write some log records that will need to be rolled back
+        let set_string_record = LogRecord::SetString {
+            txnum: 1,
+            block_id: test_block.clone(),
+            offset: 0,
+            old_val: "Hello World".to_string(),
+        };
+        set_string_record
+            .write_log_record(Arc::clone(&db.log_manager))
+            .unwrap();
+
+        //   Perform rollback
+        recovery_manager.rollback(&mut mock_tx).unwrap();
+
+        //  Verify that the value was reset to the original value
+        assert!(mock_tx.verify_string_was_reset(&test_block, 0, "Hello World".to_string()));
+        assert_eq!(
+            mock_tx.modified_strings.len(),
+            1,
+            "Should have exactly one modification"
+        );
+    }
+}
+
 trait TransactionOperations {
     fn pin(&self, block_id: &BlockId);
     fn unpin(&self, block_id: &BlockId);
-    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool);
-    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool);
+    fn set_int(&mut self, block_id: &BlockId, offset: usize, val: i32, log: bool);
+    fn set_string(&mut self, block_id: &BlockId, offset: usize, val: &str, log: bool);
 }
 
 /// The timestamp oracle which will generate unique timestamps for each transaction
@@ -306,7 +451,7 @@ impl Display for LogRecord {
                 old_val,
             } => write!(
                 f,
-                "SetInt({}, {:?}, {}, {})",
+                "SetInt(txnum: {}, block_id: {:?}, offset: {}, old_val: {})",
                 txnum, block_id, offset, old_val
             ),
             LogRecord::SetString {
@@ -316,7 +461,7 @@ impl Display for LogRecord {
                 old_val,
             } => write!(
                 f,
-                "SetString({}, {:?}, {}, {})",
+                "SetString(txnum: {}, block_id: {:?}, offset: {}, old_val: {})",
                 txnum, block_id, offset, old_val
             ),
         }
@@ -327,18 +472,21 @@ impl TryInto<Vec<u8>> for &LogRecord {
     type Error = Box<dyn Error>;
 
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        let size = self.calculate_size();
         let int_value = self.discriminant();
-        let mut bytes = vec![];
-        bytes.write_all(&int_value.to_be_bytes())?;
+        let mut page = Page::new(size);
+        let mut pos = 0;
+        page.set_int(pos, int_value as i32);
+        pos += 4;
         match self {
             LogRecord::Start(txnum) => {
-                bytes.write_all(&txnum.to_be_bytes())?;
+                page.set_int(pos, *txnum as i32);
             }
             LogRecord::Commit(txnum) => {
-                bytes.write_all(&txnum.to_be_bytes())?;
+                page.set_int(pos, *txnum as i32);
             }
             LogRecord::Rollback(txnum) => {
-                bytes.write_all(&txnum.to_be_bytes())?;
+                page.set_int(pos, *txnum as i32);
             }
             LogRecord::Checkpoint => {}
             LogRecord::SetInt {
@@ -347,12 +495,15 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 offset,
                 old_val,
             } => {
-                bytes.write_all(&txnum.to_be_bytes())?;
-                bytes.write_all(&block_id.filename.len().to_be_bytes())?;
-                bytes.write_all(&block_id.filename.as_bytes())?;
-                bytes.write_all(&block_id.block_num.to_be_bytes())?;
-                bytes.write_all(&offset.to_be_bytes())?;
-                bytes.write_all(&old_val.to_be_bytes())?;
+                page.set_int(pos, *txnum as i32);
+                pos += 4;
+                page.set_string(pos, &block_id.filename);
+                pos += 4 + block_id.filename.len();
+                page.set_int(pos, block_id.block_num as i32);
+                pos += 4;
+                page.set_int(pos, *offset as i32);
+                pos += 4;
+                page.set_int(pos, *old_val);
             }
             LogRecord::SetString {
                 txnum,
@@ -360,15 +511,18 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 offset,
                 old_val,
             } => {
-                bytes.write_all(&txnum.to_be_bytes())?;
-                bytes.write_all(&block_id.filename.len().to_be_bytes())?;
-                bytes.write_all(&block_id.filename.as_bytes())?;
-                bytes.write_all(&block_id.block_num.to_be_bytes())?;
-                bytes.write_all(&offset.to_be_bytes())?;
-                bytes.write_all(&old_val.as_bytes())?;
+                page.set_int(pos, *txnum as i32);
+                pos += 4;
+                page.set_string(pos, &block_id.filename);
+                pos += 4 + block_id.filename.len();
+                page.set_int(pos, block_id.block_num as i32);
+                pos += 4;
+                page.set_int(pos, *offset as i32);
+                pos += 4;
+                page.set_string(pos, old_val);
             }
         }
-        Ok(bytes)
+        Ok(page.contents)
     }
 }
 
@@ -428,6 +582,44 @@ impl TryFrom<Vec<u8>> for LogRecord {
 }
 
 impl LogRecord {
+    // Size constants for different components
+    const DISCRIMINANT_SIZE: usize = Page::INT_BYTES;
+    const TXNUM_SIZE: usize = Page::INT_BYTES;
+    const OFFSET_SIZE: usize = Page::INT_BYTES;
+    const BLOCK_NUM_SIZE: usize = Page::INT_BYTES;
+    const STR_LEN_SIZE: usize = Page::INT_BYTES;
+
+    fn calculate_size(&self) -> usize {
+        let base_size = Self::DISCRIMINANT_SIZE; // Every record has a discriminant
+        match self {
+            LogRecord::Start(_) | LogRecord::Commit(_) | LogRecord::Rollback(_) => {
+                base_size + Self::TXNUM_SIZE
+            }
+            LogRecord::Checkpoint => base_size,
+            LogRecord::SetInt { block_id, .. } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::TXNUM_SIZE // NOTE: old_val size (be careful of this changing)
+            }
+            LogRecord::SetString {
+                block_id, old_val, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::STR_LEN_SIZE
+                    + old_val.len()
+            }
+        }
+    }
+
     /// Get the discriminant value for the log record
     fn discriminant(&self) -> u32 {
         match self {
@@ -490,9 +682,10 @@ impl LogRecord {
         Ok(log_manager.lock().unwrap().append(bytes))
     }
 
-    /// Read the log record from the log file and deserialize it
+    /// Read the bytes from the log file and deserialize them into a [`LogRecord`]
     fn from_bytes(bytes: Vec<u8>) -> Result<LogRecord, Box<dyn Error>> {
-        bytes.try_into()
+        let result: LogRecord = bytes.try_into()?;
+        Ok(result)
     }
 }
 
