@@ -38,7 +38,11 @@
           "kind": "bin"
         }
       },
-      "args": [],
+      "args": [
+        "transaction_tests",
+        "--",
+        "--nocapture"
+      ],
       "cwd": "${workspaceFolder}"
     }
   ]

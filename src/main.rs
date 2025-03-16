@@ -1,11 +1,14 @@
 #![allow(dead_code)]
+#![allow(unused_variables)]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -61,8 +64,273 @@ impl SimpleDB {
     }
 }
 
+trait TransactionOperations {
+    fn pin(&self, block_id: &BlockId);
+    fn unpin(&self, block_id: &BlockId);
+    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool);
+    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool);
+}
+
+impl TransactionOperations for Transaction {
+    fn pin(&self, block_id: &BlockId) {
+        Transaction::pin(&self, block_id);
+    }
+
+    fn unpin(&self, block_id: &BlockId) {
+        Transaction::unpin(&self, block_id);
+    }
+
+    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
+        Transaction::set_int(&self, block_id, offset, val, log);
+    }
+
+    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
+        Transaction::set_string(&self, block_id, offset, val, log);
+    }
+}
+
+/// The timestamp oracle which will generate unique timestamps for each transaction
+/// in a monotonically increasing fashion
+struct TxIdGenerator {
+    next_id: AtomicU64,
+}
+
+impl TxIdGenerator {
+    fn next_id(&self) -> u64 {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
+
+struct Transaction {
+    file_manager: Arc<Mutex<FileManager>>,
+    log_manager: Arc<Mutex<LogManager>>,
+    buffer_manager: Arc<Mutex<BufferManager>>,
+    recovery_manager: RecoveryManager,
+    buffer_list: BufferList,
+    tx_num: u64,
+}
+
+impl Transaction {
+    fn new(
+        file_manager: Arc<Mutex<FileManager>>,
+        log_manager: Arc<Mutex<LogManager>>,
+        buffer_manager: Arc<Mutex<BufferManager>>,
+    ) -> Self {
+        let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
+            next_id: AtomicU64::new(0),
+        });
+        let tx_num = generator.next_id();
+        Self {
+            tx_num,
+            recovery_manager: RecoveryManager::new(
+                tx_num as usize,
+                Arc::clone(&log_manager),
+                Arc::clone(&buffer_manager),
+            ),
+            buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
+            buffer_manager,
+            log_manager,
+            file_manager,
+        }
+    }
+
+    /// Commit this transaction
+    /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
+    /// It will release all locks that are currently held by this transaction
+    /// It will also handle meta operations like unpinning buffers
+    fn commit(&self) {
+        //  Commit all data associated with this txn
+        self.recovery_manager.commit();
+        //  Release all locks associated with this txn
+        //  TODO
+        //  unpin all buffers and release metadata
+        self.buffer_list.unpin_all();
+    }
+
+    /// Rollback this transaction
+    /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
+    /// It will also handle meta operations like unpinning buffers
+    fn rollback(&self) {
+        //  Rollback all data associated with this txn
+        self.recovery_manager.rollback(self).unwrap();
+        //  TODO: Release all locks associated with this txn
+        //  unpin all buffers and release metadata
+        self.buffer_list.unpin_all();
+    }
+
+    /// Recover the database on start-up or after a crash
+    fn recover(&self) {
+        //  Perform a database recovery
+        self.recovery_manager.recover(self).unwrap();
+        //  TODO: Release all locks associated with this transaction
+        //  Unpin all buffers and release metadata
+        self.buffer_list.unpin_all();
+    }
+
+    /// Pin this [`BlockId`] to be used in this transaction
+    fn pin(&self, block_id: &BlockId) {
+        self.buffer_list.pin(block_id);
+    }
+
+    /// Unpin this [`BlockId`] since it is no longer needed by this transaction
+    fn unpin(&self, block_id: &BlockId) {
+        self.buffer_list.unpin(block_id);
+    }
+
+    /// Get an integer value in a [`Buffer`] associated with this transaction
+    fn get_int(&self, block_id: &BlockId, offset: usize) -> i32 {
+        //  TODO: Acquire a shared lock here
+        let buffer = self.buffer_list.get_buffer(block_id).unwrap();
+        let guard = buffer.lock().unwrap();
+        guard.contents.get_int(offset)
+    }
+
+    /// Set an integer value in a [`Buffer`] associated with this transaction
+    fn set_int(&self, block_id: &BlockId, offset: usize, value: i32, log: bool) {
+        //  TODO: Acquire an exclusive lock here
+        let buffer = self.buffer_list.get_buffer(block_id).unwrap();
+        let lsn = {
+            if log {
+                //  The LSN returned from writing to the WAL
+                self.recovery_manager
+                    .set_int(buffer.lock().unwrap().deref(), offset, value)
+                    .unwrap()
+            } else {
+                //  The default LSN when no WAL write occurs
+                LSN::MAX
+            }
+        };
+        let mut guard = buffer.lock().unwrap();
+        guard.contents.set_int(offset, value);
+        guard.set_modified(self.tx_num as usize, lsn);
+    }
+
+    /// Get a string value in a [`Buffer`] associated with this transaction
+    fn get_string(&self, block_id: &BlockId, offset: usize) -> String {
+        //  TODO: Acquire a shared lock here
+        let buffer = self.buffer_list.get_buffer(block_id).unwrap();
+        let guard = buffer.lock().unwrap();
+        guard.contents.get_string(offset)
+    }
+
+    /// Set a string value in a [`Buffer`] associated with this transaction
+    fn set_string(&self, block_id: &BlockId, offset: usize, value: &str, log: bool) {
+        //  TODO: Acquire an exclusive lock here
+        let buffer = self.buffer_list.get_buffer(block_id).unwrap();
+        let lsn = {
+            if log {
+                self.recovery_manager
+                    .set_string(buffer.lock().unwrap().deref(), offset, value)
+                    .unwrap()
+            } else {
+                LSN::MAX
+            }
+        };
+        let mut guard = buffer.lock().unwrap();
+        guard.contents.set_string(offset, value);
+        guard.set_modified(self.tx_num as usize, lsn);
+    }
+
+    /// Get the available buffers for this transaction
+    fn available_buffs(&self) -> usize {
+        self.buffer_manager.lock().unwrap().available()
+    }
+
+    /// Get the size of this file in blocks
+    fn size(&self, file_name: &str) -> usize {
+        //  TODO: Insert a shared lock here to ensure the length read is accurate
+        self.file_manager
+            .lock()
+            .unwrap()
+            .length(file_name.to_string())
+    }
+
+    /// Append a block to the file
+    fn append(&self, file_name: &str) -> BlockId {
+        //  TODO: Insert a write lock here to ensure this write is safe
+        self.file_manager
+            .lock()
+            .unwrap()
+            .append(file_name.to_string())
+    }
+
+    /// Get the block size
+    fn block_size(&self) -> usize {
+        self.file_manager.lock().unwrap().blocksize
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use std::sync::Arc;
+
+    use crate::{BlockId, SimpleDB, Transaction};
+
+    #[test]
+    fn test_transaction_single_threaded() {
+        let file = "test_file";
+        let block_size = 512;
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 3);
+
+        //  Start a transaction t1 that will set an int and a string
+        let t1 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        let block_id = BlockId::new(file.to_string(), 1);
+        t1.pin(&block_id);
+        t1.set_int(&block_id, 80, 1, false);
+        t1.set_string(&block_id, 40, "one", false);
+        t1.commit();
+
+        //  Start a transaction t2 that should see the results of the previously committed transaction t1
+        //  Set new values in this transaction
+        let t2 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t2.pin(&block_id);
+        assert_eq!(t2.get_int(&block_id, 80), 1);
+        assert_eq!(t2.get_string(&block_id, 40), "one");
+        t2.set_int(&block_id, 80, 2, true);
+        t2.set_string(&block_id, 40, "two", true);
+        t2.commit();
+
+        //  Start a transaction t3 which should see the results of t2
+        //  Set new values for t3 but roll it back instead of committing
+        let t3 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t3.pin(&block_id);
+        assert_eq!(t3.get_int(&block_id, 80), 2);
+        assert_eq!(t3.get_string(&block_id, 40), "two");
+        t3.set_int(&block_id, 80, 3, true);
+        t3.set_string(&block_id, 40, "three", true);
+        t3.rollback();
+
+        //  Start a transaction t4 which should see the result of t2 since t3 rolled back
+        //  This will be a read only transaction that commits
+        let t4 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t4.pin(&block_id);
+        assert_eq!(t4.get_int(&block_id, 80), 2);
+        assert_eq!(t4.get_string(&block_id, 40), "two");
+        t4.commit();
+    }
+}
+
 /// The container for the recovery manager - a [`Transaction`] uses a unique instance of this to
-/// manage writing records to WAL
+/// manage writing records to WAL and handling recovery & rollback
 struct RecoveryManager {
     tx_num: usize,
     log_manager: Arc<Mutex<LogManager>>,
@@ -99,7 +367,7 @@ impl RecoveryManager {
     /// Iterate over the WAL records in reverse order and undo any modifications done for this [`Transaction`]
     /// Flush all data associated with this transaction
     /// Create, write and flush a [`LogRecord::Checkpoint`] record
-    fn rollback(&self, tx: &mut dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+    fn rollback(&self, tx: &dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
         //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
         for log in log_iter {
@@ -124,7 +392,7 @@ impl RecoveryManager {
     /// Recover the database from the last [`LogRecord::Checkpoint`]
     /// Find all the incomplete transactions and undo their operations
     /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
-    fn recover(&self, tx: &mut dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+    fn recover(&self, tx: &dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
         //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
         let log_iter = self.log_manager.lock().unwrap().iterator();
         let mut finished_txns: Vec<usize> = Vec::new();
@@ -154,12 +422,12 @@ impl RecoveryManager {
     /// Write the [`LogRecord`] to set the value of an integer in a [`Buffer`]
     fn set_int(
         &self,
-        buffer: Buffer,
+        buffer: &Buffer,
         offset: usize,
-        _new_value: usize,
+        _new_value: i32,
     ) -> Result<LSN, Box<dyn Error>> {
         let old_value = buffer.contents.get_int(offset);
-        let block_id = buffer.block_id.unwrap();
+        let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetInt {
             txnum: self.tx_num,
             block_id,
@@ -172,12 +440,12 @@ impl RecoveryManager {
     /// Write the [`LogRecord`] to set the value of a String in a [`Buffer`]
     fn set_string(
         &self,
-        buffer: Buffer,
+        buffer: &Buffer,
         offset: usize,
-        _new_valu: usize,
+        _new_value: &str,
     ) -> Result<LSN, Box<dyn Error>> {
         let old_value = buffer.contents.get_string(offset);
-        let block_id = buffer.block_id.unwrap();
+        let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetString {
             txnum: self.tx_num,
             block_id,
@@ -190,22 +458,22 @@ impl RecoveryManager {
 
 #[cfg(test)]
 mod recovery_manager_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::{BlockId, LogRecord, RecoveryManager, SimpleDB, TransactionOperations};
 
     struct MockTransaction {
         pinned_blocks: Vec<BlockId>,
-        modified_ints: Vec<(BlockId, usize, i32)>,
-        modified_strings: Vec<(BlockId, usize, String)>,
+        modified_ints: Mutex<Vec<(BlockId, usize, i32)>>,
+        modified_strings: Mutex<Vec<(BlockId, usize, String)>>,
     }
 
     impl MockTransaction {
         fn new() -> Self {
             Self {
                 pinned_blocks: Vec::new(),
-                modified_ints: Vec::new(),
-                modified_strings: Vec::new(),
+                modified_ints: Mutex::new(Vec::new()),
+                modified_strings: Mutex::new(Vec::new()),
             }
         }
 
@@ -216,6 +484,8 @@ mod recovery_manager_tests {
             expected_val: i32,
         ) -> bool {
             self.modified_ints
+                .lock()
+                .unwrap()
                 .iter()
                 .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
         }
@@ -227,6 +497,8 @@ mod recovery_manager_tests {
             expected_val: String,
         ) -> bool {
             self.modified_strings
+                .lock()
+                .unwrap()
                 .iter()
                 .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
         }
@@ -234,27 +506,36 @@ mod recovery_manager_tests {
 
     impl TransactionOperations for MockTransaction {
         fn pin(&self, block_id: &BlockId) {
-            println!("Pinning block {:?}", block_id);
+            dbg!("Pinning block {:?}", block_id);
         }
 
         fn unpin(&self, block_id: &BlockId) {
-            println!("Unpinning block {:?}", block_id);
+            dbg!("Unpinning block {:?}", block_id);
         }
 
-        fn set_int(&mut self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
-            println!(
+        fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
+            dbg!(
                 "Setting int at block {:?} offset {} to {}",
-                block_id, offset, val
+                block_id,
+                offset,
+                val
             );
-            self.modified_ints.push((block_id.clone(), offset, val));
+            self.modified_ints
+                .lock()
+                .unwrap()
+                .push((block_id.clone(), offset, val));
         }
 
-        fn set_string(&mut self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
-            println!(
+        fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
+            dbg!(
                 "Setting string at block {:?} offset {} to {}",
-                block_id, offset, val
+                block_id,
+                offset,
+                val
             );
             self.modified_strings
+                .lock()
+                .unwrap()
                 .push((block_id.clone(), offset, val.to_string()));
         }
     }
@@ -289,7 +570,7 @@ mod recovery_manager_tests {
         // Verify that the value was reset to the original value
         assert!(mock_tx.verify_int_was_reset(&test_block, 0, 100));
         assert_eq!(
-            mock_tx.modified_ints.len(),
+            mock_tx.modified_ints.lock().unwrap().len(),
             1,
             "Should have exactly one modification"
         );
@@ -324,95 +605,10 @@ mod recovery_manager_tests {
         //  Verify that the value was reset to the original value
         assert!(mock_tx.verify_string_was_reset(&test_block, 0, "Hello World".to_string()));
         assert_eq!(
-            mock_tx.modified_strings.len(),
+            mock_tx.modified_strings.lock().unwrap().len(),
             1,
             "Should have exactly one modification"
         );
-    }
-}
-
-trait TransactionOperations {
-    fn pin(&self, block_id: &BlockId);
-    fn unpin(&self, block_id: &BlockId);
-    fn set_int(&mut self, block_id: &BlockId, offset: usize, val: i32, log: bool);
-    fn set_string(&mut self, block_id: &BlockId, offset: usize, val: &str, log: bool);
-}
-
-/// The timestamp oracle which will generate unique timestamps for each transaction
-/// in a monotonically increasing fashion
-struct TxIdGenerator {
-    next_id: AtomicU64,
-}
-
-impl TxIdGenerator {
-    fn next_id(&self) -> u64 {
-        self.next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
-
-struct Transaction {
-    file_manager: Arc<Mutex<FileManager>>,
-    log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
-    tx_num: u64,
-}
-
-impl Transaction {
-    fn new(
-        file_manager: Arc<Mutex<FileManager>>,
-        log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
-    ) -> Self {
-        let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
-            next_id: AtomicU64::new(0),
-        });
-        Self {
-            file_manager,
-            log_manager,
-            buffer_manager,
-            tx_num: generator.next_id(),
-        }
-    }
-
-    fn commit(&self) {}
-
-    fn rollback(&self) {}
-
-    fn recover(&self) {}
-
-    fn pin(&self, block_id: &BlockId) {}
-
-    fn unpin(&self, block_id: &BlockId) {}
-
-    fn get_int(&self, block_id: &BlockId, offset: usize) -> i32 {
-        todo!()
-    }
-
-    fn set_int(&self, block_id: &BlockId, offset: usize, value: i32, log: bool) {}
-
-    fn get_string(&self, block_id: &BlockId, offset: usize) -> String {
-        todo!()
-    }
-
-    fn set_string(&self, block_id: &BlockId, offset: usize, value: &str, log: bool) {}
-
-    fn available_buffs(&self) -> usize {
-        todo!()
-    }
-
-    fn size(&self, file_name: &str) -> usize {
-        todo!()
-    }
-
-    fn append(&self, file_name: &str) -> BlockId {
-        todo!()
-    }
-
-    fn block_size(&self) -> usize {
-        todo!()
     }
 }
 
@@ -647,7 +843,7 @@ impl LogRecord {
 
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
-    fn undo(&self, tx: &mut dyn TransactionOperations) {
+    fn undo(&self, tx: &dyn TransactionOperations) {
         match self {
             LogRecord::Start(_) => (),    //  no-op
             LogRecord::Commit(_) => (),   //  no-op
@@ -698,14 +894,14 @@ struct HashMapValue {
 /// A wrapper to maintain the list of [`Buffer`] being used by the [`Transaction`]
 /// It uses the [`BufferManager`] internally to maintain metadata
 struct BufferList {
-    buffers: HashMap<BlockId, HashMapValue>,
+    buffers: RefCell<HashMap<BlockId, HashMapValue>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
 }
 
 impl BufferList {
     fn new(buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
         Self {
-            buffers: HashMap::new(),
+            buffers: RefCell::new(HashMap::new()),
             buffer_manager,
         }
     }
@@ -713,43 +909,48 @@ impl BufferList {
     /// Get the buffer associated with the provided block_id
     fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
         self.buffers
+            .borrow()
             .get(block_id)
             .and_then(|v| Some(Arc::clone(&v.buffer)))
     }
 
     /// Pin the buffer associated with the provided [`BlockId`]
-    fn pin(&mut self, block_id: &BlockId) {
+    fn pin(&self, block_id: &BlockId) {
         let buffer = self.buffer_manager.lock().unwrap().pin(block_id).unwrap();
         self.buffers
+            .borrow_mut()
             .entry(block_id.clone())
             .and_modify(|v| v.count += 1)
             .or_insert(HashMapValue { buffer, count: 1 });
     }
 
     /// Unpin the buffer associated with the provided [`BlockId`]
-    fn unpin(&mut self, block_id: &BlockId) {
-        assert!(self.buffers.contains_key(block_id));
-        let buffer = Arc::clone(&self.buffers.get(block_id).unwrap().buffer);
+    fn unpin(&self, block_id: &BlockId) {
+        assert!(self.buffers.borrow().contains_key(block_id));
+        let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
         self.buffer_manager.lock().unwrap().unpin(buffer);
         let should_remove = {
-            let v = self.buffers.get_mut(block_id).unwrap();
+            let mut buffers = self.buffers.borrow_mut();
+            let v = buffers.get_mut(block_id).unwrap();
             v.count -= 1;
             v.count == 0
         };
         if should_remove {
-            self.buffers.remove(block_id);
+            self.buffers.borrow_mut().remove(block_id);
         }
     }
 
     /// Unpin all the buffers in this [`BufferList`]
-    fn unpin_all(&mut self) {
-        for buffer_with_meta in self.buffers.values() {
+    fn unpin_all(&self) {
+        let mut buffer_guard = self.buffers.borrow_mut();
+        let buffers = buffer_guard.values();
+        for buffer in buffers {
             self.buffer_manager
                 .lock()
                 .unwrap()
-                .unpin(Arc::clone(&buffer_with_meta.buffer));
+                .unpin(Arc::clone(&buffer.buffer));
         }
-        self.buffers.clear();
+        buffer_guard.clear();
     }
 }
 
@@ -768,7 +969,7 @@ mod buffer_list_tests {
             "buffer_list_tests_log_file",
         )));
         let buffer_manager = Arc::new(Mutex::new(BufferManager::new(file_manager, log_manager, 4)));
-        let mut buffer_list = BufferList::new(buffer_manager);
+        let buffer_list = BufferList::new(buffer_manager);
 
         //  check that there are no buffers in the buffer list initially
         let block_id = BlockId {
@@ -783,7 +984,7 @@ mod buffer_list_tests {
 
         //  unpinning all buffers will empty the buffer list
         buffer_list.unpin_all();
-        assert!(buffer_list.buffers.is_empty());
+        assert!(buffer_list.buffers.borrow().is_empty());
     }
 }
 
@@ -792,7 +993,7 @@ struct Buffer {
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
     block_id: Option<BlockId>,
-    pins: usize,
+    pub pins: usize,
     txn: Option<usize>,
     lsn: Option<LSN>,
 }
@@ -924,9 +1125,9 @@ impl BufferManager {
                     {
                         let mut buffer_guard = buffer.lock().unwrap();
                         if !buffer_guard.is_pinned() {
-                            buffer_guard.pin();
                             *num_available -= 1;
                         }
+                        buffer_guard.pin();
                     }
                     return Ok(buffer);
                 }
@@ -1131,24 +1332,24 @@ mod log_manager_tests {
     }
 
     fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
-        println!("creating records");
+        dbg!("creating records");
         for i in start..=end {
             let record = create_log_record(&format!("record{i}"), i + 100);
             let lsn = log_manager.lock().unwrap().append(record);
             print!("{lsn} ");
         }
-        println!("");
+        dbg!("");
     }
 
     fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str) {
-        println!("{message}");
+        dbg!("{message}");
         let iter = log_manager.lock().unwrap().iterator();
 
         for record in iter {
             let length = i32::from_be_bytes(record[..4].try_into().unwrap());
             let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
             let n = usize::from_be_bytes(record[4 + (length as usize)..].try_into().unwrap());
-            println!("{string} {n}");
+            dbg!("{string} {n}");
         }
     }
 
@@ -1511,6 +1712,4 @@ mod file_manager_tests {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
-}
+fn main() {}
