@@ -352,6 +352,7 @@ impl LockTable {
         }
     }
 
+    /// Acquire a shared lock on a [`BlockId`] for a [`Transaction`]
     fn acquire_shared_lock(
         &self,
         tx_id: TransactionID,
@@ -402,6 +403,7 @@ impl LockTable {
         Ok(())
     }
 
+    /// Acquire an exclusive lock on a [`BlockId`] for a [`Transaction`]
     fn acquire_write_lock(
         &self,
         tx_id: TransactionID,
@@ -489,6 +491,7 @@ impl LockTable {
         }
     }
 
+    /// Release all locks on a specific [`BlockId`] that were acquired by a [`Transaction`]
     fn release_locks(
         &self,
         tx_id: TransactionID,
@@ -513,6 +516,7 @@ impl LockTable {
     }
 }
 
+/// The static instance of the lock table
 static LOCK_TABLE_GENERATOR: OnceLock<Arc<LockTable>> = OnceLock::new();
 
 enum LockType {
@@ -523,51 +527,56 @@ enum LockType {
 struct ConcurrencyManager {
     lock_table: Arc<LockTable>,
     locks: RefCell<HashMap<BlockId, LockType>>,
+    tx_id: TransactionID,
 }
 
 impl ConcurrencyManager {
-    fn new() -> Self {
+    fn new(tx_id: TransactionID) -> Self {
         Self {
             lock_table: LOCK_TABLE_GENERATOR
                 .get_or_init(|| Arc::new(LockTable::new()))
                 .clone(),
             locks: RefCell::new(HashMap::new()),
+            tx_id,
         }
     }
 
-    fn slock(&self, tx_id: TransactionID, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
+    /// Acquire a shared lock on a [`BlockId`] for the associated [`Transaction`]
+    fn slock(&self, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
         let mut locks = self.locks.borrow_mut();
         if locks.contains_key(block_id) {
             return Ok(());
         }
-        self.lock_table.acquire_shared_lock(tx_id, block_id)?;
+        self.lock_table.acquire_shared_lock(self.tx_id, block_id)?;
         locks.insert(block_id.clone(), LockType::Shared);
         Ok(())
     }
 
-    fn xlock(&self, tx_id: TransactionID, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
+    /// Acquire an exclusive lock on a [`BlockId`] for the associated [`Transaction`]
+    fn xlock(&self, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
         let mut locks = self.locks.borrow_mut();
         match locks.get(block_id) {
             Some(lock) => match lock {
                 LockType::Shared => {
-                    self.lock_table.acquire_write_lock(tx_id, block_id)?;
+                    self.lock_table.acquire_write_lock(self.tx_id, block_id)?;
                     locks.insert(block_id.clone(), LockType::Exclusive).unwrap();
                 }
                 LockType::Exclusive => return Ok(()),
             },
             None => {
-                self.slock(tx_id, block_id)?;
-                self.lock_table.acquire_write_lock(tx_id, block_id)?;
+                self.slock(block_id)?;
+                self.lock_table.acquire_write_lock(self.tx_id, block_id)?;
                 locks.insert(block_id.clone(), LockType::Exclusive);
             }
         }
         return Ok(());
     }
 
-    fn release(&self, tx_id: TransactionID) -> Result<(), Box<dyn Error>> {
+    /// Release all locks associated with a [`Transaction`]
+    fn release(&self) -> Result<(), Box<dyn Error>> {
         let mut locks = self.locks.borrow_mut();
         for block in locks.keys() {
-            self.lock_table.release_locks(tx_id, block)?;
+            self.lock_table.release_locks(self.tx_id, block)?;
         }
         locks.clear();
         Ok(())
