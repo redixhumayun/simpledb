@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
@@ -30,8 +30,10 @@ struct SimpleDB {
 impl SimpleDB {
     const LOG_FILE: &str = "simpledb.log";
 
-    fn new<P: AsRef<Path>>(path: P, block_size: usize, num_buffers: usize) -> Self {
-        let file_manager = Arc::new(Mutex::new(FileManager::new(&path, block_size).unwrap()));
+    fn new<P: AsRef<Path>>(path: P, block_size: usize, num_buffers: usize, clean: bool) -> Self {
+        let file_manager = Arc::new(Mutex::new(
+            FileManager::new(&path, block_size, clean).unwrap(),
+        ));
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             Self::LOG_FILE,
@@ -59,7 +61,7 @@ impl SimpleDB {
             .as_millis();
         let thread_id = std::thread::current().id();
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
-        let db = Self::new(&test_dir, block_size, num_buffers);
+        let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
     }
 }
@@ -117,7 +119,7 @@ struct Transaction {
 }
 
 impl Transaction {
-    const TIMEOUT: u64 = 10_000; //  10 seconds
+    const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
     fn new(
         file_manager: Arc<Mutex<FileManager>>,
         log_manager: Arc<Mutex<LogManager>>,
@@ -137,7 +139,7 @@ impl Transaction {
             buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
             buffer_manager,
             log_manager,
-            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TIMEOUT),
+            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TXN_SLEEP_TIMEOUT),
             file_manager,
         }
     }
@@ -289,9 +291,12 @@ impl Transaction {
 
 #[cfg(test)]
 mod transaction_tests {
-    use std::{sync::Arc, thread::JoinHandle};
+    use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
 
-    use crate::{test_utils::generate_filename, BlockId, SimpleDB, Transaction};
+    use crate::{
+        test_utils::{generate_filename, TestDir},
+        BlockId, SimpleDB, Transaction,
+    };
 
     #[test]
     fn test_transaction_single_threaded() {
@@ -438,12 +443,211 @@ mod transaction_tests {
             .into_iter()
             .for_each(|handle| handle.join().unwrap());
     }
+
+    #[test]
+    fn test_transaction_rollback() {
+        let file = generate_filename();
+        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
+        let block_id = BlockId::new(file.clone(), 1);
+
+        // Setup initial state
+        let t1 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t1.pin(&block_id);
+        t1.set_int(&block_id, 80, 100, true).unwrap();
+        t1.set_string(&block_id, 40, "initial", true).unwrap();
+        t1.commit().unwrap();
+
+        // Start transaction that will modify multiple values but fail midway
+        let t2 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t2.pin(&block_id);
+        t2.set_int(&block_id, 80, 200, true).unwrap();
+        t2.set_string(&block_id, 40, "modified", true).unwrap();
+        // Simulate failure by rolling back
+        t2.rollback().unwrap();
+
+        // Verify that none of t2's changes persisted
+        let t3 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t3.pin(&block_id);
+        assert_eq!(t3.get_int(&block_id, 80).unwrap(), 100);
+        assert_eq!(t3.get_string(&block_id, 40).unwrap(), "initial");
+    }
+
+    /// This test is actually a little bit of a scam. It does concurrent writes but doesn't verify what the final counter is
+    /// because the transaction isolation level allows lost writes since all threads will read the same value initially and then overwrite each other's answer
+    /// This test is purely about ensuring that all transactions succeed in a multi-threaded scenario
+    #[test]
+    fn test_transaction_isolation_with_concurrent_writes() {
+        let file = generate_filename();
+        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
+        let block_id = BlockId::new(file.clone(), 1);
+        let num_of_txns = 10;
+        let max_retry_count = 50;
+
+        // Initialize data
+        let t1 = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t1.pin(&block_id);
+        t1.set_int(&block_id, 80, 0, true).unwrap();
+        t1.commit().unwrap();
+
+        // Create channel to track operations
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Spawn transactions that will increment the value
+        let mut handles = vec![];
+        for i in 0..num_of_txns {
+            let fm = Arc::clone(&test_db.file_manager);
+            let lm = Arc::clone(&test_db.log_manager);
+            let bm = Arc::clone(&test_db.buffer_manager);
+            let bid = block_id.clone();
+            let tx = tx.clone();
+
+            handles.push(std::thread::spawn(move || {
+                let mut retry_count = 0;
+                let txn = Transaction::new(fm.clone(), lm.clone(), bm.clone());
+                loop {
+                    if retry_count > max_retry_count {
+                        panic!("Too many retries");
+                    }
+                    txn.pin(&bid);
+
+                    // Try to perform the increment
+                    match (|| -> Result<(), Box<dyn Error>> {
+                        let val = txn.get_int(&bid, 80)?;
+
+                        // Short sleep to increase chance of conflicts
+                        std::thread::sleep(Duration::from_millis(10));
+
+                        txn.set_int(&bid, 80, val + 1, true)?;
+                        txn.commit()?;
+                        tx.send(format!(
+                            "Transaction {} successfully incremented from {} to {}",
+                            txn.tx_id,
+                            val,
+                            val + 1
+                        ))
+                        .unwrap();
+                        Ok(())
+                    })() {
+                        Ok(_) => break, // Success, exit loop
+                        Err(e) => {
+                            // If lock timeout, retry
+                            if e.to_string().contains("Timeout") {
+                                retry_count += 1;
+                                txn.rollback().unwrap();
+                                tx.send(format!(
+                                    "Transaction {} retrying after timeout",
+                                    txn.tx_id
+                                ))
+                                .unwrap();
+                                std::thread::sleep(Duration::from_millis(50));
+                                continue;
+                            }
+                            // Other errors should fail the test
+                            panic!("Transaction failed: {}", e);
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Collect and log all operations
+        let mut successful_increments = 0;
+        let mut operations = vec![];
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(msg) => {
+                    if msg.contains("successfully incremented") {
+                        successful_increments += 1;
+                    }
+                    operations.push(msg);
+
+                    if successful_increments == num_of_txns {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // Print operations for debugging
+                    println!("Operations so far: {:?}", operations);
+                    panic!(
+                        "Test timed out with {} successful increments",
+                        successful_increments
+                    );
+                }
+            }
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify final value
+        let t_final = Transaction::new(
+            Arc::clone(&test_db.file_manager),
+            Arc::clone(&test_db.log_manager),
+            Arc::clone(&test_db.buffer_manager),
+        );
+        t_final.pin(&block_id);
+        assert!(t_final.get_int(&block_id, 80).unwrap() == num_of_txns);
+    }
+
+    #[test]
+    fn test_transaction_durability() {
+        let file = generate_filename();
+        let dir = TestDir::new("/tmp/recovery_test");
+
+        //  Phase 1: Create and populate database and then drop it
+        {
+            let db = SimpleDB::new(&dir, 512, 3, true);
+            let t1 = Transaction::new(
+                Arc::clone(&db.file_manager),
+                Arc::clone(&db.log_manager),
+                Arc::clone(&db.buffer_manager),
+            );
+            let block_id = BlockId::new(file.clone(), 1);
+            t1.pin(&block_id);
+            t1.set_int(&block_id, 80, 100, true).unwrap();
+            t1.commit().unwrap();
+        }
+
+        //  Phase 2: Recover and verify
+        {
+            let db = SimpleDB::new(&dir, 512, 3, false);
+            let t2 = Transaction::new(
+                Arc::clone(&db.file_manager),
+                Arc::clone(&db.log_manager),
+                Arc::clone(&db.buffer_manager),
+            );
+            t2.recover().unwrap();
+
+            let block_id = BlockId::new(file.clone(), 1);
+            t2.pin(&block_id);
+            assert_eq!(t2.get_int(&block_id, 80).unwrap(), 100);
+        }
+    }
 }
 
 struct LockState {
     readers: HashSet<TransactionID>, //  keep track of which transaction id's have a reader lock here
     writer: Option<TransactionID>,   //  keep track of the transaction writing to a specific block
-    upgrade_request: Option<TransactionID>, //  keep track of upgrade requests to prevent writer starvation
+    upgrade_requests: VecDeque<TransactionID>, //  keep track of upgrade requests to prevent writer starvation
 }
 
 /// Global struct used by all transactions to keep track of locks
@@ -474,7 +678,7 @@ impl LockTable {
             .or_insert(LockState {
                 readers: vec![tx_id].into_iter().collect(),
                 writer: None,
-                upgrade_request: None,
+                upgrade_requests: VecDeque::new(),
             });
 
         //  Do an early return if the txn already has an SLock on this block
@@ -493,7 +697,7 @@ impl LockTable {
         let deadline = Instant::now() + Duration::from_millis(self.timeout);
         loop {
             let state = lock_table_guard.get_mut(block_id).unwrap();
-            let should_wait = state.writer.is_some() || state.upgrade_request.is_some();
+            let should_wait = state.writer.is_some() || !state.upgrade_requests.is_empty();
 
             if !should_wait {
                 break;
@@ -525,7 +729,7 @@ impl LockTable {
             .or_insert(LockState {
                 readers: HashSet::from_iter(vec![tx_id]),
                 writer: Some(tx_id),
-                upgrade_request: None,
+                upgrade_requests: VecDeque::new(),
             });
 
         //  Do an early return if this txn already has an xlock on the buffer
@@ -545,86 +749,49 @@ impl LockTable {
             .readers
             .contains(&tx_id), "Transaction {} failed to have an slock before attempting to acquire xlock on block id {:?}", tx_id, block_id);
 
-        let is_upgrade = lock_table_guard
-            .get(block_id)
+        lock_table_guard
+            .get_mut(block_id)
             .unwrap()
-            .readers
-            .contains(&tx_id);
-        if is_upgrade {
-            if lock_table_guard
-                .get(block_id)
-                .unwrap()
-                .upgrade_request
-                .is_some()
-            {
-                return Err("Upgrade request already exists".into());
-            }
-            lock_table_guard.get_mut(block_id).unwrap().upgrade_request = Some(tx_id);
-            let deadline = Instant::now() + Duration::from_millis(self.timeout);
-            loop {
-                let state = lock_table_guard.get_mut(block_id).unwrap();
-                let should_wait = state.readers.len() > 1 || state.writer.is_some();
-
-                if !should_wait {
-                    break;
-                }
-
-                let timeout = deadline.saturating_duration_since(Instant::now());
-                if timeout.is_zero() {
-                    return Err("Timeout while waiting for lock".into());
-                }
-                let (guard, timeout_reached) = self
-                    .cond_var
-                    .wait_timeout(lock_table_guard, timeout)
-                    .unwrap();
-                lock_table_guard = guard;
-
-                if timeout_reached.timed_out() {
-                    return Err("Timeout while waiting for lock".into());
-                }
-
-                if Instant::now() > deadline {
-                    return Err("Timeout while waiting for lock".into());
-                }
-            }
+            .upgrade_requests
+            .push_back(tx_id);
+        let deadline = Instant::now() + Duration::from_millis(self.timeout);
+        loop {
             let state = lock_table_guard.get_mut(block_id).unwrap();
-            assert_eq!(state.readers.len(), 1);
-            assert_eq!(state.readers.contains(&tx_id), true);
-            state.readers.remove(&tx_id);
-            state.writer = Some(tx_id);
-            state.upgrade_request = None;
-            return Ok(());
-        } else {
-            let deadline = Instant::now() + Duration::from_millis(self.timeout);
-            loop {
-                let state = lock_table_guard.get_mut(block_id).unwrap();
-                let should_wait = state.readers.len() > 0 || state.writer.is_some();
+            let should_wait = state.readers.len() > 1
+                || state.writer.is_some()
+                || state
+                    .upgrade_requests
+                    .front()
+                    .is_some_and(|id| *id != tx_id);
 
-                if !should_wait {
-                    break;
-                }
-
-                let timeout = deadline.saturating_duration_since(Instant::now());
-                if timeout.is_zero() {
-                    return Err("Timeout while waiting for lock".into());
-                }
-                let (guard, timeout_reached) = self
-                    .cond_var
-                    .wait_timeout(lock_table_guard, timeout)
-                    .unwrap();
-                lock_table_guard = guard;
-
-                if timeout_reached.timed_out() {
-                    return Err("Timeout while waiting for lock".into());
-                }
-
-                if Instant::now() > deadline {
-                    return Err("Timeout while waiting for lock".into());
-                }
+            if !should_wait {
+                break;
             }
-            lock_table_guard.get_mut(block_id).unwrap().writer = Some(tx_id);
-            return Ok(());
+
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                return Err("Timeout while waiting for lock".into());
+            }
+            let (guard, timeout_reached) = self
+                .cond_var
+                .wait_timeout(lock_table_guard, timeout)
+                .unwrap();
+            lock_table_guard = guard;
+            if timeout_reached.timed_out() {
+                return Err("Timeout while waiting for lock".into());
+            }
         }
+        let state = lock_table_guard.get_mut(block_id).unwrap();
+        assert_eq!(state.readers.len(), 1);
+        assert!(state.readers.contains(&tx_id));
+        assert!(state
+            .upgrade_requests
+            .front()
+            .is_some_and(|id| *id == tx_id));
+        state.writer = Some(tx_id);
+        state.readers.remove(&tx_id);
+        state.upgrade_requests.pop_front();
+        Ok(())
     }
 
     /// Release all locks on a specific [`BlockId`] that were acquired by a [`Transaction`]
@@ -637,15 +804,9 @@ impl LockTable {
         if let Some(state) = lock_table_guard.get_mut(block_id) {
             state.readers.remove(&tx_id);
             if let Some(writer_tx_id) = state.writer {
-                if writer_tx_id == tx_id {
-                    state.writer = None;
-                }
+                state.writer = None;
             }
-            if let Some(upgrade_req_tx_id) = state.upgrade_request {
-                if upgrade_req_tx_id == tx_id {
-                    state.upgrade_request = None;
-                }
-            }
+            state.upgrade_requests.retain(|&id| id != tx_id);
         }
         self.cond_var.notify_all();
         return Ok(());
@@ -1341,7 +1502,7 @@ impl LogRecord {
         match self {
             LogRecord::Start(txnum) => *txnum,
             LogRecord::Commit(txnum) => *txnum,
-            LogRecord::Checkpoint => panic!("Checkpoint does not have a transaction number"),
+            LogRecord::Checkpoint => usize::MAX, //  dummy value
             LogRecord::Rollback(txnum) => *txnum,
             LogRecord::SetInt { txnum, .. } => *txnum,
             LogRecord::SetString { txnum, .. } => *txnum,
@@ -1470,7 +1631,7 @@ mod buffer_list_tests {
     #[test]
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
-        let file_manager = Arc::new(Mutex::new(FileManager::new(&dir, 400).unwrap()));
+        let file_manager = Arc::new(Mutex::new(FileManager::new(&dir, 400, true).unwrap()));
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -1500,7 +1661,7 @@ struct Buffer {
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
     block_id: Option<BlockId>,
-    pub pins: usize,
+    pins: usize,
     txn: Option<usize>,
     lsn: Option<LSN>,
 }
@@ -2089,18 +2250,20 @@ struct FileManager {
 }
 
 impl FileManager {
-    fn new<P>(db_directory: &P, blocksize: usize) -> io::Result<Self>
+    fn new<P>(db_directory: &P, blocksize: usize, clean: bool) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
         let db_path = db_directory.as_ref().to_path_buf();
         fs::create_dir_all(&db_path)?;
 
-        //  remove all existing files in the directory
-        for entry in fs::read_dir(&db_path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::remove_file(entry.path())?;
+        if clean {
+            //  remove all existing files in the directory
+            for entry in fs::read_dir(&db_path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    fs::remove_file(entry.path())?;
+                }
             }
         }
 
@@ -2188,7 +2351,7 @@ mod file_manager_tests {
             .as_millis();
         let thread_id = std::thread::current().id();
         let dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
-        let file_manger = FileManager::new(&dir, 400).unwrap();
+        let file_manger = FileManager::new(&dir, 400, true).unwrap();
         (dir, file_manger)
     }
 
