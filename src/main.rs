@@ -81,11 +81,11 @@ impl TransactionOperations for Transaction {
     }
 
     fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
-        Transaction::set_int(&self, block_id, offset, val, log);
+        Transaction::set_int(&self, block_id, offset, val, log).unwrap();
     }
 
     fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
-        Transaction::set_string(&self, block_id, offset, val, log);
+        Transaction::set_string(&self, block_id, offset, val, log).unwrap();
     }
 }
 
@@ -111,11 +111,13 @@ struct Transaction {
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     recovery_manager: RecoveryManager,
+    concurrency_manager: ConcurrencyManager,
     buffer_list: BufferList,
     tx_id: TransactionID,
 }
 
 impl Transaction {
+    const TIMEOUT: u64 = 10_000; //  10 seconds
     fn new(
         file_manager: Arc<Mutex<FileManager>>,
         log_manager: Arc<Mutex<LogManager>>,
@@ -135,6 +137,7 @@ impl Transaction {
             buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
             buffer_manager,
             log_manager,
+            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TIMEOUT),
             file_manager,
         }
     }
@@ -143,33 +146,38 @@ impl Transaction {
     /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
-    fn commit(&self) {
+    fn commit(&self) -> Result<(), Box<dyn Error>> {
         //  Commit all data associated with this txn
         self.recovery_manager.commit();
         //  Release all locks associated with this txn
-        //  TODO
+        self.concurrency_manager.release()?;
         //  unpin all buffers and release metadata
         self.buffer_list.unpin_all();
+        Ok(())
     }
 
     /// Rollback this transaction
     /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
     /// It will also handle meta operations like unpinning buffers
-    fn rollback(&self) {
+    fn rollback(&self) -> Result<(), Box<dyn Error>> {
         //  Rollback all data associated with this txn
         self.recovery_manager.rollback(self).unwrap();
-        //  TODO: Release all locks associated with this txn
+        //  Release all locks associated with this txn
+        self.concurrency_manager.release()?;
         //  unpin all buffers and release metadata
         self.buffer_list.unpin_all();
+        Ok(())
     }
 
     /// Recover the database on start-up or after a crash
-    fn recover(&self) {
+    fn recover(&self) -> Result<(), Box<dyn Error>> {
         //  Perform a database recovery
         self.recovery_manager.recover(self).unwrap();
         //  TODO: Release all locks associated with this transaction
+        self.concurrency_manager.release()?;
         //  Unpin all buffers and release metadata
         self.buffer_list.unpin_all();
+        Ok(())
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -183,16 +191,22 @@ impl Transaction {
     }
 
     /// Get an integer value in a [`Buffer`] associated with this transaction
-    fn get_int(&self, block_id: &BlockId, offset: usize) -> i32 {
-        //  TODO: Acquire a shared lock here
+    fn get_int(&self, block_id: &BlockId, offset: usize) -> Result<i32, Box<dyn Error>> {
+        self.concurrency_manager.slock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let guard = buffer.lock().unwrap();
-        guard.contents.get_int(offset)
+        Ok(guard.contents.get_int(offset))
     }
 
     /// Set an integer value in a [`Buffer`] associated with this transaction
-    fn set_int(&self, block_id: &BlockId, offset: usize, value: i32, log: bool) {
-        //  TODO: Acquire an exclusive lock here
+    fn set_int(
+        &self,
+        block_id: &BlockId,
+        offset: usize,
+        value: i32,
+        log: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        self.concurrency_manager.xlock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let lsn = {
             if log {
@@ -208,19 +222,26 @@ impl Transaction {
         let mut guard = buffer.lock().unwrap();
         guard.contents.set_int(offset, value);
         guard.set_modified(self.tx_id as usize, lsn);
+        Ok(())
     }
 
     /// Get a string value in a [`Buffer`] associated with this transaction
-    fn get_string(&self, block_id: &BlockId, offset: usize) -> String {
-        //  TODO: Acquire a shared lock here
+    fn get_string(&self, block_id: &BlockId, offset: usize) -> Result<String, Box<dyn Error>> {
+        self.concurrency_manager.slock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let guard = buffer.lock().unwrap();
-        guard.contents.get_string(offset)
+        Ok(guard.contents.get_string(offset))
     }
 
     /// Set a string value in a [`Buffer`] associated with this transaction
-    fn set_string(&self, block_id: &BlockId, offset: usize, value: &str, log: bool) {
-        //  TODO: Acquire an exclusive lock here
+    fn set_string(
+        &self,
+        block_id: &BlockId,
+        offset: usize,
+        value: &str,
+        log: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        self.concurrency_manager.xlock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let lsn = {
             if log {
@@ -234,6 +255,7 @@ impl Transaction {
         let mut guard = buffer.lock().unwrap();
         guard.contents.set_string(offset, value);
         guard.set_modified(self.tx_id as usize, lsn);
+        Ok(())
     }
 
     /// Get the available buffers for this transaction
@@ -267,13 +289,13 @@ impl Transaction {
 
 #[cfg(test)]
 mod transaction_tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, thread::JoinHandle};
 
-    use crate::{BlockId, SimpleDB, Transaction};
+    use crate::{test_utils::generate_filename, BlockId, SimpleDB, Transaction};
 
     #[test]
     fn test_transaction_single_threaded() {
-        let file = "test_file";
+        let file = generate_filename();
         let block_size = 512;
         let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 3);
 
@@ -285,9 +307,9 @@ mod transaction_tests {
         );
         let block_id = BlockId::new(file.to_string(), 1);
         t1.pin(&block_id);
-        t1.set_int(&block_id, 80, 1, false);
-        t1.set_string(&block_id, 40, "one", false);
-        t1.commit();
+        t1.set_int(&block_id, 80, 1, false).unwrap();
+        t1.set_string(&block_id, 40, "one", false).unwrap();
+        t1.commit().unwrap();
 
         //  Start a transaction t2 that should see the results of the previously committed transaction t1
         //  Set new values in this transaction
@@ -297,11 +319,11 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
         );
         t2.pin(&block_id);
-        assert_eq!(t2.get_int(&block_id, 80), 1);
-        assert_eq!(t2.get_string(&block_id, 40), "one");
-        t2.set_int(&block_id, 80, 2, true);
-        t2.set_string(&block_id, 40, "two", true);
-        t2.commit();
+        assert_eq!(t2.get_int(&block_id, 80).unwrap(), 1);
+        assert_eq!(t2.get_string(&block_id, 40).unwrap(), "one");
+        t2.set_int(&block_id, 80, 2, true).unwrap();
+        t2.set_string(&block_id, 40, "two", true).unwrap();
+        t2.commit().unwrap();
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
@@ -311,11 +333,11 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
         );
         t3.pin(&block_id);
-        assert_eq!(t3.get_int(&block_id, 80), 2);
-        assert_eq!(t3.get_string(&block_id, 40), "two");
-        t3.set_int(&block_id, 80, 3, true);
-        t3.set_string(&block_id, 40, "three", true);
-        t3.rollback();
+        assert_eq!(t3.get_int(&block_id, 80).unwrap(), 2);
+        assert_eq!(t3.get_string(&block_id, 40).unwrap(), "two");
+        t3.set_int(&block_id, 80, 3, true).unwrap();
+        t3.set_string(&block_id, 40, "three", true).unwrap();
+        t3.rollback().unwrap();
 
         //  Start a transaction t4 which should see the result of t2 since t3 rolled back
         //  This will be a read only transaction that commits
@@ -325,9 +347,96 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
         );
         t4.pin(&block_id);
-        assert_eq!(t4.get_int(&block_id, 80), 2);
-        assert_eq!(t4.get_string(&block_id, 40), "two");
-        t4.commit();
+        assert_eq!(t4.get_int(&block_id, 80).unwrap(), 2);
+        assert_eq!(t4.get_string(&block_id, 40).unwrap(), "two");
+        t4.commit().unwrap();
+    }
+
+    #[test]
+    fn test_transaction_multi_threaded_single_reader_single_writer() {
+        let file = generate_filename();
+        let block_size = 512;
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10);
+        let block_id = BlockId::new(file.to_string(), 1);
+
+        let fm1 = Arc::clone(&test_db.file_manager);
+        let lm1 = Arc::clone(&test_db.log_manager);
+        let bm1 = Arc::clone(&test_db.buffer_manager);
+        let bid1 = block_id.clone();
+
+        let fm2 = Arc::clone(&test_db.file_manager);
+        let lm2 = Arc::clone(&test_db.log_manager);
+        let bm2 = Arc::clone(&test_db.buffer_manager);
+        let bid2 = block_id.clone();
+
+        //  Create a read only transasction
+        let t1 = std::thread::spawn(move || {
+            let txn = Transaction::new(fm1, lm1, bm1);
+            txn.pin(&bid1);
+            txn.get_int(&bid1, 80).unwrap();
+            txn.get_string(&bid1, 40).unwrap();
+            txn.commit().unwrap();
+        });
+
+        //  Create a write only transaction
+        let t2 = std::thread::spawn(move || {
+            let txn = Transaction::new(fm2, lm2, bm2);
+            txn.pin(&bid2.clone());
+            txn.set_int(&bid2, 80, 1, false).unwrap();
+            txn.set_string(&bid2, 40, "Hello", false).unwrap();
+            txn.commit().unwrap();
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        //  Create a final read-only transaction that will read the written values
+        let txn = Transaction::new(
+            test_db.file_manager,
+            test_db.log_manager,
+            test_db.buffer_manager,
+        );
+        txn.pin(&block_id);
+        assert_eq!(txn.get_int(&block_id, 80).unwrap(), 1);
+        assert_eq!(txn.get_string(&block_id, 40).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn test_transaction_multi_threaded_multiple_readers_single_writer() {
+        let file = generate_filename();
+        let block_size = 512;
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10);
+        let block_id = BlockId::new(file.to_string(), 1);
+
+        let reader_threads = 10;
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        for _ in 0..reader_threads {
+            let fm = Arc::clone(&test_db.file_manager);
+            let lm = Arc::clone(&test_db.log_manager);
+            let bm = Arc::clone(&test_db.buffer_manager);
+            let bid = block_id.clone();
+
+            handles.push(std::thread::spawn(move || {
+                let txn = Transaction::new(fm, lm, bm);
+                txn.pin(&bid);
+                txn.get_int(&bid, 80).unwrap();
+                txn.get_string(&bid, 40).unwrap();
+                txn.commit().unwrap();
+            }));
+        }
+
+        let txn = Transaction::new(
+            test_db.file_manager.clone(),
+            test_db.log_manager.clone(),
+            test_db.buffer_manager.clone(),
+        );
+        txn.pin(&block_id);
+        txn.set_int(&block_id, 80, 1, false).unwrap();
+        txn.set_string(&block_id, 40, "Hello", false).unwrap();
+        txn.commit().unwrap();
+
+        handles
+            .into_iter()
+            .for_each(|handle| handle.join().unwrap());
     }
 }
 
@@ -341,14 +450,15 @@ struct LockState {
 struct LockTable {
     lock_table: Mutex<HashMap<BlockId, LockState>>,
     cond_var: Condvar,
+    timeout: u64,
 }
 
 impl LockTable {
-    const TIMEOUT: u64 = 10_000; //  timeout in ms
-    fn new() -> Self {
+    fn new(timeout: u64) -> Self {
         Self {
             lock_table: Mutex::new(HashMap::new()),
             cond_var: Condvar::new(),
+            timeout,
         }
     }
 
@@ -380,7 +490,7 @@ impl LockTable {
         //  Loop until either
         //  1. There are no more writers or pending writers on this block
         //  2. The timeout expires
-        let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+        let deadline = Instant::now() + Duration::from_millis(self.timeout);
         loop {
             let state = lock_table_guard.get_mut(block_id).unwrap();
             let should_wait = state.writer.is_some() || state.upgrade_request.is_some();
@@ -413,7 +523,7 @@ impl LockTable {
         lock_table_guard
             .entry(block_id.clone())
             .or_insert(LockState {
-                readers: HashSet::new(),
+                readers: HashSet::from_iter(vec![tx_id]),
                 writer: Some(tx_id),
                 upgrade_request: None,
             });
@@ -433,7 +543,7 @@ impl LockTable {
             .get(block_id)
             .unwrap()
             .readers
-            .contains(&tx_id));
+            .contains(&tx_id), "Transaction {} failed to have an slock before attempting to acquire xlock on block id {:?}", tx_id, block_id);
 
         let is_upgrade = lock_table_guard
             .get(block_id)
@@ -450,7 +560,7 @@ impl LockTable {
                 return Err("Upgrade request already exists".into());
             }
             lock_table_guard.get_mut(block_id).unwrap().upgrade_request = Some(tx_id);
-            let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+            let deadline = Instant::now() + Duration::from_millis(self.timeout);
             loop {
                 let state = lock_table_guard.get_mut(block_id).unwrap();
                 let should_wait = state.readers.len() > 1 || state.writer.is_some();
@@ -458,7 +568,20 @@ impl LockTable {
                 if !should_wait {
                     break;
                 }
-                lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
+
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    return Err("Timeout while waiting for lock".into());
+                }
+                let (guard, timeout_reached) = self
+                    .cond_var
+                    .wait_timeout(lock_table_guard, timeout)
+                    .unwrap();
+                lock_table_guard = guard;
+
+                if timeout_reached.timed_out() {
+                    return Err("Timeout while waiting for lock".into());
+                }
 
                 if Instant::now() > deadline {
                     return Err("Timeout while waiting for lock".into());
@@ -472,7 +595,7 @@ impl LockTable {
             state.upgrade_request = None;
             return Ok(());
         } else {
-            let deadline = Instant::now() + Duration::from_millis(Self::TIMEOUT);
+            let deadline = Instant::now() + Duration::from_millis(self.timeout);
             loop {
                 let state = lock_table_guard.get_mut(block_id).unwrap();
                 let should_wait = state.readers.len() > 0 || state.writer.is_some();
@@ -480,7 +603,20 @@ impl LockTable {
                 if !should_wait {
                     break;
                 }
-                lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
+
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    return Err("Timeout while waiting for lock".into());
+                }
+                let (guard, timeout_reached) = self
+                    .cond_var
+                    .wait_timeout(lock_table_guard, timeout)
+                    .unwrap();
+                lock_table_guard = guard;
+
+                if timeout_reached.timed_out() {
+                    return Err("Timeout while waiting for lock".into());
+                }
 
                 if Instant::now() > deadline {
                     return Err("Timeout while waiting for lock".into());
@@ -516,6 +652,116 @@ impl LockTable {
     }
 }
 
+#[cfg(test)]
+mod lock_table_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{test_utils::generate_filename, BlockId, LockTable};
+
+    #[test]
+    fn test_basic_shared_lock() {
+        let filename = generate_filename();
+        let lock_table = Arc::new(LockTable::new(10_000));
+        let block_id = BlockId::new(filename, 1);
+
+        // Should be able to acquire shared lock
+        lock_table.acquire_shared_lock(1, &block_id).unwrap();
+
+        // Another transaction should also be able to acquire shared lock
+        lock_table.acquire_shared_lock(2, &block_id).unwrap();
+
+        // Release locks
+        lock_table.release_locks(1, &block_id).unwrap();
+        lock_table.release_locks(2, &block_id).unwrap();
+    }
+
+    #[test]
+    fn test_basic_exclusive_lock() {
+        let filename = generate_filename();
+        let lock_table = Arc::new(LockTable::new(1)); //  extremely short timeout of 1ms
+        let block_id = BlockId::new(filename, 1);
+
+        // Should be able to acquire exclusive lock
+        lock_table.acquire_write_lock(1, &block_id).unwrap();
+
+        let lt_1 = Arc::clone(&lock_table);
+        let bid_1 = block_id.clone();
+
+        //  Another transaction should not be able to acquire any locks
+        let handle = std::thread::spawn(move || {
+            lt_1.acquire_shared_lock(2, &bid_1).unwrap_err();
+        });
+
+        // Release lock after a timeout of making sure t2 panics
+        std::thread::sleep(Duration::from_millis(5));
+        lock_table.release_locks(1, &block_id).unwrap();
+    }
+
+    #[test]
+    fn test_read_write_interleaving() {
+        let lock_table = Arc::new(LockTable::new(1000)); //  timeout of 1sec
+        let block_id = BlockId::new(generate_filename(), 1);
+
+        //  reader thread
+        let lt_1 = Arc::clone(&lock_table);
+        let bid_1 = block_id.clone();
+        std::thread::spawn(move || {
+            let readers = 10;
+            for i in 0..readers {
+                lt_1.acquire_shared_lock(i, &bid_1).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                lt_1.release_locks(i, &bid_1).unwrap();
+            }
+        });
+
+        //  writer thread
+        let lt_2 = Arc::clone(&lock_table);
+        let bid_2 = block_id.clone();
+        std::thread::spawn(move || {
+            let count = 10;
+            let mut iterations = 0;
+            loop {
+                if iterations == count {
+                    break;
+                }
+
+                lt_2.acquire_shared_lock(12, &bid_2).unwrap();
+                lt_2.acquire_write_lock(12, &bid_2).unwrap();
+                lt_2.release_locks(12, &bid_2).unwrap();
+
+                iterations += 1;
+            }
+        });
+    }
+
+    #[test]
+    fn test_lock_upgrade() {
+        let lock_table = Arc::new(LockTable::new(1000));
+        let block_id = BlockId::new(generate_filename(), 1);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+        //  T1 acquires shared lock
+        lock_table.acquire_shared_lock(1, &block_id).unwrap();
+
+        //  T2 acquires shared lock
+        lock_table.acquire_shared_lock(2, &block_id).unwrap();
+
+        //  T1 requests an upgrade
+        let lt1 = Arc::clone(&lock_table);
+        let bid1 = block_id.clone();
+        let j1 = std::thread::spawn(move || {
+            tx.send("Acquiring write lock".to_string()).unwrap();
+            lt1.acquire_write_lock(1, &bid1).unwrap();
+            tx.send("Acquired write lock".to_string()).unwrap();
+        });
+
+        //  Wait for T1 to start acquiring write lock and release T2's lock
+        assert!(rx.recv().unwrap() == "Acquiring write lock".to_string());
+        lock_table.release_locks(2, &block_id).unwrap();
+        assert!(rx.recv().unwrap() == "Acquired write lock".to_string());
+    }
+}
+
 /// The static instance of the lock table
 static LOCK_TABLE_GENERATOR: OnceLock<Arc<LockTable>> = OnceLock::new();
 
@@ -531,10 +777,10 @@ struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    fn new(tx_id: TransactionID) -> Self {
+    fn new(tx_id: TransactionID, timeout: u64) -> Self {
         Self {
             lock_table: LOCK_TABLE_GENERATOR
-                .get_or_init(|| Arc::new(LockTable::new()))
+                .get_or_init(|| Arc::new(LockTable::new(timeout)))
                 .clone(),
             locks: RefCell::new(HashMap::new()),
             tx_id,
@@ -553,6 +799,8 @@ impl ConcurrencyManager {
     }
 
     /// Acquire an exclusive lock on a [`BlockId`] for the associated [`Transaction`]
+    /// It will first check to see if there is already a [`LockType`] available on the [`BlockId`]
+    /// If there is none, it will first attempt to acquire a [`LockType::Shared`] and then a [`LockType::Exclusive`]
     fn xlock(&self, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
         let mut locks = self.locks.borrow_mut();
         match locks.get(block_id) {
@@ -564,8 +812,13 @@ impl ConcurrencyManager {
                 LockType::Exclusive => return Ok(()),
             },
             None => {
+                //  drop the value here so no overlapping borrows
+                drop(locks);
                 self.slock(block_id)?;
                 self.lock_table.acquire_write_lock(self.tx_id, block_id)?;
+
+                //  re-acquire the borrow mut here
+                let mut locks = self.locks.borrow_mut();
                 locks.insert(block_id.clone(), LockType::Exclusive);
             }
         }

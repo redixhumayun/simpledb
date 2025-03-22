@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// A temporary directory that is deleted when it goes out of scope.
 /// Used for testing
@@ -27,4 +30,13 @@ impl AsRef<Path> for TestDir {
     fn as_ref(&self) -> &Path {
         self.path.as_ref()
     }
+}
+
+pub fn generate_filename() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let thread_id = std::thread::current().id();
+    format!("test_file_{}_{:?}", timestamp, thread_id)
 }
