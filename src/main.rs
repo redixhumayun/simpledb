@@ -804,7 +804,9 @@ impl LockTable {
         if let Some(state) = lock_table_guard.get_mut(block_id) {
             state.readers.remove(&tx_id);
             if let Some(writer_tx_id) = state.writer {
-                state.writer = None;
+                if writer_tx_id == tx_id {
+                    state.writer = None;
+                }
             }
             state.upgrade_requests.retain(|&id| id != tx_id);
         }
