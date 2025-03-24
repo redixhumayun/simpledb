@@ -2187,6 +2187,12 @@ impl Page {
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
     }
 
+    /// Get the raw bytes from the page at the given offset for the given length
+    fn get_raw_bytes(&self, offset: usize, length: usize) -> Vec<u8> {
+        let bytes = &self.contents[offset..offset + length];
+        bytes.to_vec()
+    }
+
     /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
     fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
         let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]

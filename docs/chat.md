@@ -142,11 +142,39 @@ let name = record_page.get_string(slot, "name");
 - Layout implements physical organization
 - Together they enable field access in records
 
-## Next Topics
 
-Potential areas for further discussion:
-1. Query processing using these abstractions
-2. Index implementation and RID usage
-3. Transaction management and record access
-4. Buffer pool management and pinning strategies
-5. Recovery and logging mechanisms
+## Page Layout
+
+┌───────────────────────────────────────────────────────────────┐
+│                         4096-byte Page                         │
+├────────┬────────┬─────────────────┬────────────────────────────┤
+│ Header │ Bitmap │    ID Table     │       Record Space         │
+│8 bytes │32 bytes│   512 bytes     │       3544 bytes           │
+├────────┼────────┼─────────────────┼────────────────────────────┤
+│        │        │                 │                            │
+│ - Slot │ - 1 bit│ - 2-byte offset │  - Records grow from here  │
+│  count │  per   │   per slot      │    toward the left         │
+│ - Free │  slot  │ - Points to     │  - Each record has a       │
+│  ptr   │ 256 max│   record start  │    4-byte header           │
+└────────┴────────┴─────────────────┴────────────────────────────┘
+
+The idea behind the page layout is simple:
+* The header contains the slot count (4 bytes) and the free pointer (4 bytes). The free pointer points to the beginning of the free space in the record space. This needs to be updated after each record is written.
+* The next 32 bytes are where the bitmap is stored. This bitmap is used to mark the presence/absence of each record slot.
+* The next 512 bytes are for the ID table which serves a similar purpose as in a B-tree where it marks the offset of its respective record.
+
+The calculations for this were done as follows:
+┌────────┬────────────────────────────┐
+│ Header │ Field Values               │
+│4 bytes │ (variable, schema-defined) │
+└────────┴────────────────────────────┘
+* First, each record will have a 4-byte header (2 bytes for the record length and 2 bytes reserved for future flags)
+* Second, at minimum each record will also contain a 4-byte integer field (giving a minimum total of 8 bytes per record)
+* Assuming a 4,096(4KB) bytes page, the number of slots for records = 4,096/8 = 512. Take 256 slots instead of 512 because 512 is a thereotical limit
+* For 256 slots, we need 256 bits in the bitmap and 256 bits = 32 bytes
+* Each entry in the ID table will contain the offset for a record, so 2 bytes should allow us to address offsets up to 2^16=65,536 which is >> 4,096. So, each entry in the ID table will be 2 bytes giving us 2 * 256 = 512 bytes for the ID table
+
+## Notes On Implementation
+Upon trying to implement this approach, I noticed that I have to do a bunch of nonsense to get around the design of the `Page` and `Transaction` objects because those don't have the concept & affordances of bit maps and ID tables.
+If I truly want to modify this, I should change the actual `Page` format so that it has knowledge of the bitmap and the ID table. That way, all these changes can go through the `RecoveryManager` correctly.
+Refer to [this chat](https://claude.ai/chat/b36c7658-2311-479b-acc9-945e95ea2ba5) for more details.
