@@ -51,6 +51,14 @@ impl SimpleDB {
         }
     }
 
+    fn new_tx(&self) -> Transaction {
+        Transaction::new(
+            Arc::clone(&self.file_manager),
+            Arc::clone(&self.log_manager),
+            Arc::clone(&self.buffer_manager),
+        )
+    }
+
     #[cfg(test)]
     fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +71,358 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+}
+
+struct RecordPageIterator<'a> {
+    record_page: &'a RecordPage,
+    current_slot: usize,
+    presence: SlotPresence,
+}
+
+impl<'a> RecordPageIterator<'a> {
+    fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
+        Self {
+            record_page,
+            current_slot: 0,
+            presence,
+        }
+    }
+}
+
+impl<'a> Iterator for RecordPageIterator<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.record_page.is_valid_slot(self.current_slot) {
+            let slot = self.current_slot;
+            self.current_slot += 1;
+
+            let slot_value = self
+                .record_page
+                .tx
+                .get_int(&self.record_page.block_id, self.record_page.offset(slot))
+                .unwrap();
+
+            if slot_value == self.presence as i32 {
+                return Some(slot);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SlotPresence {
+    EMPTY,
+    USED,
+}
+
+struct RecordPage {
+    tx: Transaction,
+    block_id: BlockId,
+    layout: Layout,
+}
+
+impl RecordPage {
+    fn new(tx: Transaction, block_id: BlockId, layout: Layout) -> Self {
+        tx.pin(&block_id);
+        Self {
+            tx,
+            block_id,
+            layout,
+        }
+    }
+
+    fn get_int(&self, slot: usize, field_name: &str) -> i32 {
+        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
+        self.tx.get_int(&self.block_id, offset).unwrap()
+    }
+
+    fn get_string(&self, slot: usize, field_name: &str) -> String {
+        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
+        self.tx.get_string(&self.block_id, offset).unwrap()
+    }
+
+    fn set_int(&self, slot: usize, field_name: &str, value: i32) {
+        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
+        self.tx
+            .set_int(&self.block_id, offset, value, true)
+            .unwrap();
+    }
+
+    fn set_string(&self, slot: usize, field_name: &str, value: &str) {
+        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
+        self.tx
+            .set_string(&self.block_id, offset, value, true)
+            .unwrap();
+    }
+
+    fn insert(&self, slot: usize) -> usize {
+        self.set_flag(slot, SlotPresence::USED);
+        slot
+    }
+
+    fn insert_after(&self, slot: usize) -> usize {
+        let new_slot = self
+            .iter_empty_slots()
+            .skip_while(|s| *s <= slot)
+            .next()
+            .unwrap();
+        self.set_flag(new_slot, SlotPresence::USED);
+        new_slot
+    }
+
+    fn set_flag(&self, slot: usize, flag: SlotPresence) {
+        self.tx
+            .set_int(&self.block_id, self.offset(slot), flag as i32, true)
+            .unwrap();
+    }
+
+    fn delete(&self, slot: usize) {
+        self.set_flag(slot, SlotPresence::EMPTY);
+    }
+
+    fn offset(&self, slot: usize) -> usize {
+        slot * self.layout.slot_size
+    }
+
+    fn is_valid_slot(&self, slot: usize) -> bool {
+        self.offset(slot + 1) <= self.tx.block_size()
+    }
+
+    fn format(&self) {
+        let mut current_slot = 0;
+        while self.is_valid_slot(current_slot) {
+            self.tx
+                .set_int(
+                    &self.block_id,
+                    self.offset(current_slot),
+                    SlotPresence::EMPTY as i32,
+                    false,
+                )
+                .unwrap();
+            let schema = &self.layout.schema;
+            for field in &schema.fields {
+                let field_pos = self.offset(current_slot) + self.layout.offset(&field).unwrap();
+                match schema.info.get(field).unwrap().field_type {
+                    FieldType::INT => self
+                        .tx
+                        .set_int(&self.block_id, field_pos, 0, false)
+                        .unwrap(),
+                    FieldType::STRING => self
+                        .tx
+                        .set_string(&self.block_id, field_pos, "", false)
+                        .unwrap(),
+                }
+            }
+            current_slot += 1;
+        }
+    }
+
+    fn iter_empty_slots(&self) -> RecordPageIterator {
+        RecordPageIterator {
+            record_page: self,
+            current_slot: 0,
+            presence: SlotPresence::EMPTY,
+        }
+    }
+
+    fn iter_used_slots(&self) -> RecordPageIterator {
+        RecordPageIterator {
+            record_page: self,
+            current_slot: 0,
+            presence: SlotPresence::USED,
+        }
+    }
+}
+
+#[cfg(test)]
+mod record_page_tests {
+    use std::{fs::File, io::Read};
+
+    use crate::{Layout, RecordPage, Schema, SimpleDB};
+
+    #[test]
+    fn record_page_test() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = db.new_tx();
+
+        //  Set up the test
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema);
+        for field in &layout.schema.fields {
+            let offset = layout.offset(&field).unwrap();
+            if field == "A" {
+                assert_eq!(offset, 4);
+            }
+            if field == "B" {
+                assert_eq!(offset, 8);
+            }
+        }
+        let block_id = txn.append("test_file");
+        txn.pin(&block_id);
+        let record_page = RecordPage::new(txn, block_id, layout);
+        record_page.format();
+
+        //  Create a bunch of records
+        let record_iter = record_page.iter_empty_slots();
+        let mut inserted_count = 0;
+        for slot in record_iter {
+            let mut f = File::open("/dev/urandom").unwrap();
+            let mut buf = [0u8; 2];
+            f.read_exact(&mut buf).unwrap();
+            let number = (u16::from_le_bytes(buf) % 100) + 1;
+
+            record_page.set_int(slot, "A", number as i32);
+            record_page.set_string(slot, "B", &format!("rec{number}"));
+            inserted_count += 1;
+            println!(
+                "Inserting into slot {slot}, num: {}, str: rec{}",
+                number, number
+            );
+            record_page.insert(slot);
+        }
+
+        //  Delete all records with a value less than 25
+        let record_iter = record_page.iter_used_slots();
+        let mut deleted_count = 0;
+        for slot in record_iter {
+            let a = record_page.get_int(slot, "A");
+            println!("value of a {a}");
+            let b = record_page.get_string(slot, "B");
+            if a < 25 {
+                deleted_count += 1;
+                record_page.delete(slot);
+            }
+        }
+        println!("{} values were deleted", deleted_count);
+
+        //  Check that the correct number of records are left
+        let record_iter = record_page.iter_used_slots();
+        let mut remaining_count = 0;
+        for slot in record_iter {
+            let a = record_page.get_int(slot, "A");
+            let b = record_page.get_string(slot, "B");
+            assert!(a >= 25);
+            remaining_count += 1;
+        }
+
+        assert_eq!(remaining_count + deleted_count, inserted_count);
+    }
+}
+
+struct Layout {
+    schema: Schema,
+    offsets: HashMap<String, usize>, //  map the field name to the offset
+    slot_size: usize,
+}
+
+impl Layout {
+    fn new(schema: Schema) -> Self {
+        let mut offsets = HashMap::new();
+        let mut offset = Page::INT_BYTES;
+        for field in schema.fields.iter() {
+            let field_length = schema.info.get(field).unwrap().length;
+            offsets.insert(field.clone(), offset);
+            offset += field_length;
+        }
+        Self {
+            schema,
+            offsets,
+            slot_size: offset,
+        }
+    }
+
+    /// Get the offset of a field in a record
+    fn offset(&self, field: &str) -> Option<usize> {
+        self.offsets.get(field).copied()
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use crate::{Layout, Schema};
+
+    #[test]
+    fn layout_test() {
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema);
+        for field in layout.schema.fields.iter() {
+            let offset = layout.offset(&field).unwrap();
+            if field == "A" {
+                assert_eq!(offset, 4);
+            }
+            if field == "B" {
+                assert_eq!(offset, 8);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FieldType {
+    INT,
+    STRING,
+}
+
+#[derive(Clone, Copy)]
+struct FieldInfo {
+    field_type: FieldType,
+    length: usize,
+}
+
+struct Schema {
+    fields: Vec<String>,
+    info: HashMap<String, FieldInfo>,
+}
+
+impl Schema {
+    fn new() -> Self {
+        Schema {
+            fields: Vec::new(),
+            info: HashMap::new(),
+        }
+    }
+
+    fn add_field(&mut self, field_name: &str, field_type: FieldType, length: usize) {
+        self.fields.push(field_name.to_string());
+        self.info
+            .entry(field_name.to_string())
+            .and_modify(|entry| *entry = FieldInfo { field_type, length })
+            .or_insert_with(|| FieldInfo { field_type, length });
+    }
+
+    fn add_int_field(&mut self, field_name: &str) {
+        self.add_field(field_name, FieldType::INT, Page::INT_BYTES);
+    }
+
+    fn add_string_field(&mut self, field_name: &str, length: usize) {
+        self.add_field(field_name, FieldType::STRING, length);
+    }
+
+    fn add_from_schema(&mut self, field_name: &str, schema: &Schema) {
+        let field_type = schema
+            .info
+            .get(field_name)
+            .and_then(|info| Some(info.field_type))
+            .unwrap();
+        let field_length = schema
+            .info
+            .get(field_name)
+            .and_then(|info| Some(info.length))
+            .unwrap();
+        self.add_field(field_name, field_type, field_length);
+    }
+
+    fn add_all_from_schema(&mut self, schema: &Schema) {
+        for field_name in schema.fields.iter() {
+            self.add_from_schema(field_name, schema);
+        }
     }
 }
 
