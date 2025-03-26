@@ -125,6 +125,8 @@ struct RecordPage {
 }
 
 impl RecordPage {
+    /// Creates a new RecordPage with the given transaction, block ID, and layout.
+    /// Pins the block in memory.
     fn new(tx: Transaction, block_id: BlockId, layout: Layout) -> Self {
         tx.pin(&block_id);
         Self {
@@ -134,16 +136,22 @@ impl RecordPage {
         }
     }
 
+    /// Retrieves an integer value from the specified slot and field.
+    /// The offset is calculated using the slot number and field layout.
     fn get_int(&self, slot: usize, field_name: &str) -> i32 {
         let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
         self.tx.get_int(&self.block_id, offset).unwrap()
     }
 
+    /// Retrieves a string value from the specified slot and field.
+    /// The offset is calculated using the slot number and field layout.
     fn get_string(&self, slot: usize, field_name: &str) -> String {
         let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
         self.tx.get_string(&self.block_id, offset).unwrap()
     }
 
+    /// Sets an integer value in the specified slot and field.
+    /// The offset is calculated using the slot number and field layout.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) {
         let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
         self.tx
@@ -151,6 +159,8 @@ impl RecordPage {
             .unwrap();
     }
 
+    /// Sets a string value in the specified slot and field.
+    /// The offset is calculated using the slot number and field layout.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) {
         let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
         self.tx
@@ -158,11 +168,13 @@ impl RecordPage {
             .unwrap();
     }
 
+    /// Marks a slot as used and returns its slot number.
     fn insert(&self, slot: usize) -> usize {
         self.set_flag(slot, SlotPresence::USED);
         slot
     }
 
+    /// Finds the next empty slot after the given slot, marks it as used, and returns its number.
     fn insert_after(&self, slot: usize) -> usize {
         let new_slot = self
             .iter_empty_slots()
@@ -173,24 +185,30 @@ impl RecordPage {
         new_slot
     }
 
+    /// Sets the presence flag (EMPTY or USED) for a given slot.
     fn set_flag(&self, slot: usize, flag: SlotPresence) {
         self.tx
             .set_int(&self.block_id, self.offset(slot), flag as i32, true)
             .unwrap();
     }
 
+    /// Marks a slot as empty, effectively deleting its record.
     fn delete(&self, slot: usize) {
         self.set_flag(slot, SlotPresence::EMPTY);
     }
 
+    /// Calculates the byte offset for a given slot based on the layout's slot size.
     fn offset(&self, slot: usize) -> usize {
         slot * self.layout.slot_size
     }
 
+    /// Checks if a slot number is valid within the block's size.
     fn is_valid_slot(&self, slot: usize) -> bool {
         self.offset(slot + 1) <= self.tx.block_size()
     }
 
+    /// Initializes all slots in the block with empty flags and default values.
+    /// For each field in the schema, sets integers to 0 and strings to empty.
     fn format(&self) {
         let mut current_slot = 0;
         while self.is_valid_slot(current_slot) {
@@ -220,6 +238,7 @@ impl RecordPage {
         }
     }
 
+    /// Returns an iterator over empty slots in the record page.
     fn iter_empty_slots(&self) -> RecordPageIterator {
         RecordPageIterator {
             record_page: self,
@@ -228,6 +247,7 @@ impl RecordPage {
         }
     }
 
+    /// Returns an iterator over used slots in the record page.
     fn iter_used_slots(&self) -> RecordPageIterator {
         RecordPageIterator {
             record_page: self,
