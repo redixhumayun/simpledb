@@ -74,6 +74,252 @@ impl SimpleDB {
     }
 }
 
+struct TableScan {
+    txn: Arc<Transaction>,
+    layout: Layout,
+    file_name: String,
+    record_page: Option<RecordPage>,
+    current_slot: Option<usize>,
+}
+
+impl TableScan {
+    fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
+        let file_name = format!("{}.tbl", table_name);
+        let mut scan = Self {
+            txn,
+            layout,
+            file_name: file_name.clone(),
+            record_page: None,
+            current_slot: None,
+        };
+
+        if scan.txn.size(&file_name) == 0 {
+            scan.move_to_new_block();
+        } else {
+            scan.move_to_block(0);
+        }
+        scan
+    }
+
+    /// Unpins the underlying [`BlockId`] from the [`BufferList`] & [`Buffer`]
+    fn close(&self) {
+        if let Some(record_page) = &self.record_page {
+            self.txn.unpin(&record_page.block_id);
+        }
+    }
+
+    /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
+    fn move_to_block(&mut self, block_num: usize) {
+        self.close();
+        let block_id = BlockId::new(self.file_name.clone(), block_num);
+        let record_page = RecordPage::new(self.txn.clone(), block_id, self.layout.clone());
+        self.current_slot = Some(0);
+        self.record_page = Some(record_page);
+    }
+
+    /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
+    fn move_to_new_block(&mut self) {
+        self.close();
+        let block = self.txn.append(&self.file_name);
+        let record_page = RecordPage::new(self.txn.clone(), block, self.layout.clone());
+        record_page.format();
+        self.current_slot = Some(0);
+        self.record_page = Some(record_page);
+    }
+
+    /// Checks if the [`TableScan`] is at the last block in the file
+    fn at_last_block(&self) -> bool {
+        self.record_page.as_ref().unwrap().block_id.block_num == self.txn.size(&self.file_name) - 1
+    }
+
+    /// Moves the [`RecordPage`] to the start of the file
+    fn move_to_start(&mut self) {
+        self.move_to_block(0);
+    }
+
+    /// Gets the integer value of a field in the current slot
+    fn get_int(&self, field_name: &str) -> i32 {
+        self.record_page
+            .as_ref()
+            .unwrap()
+            .get_int(*self.current_slot.as_ref().unwrap(), field_name)
+    }
+
+    /// Gets the string value of a field in the current slot
+    fn get_string(&self, field_name: &str) -> String {
+        self.record_page
+            .as_ref()
+            .unwrap()
+            .get_string(*self.current_slot.as_ref().unwrap(), field_name)
+    }
+
+    /// Sets the integer value of a field in the current slot
+    fn set_int(&self, field_name: &str, value: i32) {
+        self.record_page.as_ref().unwrap().set_int(
+            *self.current_slot.as_ref().unwrap(),
+            field_name,
+            value,
+        )
+    }
+
+    /// Sets the string value of a field in the current slot
+    fn set_string(&self, field_name: &str, value: &str) {
+        self.record_page.as_ref().unwrap().set_string(
+            *self.current_slot.as_ref().unwrap(),
+            field_name,
+            value,
+        )
+    }
+
+    /// Tries to insert a new record into the table
+    fn insert(&mut self) {
+        let mut iterations = 0;
+        loop {
+            //  sanity check in case i runs into an infinite loop
+            iterations += 1;
+            assert!(
+                iterations <= 10000,
+                "Table scan insert failed for {} iterations",
+                iterations
+            );
+            match self
+                .record_page
+                .as_ref()
+                .unwrap()
+                .insert_after(*self.current_slot.as_ref().unwrap())
+            {
+                Ok(slot) => {
+                    self.current_slot = Some(slot);
+                    break;
+                }
+                Err(_) => {
+                    if self.at_last_block() {
+                        self.move_to_new_block();
+                    } else {
+                        self.move_to_block(
+                            self.record_page.as_ref().unwrap().block_id.block_num + 1,
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Deletes the record pointed to by current slot from the table
+    fn delete(&self) {
+        self.record_page
+            .as_ref()
+            .unwrap()
+            .delete(*self.current_slot.as_ref().unwrap());
+    }
+}
+
+/// An iterator over the records in the table
+impl Iterator for TableScan {
+    type Item = ();
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            //  Check if there is a record page currently
+            if let Some(record_page) = &self.record_page {
+                let next_slot = match self.current_slot {
+                    None => record_page.iter_used_slots().next(),
+                    Some(slot) => record_page
+                        .iter_used_slots()
+                        .skip_while(|s| *s <= slot)
+                        .next(),
+                };
+
+                if let Some(slot) = next_slot {
+                    self.current_slot = Some(slot);
+                    return Some(());
+                }
+            }
+
+            if self.at_last_block() {
+                return None;
+            }
+            self.move_to_block(self.record_page.as_ref().unwrap().block_id.block_num + 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_scan_tests {
+    use std::sync::Arc;
+
+    use crate::{test_utils::generate_random_number, Layout, Schema, SimpleDB, TableScan};
+
+    #[test]
+    fn table_scan_test() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 4);
+        let txn = Arc::new(db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema);
+
+        dbg!("Inserting a bunch of records into the table");
+        let mut inserted_count = 0;
+        let mut table_scan = TableScan::new(txn, layout, "table");
+        for i in 0..100 {
+            table_scan.insert();
+            let number = (generate_random_number() % 100) + 1;
+            table_scan.set_int("A", number as i32);
+            table_scan.set_string("B", &format!("rec{}", number));
+            dbg!(format!("Inserting number {}", number));
+            inserted_count += 1;
+        }
+        dbg!(format!("Inserted {} records", inserted_count));
+
+        dbg!("Deleting a bunch of records");
+        dbg!(format!(
+            "The table scan is at {:?}",
+            table_scan.record_page.as_ref().unwrap().block_id
+        ));
+        let mut deleted_count = 0;
+        table_scan.move_to_start();
+        while let Some(_) = table_scan.next() {
+            let number = table_scan.get_int("A");
+            dbg!(format!("The number retrieved {}", number));
+            if number < 25 {
+                deleted_count += 1;
+                table_scan.delete();
+            }
+        }
+        dbg!(format!("Deleted {} records", deleted_count));
+
+        dbg!("Finding remaining records");
+        let mut remaining_count = 0;
+        table_scan.move_to_start();
+        while let Some(_) = table_scan.next() {
+            let number = table_scan.get_int("A");
+            let string = table_scan.get_string("B");
+            remaining_count += 1;
+        }
+        assert_eq!(remaining_count + deleted_count, inserted_count);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Constant {
+    Int(i32),
+    String(String),
+}
+
+struct RID {
+    block_num: usize,
+    slot: usize,
+}
+
+impl RID {
+    fn new(block_num: usize, slot: usize) -> Self {
+        Self { block_num, slot }
+    }
+}
+
 struct RecordPageIterator<'a> {
     record_page: &'a RecordPage,
     current_slot: usize,
@@ -119,7 +365,7 @@ enum SlotPresence {
 }
 
 struct RecordPage {
-    tx: Transaction,
+    tx: Arc<Transaction>,
     block_id: BlockId,
     layout: Layout,
 }
@@ -127,7 +373,7 @@ struct RecordPage {
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
-    fn new(tx: Transaction, block_id: BlockId, layout: Layout) -> Self {
+    fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         tx.pin(&block_id);
         Self {
             tx,
@@ -175,14 +421,24 @@ impl RecordPage {
     }
 
     /// Finds the next empty slot after the given slot, marks it as used, and returns its number.
-    fn insert_after(&self, slot: usize) -> usize {
+    fn insert_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
         let new_slot = self
             .iter_empty_slots()
             .skip_while(|s| *s <= slot)
             .next()
-            .unwrap();
+            .ok_or_else(|| "no empty slots available in this record page")?;
         self.set_flag(new_slot, SlotPresence::USED);
-        new_slot
+        Ok(new_slot)
+    }
+
+    /// Returns the next [`SlotPresence::USED`] slot after the slot passed in
+    fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
+        let next_slot = self
+            .iter_used_slots()
+            .skip_while(|s| *s <= slot)
+            .next()
+            .unwrap();
+        Ok(next_slot)
     }
 
     /// Sets the presence flag (EMPTY or USED) for a given slot.
@@ -259,14 +515,14 @@ impl RecordPage {
 
 #[cfg(test)]
 mod record_page_tests {
-    use std::{fs::File, io::Read};
+    use std::sync::Arc;
 
-    use crate::{Layout, RecordPage, Schema, SimpleDB};
+    use crate::{test_utils::generate_random_number, Layout, RecordPage, Schema, SimpleDB};
 
     #[test]
     fn record_page_test() {
         let (db, test_dir) = SimpleDB::new_for_test(400, 3);
-        let txn = db.new_tx();
+        let txn = Arc::new(db.new_tx());
 
         //  Set up the test
         let mut schema = Schema::new();
@@ -291,10 +547,7 @@ mod record_page_tests {
         let record_iter = record_page.iter_empty_slots();
         let mut inserted_count = 0;
         for slot in record_iter {
-            let mut f = File::open("/dev/urandom").unwrap();
-            let mut buf = [0u8; 2];
-            f.read_exact(&mut buf).unwrap();
-            let number = (u16::from_le_bytes(buf) % 100) + 1;
+            let number = (generate_random_number() % 100) + 1;
 
             record_page.set_int(slot, "A", number as i32);
             record_page.set_string(slot, "B", &format!("rec{number}"));
@@ -334,6 +587,7 @@ mod record_page_tests {
     }
 }
 
+#[derive(Clone)]
 struct Layout {
     schema: Schema,
     offsets: HashMap<String, usize>, //  map the field name to the offset
@@ -396,6 +650,7 @@ struct FieldInfo {
     length: usize,
 }
 
+#[derive(Clone)]
 struct Schema {
     fields: Vec<String>,
     info: HashMap<String, FieldInfo>,

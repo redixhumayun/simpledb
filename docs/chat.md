@@ -177,4 +177,4 @@ The calculations for this were done as follows:
 ## Notes On Implementation
 Upon trying to implement this approach, I noticed that I have to do a bunch of nonsense to get around the design of the `Page` and `Transaction` objects because those don't have the concept & affordances of bit maps and ID tables.
 If I truly want to modify this, I should change the actual `Page` format so that it has knowledge of the bitmap and the ID table. That way, all these changes can go through the `RecoveryManager` correctly.
-Refer to [this chat](https://claude.ai/chat/b36c7658-2311-479b-acc9-945e95ea2ba5) for more details.
+Refer to [this chat](https://claude.ai/chat/b36c7658-2311-479b-acc9-945e95ea2ba5) for more details. Also, look at [this chat](https://claude.ai/chat/191a1311-abdf-47c6-b92a-1e7fb617f545).

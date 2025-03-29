@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -39,4 +41,11 @@ pub fn generate_filename() -> String {
         .as_nanos();
     let thread_id = std::thread::current().id();
     format!("test_file_{}_{:?}", timestamp, thread_id)
+}
+
+pub fn generate_random_number() -> usize {
+    let mut f = File::open("/dev/urandom").unwrap();
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf).unwrap();
+    usize::from_le_bytes(buf)
 }
