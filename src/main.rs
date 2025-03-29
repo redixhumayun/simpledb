@@ -213,6 +213,24 @@ impl TableScan {
             .unwrap()
             .delete(*self.current_slot.as_ref().unwrap());
     }
+
+    fn move_to_row_id(&mut self, row_id: RID) {
+        self.close();
+        let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
+        self.record_page = Some(RecordPage::new(
+            Arc::clone(&self.txn),
+            block_id,
+            self.layout.clone(),
+        ));
+        self.current_slot = Some(row_id.slot);
+    }
+
+    fn get_row_id(&self) -> RID {
+        RID::new(
+            self.record_page.as_ref().unwrap().block_id.block_num,
+            *self.current_slot.as_ref().unwrap(),
+        )
+    }
 }
 
 /// An iterator over the records in the table
