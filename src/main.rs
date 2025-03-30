@@ -74,6 +74,220 @@ impl SimpleDB {
     }
 }
 
+struct StatInfo {
+    num_block: usize,
+    num_records: usize,
+}
+
+impl StatInfo {
+    fn new(num_block: usize, num_records: usize) -> Self {
+        Self {
+            num_block,
+            num_records,
+        }
+    }
+
+    fn distinct_values(&self, _field_name: &str) -> usize {
+        1 + (self.num_records / 3)
+    }
+}
+
+struct ViewManager {}
+
+struct TableManager {
+    table_catalog_layout: Layout,
+    field_catalog_layout: Layout,
+}
+
+impl TableManager {
+    const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name
+    const TABLE_CAT_TABLE_NAME: &str = "table_catalog";
+    const FIELD_CAT_TABLE_NAME: &str = "field_catalog";
+
+    // Table catalog columns
+    const TABLE_NAME_COL: &str = "table_name";
+    const SLOT_SIZE_COL: &str = "slot_size";
+
+    // Field catalog columns
+    const FIELD_NAME_COL: &str = "field_name";
+    const FIELD_TYPE_COL: &str = "type";
+    const FIELD_LENGTH_COL: &str = "length";
+    const FIELD_OFFSET_COL: &str = "offset";
+
+    fn new(is_new: bool, tx: Arc<Transaction>) -> Self {
+        //  Create the table catalog layout
+        let mut table_cat_schema = Schema::new();
+        table_cat_schema.add_string_field(Self::TABLE_NAME_COL, Self::MAX_NAME_LENGTH);
+        table_cat_schema.add_int_field(Self::SLOT_SIZE_COL);
+        let table_cat_layout = Layout::new(table_cat_schema.clone());
+
+        //  Create the field catalog layout
+        let mut field_cat_schema = Schema::new();
+        field_cat_schema.add_string_field(Self::TABLE_NAME_COL, Self::MAX_NAME_LENGTH);
+        field_cat_schema.add_string_field(Self::FIELD_NAME_COL, Self::MAX_NAME_LENGTH);
+        field_cat_schema.add_int_field(Self::FIELD_TYPE_COL);
+        field_cat_schema.add_int_field(Self::FIELD_LENGTH_COL);
+        field_cat_schema.add_int_field(Self::FIELD_OFFSET_COL);
+        let field_cat_layout = Layout::new(field_cat_schema.clone());
+
+        let table_mgr = Self {
+            table_catalog_layout: table_cat_layout,
+            field_catalog_layout: field_cat_layout,
+        };
+
+        if is_new {
+            //  Create both tables
+            table_mgr.create_table(
+                Self::TABLE_CAT_TABLE_NAME,
+                &table_cat_schema,
+                Arc::clone(&tx),
+            );
+            table_mgr.create_table(Self::FIELD_CAT_TABLE_NAME, &field_cat_schema, tx);
+        }
+
+        table_mgr
+    }
+
+    /// This method will accept a [`Schema`] for a table that is being created as part of a txn and
+    /// create the relevant metadata in the catalog tables
+    fn create_table(&self, table_name: &str, schema: &Schema, tx: Arc<Transaction>) {
+        let layout = Layout::new(schema.clone());
+
+        //  insert the record for the table name and slot size
+        {
+            let mut table_scan = TableScan::new(
+                Arc::clone(&tx),
+                self.table_catalog_layout.clone(),
+                Self::TABLE_CAT_TABLE_NAME,
+            );
+            table_scan.insert();
+            table_scan.set_string(Self::TABLE_NAME_COL, table_name);
+            table_scan.set_int(Self::SLOT_SIZE_COL, layout.slot_size as i32);
+        }
+
+        // insert the records for the fields into the field catalog table
+        {
+            let mut table_scan = TableScan::new(
+                tx,
+                self.field_catalog_layout.clone(),
+                Self::FIELD_CAT_TABLE_NAME,
+            );
+            for field in &schema.fields {
+                table_scan.insert();
+                table_scan.set_string(Self::TABLE_NAME_COL, table_name);
+                table_scan.set_string(Self::FIELD_NAME_COL, field);
+                let field_info = schema.info.get(field).unwrap();
+                table_scan.set_int(Self::FIELD_TYPE_COL, field_info.field_type as i32);
+                table_scan.set_int(Self::FIELD_LENGTH_COL, field_info.length as i32);
+                table_scan.set_int(Self::FIELD_OFFSET_COL, layout.offset(field).unwrap() as i32);
+            }
+        }
+    }
+
+    /// Return the physical [`Layout`] for a specific table defined in the table catalog metadata
+    fn get_layout(&self, table_name: &str, tx: Arc<Transaction>) -> Layout {
+        //  Get the slot size of the table
+        let slot_size = {
+            let mut table_scan = TableScan::new(
+                Arc::clone(&tx),
+                self.table_catalog_layout.clone(),
+                Self::TABLE_CAT_TABLE_NAME,
+            );
+            let mut slot_size = None;
+            while let Some(_) = table_scan.next() {
+                if table_name == table_scan.get_string(Self::TABLE_NAME_COL) {
+                    slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
+                }
+            }
+            slot_size.unwrap()
+        };
+
+        //  Construct the schema from the table so the layout can be created
+        let schema = {
+            let mut table_scan = TableScan::new(
+                Arc::clone(&tx),
+                self.field_catalog_layout.clone(),
+                Self::FIELD_CAT_TABLE_NAME,
+            );
+            let mut schema = Schema::new();
+            while let Some(_) = table_scan.next() {
+                if table_name == table_scan.get_string(Self::TABLE_NAME_COL) {
+                    let field_name = table_scan.get_string(Self::FIELD_NAME_COL);
+                    let field_type: FieldType = table_scan.get_int(Self::FIELD_TYPE_COL).into();
+                    let field_length = table_scan.get_int(Self::FIELD_LENGTH_COL) as usize;
+                    schema.add_field(&field_name, field_type, field_length);
+                }
+            }
+            schema
+        };
+        Layout::new(schema)
+    }
+}
+
+#[cfg(test)]
+mod table_manager_tests {
+    use std::sync::Arc;
+
+    use crate::{FieldType, Schema, SimpleDB, TableManager};
+
+    #[test]
+    fn test_table_manager() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let table_manager = TableManager::new(true, Arc::clone(&tx));
+
+        // Create schema
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 9);
+
+        // Create table and get its layout
+        let table_name = "MyTable";
+        table_manager.create_table(table_name, &schema, Arc::clone(&tx));
+        let layout = table_manager.get_layout(table_name, Arc::clone(&tx));
+
+        // Verify slot size
+        println!("MyTable has slot size {}", layout.slot_size);
+        // Assert slot size matches expected (calculate expected size based on schema)
+        let expected_slot_size = 4 + // header
+                            4 + // int field
+                            (4 + 9); // string field (length prefix + chars)
+        assert_eq!(layout.slot_size, expected_slot_size);
+
+        // Verify schema fields
+        println!("Its fields are:");
+        for field in &layout.schema.fields {
+            let field_info = layout.schema.info.get(field).unwrap();
+            let type_str = match field_info.field_type {
+                FieldType::INT => "int".to_string(),
+                FieldType::STRING => format!("varchar({})", field_info.length),
+            };
+            println!("{}: {}", field, type_str);
+
+            // Assert field properties
+            match field.as_str() {
+                "A" => {
+                    assert_eq!(field_info.field_type, FieldType::INT);
+                }
+                "B" => {
+                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.length, 9);
+                }
+                _ => panic!("Unexpected field: {}", field),
+            }
+        }
+
+        // Verify field count
+        assert_eq!(layout.schema.fields.len(), 2);
+
+        // Verify field offsets
+        assert_eq!(layout.offset("A").unwrap(), 4); // First field after slot header
+        assert_eq!(layout.offset("B").unwrap(), 8); // After int field
+
+        tx.commit().unwrap();
+    }
+}
+
 struct TableScan {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -230,6 +444,12 @@ impl TableScan {
             self.record_page.as_ref().unwrap().block_id.block_num,
             *self.current_slot.as_ref().unwrap(),
         )
+    }
+}
+
+impl Drop for TableScan {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -605,7 +825,7 @@ mod record_page_tests {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Layout {
     schema: Schema,
     offsets: HashMap<String, usize>, //  map the field name to the offset
@@ -617,9 +837,13 @@ impl Layout {
         let mut offsets = HashMap::new();
         let mut offset = Page::INT_BYTES;
         for field in schema.fields.iter() {
-            let field_length = schema.info.get(field).unwrap().length;
+            let field_info = schema.info.get(field).unwrap();
             offsets.insert(field.clone(), offset);
-            offset += field_length;
+
+            match field_info.field_type {
+                FieldType::INT => offset += field_info.length,
+                FieldType::STRING => offset += Page::INT_BYTES + field_info.length,
+            }
         }
         Self {
             schema,
@@ -656,19 +880,29 @@ mod layout_tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum FieldType {
-    INT,
-    STRING,
+    INT = 0,
+    STRING = 1,
 }
 
-#[derive(Clone, Copy)]
+impl From<i32> for FieldType {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => FieldType::INT,
+            1 => FieldType::STRING,
+            _ => panic!("Invalid field type"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct FieldInfo {
     field_type: FieldType,
     length: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Schema {
     fields: Vec<String>,
     info: HashMap<String, FieldInfo>,
@@ -2848,6 +3082,7 @@ impl Page {
 
     /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
     fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
+        let length_bytes = &self.contents[offset..offset + Self::INT_BYTES];
         let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
             .try_into()
             .unwrap();
@@ -2859,6 +3094,7 @@ impl Page {
     /// Set a slice of bytes at the given offset. Write the length and then the bytes
     fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
         let length = bytes.len() as u32;
+        let length_bytes = length.to_be_bytes();
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
         offset = offset + Self::INT_BYTES;
         self.contents[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -2982,7 +3218,7 @@ impl FileManager {
         block_id
     }
 
-    /// Get the file handle for the file with the given filename
+    /// Get the file handle for the file with the given filename or create it if it doesn't exist
     fn get_file(&mut self, filename: &str) -> File {
         self.open_files
             .entry(filename.to_string())

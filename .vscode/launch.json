@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "transaction_tests",
+        "table_manager_tests",
         "--",
         "--nocapture"
       ],
