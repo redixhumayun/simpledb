@@ -100,7 +100,7 @@ struct TableManager {
 }
 
 impl TableManager {
-    const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name
+    const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name (TODO: Do other databases use variable name lengths?)
     const TABLE_CAT_TABLE_NAME: &str = "table_catalog";
     const FIELD_CAT_TABLE_NAME: &str = "field_catalog";
 
