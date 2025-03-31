@@ -7,6 +7,7 @@ use std::{
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, Write},
     ops::Deref,
     path::{Path, PathBuf},
@@ -74,15 +75,541 @@ impl SimpleDB {
     }
 }
 
+struct MetadataManager {
+    table_manager: Arc<TableManager>,
+    view_manager: Arc<ViewManager>,
+    index_manager: Arc<IndexManager>,
+    stat_manager: Arc<Mutex<StatManager>>,
+}
+
+impl MetadataManager {
+    fn new(is_new: bool, txn: Arc<Transaction>) -> Self {
+        let table_manager = Arc::new(TableManager::new(is_new, Arc::clone(&txn)));
+        let view_manager = Arc::new(ViewManager::new(
+            is_new,
+            Arc::clone(&table_manager),
+            Arc::clone(&txn),
+        ));
+        let stat_manager = Arc::new(Mutex::new(StatManager::new(Arc::clone(&table_manager))));
+        let index_manager = Arc::new(IndexManager::new(
+            is_new,
+            Arc::clone(&table_manager),
+            Arc::clone(&stat_manager),
+            txn,
+        ));
+        Self {
+            table_manager,
+            view_manager,
+            index_manager,
+            stat_manager,
+        }
+    }
+
+    fn create_table(&self, table_name: &str, schema: Schema, txn: Arc<Transaction>) {
+        self.table_manager.create_table(table_name, &schema, txn);
+    }
+
+    fn get_layout(&self, table_name: &str, txn: Arc<Transaction>) -> Layout {
+        self.table_manager.get_layout(table_name, txn)
+    }
+
+    fn create_view(&self, view_name: &str, view_def: &str, txn: Arc<Transaction>) {
+        self.view_manager.create_view(view_name, view_def, txn);
+    }
+
+    fn get_view_def(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
+        self.view_manager.get_view(view_name, txn)
+    }
+
+    fn create_index(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        field_name: &str,
+        txn: Arc<Transaction>,
+    ) {
+        println!(
+            "Creating index {} on table {} for field {}",
+            index_name, table_name, field_name
+        );
+        self.index_manager
+            .create_index(index_name, table_name, field_name, txn);
+    }
+
+    fn get_index_info(
+        &self,
+        table_name: &str,
+        txn: Arc<Transaction>,
+    ) -> HashMap<String, IndexInfo> {
+        println!("Fetching indices for table {}", table_name);
+        self.index_manager.get_index_info(table_name, txn)
+    }
+
+    fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
+        self.stat_manager
+            .lock()
+            .unwrap()
+            .get_stat_info(table_name, layout, txn)
+    }
+}
+
+#[cfg(test)]
+mod metadata_manager_tests {
+    use crate::{
+        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB, TableScan,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn test_metadata_manager() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let mdm = MetadataManager::new(true, Arc::clone(&tx));
+
+        // Part 1: Table Metadata
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 9);
+
+        let table_name = "MyTable";
+        mdm.create_table(table_name, schema.clone(), Arc::clone(&tx));
+        let layout = mdm.get_layout(table_name, Arc::clone(&tx));
+
+        println!("MyTable has slot size {}", layout.slot_size);
+        // Verify slot size
+        let expected_slot_size = 4 + 4 + (4 + 9); // header + int + (string length prefix + chars)
+        assert_eq!(layout.slot_size, expected_slot_size);
+
+        // Verify schema fields
+        println!("Its fields are:");
+        for field in &layout.schema.fields {
+            let field_info = layout.schema.info.get(field).unwrap();
+            let type_str = match field_info.field_type {
+                FieldType::INT => "int".to_string(),
+                FieldType::STRING => format!("varchar({})", field_info.length),
+            };
+            println!("{}: {}", field, type_str);
+
+            // Assert field properties
+            match field.as_str() {
+                "A" => assert_eq!(field_info.field_type, FieldType::INT),
+                "B" => {
+                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.length, 9);
+                }
+                _ => panic!("Unexpected field: {}", field),
+            }
+        }
+
+        // Part 2: Statistics Metadata
+        {
+            let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name);
+            for _ in 0..50 {
+                table_scan.insert();
+                let n = (generate_random_number() % 50) + 1;
+                table_scan.set_int("A", n as i32);
+                table_scan.set_string("B", &format!("rec{}", n));
+            }
+
+            let stat_info = mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&tx));
+            println!("B(MyTable) = {}", stat_info.num_blocks);
+            println!("R(MyTable) = {}", stat_info.num_blocks);
+            println!("V(MyTable,A) = {}", stat_info.distinct_values("A"));
+            println!("V(MyTable,B) = {}", stat_info.distinct_values("B"));
+
+            // Add assertions for statistics
+            assert!(stat_info.num_blocks > 0);
+            assert_eq!(stat_info.num_records, 50);
+            assert!(stat_info.distinct_values("A") <= 50);
+            assert!(stat_info.distinct_values("B") <= 50);
+        }
+
+        // Part 3: View Metadata
+        let view_def = "select B from MyTable where A = 1";
+        mdm.create_view("viewA", view_def, Arc::clone(&tx));
+        let retrieved_view = mdm.get_view_def("viewA", Arc::clone(&tx));
+        println!("View def = {:?}", retrieved_view);
+        assert_eq!(retrieved_view, Some(view_def.to_string()));
+
+        // Part 4: Index Metadata
+        mdm.create_index(table_name, "indexA", "A", Arc::clone(&tx));
+        mdm.create_index(table_name, "indexB", "B", Arc::clone(&tx));
+
+        let idx_map = mdm.get_index_info(table_name, Arc::clone(&tx));
+
+        // Verify index A
+        let idx_a = idx_map.get("A").expect("Index A not found");
+        println!("B(indexA) = {}", idx_a.blocks_accessed());
+        println!("R(indexA) = {}", idx_a.records_output());
+        println!("V(indexA,A) = {}", idx_a.distinct_values("A"));
+        println!("V(indexA,B) = {}", idx_a.distinct_values("B"));
+
+        assert!(idx_a.blocks_accessed() >= 0); //  TODO: is there a better way to assert this?
+        assert_eq!(idx_a.records_output(), 2);
+        assert!(idx_a.distinct_values("A") == 1); //  we have an index on A
+
+        // Verify index B
+        let idx_b = idx_map.get("B").expect("Index B not found");
+        println!("B(indexB) = {}", idx_b.blocks_accessed());
+        println!("R(indexB) = {}", idx_b.records_output());
+        println!("V(indexB,A) = {}", idx_b.distinct_values("A"));
+        println!("V(indexB,B) = {}", idx_b.distinct_values("B"));
+
+        assert!(idx_b.blocks_accessed() >= 0); //  TODO: Is there a better way to assert this?
+        assert_eq!(idx_b.records_output(), 2);
+        assert!(idx_b.distinct_values("B") == 1); //  we have an index on B
+
+        tx.commit().unwrap();
+    }
+}
+
+struct IndexManager {
+    layout: Layout,
+    table_manager: Arc<TableManager>,
+    stat_manager: Arc<Mutex<StatManager>>,
+}
+
+impl IndexManager {
+    const INDEX_CAT_TBL_NAME: &str = "index_cat";
+    const INDEX_COL_NAME: &str = "index_name";
+    const TABLE_COL_NAME: &str = "table_name";
+    const TABLE_FIELD_NAME: &str = "field_name";
+
+    fn new(
+        is_new: bool,
+        table_manager: Arc<TableManager>,
+        stat_manager: Arc<Mutex<StatManager>>,
+        txn: Arc<Transaction>,
+    ) -> Self {
+        if is_new {
+            let mut schema = Schema::new();
+            schema.add_string_field(Self::INDEX_COL_NAME, TableManager::MAX_NAME_LENGTH);
+            schema.add_string_field(Self::TABLE_COL_NAME, TableManager::MAX_NAME_LENGTH);
+            schema.add_string_field(Self::TABLE_FIELD_NAME, TableManager::MAX_NAME_LENGTH);
+            table_manager.create_table(Self::INDEX_CAT_TBL_NAME, &schema, Arc::clone(&txn));
+        }
+        let layout = table_manager.get_layout(Self::INDEX_CAT_TBL_NAME, txn);
+        Self {
+            layout,
+            table_manager,
+            stat_manager,
+        }
+    }
+
+    fn create_index(
+        &self,
+        index_name: &str,
+        table_name: &str,
+        field_name: &str,
+        txn: Arc<Transaction>,
+    ) {
+        let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME);
+        table_scan.insert();
+        table_scan.set_string(Self::INDEX_COL_NAME, index_name);
+        table_scan.set_string(Self::TABLE_COL_NAME, table_name);
+        table_scan.set_string(Self::TABLE_FIELD_NAME, field_name);
+    }
+
+    fn get_index_info(
+        &self,
+        table_name: &str,
+        txn: Arc<Transaction>,
+    ) -> HashMap<String, IndexInfo> {
+        let mut hash_map = HashMap::new();
+        let mut table_scan = TableScan::new(
+            Arc::clone(&txn),
+            self.layout.clone(),
+            Self::INDEX_CAT_TBL_NAME,
+        );
+        while table_scan.next().is_some() {
+            if table_scan.get_string(Self::TABLE_COL_NAME) == table_name {
+                let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME);
+                let index_name = table_scan.get_string(Self::INDEX_COL_NAME);
+                let layout = self.table_manager.get_layout(table_name, Arc::clone(&txn));
+                let stat_info = self.stat_manager.lock().unwrap().get_stat_info(
+                    table_name,
+                    layout.clone(),
+                    Arc::clone(&txn),
+                );
+                let index_info = IndexInfo::new(
+                    &index_name,
+                    &field_name,
+                    Arc::clone(&txn),
+                    layout.schema,
+                    stat_info,
+                );
+                hash_map.insert(field_name, index_info);
+            }
+        }
+        hash_map
+    }
+}
+
+struct IndexInfo {
+    index_name: String,
+    field_name: String,
+    txn: Arc<Transaction>,
+    table_schema: Schema,
+    index_layout: Layout,
+    stat_info: StatInfo,
+}
+
+impl IndexInfo {
+    const BLOCK_NUM_FIELD: &str = "block_num"; //   the block number
+    const ID_FIELD: &str = "id"; //  the record id (slot number)
+    const DATA_FIELD: &str = "dataval"; //  the data field
+    fn new(
+        index_name: &str,
+        field_name: &str,
+        txn: Arc<Transaction>,
+        table_schema: Schema,
+        stat_info: StatInfo,
+    ) -> Self {
+        let mut schema = Schema::new();
+        schema.add_int_field(Self::BLOCK_NUM_FIELD);
+        schema.add_int_field(Self::ID_FIELD);
+        match table_schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => {
+                schema.add_int_field(field_name);
+            }
+            FieldType::STRING => {
+                schema.add_string_field(
+                    field_name,
+                    table_schema.info.get(field_name).unwrap().length,
+                );
+            }
+        };
+        let index_layout = Layout::new(schema);
+        Self {
+            index_name: index_name.to_string(),
+            field_name: field_name.to_string(),
+            txn,
+            table_schema,
+            index_layout,
+            stat_info,
+        }
+    }
+
+    /// This function returns the number of blocks that would need to be searched for this index on a specific field
+    fn blocks_accessed(&self) -> usize {
+        let records_per_block = self.txn.block_size() / self.index_layout.slot_size;
+        let num_blocks = self.stat_info.num_records / records_per_block;
+        HashIndex::search_cost(num_blocks)
+    }
+
+    /// This function returns the number of records that we would expect to get when using this index on a specific field
+    fn records_output(&self) -> usize {
+        self.stat_info.num_records / self.stat_info.distinct_values(&self.field_name)
+    }
+
+    /// This function returns the number of distinct values for a specific field in this index
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self.field_name == field_name {
+            1
+        } else {
+            self.stat_info.distinct_values(&self.field_name)
+        }
+    }
+}
+
+struct HashIndex {
+    txn: Arc<Transaction>,
+    index_name: String,
+    layout: Layout,
+    search_key: Option<Constant>,
+    table_scan: Option<TableScan>,
+}
+
+impl HashIndex {
+    const NUM_BUCKETS: usize = 100;
+
+    fn new(txn: Arc<Transaction>, index_name: &str, layout: Layout) -> Self {
+        Self {
+            txn,
+            index_name: index_name.to_string(),
+            layout,
+            search_key: None,
+            table_scan: None,
+        }
+    }
+
+    fn search_cost(num_blocks: usize) -> usize {
+        num_blocks / HashIndex::NUM_BUCKETS
+    }
+}
+
+impl Index for HashIndex {
+    fn before_first(&mut self, search_key: &Constant) {
+        self.close();
+        self.search_key = Some(search_key.clone());
+        let mut hasher = DefaultHasher::new();
+        search_key.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        let bucket = hash % Self::NUM_BUCKETS;
+        let table_name = format!("{}_{}", self.index_name, bucket);
+        let table_scan = TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name);
+        self.table_scan = Some(table_scan);
+    }
+
+    fn next(&mut self) -> bool {
+        let table_scan = self.table_scan.as_mut().unwrap();
+        while table_scan.next().is_some() {
+            if table_scan.get_value(IndexInfo::DATA_FIELD) == *self.search_key.as_ref().unwrap() {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn get_data_rid(&self) -> RID {
+        let table_scan = self.table_scan.as_ref().unwrap();
+        let block_num = table_scan.get_int(IndexInfo::BLOCK_NUM_FIELD);
+        let id = table_scan.get_int(IndexInfo::ID_FIELD);
+        RID {
+            block_num: block_num as usize,
+            slot: id as usize,
+        }
+    }
+
+    fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.before_first(data_val);
+        let table_scan = self.table_scan.as_mut().unwrap();
+        table_scan.insert();
+        table_scan.set_int(IndexInfo::BLOCK_NUM_FIELD, data_rid.block_num as i32);
+        table_scan.set_int(IndexInfo::ID_FIELD, data_rid.slot as i32);
+        table_scan.set_value(IndexInfo::DATA_FIELD, data_val.clone());
+    }
+
+    fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.before_first(data_val);
+        while self.next() {
+            if *data_rid == self.get_data_rid() {
+                self.table_scan.as_ref().unwrap().delete();
+                return;
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.table_scan.as_ref().and_then(|ts| Some(ts.close()));
+    }
+}
+
+/// Interface for traversing and modifying an index
+trait Index {
+    /// Position the index before the first record having the specified search key
+    fn before_first(&mut self, search_key: &Constant);
+
+    /// Move to the next record having the search key specified in before_first
+    /// Returns false if there are no more index records with that search key
+    fn next(&mut self) -> bool;
+
+    /// Get the RID stored in the current index record
+    fn get_data_rid(&self) -> RID;
+
+    /// Insert an index record with the specified value and RID
+    fn insert(&mut self, data_val: &Constant, data_rid: &RID);
+
+    /// Delete the index record with the specified value and RID
+    fn delete(&mut self, data_val: &Constant, data_rid: &RID);
+
+    /// Close the index and release any resources
+    fn close(&mut self);
+}
+
+struct StatManager {
+    table_manager: Arc<TableManager>,
+    table_stats: HashMap<String, StatInfo>,
+    num_calls: usize,
+}
+
+impl StatManager {
+    fn new(table_manager: Arc<TableManager>) -> Self {
+        Self {
+            table_manager,
+            table_stats: HashMap::new(),
+            num_calls: 0,
+        }
+    }
+
+    /// Returns the statistics for a given table
+    /// Refreshes all stats for all tables based on a counter
+    fn get_stat_info(
+        &mut self,
+        table_name: &str,
+        layout: Layout,
+        txn: Arc<Transaction>,
+    ) -> StatInfo {
+        println!("getting stat info for {}", table_name);
+        self.num_calls += 1;
+        if self.num_calls > 100 {
+            self.refresh_stats(Arc::clone(&txn));
+        }
+
+        if let Some(stats) = self.table_stats.get(table_name) {
+            println!("found table stats {:?}", stats);
+            stats.clone()
+        } else {
+            println!("going to calculate table stats");
+            let table_stats = self.calculate_table_stats(table_name, layout, txn);
+            println!("table stats {:?}", table_stats);
+            self.table_stats
+                .insert(table_name.to_string(), table_stats.clone());
+            table_stats
+        }
+    }
+
+    /// Refreshes the statistics for all tables in the database
+    fn refresh_stats(&mut self, txn: Arc<Transaction>) {
+        self.table_stats.clear();
+        let table_catalog_layout = self
+            .table_manager
+            .get_layout(TableManager::TABLE_CAT_TABLE_NAME, Arc::clone(&txn));
+        let mut table_scan = TableScan::new(
+            Arc::clone(&txn),
+            table_catalog_layout,
+            TableManager::TABLE_CAT_TABLE_NAME,
+        );
+        while table_scan.next().is_some() {
+            let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL);
+            let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
+            let table_stats = self.calculate_table_stats(&table_name, layout, Arc::clone(&txn));
+            self.table_stats.insert(table_name, table_stats);
+        }
+    }
+
+    /// Calculates the [`StatInfo`] for a given table
+    fn calculate_table_stats(
+        &self,
+        table_name: &str,
+        layout: Layout,
+        txn: Arc<Transaction>,
+    ) -> StatInfo {
+        println!("calculating table stats for {}", table_name);
+        let mut table_scan = TableScan::new(txn, layout, table_name);
+        let mut num_rec = 0;
+        let mut num_blocks = 0;
+        while table_scan.next().is_some() {
+            num_rec += 1;
+            num_blocks = table_scan.record_page.as_ref().unwrap().block_id.block_num + 1;
+        }
+        StatInfo {
+            num_blocks,
+            num_records: num_rec,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct StatInfo {
-    num_block: usize,
+    num_blocks: usize,
     num_records: usize,
 }
 
 impl StatInfo {
     fn new(num_block: usize, num_records: usize) -> Self {
         Self {
-            num_block,
+            num_blocks: num_block,
             num_records,
         }
     }
@@ -92,7 +619,52 @@ impl StatInfo {
     }
 }
 
-struct ViewManager {}
+struct ViewManager {
+    table_manager: Arc<TableManager>,
+}
+
+impl ViewManager {
+    const VIEW_DEF_MAX_LENGTH: usize = 100;
+    const VIEW_MANAGER_TABLE_NAME: &str = "view_catalog";
+    const VIEW_NAME_COL: &str = "view_name";
+    const VIEW_DEF_COL: &str = "view_col";
+
+    fn new(is_new: bool, table_manager: Arc<TableManager>, txn: Arc<Transaction>) -> Self {
+        if is_new {
+            let mut schema = Schema::new();
+            schema.add_string_field(Self::VIEW_NAME_COL, TableManager::MAX_NAME_LENGTH);
+            schema.add_string_field(Self::VIEW_DEF_COL, Self::VIEW_DEF_MAX_LENGTH);
+            table_manager.create_table(Self::VIEW_MANAGER_TABLE_NAME, &schema, txn);
+        }
+        let view_manager = ViewManager { table_manager };
+        view_manager
+    }
+
+    /// Creates a new view in the view catalog
+    fn create_view(&self, view_name: &str, view_def: &str, txn: Arc<Transaction>) {
+        let layout = self
+            .table_manager
+            .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
+        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        table_scan.insert();
+        table_scan.set_string(Self::VIEW_NAME_COL, view_name);
+        table_scan.set_string(Self::VIEW_DEF_COL, view_def);
+    }
+
+    /// Returns the view definition for a given view name
+    fn get_view(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
+        let layout = self
+            .table_manager
+            .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
+        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        while let Some(_) = table_scan.next() {
+            if view_name == table_scan.get_string(Self::VIEW_NAME_COL) {
+                return Some(table_scan.get_string(Self::VIEW_DEF_COL));
+            }
+        }
+        None
+    }
+}
 
 struct TableManager {
     table_catalog_layout: Layout,
@@ -100,7 +672,7 @@ struct TableManager {
 }
 
 impl TableManager {
-    const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name (TODO: Do other databases use variable name lengths?)
+    const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name (TODO: Do other databases use variable name lengths for tables?)
     const TABLE_CAT_TABLE_NAME: &str = "table_catalog";
     const FIELD_CAT_TABLE_NAME: &str = "field_catalog";
 
@@ -445,6 +1017,20 @@ impl TableScan {
             *self.current_slot.as_ref().unwrap(),
         )
     }
+
+    fn get_value(&self, field_name: &str) -> Constant {
+        match self.layout.schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => Constant::Int(self.get_int(field_name)),
+            FieldType::STRING => Constant::String(self.get_string(field_name)),
+        }
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) {
+        match self.layout.schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => self.set_int(field_name, value.as_int()),
+            FieldType::STRING => self.set_string(field_name, value.as_str()),
+        }
+    }
 }
 
 impl Drop for TableScan {
@@ -541,12 +1127,29 @@ mod table_scan_tests {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum Constant {
     Int(i32),
     String(String),
 }
 
+impl Constant {
+    fn as_int(&self) -> i32 {
+        match self {
+            Constant::Int(value) => *value,
+            _ => panic!("Expected an integer constant"),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Constant::String(value) => value,
+            _ => panic!("Expected a string constant"),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
 struct RID {
     block_num: usize,
     slot: usize,
