@@ -75,6 +75,300 @@ impl SimpleDB {
     }
 }
 
+struct ProductScan<S>
+where
+    S: Scan,
+{
+    s1: S,
+    s2: S,
+}
+
+impl<S> Iterator for ProductScan<S>
+where
+    S: Scan,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.s2.next() {
+            Some(result) => match result {
+                Ok(_) => {
+                    return Some(Ok(()));
+                }
+                Err(e) => return Some(Err(e)),
+            },
+            //  s2 cannot be advanced
+            None => match self.s1.next() {
+                //  advance s1, reset s2 and then return
+                Some(result) => match result {
+                    Ok(_) => {
+                        self.s2.before_first().unwrap();
+                        return Some(Ok(()));
+                    }
+                    Err(e) => return Some(Err(e)),
+                },
+                None => return None,
+            },
+        }
+    }
+}
+
+struct ProjectScan<S>
+where
+    S: Scan,
+{
+    scan: S,
+    field_list: Vec<String>,
+}
+
+impl<S> Iterator for ProjectScan<S>
+where
+    S: Scan,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(result) = self.scan.next() {
+            match result {
+                Ok(_) => {
+                    match self.field_list.iter().try_fold(true, |acc, field_name| {
+                        self.scan.has_field(field_name).map(|result| acc && result)
+                    }) {
+                        Ok(result) if result == true => return Some(Ok(())),
+                        Ok(result) => {
+                            return Some(Err("Field not found".into()));
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+}
+
+impl<S> Scan for ProjectScan<S>
+where
+    S: Scan,
+{
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        self.scan.get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        self.scan.get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        self.scan.get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        self.scan.has_field(field_name)
+    }
+
+    fn close(&self) {
+        self.scan.close();
+    }
+
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.before_first()
+    }
+}
+
+impl<S> UpdateScan for ProjectScan<S>
+where
+    S: UpdateScan,
+{
+    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_int(field_name)
+    }
+
+    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_string(field_name)
+    }
+
+    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_value(field_name)
+    }
+
+    fn insert(&self) -> Result<(), Box<dyn Error>> {
+        self.scan.insert()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.delete()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        self.scan.get_rid()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        self.scan.move_to_rid(rid)
+    }
+}
+
+impl<S> Drop for ProjectScan<S>
+where
+    S: Scan,
+{
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+struct SelectScan<S>
+where
+    S: Scan,
+{
+    scan: S,
+    predicate: Predicate,
+}
+
+impl<S> Iterator for SelectScan<S>
+where
+    S: Scan,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(result) = self.scan.next() {
+            match result {
+                Ok(_) => match self.predicate.is_satisfied(&self.scan) {
+                    Ok(true) => return Some(Ok(())),
+                    Ok(false) => continue,
+                    Err(e) => return Some(Err(e)),
+                },
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        None
+    }
+}
+
+impl<S> Scan for SelectScan<S>
+where
+    S: Scan,
+{
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        self.scan.get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        self.scan.get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        self.scan.get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        self.scan.has_field(field_name)
+    }
+
+    fn close(&self) {
+        self.scan.close();
+    }
+
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.before_first()
+    }
+}
+
+impl<S> UpdateScan for SelectScan<S>
+where
+    S: UpdateScan,
+{
+    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_int(field_name)
+    }
+
+    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_string(field_name)
+    }
+
+    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
+        self.scan.set_value(field_name)
+    }
+
+    fn insert(&self) -> Result<(), Box<dyn Error>> {
+        self.scan.insert()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.delete()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        self.scan.get_rid()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        self.scan.move_to_rid(rid)
+    }
+}
+
+impl<S> Drop for SelectScan<S>
+where
+    S: Scan,
+{
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+struct Predicate {
+    terms: Vec<Term>,
+}
+
+impl Predicate {
+    fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
+    where
+        S: Scan,
+    {
+        self.terms.iter().try_fold(true, |acc, term| {
+            term.is_satisfied(scan).map(|satisfied| acc && satisfied)
+        })
+    }
+}
+
+struct Term {
+    lsh: Expression,
+    rhs: Expression,
+}
+
+impl Term {
+    fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
+    where
+        S: Scan,
+    {
+        Ok(self.lsh.evaluate(scan)? == self.rhs.evaluate(scan)?)
+    }
+}
+
+enum Expression {
+    Constant(Constant),
+    FieldName(String),
+}
+
+impl Expression {
+    fn evaluate<S: Scan>(&self, scan: &S) -> Result<Constant, Box<dyn Error>> {
+        match self {
+            Expression::Constant(constant) => Ok(constant.clone()),
+            Expression::FieldName(field_name) => scan.get_value(field_name),
+        }
+    }
+
+    fn applies_to(&self, schema: &Schema) -> Result<bool, Box<dyn Error>> {
+        match self {
+            Expression::Constant(_) => Ok(true),
+            Expression::FieldName(field_name) => Ok(schema.fields.contains(field_name)),
+        }
+    }
+}
+
 struct MetadataManager {
     table_manager: Arc<TableManager>,
     view_manager: Arc<ViewManager>,
@@ -322,9 +616,9 @@ impl IndexManager {
             Self::INDEX_CAT_TBL_NAME,
         );
         while table_scan.next().is_some() {
-            if table_scan.get_string(Self::TABLE_COL_NAME) == table_name {
-                let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME);
-                let index_name = table_scan.get_string(Self::INDEX_COL_NAME);
+            if table_scan.get_string(Self::TABLE_COL_NAME).unwrap() == table_name {
+                let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
+                let index_name = table_scan.get_string(Self::INDEX_COL_NAME).unwrap();
                 let layout = self.table_manager.get_layout(table_name, Arc::clone(&txn));
                 let stat_info = self.stat_manager.lock().unwrap().get_stat_info(
                     table_name,
@@ -454,7 +748,9 @@ impl Index for HashIndex {
     fn next(&mut self) -> bool {
         let table_scan = self.table_scan.as_mut().unwrap();
         while table_scan.next().is_some() {
-            if table_scan.get_value(IndexInfo::DATA_FIELD) == *self.search_key.as_ref().unwrap() {
+            if table_scan.get_value(IndexInfo::DATA_FIELD).unwrap()
+                == *self.search_key.as_ref().unwrap()
+            {
                 return true;
             }
         }
@@ -463,8 +759,8 @@ impl Index for HashIndex {
 
     fn get_data_rid(&self) -> RID {
         let table_scan = self.table_scan.as_ref().unwrap();
-        let block_num = table_scan.get_int(IndexInfo::BLOCK_NUM_FIELD);
-        let id = table_scan.get_int(IndexInfo::ID_FIELD);
+        let block_num = table_scan.get_int(IndexInfo::BLOCK_NUM_FIELD).unwrap();
+        let id = table_scan.get_int(IndexInfo::ID_FIELD).unwrap();
         RID {
             block_num: block_num as usize,
             slot: id as usize,
@@ -571,7 +867,7 @@ impl StatManager {
             TableManager::TABLE_CAT_TABLE_NAME,
         );
         while table_scan.next().is_some() {
-            let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL);
+            let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
             let table_stats = self.calculate_table_stats(&table_name, layout, Arc::clone(&txn));
             self.table_stats.insert(table_name, table_stats);
@@ -658,8 +954,8 @@ impl ViewManager {
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
         let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
         while let Some(_) = table_scan.next() {
-            if view_name == table_scan.get_string(Self::VIEW_NAME_COL) {
-                return Some(table_scan.get_string(Self::VIEW_DEF_COL));
+            if view_name == table_scan.get_string(Self::VIEW_NAME_COL).unwrap() {
+                return Some(table_scan.get_string(Self::VIEW_DEF_COL).unwrap());
             }
         }
         None
@@ -767,7 +1063,7 @@ impl TableManager {
             );
             let mut slot_size = None;
             while let Some(_) = table_scan.next() {
-                if table_name == table_scan.get_string(Self::TABLE_NAME_COL) {
+                if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
                     slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
                 }
             }
@@ -783,10 +1079,11 @@ impl TableManager {
             );
             let mut schema = Schema::new();
             while let Some(_) = table_scan.next() {
-                if table_name == table_scan.get_string(Self::TABLE_NAME_COL) {
-                    let field_name = table_scan.get_string(Self::FIELD_NAME_COL);
-                    let field_type: FieldType = table_scan.get_int(Self::FIELD_TYPE_COL).into();
-                    let field_length = table_scan.get_int(Self::FIELD_LENGTH_COL) as usize;
+                if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
+                    let field_name = table_scan.get_string(Self::FIELD_NAME_COL).unwrap();
+                    let field_type: FieldType =
+                        table_scan.get_int(Self::FIELD_TYPE_COL).unwrap().into();
+                    let field_length = table_scan.get_int(Self::FIELD_LENGTH_COL).unwrap() as usize;
                     schema.add_field(&field_name, field_type, field_length);
                 }
             }
@@ -887,13 +1184,6 @@ impl TableScan {
         scan
     }
 
-    /// Unpins the underlying [`BlockId`] from the [`BufferList`] & [`Buffer`]
-    fn close(&self) {
-        if let Some(record_page) = &self.record_page {
-            self.txn.unpin(&record_page.block_id);
-        }
-    }
-
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
     fn move_to_block(&mut self, block_num: usize) {
         self.close();
@@ -921,22 +1211,6 @@ impl TableScan {
     /// Moves the [`RecordPage`] to the start of the file
     fn move_to_start(&mut self) {
         self.move_to_block(0);
-    }
-
-    /// Gets the integer value of a field in the current slot
-    fn get_int(&self, field_name: &str) -> i32 {
-        self.record_page
-            .as_ref()
-            .unwrap()
-            .get_int(*self.current_slot.as_ref().unwrap(), field_name)
-    }
-
-    /// Gets the string value of a field in the current slot
-    fn get_string(&self, field_name: &str) -> String {
-        self.record_page
-            .as_ref()
-            .unwrap()
-            .get_string(*self.current_slot.as_ref().unwrap(), field_name)
     }
 
     /// Sets the integer value of a field in the current slot
@@ -1018,13 +1292,6 @@ impl TableScan {
         )
     }
 
-    fn get_value(&self, field_name: &str) -> Constant {
-        match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => Constant::Int(self.get_int(field_name)),
-            FieldType::STRING => Constant::String(self.get_string(field_name)),
-        }
-    }
-
     fn set_value(&self, field_name: &str, value: Constant) {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::INT => self.set_int(field_name, value.as_int()),
@@ -1041,7 +1308,7 @@ impl Drop for TableScan {
 
 /// An iterator over the records in the table
 impl Iterator for TableScan {
-    type Item = ();
+    type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1057,7 +1324,7 @@ impl Iterator for TableScan {
 
                 if let Some(slot) = next_slot {
                     self.current_slot = Some(slot);
-                    return Some(());
+                    return Some(Ok(()));
                 }
             }
 
@@ -1069,17 +1336,70 @@ impl Iterator for TableScan {
     }
 }
 
+impl Scan for TableScan {
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        Ok(self
+            .record_page
+            .as_ref()
+            .unwrap()
+            .get_int(*self.current_slot.as_ref().unwrap(), field_name))
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        Ok(self
+            .record_page
+            .as_ref()
+            .unwrap()
+            .get_string(*self.current_slot.as_ref().unwrap(), field_name))
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        match self.layout.schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+        }
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.layout.schema.fields.contains(&field_name.to_string()))
+    }
+
+    fn close(&self) {
+        if let Some(record_page) = &self.record_page {
+            self.txn.unpin(&record_page.block_id);
+        }
+    }
+
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.move_to_block(0);
+        Ok(())
+    }
+}
+
+trait UpdateScan: Scan {
+    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
+    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
+    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
+    fn insert(&self) -> Result<(), Box<dyn Error>>;
+    fn delete(&mut self) -> Result<(), Box<dyn Error>>;
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>>;
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>>;
+}
+
 trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>>;
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>>;
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
+    fn close(&self);
 }
 
 #[cfg(test)]
 mod table_scan_tests {
     use std::sync::Arc;
 
-    use crate::{test_utils::generate_random_number, Layout, Schema, SimpleDB, TableScan};
+    use crate::{test_utils::generate_random_number, Layout, Scan, Schema, SimpleDB, TableScan};
 
     #[test]
     fn table_scan_test() {
@@ -1112,7 +1432,7 @@ mod table_scan_tests {
         let mut deleted_count = 0;
         table_scan.move_to_start();
         while let Some(_) = table_scan.next() {
-            let number = table_scan.get_int("A");
+            let number = table_scan.get_int("A").unwrap();
             dbg!(format!("The number retrieved {}", number));
             if number < 25 {
                 deleted_count += 1;
@@ -1125,10 +1445,11 @@ mod table_scan_tests {
         let mut remaining_count = 0;
         table_scan.move_to_start();
         while let Some(_) = table_scan.next() {
-            let number = table_scan.get_int("A");
+            let number = table_scan.get_int("A").unwrap();
             let string = table_scan.get_string("B");
             remaining_count += 1;
         }
+        dbg!(format!("Found {} remaining records", remaining_count));
         assert_eq!(remaining_count + deleted_count, inserted_count);
     }
 }
