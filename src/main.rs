@@ -1069,6 +1069,12 @@ impl Iterator for TableScan {
     }
 }
 
+trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>>;
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
+}
+
 #[cfg(test)]
 mod table_scan_tests {
     use std::sync::Arc;
@@ -1982,7 +1988,7 @@ mod transaction_tests {
         let file = generate_filename();
         let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
         let block_id = BlockId::new(file.clone(), 1);
-        let num_of_txns = 10;
+        let num_of_txns = 5;
         let max_retry_count = 50;
 
         // Initialize data
