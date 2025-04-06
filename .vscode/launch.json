@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "table_manager_tests",
+        "product_scan_tests",
         "--",
         "--nocapture"
       ],

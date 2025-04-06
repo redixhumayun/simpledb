@@ -84,6 +84,16 @@ where
     s2: S2,
 }
 
+impl<S1, S2> ProductScan<S1, S2>
+where
+    S1: Scan,
+    S2: Scan,
+{
+    fn new(s1: S1, s2: S2) -> Self {
+        Self { s1, s2 }
+    }
+}
+
 impl<S1, S2> Iterator for ProductScan<S1, S2>
 where
     S1: Scan,
@@ -112,6 +122,120 @@ where
                 None => return None,
             },
         }
+    }
+}
+
+impl<S1, S2> Scan for ProductScan<S1, S2>
+where
+    S1: Scan,
+    S2: Scan,
+{
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.s1.before_first()?;
+        self.s2.before_first()
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.get_int(field_name);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.get_int(field_name);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.get_string(field_name);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.get_string(field_name);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.get_value(field_name);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.get_value(field_name);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return Ok(true);
+        }
+        if self.s2.has_field(field_name)? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn close(&self) {
+        //  no-op because no resources to clean up
+    }
+}
+
+#[cfg(test)]
+mod product_scan_tests {
+    use std::sync::Arc;
+
+    use crate::{
+        Layout, Predicate, ProductScan, ProjectScan, Scan, Schema, SelectScan, SimpleDB, TableScan,
+        Term,
+    };
+
+    #[test]
+    fn product_scan_test() {
+        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(test_db.new_tx());
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("A");
+        schema1.add_string_field("B", 10);
+        let layout1 = Layout::new(schema1);
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("C");
+        schema2.add_string_field("D", 10);
+        let layout2 = Layout::new(schema2);
+
+        //  open scanners for both schemas and insert them
+        {
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            for i in 1..50 {
+                scan1.insert();
+                scan1.set_int("A", i as i32);
+                scan1.set_string("B", &format!("string{}", i));
+                scan2.insert();
+                scan2.set_int("C", i as i32);
+                scan2.set_string("D", &format!("string{}", i));
+            }
+        }
+
+        //  create a product scan for both tables and retrieve B and D where A = C
+        {
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let product_scan = ProductScan::new(scan1, scan2);
+            let term = Term::new(
+                crate::Expression::FieldName("A".to_string()),
+                crate::Expression::FieldName("C".to_string()),
+            );
+            let predicate = Predicate::new(vec![term]);
+            let select_scan = SelectScan::new(product_scan, predicate);
+            let mut project_scan =
+                ProjectScan::new(select_scan, vec!["B".to_string(), "D".to_string()]);
+            while let Some(_) = project_scan.next() {
+                let lhs = project_scan.get_string("B").unwrap();
+                let rhs = project_scan.get_string("D").unwrap();
+                assert_eq!(lhs, rhs);
+            }
+        }
+        txn.commit().unwrap();
     }
 }
 
@@ -238,7 +362,7 @@ mod project_scan_tests {
         //  selection and projection block
         {
             let mut projected_count = 0;
-            let mut scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -1354,7 +1478,7 @@ impl TableScan {
             *self.current_slot.as_ref().unwrap(),
             field_name,
             value,
-        )
+        );
     }
 
     /// Tries to insert a new record into the table
@@ -1846,10 +1970,6 @@ mod record_page_tests {
             record_page.set_int(slot, "A", number as i32);
             record_page.set_string(slot, "B", &format!("rec{number}"));
             inserted_count += 1;
-            println!(
-                "Inserting into slot {slot}, num: {}, str: rec{}",
-                number, number
-            );
             record_page.insert(slot);
         }
 
@@ -2188,7 +2308,7 @@ impl Transaction {
     ) -> Result<(), Box<dyn Error>> {
         self.concurrency_manager.xlock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
-        let lsn = {
+        let lsn: usize = {
             if log {
                 self.recovery_manager
                     .set_string(buffer.lock().unwrap().deref(), offset, value)
