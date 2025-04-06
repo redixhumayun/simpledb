@@ -115,6 +115,7 @@ where
                 Some(result) => match result {
                     Ok(_) => {
                         self.s2.before_first().unwrap();
+                        self.s2.next();
                         return Some(Ok(()));
                     }
                     Err(e) => return Some(Err(e)),
@@ -132,6 +133,7 @@ where
 {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
         self.s1.before_first()?;
+        self.s1.next();
         self.s2.before_first()
     }
 
@@ -206,7 +208,7 @@ mod product_scan_tests {
         {
             let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
-            for i in 1..50 {
+            for i in 0..50 {
                 //  TODO: There is a bug because this cannot start from 0
                 scan1.insert();
                 scan1.set_int("A", i as i32);
@@ -230,9 +232,11 @@ mod product_scan_tests {
             let select_scan = SelectScan::new(product_scan, predicate);
             let mut project_scan =
                 ProjectScan::new(select_scan, vec!["B".to_string(), "D".to_string()]);
+            project_scan.before_first().unwrap();
             while let Some(_) = project_scan.next() {
                 let lhs = project_scan.get_string("B").unwrap();
                 let rhs = project_scan.get_string("D").unwrap();
+                println!("{}, {}", lhs, rhs);
                 assert_eq!(lhs, rhs);
             }
         }
@@ -1440,7 +1444,7 @@ impl TableScan {
         self.close();
         let block_id = BlockId::new(self.file_name.clone(), block_num);
         let record_page = RecordPage::new(self.txn.clone(), block_id, self.layout.clone());
-        self.current_slot = Some(0);
+        self.current_slot = None;
         self.record_page = Some(record_page);
     }
 
@@ -1450,7 +1454,7 @@ impl TableScan {
         let block = self.txn.append(&self.file_name);
         let record_page = RecordPage::new(self.txn.clone(), block, self.layout.clone());
         record_page.format();
-        self.current_slot = Some(0);
+        self.current_slot = None;
         self.record_page = Some(record_page);
     }
 
@@ -1497,7 +1501,7 @@ impl TableScan {
                 .record_page
                 .as_ref()
                 .unwrap()
-                .insert_after(*self.current_slot.as_ref().unwrap())
+                .insert_after(self.current_slot)
             {
                 Ok(slot) => {
                     self.current_slot = Some(slot);
@@ -1741,7 +1745,7 @@ impl RID {
 
 struct RecordPageIterator<'a> {
     record_page: &'a RecordPage,
-    current_slot: usize,
+    current_slot: Option<usize>,
     presence: SlotPresence,
 }
 
@@ -1749,7 +1753,7 @@ impl<'a> RecordPageIterator<'a> {
     fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
         Self {
             record_page,
-            current_slot: 0,
+            current_slot: None,
             presence,
         }
     }
@@ -1759,9 +1763,16 @@ impl<'a> Iterator for RecordPageIterator<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.record_page.is_valid_slot(self.current_slot) {
-            let slot = self.current_slot;
-            self.current_slot += 1;
+        loop {
+            let slot = match self.current_slot {
+                None => 0,
+                Some(slot) => slot + 1,
+            };
+            if !self.record_page.is_valid_slot(slot) {
+                break;
+            }
+
+            self.current_slot = Some(slot);
 
             let slot_value = self
                 .record_page
@@ -1840,12 +1851,18 @@ impl RecordPage {
     }
 
     /// Finds the next empty slot after the given slot, marks it as used, and returns its number.
-    fn insert_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        let new_slot = self
-            .iter_empty_slots()
-            .skip_while(|s| *s <= slot)
-            .next()
-            .ok_or_else(|| "no empty slots available in this record page")?;
+    fn insert_after(&self, slot: Option<usize>) -> Result<usize, Box<dyn Error>> {
+        let new_slot = match slot {
+            None => self
+                .iter_empty_slots()
+                .next()
+                .ok_or_else(|| "no empty slots available in this record page")?,
+            Some(current_slot) => self
+                .iter_empty_slots()
+                .skip_while(|s| *s <= current_slot)
+                .next()
+                .ok_or_else(|| "no empty slots available in this record page")?,
+        };
         self.set_flag(new_slot, SlotPresence::USED);
         Ok(new_slot)
     }
@@ -1917,7 +1934,7 @@ impl RecordPage {
     fn iter_empty_slots(&self) -> RecordPageIterator {
         RecordPageIterator {
             record_page: self,
-            current_slot: 0,
+            current_slot: None,
             presence: SlotPresence::EMPTY,
         }
     }
@@ -1926,7 +1943,7 @@ impl RecordPage {
     fn iter_used_slots(&self) -> RecordPageIterator {
         RecordPageIterator {
             record_page: self,
-            current_slot: 0,
+            current_slot: None,
             presence: SlotPresence::USED,
         }
     }
