@@ -123,6 +123,15 @@ where
     field_list: Vec<String>,
 }
 
+impl<S> ProjectScan<S>
+where
+    S: Scan,
+{
+    fn new(scan: S, field_list: Vec<String>) -> Self {
+        Self { scan, field_list }
+    }
+}
+
 impl<S> Iterator for ProjectScan<S>
 where
     S: Scan,
@@ -178,6 +187,77 @@ where
 {
     fn drop(&mut self) {
         //  no-op because no resources to clean up
+    }
+}
+
+#[cfg(test)]
+mod project_scan_tests {
+    use std::sync::Arc;
+
+    use crate::{
+        test_utils::generate_random_number, Constant, Layout, Predicate, ProjectScan, Scan, Schema,
+        SelectScan, SimpleDB, TableScan, Term,
+    };
+
+    #[test]
+    fn project_scan_test() {
+        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(test_db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema);
+
+        let mut inserted_count = 0;
+        let mut inserted_count_10 = 0;
+        //  insertion block
+        {
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            for i in 0..50 {
+                if i % 10 == 0 {
+                    dbg!("Inserting number {}", 10);
+                    scan.insert();
+                    scan.set_int("A", 10);
+                    scan.set_string("B", &format!("string{}", 10));
+                    inserted_count += 1;
+                    inserted_count_10 += 1;
+                    continue;
+                }
+
+                let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
+                dbg!("Inserting number {}", number);
+                scan.insert();
+                scan.set_int("A", number.try_into().unwrap());
+                scan.set_string("B", &format!("string{}", number));
+                inserted_count += 1;
+            }
+            dbg!("Inserted count {}", inserted_count);
+        }
+
+        //  selection and projection block
+        {
+            let mut projected_count = 0;
+            let mut scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let constant = Constant::Int(10);
+            let term = Term::new(
+                crate::Expression::FieldName("A".to_string()),
+                crate::Expression::Constant(constant),
+            );
+            let predicate = Predicate::new(vec![term]);
+            let select_scan = SelectScan::new(scan, predicate);
+            let mut projection_scan = ProjectScan::new(select_scan, vec!["B".to_string()]);
+            while let Some(_) = projection_scan.next() {
+                assert_eq!(projection_scan.get_int("A").unwrap(), 10);
+                assert_eq!(
+                    projection_scan.get_string("B").unwrap(),
+                    format!("string{}", 10)
+                );
+                projected_count += 1;
+            }
+            assert_eq!(projected_count, 5);
+        }
+        txn.commit().unwrap();
     }
 }
 
@@ -338,7 +418,7 @@ mod select_scan_tests {
         //  selection block
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(txn, layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -353,6 +433,7 @@ mod select_scan_tests {
             }
             assert_eq!(selection_count, 5);
         }
+        txn.commit().unwrap();
     }
 }
 
@@ -583,7 +664,7 @@ mod metadata_manager_tests {
         println!("V(indexA,A) = {}", idx_a.distinct_values("A"));
         println!("V(indexA,B) = {}", idx_a.distinct_values("B"));
 
-        assert!(idx_a.blocks_accessed() >= 0); //  TODO: is there a better way to assert this?
+        // assert!(idx_a.blocks_accessed() >= 0); //  TODO: is there a better way to assert this?
         assert_eq!(idx_a.records_output(), 2);
         assert!(idx_a.distinct_values("A") == 1); //  we have an index on A
 
@@ -594,7 +675,7 @@ mod metadata_manager_tests {
         println!("V(indexB,A) = {}", idx_b.distinct_values("A"));
         println!("V(indexB,B) = {}", idx_b.distinct_values("B"));
 
-        assert!(idx_b.blocks_accessed() >= 0); //  TODO: Is there a better way to assert this?
+        // assert!(idx_b.blocks_accessed() >= 0); //  TODO: Is there a better way to assert this?
         assert_eq!(idx_b.records_output(), 2);
         assert!(idx_b.distinct_values("B") == 1); //  we have an index on B
 
@@ -1347,7 +1428,6 @@ impl TableScan {
 
 impl Drop for TableScan {
     fn drop(&mut self) {
-        println!("Calling Drop for TableScan");
         self.close();
     }
 }
