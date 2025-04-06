@@ -207,6 +207,7 @@ mod product_scan_tests {
             let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
             for i in 1..50 {
+                //  TODO: There is a bug because this cannot start from 0
                 scan1.insert();
                 scan1.set_int("A", i as i32);
                 scan1.set_string("B", &format!("string{}", i));
