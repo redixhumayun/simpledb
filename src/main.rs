@@ -75,17 +75,19 @@ impl SimpleDB {
     }
 }
 
-struct ProductScan<S>
+struct ProductScan<S1, S2>
 where
-    S: Scan,
+    S1: Scan,
+    S2: Scan,
 {
-    s1: S,
-    s2: S,
+    s1: S1,
+    s2: S2,
 }
 
-impl<S> Iterator for ProductScan<S>
+impl<S1, S2> Iterator for ProductScan<S1, S2>
 where
-    S: Scan,
+    S1: Scan,
+    S2: Scan,
 {
     type Item = Result<(), Box<dyn Error>>;
 
@@ -128,23 +130,7 @@ where
     type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(result) = self.scan.next() {
-            match result {
-                Ok(_) => {
-                    match self.field_list.iter().try_fold(true, |acc, field_name| {
-                        self.scan.has_field(field_name).map(|result| acc && result)
-                    }) {
-                        Ok(result) if result == true => return Some(Ok(())),
-                        Ok(result) => {
-                            return Some(Err("Field not found".into()));
-                        }
-                        Err(e) => return Some(Err(e)),
-                    }
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-        None
+        self.scan.next()
     }
 }
 
@@ -153,14 +139,23 @@ where
     S: Scan,
 {
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        if !self.has_field(field_name)? {
+            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+        }
         self.scan.get_int(field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        if !self.has_field(field_name)? {
+            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+        }
         self.scan.get_string(field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        if !self.has_field(field_name)? {
+            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+        }
         self.scan.get_value(field_name)
     }
 
@@ -169,44 +164,11 @@ where
     }
 
     fn close(&self) {
-        self.scan.close();
+        //  no-op because no resources to clean up
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
         self.scan.before_first()
-    }
-}
-
-impl<S> UpdateScan for ProjectScan<S>
-where
-    S: UpdateScan,
-{
-    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_int(field_name)
-    }
-
-    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_string(field_name)
-    }
-
-    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_value(field_name)
-    }
-
-    fn insert(&self) -> Result<(), Box<dyn Error>> {
-        self.scan.insert()
-    }
-
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
-        self.scan.delete()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        self.scan.get_rid()
-    }
-
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        self.scan.move_to_rid(rid)
     }
 }
 
@@ -215,7 +177,7 @@ where
     S: Scan,
 {
     fn drop(&mut self) {
-        self.close();
+        //  no-op because no resources to clean up
     }
 }
 
@@ -225,6 +187,15 @@ where
 {
     scan: S,
     predicate: Predicate,
+}
+
+impl<S> SelectScan<S>
+where
+    S: Scan,
+{
+    fn new(scan: S, predicate: Predicate) -> Self {
+        Self { scan, predicate }
+    }
 }
 
 impl<S> Iterator for SelectScan<S>
@@ -269,7 +240,7 @@ where
     }
 
     fn close(&self) {
-        self.scan.close();
+        //  no-op because no resources to clean up
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
@@ -315,7 +286,73 @@ where
     S: Scan,
 {
     fn drop(&mut self) {
-        self.close();
+        //  no-op because no resources to cleanup
+    }
+}
+
+#[cfg(test)]
+mod select_scan_tests {
+    use std::sync::Arc;
+
+    use crate::{
+        test_utils::generate_random_number, Constant, Layout, Predicate, Scan, Schema, SelectScan,
+        SimpleDB, TableScan, Term,
+    };
+
+    #[test]
+    fn select_scan_test() {
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(simple_db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema);
+
+        let mut inserted_count = 0;
+        let mut inserted_count_10 = 0;
+        //  insertion block
+        {
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            for i in 0..50 {
+                if i % 10 == 0 {
+                    dbg!("Inserting number {}", 10);
+                    scan.insert();
+                    scan.set_int("A", 10);
+                    scan.set_string("B", &format!("string{}", 10));
+                    inserted_count += 1;
+                    inserted_count_10 += 1;
+                    continue;
+                }
+
+                let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
+                dbg!("Inserting number {}", number);
+                scan.insert();
+                scan.set_int("A", number.try_into().unwrap());
+                scan.set_string("B", &format!("string{}", number));
+                inserted_count += 1;
+            }
+            dbg!("Inserted count {}", inserted_count);
+        }
+
+        //  selection block
+        {
+            let mut selection_count = 0;
+            let scan = TableScan::new(txn, layout, "T");
+            let constant = Constant::Int(10);
+            let term = Term::new(
+                crate::Expression::FieldName("A".to_string()),
+                crate::Expression::Constant(constant),
+            );
+            let predicate = Predicate::new(vec![term]);
+            let mut select_scan = SelectScan::new(scan, predicate);
+            while let Some(result) = select_scan.next() {
+                assert!(result.is_ok());
+                assert!(select_scan.get_int("A").unwrap() == 10);
+                selection_count += 1;
+            }
+            assert_eq!(selection_count, 5);
+        }
     }
 }
 
@@ -324,6 +361,10 @@ struct Predicate {
 }
 
 impl Predicate {
+    fn new(terms: Vec<Term>) -> Self {
+        Self { terms }
+    }
+
     fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
     where
         S: Scan,
@@ -335,16 +376,20 @@ impl Predicate {
 }
 
 struct Term {
-    lsh: Expression,
+    lhs: Expression,
     rhs: Expression,
 }
 
 impl Term {
+    fn new(lhs: Expression, rhs: Expression) -> Self {
+        Self { lhs, rhs }
+    }
+
     fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
     where
         S: Scan,
     {
-        Ok(self.lsh.evaluate(scan)? == self.rhs.evaluate(scan)?)
+        Ok(self.lhs.evaluate(scan)? == self.rhs.evaluate(scan)?)
     }
 }
 
@@ -1302,6 +1347,7 @@ impl TableScan {
 
 impl Drop for TableScan {
     fn drop(&mut self) {
+        println!("Calling Drop for TableScan");
         self.close();
     }
 }
