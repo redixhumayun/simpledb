@@ -503,8 +503,8 @@ mod select_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        test_utils::generate_random_number, Constant, Layout, Predicate, Scan, Schema, SelectScan,
-        SimpleDB, TableScan, Term,
+        test_utils::generate_random_number, ComparisonOp, Constant, Expression, Layout, Predicate,
+        Scan, Schema, SelectScan, SimpleDB, TableScan, Term,
     };
 
     #[test]
@@ -543,6 +543,28 @@ mod select_scan_tests {
             dbg!("Inserted count {}", inserted_count);
         }
 
+        let age_gt_30 = Term::new_with_op(
+            Expression::FieldName("age".to_string()),
+            Expression::Constant(Constant::Int(30)),
+            ComparisonOp::GreaterThan,
+        );
+        let name_eq_john = Term::new_with_op(
+            Expression::FieldName("name".to_string()),
+            Expression::Constant(Constant::String("John".to_string())),
+            ComparisonOp::Equal,
+        );
+
+        let dept_eq_eng = Term::new_with_op(
+            Expression::FieldName("dept".to_string()),
+            Expression::Constant(Constant::String("Engineering".to_string())),
+            ComparisonOp::Equal,
+        );
+
+        let name_or_dept = Predicate::or(vec![
+            Predicate::new(vec![name_eq_john]),
+            Predicate::new(vec![dept_eq_eng]),
+        ]);
+
         //  selection block
         {
             let mut selection_count = 0;
@@ -566,45 +588,176 @@ mod select_scan_tests {
 }
 
 struct Predicate {
-    terms: Vec<Term>,
+    root: PredicateNode,
+}
+
+#[derive(Clone)]
+enum PredicateNode {
+    Term(Term),
+    Composite {
+        op: BooleanConnective,
+        operands: Vec<PredicateNode>,
+    },
+}
+
+#[derive(Clone)]
+enum BooleanConnective {
+    And,
+    Or,
+    Not,
 }
 
 impl Predicate {
     fn new(terms: Vec<Term>) -> Self {
-        Self { terms }
+        if terms.len() == 1 {
+            return Self {
+                root: PredicateNode::Term(terms[0].clone()),
+            };
+        } else if terms.len() > 1 {
+            return Self {
+                root: PredicateNode::Composite {
+                    op: BooleanConnective::And,
+                    operands: terms.into_iter().map(PredicateNode::Term).collect(),
+                },
+            };
+        }
+        panic!("incorrect construction of a predicate");
+    }
+
+    fn or(predicates: Vec<Predicate>) -> Self {
+        Self {
+            root: PredicateNode::Composite {
+                op: BooleanConnective::Or,
+                operands: predicates.iter().map(|p| p.root.clone()).collect(),
+            },
+        }
+    }
+
+    fn and(predicates: Vec<Predicate>) -> Self {
+        Self {
+            root: PredicateNode::Composite {
+                op: BooleanConnective::And,
+                operands: predicates.iter().map(|p| p.root.clone()).collect(),
+            },
+        }
+    }
+
+    fn not(predicate: Predicate) -> Self {
+        Self {
+            root: PredicateNode::Composite {
+                op: BooleanConnective::Not,
+                operands: vec![predicate.root],
+            },
+        }
     }
 
     fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
     where
         S: Scan,
     {
-        self.terms.iter().try_fold(true, |acc, term| {
-            term.is_satisfied(scan).map(|satisfied| acc && satisfied)
-        })
+        return self.evaluate_node(&self.root, scan);
+    }
+
+    fn evaluate_node<S>(&self, node: &PredicateNode, scan: &S) -> Result<bool, Box<dyn Error>>
+    where
+        S: Scan,
+    {
+        match node {
+            //  terminal condition for recursion
+            PredicateNode::Term(term) => {
+                return term.is_satisfied(scan);
+            }
+            PredicateNode::Composite { op, operands } => {
+                match op {
+                    BooleanConnective::And => {
+                        for operand in operands {
+                            if !self.evaluate_node(operand, scan)? {
+                                return Ok(false);
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    BooleanConnective::Or => {
+                        for operand in operands {
+                            if self.evaluate_node(operand, scan)? {
+                                return Ok(true);
+                            }
+                        }
+                        return Ok(false);
+                    }
+                    BooleanConnective::Not => {
+                        if operands.len() != 1 {
+                            return Err("NOT operator must have exactly one operand".into());
+                        }
+                        return Ok(!self.evaluate_node(&operands[0], scan)?);
+                    }
+                };
+            }
+        }
     }
 }
 
+#[derive(Clone)]
 struct Term {
     lhs: Expression,
     rhs: Expression,
+    comparison_op: ComparisonOp,
+}
+
+#[derive(Clone)]
+enum ComparisonOp {
+    Equal,
+    LessThan,
+    GreaterThan,
+    LessThanOrEqual,
+    GreaterThanOrEqual,
+    NotEqual,
 }
 
 impl Term {
     fn new(lhs: Expression, rhs: Expression) -> Self {
-        Self { lhs, rhs }
+        Self {
+            lhs,
+            rhs,
+            comparison_op: ComparisonOp::Equal,
+        }
+    }
+
+    fn new_with_op(lhs: Expression, rhs: Expression, comparison_op: ComparisonOp) -> Self {
+        Self {
+            lhs,
+            rhs,
+            comparison_op,
+        }
     }
 
     fn is_satisfied<S>(&self, scan: &S) -> Result<bool, Box<dyn Error>>
     where
         S: Scan,
     {
-        Ok(self.lhs.evaluate(scan)? == self.rhs.evaluate(scan)?)
+        let lhs = self.lhs.evaluate(scan)?;
+        let rhs = self.rhs.evaluate(scan)?;
+
+        match self.comparison_op {
+            ComparisonOp::Equal => Ok(lhs == rhs),
+            ComparisonOp::LessThan => Ok(lhs < rhs),
+            ComparisonOp::GreaterThan => Ok(lhs > rhs),
+            ComparisonOp::LessThanOrEqual => Ok(lhs <= rhs),
+            ComparisonOp::GreaterThanOrEqual => Ok(lhs >= rhs),
+            ComparisonOp::NotEqual => Ok(lhs != rhs),
+        }
     }
 }
 
+#[derive(Clone)]
 enum Expression {
     Constant(Constant),
     FieldName(String),
+    BinaryOp {
+        operator: BinaryOperator,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
 }
 
 impl Expression {
@@ -612,6 +765,33 @@ impl Expression {
         match self {
             Expression::Constant(constant) => Ok(constant.clone()),
             Expression::FieldName(field_name) => scan.get_value(field_name),
+            Expression::BinaryOp {
+                operator,
+                left,
+                right,
+            } => {
+                let left_val = left.evaluate(scan)?;
+                let right_val = right.evaluate(scan)?;
+
+                let left_int = match left_val {
+                    Constant::Int(value) => value,
+                    _ => return Err("Left operand must be an integer".into()),
+                };
+                let right_int = match right_val {
+                    Constant::Int(value) => value,
+                    _ => return Err("Right operand must be an integer".into()),
+                };
+
+                let result = match operator {
+                    BinaryOperator::Add => left_int + right_int,
+                    BinaryOperator::Subtract => left_int - right_int,
+                    BinaryOperator::Divide => left_int / right_int,
+                    BinaryOperator::Multiply => left_int * right_int,
+                    BinaryOperator::Modulo => left_int % right_int,
+                };
+
+                Ok(Constant::Int(result))
+            }
         }
     }
 
@@ -619,8 +799,18 @@ impl Expression {
         match self {
             Expression::Constant(_) => Ok(true),
             Expression::FieldName(field_name) => Ok(schema.fields.contains(field_name)),
+            _ => panic!("applies_to called for something that doesn't make sense"),
         }
     }
+}
+
+#[derive(Clone)]
+enum BinaryOperator {
+    Add,
+    Subtract,
+    Divide,
+    Multiply,
+    Modulo,
 }
 
 struct MetadataManager {
@@ -1708,7 +1898,7 @@ mod table_scan_tests {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 enum Constant {
     Int(i32),
     String(String),
