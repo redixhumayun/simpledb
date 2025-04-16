@@ -17,6 +17,7 @@ use std::{
 mod test_utils;
 #[cfg(test)]
 use test_utils::TestDir;
+mod parser;
 
 type LSN = usize;
 
