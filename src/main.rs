@@ -588,12 +588,14 @@ mod select_scan_tests {
     }
 }
 
+#[derive(Debug)]
 struct Predicate {
     root: PredicateNode,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum PredicateNode {
+    Empty,
     Term(Term),
     Composite {
         op: BooleanConnective,
@@ -601,7 +603,7 @@ enum PredicateNode {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum BooleanConnective {
     And,
     Or,
@@ -610,19 +612,20 @@ enum BooleanConnective {
 
 impl Predicate {
     fn new(terms: Vec<Term>) -> Self {
-        if terms.len() == 1 {
-            return Self {
+        match terms.len() {
+            0 => Self {
+                root: PredicateNode::Empty,
+            },
+            1 => Self {
                 root: PredicateNode::Term(terms[0].clone()),
-            };
-        } else if terms.len() > 1 {
-            return Self {
+            },
+            _ => Self {
                 root: PredicateNode::Composite {
                     op: BooleanConnective::And,
                     operands: terms.into_iter().map(PredicateNode::Term).collect(),
                 },
-            };
+            },
         }
-        panic!("incorrect construction of a predicate");
     }
 
     fn or(predicates: Vec<Predicate>) -> Self {
@@ -665,9 +668,8 @@ impl Predicate {
     {
         match node {
             //  terminal condition for recursion
-            PredicateNode::Term(term) => {
-                return term.is_satisfied(scan);
-            }
+            PredicateNode::Empty => Ok(true),
+            PredicateNode::Term(term) => term.is_satisfied(scan),
             PredicateNode::Composite { op, operands } => {
                 match op {
                     BooleanConnective::And => {
@@ -698,14 +700,14 @@ impl Predicate {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Term {
     lhs: Expression,
     rhs: Expression,
     comparison_op: ComparisonOp,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ComparisonOp {
     Equal,
     LessThan,
@@ -750,7 +752,7 @@ impl Term {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Expression {
     Constant(Constant),
     FieldName(String),
@@ -805,7 +807,7 @@ impl Expression {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum BinaryOperator {
     Add,
     Subtract,

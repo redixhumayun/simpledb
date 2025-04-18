@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "product_scan_tests",
+        "parser_tests",
         "--",
         "--nocapture"
       ],

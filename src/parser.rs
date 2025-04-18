@@ -1,20 +1,178 @@
-use std::{iter::Peekable, str::Chars};
+use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Token {
-    Keyword(String),
-    Identifier(String),
-    IntConstant(i32),
-    StringConstant(String),
-    Delimiter(char),
+use crate::{ComparisonOp, Constant, Expression, Predicate, Term};
+
+#[derive(Debug)]
+enum ParserError {
+    BadSyntax,
+}
+
+impl Error for ParserError {}
+
+impl Display for ParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParserError::BadSyntax => write!(f, "Bad syntax"),
+        }
+    }
+}
+
+struct Parser<'a> {
+    lexer: Lexer<'a>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(string: &'a str) -> Self {
+        Self {
+            lexer: Lexer::new(string),
+        }
+    }
+
+    fn select_list(&mut self) -> Result<Vec<String>, ParserError> {
+        let mut list = Vec::new();
+        list.push(self.lexer.eat_identifier()?);
+        while self.lexer.match_delim(',') {
+            self.lexer.eat_delim(',')?;
+            list.push(self.lexer.eat_identifier()?);
+        }
+        Ok(list)
+    }
+
+    fn select_tables(&mut self) -> Result<Vec<String>, ParserError> {
+        let mut list = Vec::new();
+        list.push(self.lexer.eat_identifier()?);
+        while self.lexer.match_delim(',') {
+            self.lexer.eat_delim(',')?;
+            list.push(self.lexer.eat_identifier()?);
+        }
+        Ok(list)
+    }
+
+    fn constant(&mut self) -> Result<Constant, ParserError> {
+        if self.lexer.match_string_constant() {
+            return Ok(Constant::String(self.lexer.eat_string_constant()?));
+        }
+        return Ok(Constant::Int(self.lexer.eat_int_constant()?));
+    }
+
+    fn expression(&mut self) -> Result<Expression, ParserError> {
+        if self.lexer.match_identifier() {
+            return Ok(Expression::FieldName(self.lexer.eat_identifier()?));
+        }
+        return Ok(Expression::Constant(self.constant()?));
+    }
+
+    fn term(&mut self) -> Result<Term, ParserError> {
+        let lhs = self.expression()?;
+        let op = match self.lexer.current_token {
+            Some(Token::Delimiter(Lexer::EQUAL)) => ComparisonOp::Equal,
+            Some(Token::Delimiter(Lexer::GREATER)) => ComparisonOp::GreaterThan,
+            Some(Token::Delimiter(Lexer::LESS)) => ComparisonOp::LessThan,
+            _ => return Err(ParserError::BadSyntax),
+        };
+        self.lexer
+            .next_token()
+            .ok_or_else(|| ParserError::BadSyntax)?;
+        let rhs = self.expression()?;
+        Ok(Term::new_with_op(lhs, rhs, op))
+    }
+
+    fn terms(&mut self) -> Result<Vec<Term>, ParserError> {
+        let mut terms = Vec::new();
+        terms.push(self.term()?);
+        //  TODO: Handle more boolean connectives
+        while self.lexer.match_keyword("and") {
+            self.lexer.eat_keyword("and")?;
+            terms.push(self.term()?);
+        }
+        Ok(terms)
+    }
+
+    fn query(&mut self) -> Result<QueryData, ParserError> {
+        self.lexer.eat_keyword("select")?;
+        let select_list = self.select_list()?;
+        self.lexer.eat_keyword("from")?;
+        let table_list = self.select_tables()?;
+        let predicate = {
+            if self.lexer.match_keyword("where") {
+                self.lexer.eat_keyword("where")?;
+                let terms = self.terms()?;
+                let predicate = Predicate::new(terms);
+                predicate
+            } else {
+                Predicate::new(Vec::new())
+            }
+        };
+        Ok(QueryData::new(select_list, table_list, predicate))
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use crate::PredicateNode;
+
+    #[test]
+    fn parse_basic_select_statement() {
+        let sql = "SELECT name, age FROM users WHERE id = 3 AND name = 'John'";
+        let mut parser = super::Parser::new(sql);
+        let result = parser.query();
+        println!("the result {:?}", result);
+
+        assert!(result.is_ok());
+        let query_data = result.unwrap();
+
+        assert_eq!(query_data.fields, vec!["name", "age"]);
+        assert_eq!(query_data.tables, vec!["users"]);
+        matches!(
+            query_data.predicate.root,
+            PredicateNode::Composite { op, operands }
+        );
+        // assert_eq!(
+        //     query_data.predicate.terms,
+        //     vec![
+        //         super::Term::new_with_op(
+        //             super::Expression::FieldName("id".to_string()),
+        //             super::Expression::Constant(super::Constant::Int(3)),
+        //             super::ComparisonOp::Equal
+        //         ),
+        //         super::Term::new_with_op(
+        //             super::Expression::FieldName("name".to_string()),
+        //             super::Expression::Constant(super::Constant::String("John".to_string())),
+        //             super::ComparisonOp::Equal
+        //         )
+        //     ]
+        // );
+    }
+}
+
+#[derive(Debug)]
+struct QueryData {
+    fields: Vec<String>,
+    tables: Vec<String>,
+    predicate: Predicate,
+}
+
+impl QueryData {
+    fn new(fields: Vec<String>, tables: Vec<String>, predicate: Predicate) -> Self {
+        Self {
+            fields,
+            tables,
+            predicate,
+        }
+    }
 }
 
 struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
-    keywords: Vec<&'static str>,
+    keywords: Vec<String>,
+    current_token: Option<Token>,
 }
 
 impl<'a> Lexer<'a> {
+    const EQUAL: char = '=';
+    const GREATER: char = '>';
+    const LESS: char = '<';
+
     fn new(string: &'a str) -> Self {
         let keywords = [
             "select", "from", "where", "and", "insert", "into", "values", "delete", "update",
@@ -22,7 +180,8 @@ impl<'a> Lexer<'a> {
         ];
         Self {
             input: string.chars().peekable(),
-            keywords: keywords.to_vec(),
+            keywords: keywords.iter().map(|s| s.to_lowercase()).collect(),
+            current_token: None,
         }
     }
 
@@ -37,7 +196,7 @@ impl<'a> Lexer<'a> {
             string.push(c);
             self.input.next();
         }
-        Some(Token::StringConstant(string))
+        Some(Token::StringConstant(string.to_lowercase()))
     }
 
     fn parse_number(&mut self) -> Option<Token> {
@@ -61,16 +220,17 @@ impl<'a> Lexer<'a> {
             string.push(c);
             self.input.next();
         }
-        if self.keywords.contains(&string.as_str()) {
+        if self.keywords.contains(&string.to_lowercase()) {
             return Some(Token::Keyword(string));
         }
-        Some(Token::Identifier(string))
+        Some(Token::Identifier(string.to_lowercase()))
     }
 
+    /// Returns the next token from the input stream.
     fn next_token(&mut self) -> Option<Token> {
         let c = self.input.peek().cloned()?;
-        match c {
-            '=' | ',' | '{' | '}' => {
+        let token = match c {
+            Self::EQUAL | Self::GREATER | Self::LESS | ',' | '{' | '}' => {
                 self.input.next();
                 Some(Token::Delimiter(c))
             } // delimiter
@@ -81,8 +241,91 @@ impl<'a> Lexer<'a> {
                 self.input.next()?;
                 self.next_token()
             }
-        }
+        };
+        self.current_token = token.clone();
+        token
     }
+
+    fn match_delim(&self, ch: char) -> bool {
+        matches!(self.current_token, Some(Token::Delimiter(d)) if d == ch)
+    }
+
+    fn eat_delim(&mut self, ch: char) -> Result<(), ParserError> {
+        if !self.match_delim(ch) {
+            return Err(ParserError::BadSyntax);
+        }
+        self.next_token();
+        Ok(())
+    }
+
+    fn match_int_constant(&self) -> bool {
+        matches!(self.current_token, Some(Token::IntConstant(_)))
+    }
+
+    fn eat_int_constant(&mut self) -> Result<i32, ParserError> {
+        if !self.match_int_constant() {
+            return Err(ParserError::BadSyntax);
+        }
+        let Some(Token::IntConstant(i)) = self.current_token else {
+            return Err(ParserError::BadSyntax);
+        };
+        self.next_token();
+        Ok(i)
+    }
+
+    fn match_string_constant(&self) -> bool {
+        matches!(self.current_token, Some(Token::StringConstant(_)))
+    }
+
+    fn eat_string_constant(&mut self) -> Result<String, ParserError> {
+        if !self.match_string_constant() {
+            return Err(ParserError::BadSyntax);
+        }
+        let Some(Token::StringConstant(s)) = self.current_token.clone() else {
+            return Err(ParserError::BadSyntax);
+        };
+        self.next_token();
+        Ok(s)
+    }
+
+    fn match_identifier(&self) -> bool {
+        matches!(self.current_token, Some(Token::Identifier(_)))
+    }
+
+    fn eat_identifier(&mut self) -> Result<String, ParserError> {
+        if !self.match_identifier() {
+            return Err(ParserError::BadSyntax);
+        }
+        let Some(Token::Identifier(id)) = self.current_token.clone() else {
+            return Err(ParserError::BadSyntax);
+        };
+        self.next_token();
+        Ok(id)
+    }
+
+    fn match_keyword(&self, keyword: &str) -> bool {
+        matches!(&self.current_token, Some(Token::Keyword(token)) if token == keyword)
+    }
+
+    fn eat_keyword(&mut self, keyword: &str) -> Result<String, ParserError> {
+        if !self.match_keyword(keyword) {
+            return Err(ParserError::BadSyntax);
+        }
+        let Some(Token::Keyword(keyword)) = self.current_token.clone() else {
+            return Err(ParserError::BadSyntax);
+        };
+        self.next_token();
+        Ok(keyword)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Token {
+    Keyword(String),
+    Identifier(String),
+    IntConstant(i32),
+    StringConstant(String),
+    Delimiter(char),
 }
 
 #[cfg(test)]
@@ -125,6 +368,27 @@ mod lexer_tests {
             Token::Keyword("from".to_string()),
             Token::Identifier("users".to_string()),
             Token::Keyword("where".to_string()),
+            Token::Identifier("city".to_string()),
+            Token::Delimiter('='),
+            Token::StringConstant("New York".to_string()),
+        ];
+
+        let received_tokens: Vec<Token> = std::iter::from_fn(|| lexer.next_token()).collect();
+
+        assert_eq!(received_tokens, expected_tokens);
+    }
+
+    #[test]
+    fn test_case_insensitive_keywords() {
+        let sql = "SELECT name FROM users WHERE city = 'New York'";
+        let mut lexer = Lexer::new(sql);
+
+        let expected_tokens = vec![
+            Token::Keyword("SELECT".to_string()),
+            Token::Identifier("name".to_string()),
+            Token::Keyword("FROM".to_string()),
+            Token::Identifier("users".to_string()),
+            Token::Keyword("WHERE".to_string()),
             Token::Identifier("city".to_string()),
             Token::Delimiter('='),
             Token::StringConstant("New York".to_string()),
