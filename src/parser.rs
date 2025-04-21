@@ -109,39 +109,39 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod parser_tests {
-    use crate::PredicateNode;
+    use crate::{ComparisonOp, Constant, Expression, PredicateNode, Term};
 
     #[test]
     fn parse_basic_select_statement() {
         let sql = "SELECT name, age FROM users WHERE id = 3 AND name = 'John'";
         let mut parser = super::Parser::new(sql);
-        let result = parser.query();
-        println!("the result {:?}", result);
-
-        assert!(result.is_ok());
-        let query_data = result.unwrap();
+        let query_data = parser.query().unwrap();
 
         assert_eq!(query_data.fields, vec!["name", "age"]);
         assert_eq!(query_data.tables, vec!["users"]);
         matches!(
             query_data.predicate.root,
-            PredicateNode::Composite { op, operands }
+            PredicateNode::Composite { ref op, ref operands }
         );
-        // assert_eq!(
-        //     query_data.predicate.terms,
-        //     vec![
-        //         super::Term::new_with_op(
-        //             super::Expression::FieldName("id".to_string()),
-        //             super::Expression::Constant(super::Constant::Int(3)),
-        //             super::ComparisonOp::Equal
-        //         ),
-        //         super::Term::new_with_op(
-        //             super::Expression::FieldName("name".to_string()),
-        //             super::Expression::Constant(super::Constant::String("John".to_string())),
-        //             super::ComparisonOp::Equal
-        //         )
-        //     ]
-        // );
+        let PredicateNode::Composite { op, operands } = &query_data.predicate.root else {
+            panic!("Expected Composite PredicateNode");
+        };
+        matches!(
+            &operands[0],
+            PredicateNode::Term(Term {
+                lhs: Expression::FieldName(id),
+                rhs: Expression::Constant(Constant::Int(val)),
+                comparison_op: ComparisonOp::Equal,
+            }) if *val == 3
+        );
+        matches!(
+            &operands[1],
+            PredicateNode::Term(Term {
+                lhs: Expression::FieldName(name),
+                rhs: Expression::Constant(Constant::String(val)),
+                comparison_op: ComparisonOp::Equal
+            }) if val == "john"
+        );
     }
 }
 
@@ -178,11 +178,13 @@ impl<'a> Lexer<'a> {
             "select", "from", "where", "and", "insert", "into", "values", "delete", "update",
             "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
         ];
-        Self {
+        let mut lexer = Self {
             input: string.chars().peekable(),
             keywords: keywords.iter().map(|s| s.to_lowercase()).collect(),
             current_token: None,
-        }
+        };
+        lexer.next_token().unwrap();
+        lexer
     }
 
     fn parse_string(&mut self) -> Option<Token> {
@@ -196,7 +198,7 @@ impl<'a> Lexer<'a> {
             string.push(c);
             self.input.next();
         }
-        Some(Token::StringConstant(string.to_lowercase()))
+        Some(Token::StringConstant(string))
     }
 
     fn parse_number(&mut self) -> Option<Token> {
@@ -221,7 +223,7 @@ impl<'a> Lexer<'a> {
             self.input.next();
         }
         if self.keywords.contains(&string.to_lowercase()) {
-            return Some(Token::Keyword(string));
+            return Some(Token::Keyword(string.to_lowercase()));
         }
         Some(Token::Identifier(string.to_lowercase()))
     }
@@ -352,9 +354,13 @@ mod lexer_tests {
             Token::IntConstant(3),
         ];
 
+        let first_token = lexer.current_token.clone().unwrap();
         let received_tokens: Vec<Token> = std::iter::from_fn(|| lexer.next_token()).collect();
+        let all_tokens: Vec<Token> = std::iter::once(first_token)
+            .chain(received_tokens)
+            .collect();
 
-        assert_eq!(received_tokens, expected_tokens);
+        assert_eq!(all_tokens, expected_tokens);
     }
 
     #[test]
@@ -373,9 +379,13 @@ mod lexer_tests {
             Token::StringConstant("New York".to_string()),
         ];
 
+        let first_token = lexer.current_token.clone().unwrap();
         let received_tokens: Vec<Token> = std::iter::from_fn(|| lexer.next_token()).collect();
+        let all_tokens: Vec<Token> = std::iter::once(first_token)
+            .chain(received_tokens)
+            .collect();
 
-        assert_eq!(received_tokens, expected_tokens);
+        assert_eq!(all_tokens, expected_tokens);
     }
 
     #[test]
@@ -384,18 +394,22 @@ mod lexer_tests {
         let mut lexer = Lexer::new(sql);
 
         let expected_tokens = vec![
-            Token::Keyword("SELECT".to_string()),
+            Token::Keyword("select".to_string()),
             Token::Identifier("name".to_string()),
-            Token::Keyword("FROM".to_string()),
+            Token::Keyword("from".to_string()),
             Token::Identifier("users".to_string()),
-            Token::Keyword("WHERE".to_string()),
+            Token::Keyword("where".to_string()),
             Token::Identifier("city".to_string()),
             Token::Delimiter('='),
             Token::StringConstant("New York".to_string()),
         ];
 
+        let first_token = lexer.current_token.clone().unwrap();
         let received_tokens: Vec<Token> = std::iter::from_fn(|| lexer.next_token()).collect();
+        let all_tokens: Vec<Token> = std::iter::once(first_token)
+            .chain(received_tokens)
+            .collect();
 
-        assert_eq!(received_tokens, expected_tokens);
+        assert_eq!(all_tokens, expected_tokens);
     }
 }
