@@ -1,6 +1,6 @@
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
-use crate::{ComparisonOp, Constant, Expression, Predicate, Term};
+use crate::{ComparisonOp, Constant, Expression, Predicate, Schema, Term};
 
 #[derive(Debug)]
 enum ParserError {
@@ -28,7 +28,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn select_list(&mut self) -> Result<Vec<String>, ParserError> {
+    /// Parse a list of fields from the SQL statement
+    /// Each field is just an identifier
+    fn field_list(&mut self) -> Result<Vec<String>, ParserError> {
         let mut list = Vec::new();
         list.push(self.lexer.eat_identifier()?);
         while self.lexer.match_delim(',') {
@@ -36,6 +38,10 @@ impl<'a> Parser<'a> {
             list.push(self.lexer.eat_identifier()?);
         }
         Ok(list)
+    }
+
+    fn select_list(&mut self) -> Result<Vec<String>, ParserError> {
+        self.field_list()
     }
 
     fn select_tables(&mut self) -> Result<Vec<String>, ParserError> {
@@ -53,6 +59,16 @@ impl<'a> Parser<'a> {
             return Ok(Constant::String(self.lexer.eat_string_constant()?));
         }
         return Ok(Constant::Int(self.lexer.eat_int_constant()?));
+    }
+
+    fn constants(&mut self) -> Result<Vec<Constant>, ParserError> {
+        let mut const_list = Vec::new();
+        const_list.push(self.constant()?);
+        while self.lexer.match_delim(',') {
+            self.lexer.eat_delim(',')?;
+            const_list.push(self.constant()?);
+        }
+        Ok(const_list)
     }
 
     fn expression(&mut self) -> Result<Expression, ParserError> {
@@ -90,7 +106,7 @@ impl<'a> Parser<'a> {
 
     fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
-        let select_list = self.select_list()?;
+        let select_list = self.field_list()?;
         self.lexer.eat_keyword("from")?;
         let table_list = self.select_tables()?;
         let predicate = {
@@ -105,11 +121,149 @@ impl<'a> Parser<'a> {
         };
         Ok(QueryData::new(select_list, table_list, predicate))
     }
+
+    fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
+        if self.lexer.match_keyword("insert") {
+            return Ok(SQLStatement::InsertData(self.insert()?));
+        } else if self.lexer.match_keyword("delete") {
+            return Ok(SQLStatement::DeleteData(self.delete()?));
+        } else if self.lexer.match_keyword("update") {
+            return Ok(SQLStatement::ModifyData(self.modify()?));
+        } else {
+            return self.create();
+        }
+    }
+
+    fn create(&mut self) -> Result<SQLStatement, ParserError> {
+        self.lexer.eat_keyword("create")?;
+        if self.lexer.match_keyword("table") {
+            return Ok(SQLStatement::CreateTableData(self.create_table()?));
+        } else if self.lexer.match_keyword("view") {
+            self.lexer.match_keyword("view");
+            return Ok(SQLStatement::CreateViewData(self.create_view()?));
+        } else if self.lexer.match_keyword("index") {
+            self.lexer.match_keyword("index");
+            return Ok(SQLStatement::CreateIndexData(self.create_index()?));
+        } else {
+            return Err(ParserError::BadSyntax);
+        }
+    }
+
+    fn field_def(&mut self) -> Result<Schema, ParserError> {
+        let field_name = self.lexer.eat_identifier()?;
+        let mut schema = Schema::new();
+        if self.lexer.match_keyword("int") {
+            self.lexer.eat_keyword("int")?;
+            schema.add_int_field(&field_name);
+        } else if self.lexer.match_keyword("varchar") {
+            self.lexer.eat_keyword("varchar")?;
+            self.lexer.eat_delim('(')?;
+            let size = self.lexer.eat_int_constant()?;
+            self.lexer.eat_delim(')')?;
+            schema.add_string_field(&field_name, size as usize);
+        } else {
+            return Err(ParserError::BadSyntax);
+        }
+        Ok(schema)
+    }
+
+    fn field_defs(&mut self) -> Result<Schema, ParserError> {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(&self.field_def()?);
+        while self.lexer.match_delim(',') {
+            self.lexer.eat_delim(',')?;
+            schema.add_all_from_schema(&self.field_def()?);
+        }
+        Ok(schema)
+    }
+
+    fn create_table(&mut self) -> Result<CreateTableData, ParserError> {
+        self.lexer.eat_keyword("table")?;
+        let table_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim('(')?;
+        let field_defs = self.field_defs()?;
+        self.lexer.eat_delim(')')?;
+        Ok(CreateTableData::new(table_name, field_defs))
+    }
+
+    fn create_view(&mut self) -> Result<CreateViewData, ParserError> {
+        self.lexer.eat_keyword("view")?;
+        let view_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_keyword("as")?;
+        let query_data = self.query()?;
+        Ok(CreateViewData::new(view_name, query_data))
+    }
+
+    fn create_index(&mut self) -> Result<CreateIndexData, ParserError> {
+        self.lexer.eat_keyword("index")?;
+        let index_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_keyword("on")?;
+        let table_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim('(')?;
+        let field = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim(')')?;
+        Ok(CreateIndexData::new(index_name, table_name, field))
+    }
+
+    fn insert(&mut self) -> Result<InsertData, ParserError> {
+        self.lexer.eat_keyword("insert")?;
+        self.lexer.eat_keyword("into")?;
+        let table_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim('(')?;
+        let field_list = self.field_list()?;
+        self.lexer.eat_delim(')')?;
+        self.lexer.eat_keyword("values")?;
+        self.lexer.eat_delim('(')?;
+        let constants = self.constants()?;
+        self.lexer.eat_delim(')')?;
+        Ok(InsertData::new(table_name, field_list, constants))
+    }
+
+    fn delete(&mut self) -> Result<DeleteData, ParserError> {
+        self.lexer.eat_keyword("delete")?;
+        self.lexer.eat_keyword("from")?;
+        let table_name = self.lexer.eat_identifier()?;
+        let predicate = {
+            if self.lexer.match_keyword("where") {
+                self.lexer.eat_keyword("where")?;
+                let terms = self.terms()?;
+                let predicate = Predicate::new(terms);
+                predicate
+            } else {
+                Predicate::new(Vec::new())
+            }
+        };
+        Ok(DeleteData::new(table_name, predicate))
+    }
+
+    fn modify(&mut self) -> Result<ModifyData, ParserError> {
+        self.lexer.eat_keyword("update")?;
+        let table_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_keyword("set")?;
+        let field_name = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim('=')?;
+        let new_value = self.constant()?;
+        let predicate = {
+            if self.lexer.match_keyword("where") {
+                self.lexer.eat_keyword("where")?;
+                let terms = self.terms()?;
+                let predicate = Predicate::new(terms);
+                predicate
+            } else {
+                Predicate::new(Vec::new())
+            }
+        };
+        Ok(ModifyData::new(
+            table_name, field_name, new_value, predicate,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod parser_tests {
-    use crate::{ComparisonOp, Constant, Expression, PredicateNode, Term};
+    use crate::{BooleanConnective, ComparisonOp, Constant, Expression, PredicateNode, Term};
+
+    use super::{Parser, SQLStatement};
 
     #[test]
     fn parse_basic_select_statement() {
@@ -143,6 +297,275 @@ mod parser_tests {
             }) if val == "john"
         );
     }
+
+    #[test]
+    fn test_create_table() {
+        let sql = "CREATE TABLE students (id int, name varchar(20), age int)";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::CreateTableData(create_table) = stmt {
+            assert_eq!(create_table.table_name, "students");
+            assert!(create_table.schema.fields.contains(&"id".to_string()));
+            assert!(create_table.schema.fields.contains(&"name".to_string()));
+            assert!(create_table.schema.fields.contains(&"age".to_string()));
+        } else {
+            panic!("Expected CreateTableData");
+        }
+    }
+
+    #[test]
+    fn test_insert() {
+        let sql = "INSERT INTO users (name, age) VALUES ('Alice', 25)";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::InsertData(insert) = stmt {
+            assert_eq!(insert.table_name, "users");
+            assert_eq!(insert.fields, vec!["name", "age"]);
+            assert_eq!(
+                insert.values,
+                vec![Constant::String("Alice".to_string()), Constant::Int(25)]
+            );
+        } else {
+            panic!("Expected InsertData");
+        }
+    }
+
+    #[test]
+    fn test_delete() {
+        let sql = "DELETE FROM users WHERE age > 30";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::DeleteData(delete) = stmt {
+            assert_eq!(delete.table_name, "users");
+            if let PredicateNode::Term(term) = &delete.predicate.root {
+                assert!(matches!(term.lhs, Expression::FieldName(ref name) if name == "age"));
+                assert!(matches!(term.rhs, Expression::Constant(Constant::Int(30))));
+                assert!(matches!(term.comparison_op, ComparisonOp::GreaterThan));
+            } else {
+                panic!("Expected Term PredicateNode");
+            }
+        } else {
+            panic!("Expected DeleteData");
+        }
+    }
+
+    #[test]
+    fn test_update() {
+        let sql = "UPDATE employees SET salary = 50000 WHERE department = 'IT'";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::ModifyData(modify) = stmt {
+            assert_eq!(modify.table_name, "employees");
+            assert_eq!(modify.field_name, "salary");
+            assert_eq!(modify.new_value, Constant::Int(50000));
+            if let PredicateNode::Term(term) = &modify.predicate.root {
+                assert!(
+                    matches!(term.lhs, Expression::FieldName(ref name) if name == "department")
+                );
+                assert!(
+                    matches!(term.rhs, Expression::Constant(Constant::String(ref s)) if s == "IT")
+                );
+                assert!(matches!(term.comparison_op, ComparisonOp::Equal));
+            } else {
+                panic!("Expected Term PredicateNode");
+            }
+        } else {
+            panic!("Expected ModifyData");
+        }
+    }
+
+    #[test]
+    fn test_create_index() {
+        let sql = "CREATE INDEX idx_name ON users (name)";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::CreateIndexData(create_index) = stmt {
+            assert_eq!(create_index.index_name, "idx_name");
+            assert_eq!(create_index.table_name, "users");
+            assert_eq!(create_index.field_name, "name");
+        } else {
+            panic!("Expected CreateIndexData");
+        }
+    }
+
+    #[test]
+    fn test_create_view() {
+        let sql =
+            "CREATE VIEW high_salary AS SELECT name, salary FROM employees WHERE salary > 100000";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::CreateViewData(create_view) = stmt {
+            assert_eq!(create_view.view_name, "high_salary");
+            assert_eq!(create_view.query_data.fields, vec!["name", "salary"]);
+            assert_eq!(create_view.query_data.tables, vec!["employees"]);
+
+            if let PredicateNode::Term(term) = &create_view.query_data.predicate.root {
+                assert!(matches!(term.lhs, Expression::FieldName(ref name) if name == "salary"));
+                assert!(matches!(
+                    term.rhs,
+                    Expression::Constant(Constant::Int(100000))
+                ));
+                assert!(matches!(term.comparison_op, ComparisonOp::GreaterThan));
+            } else {
+                panic!("Expected Term PredicateNode");
+            }
+        } else {
+            panic!("Expected CreateViewData");
+        }
+    }
+
+    #[test]
+    fn test_complex_select() {
+        let sql =
+            "SELECT name, department FROM employees WHERE salary > 50000 AND department = 'IT'";
+        let mut parser = Parser::new(sql);
+        let query = parser.query().unwrap();
+
+        assert_eq!(query.fields, vec!["name", "department"]);
+        assert_eq!(query.tables, vec!["employees"]);
+
+        if let PredicateNode::Composite { op, operands } = &query.predicate.root {
+            assert!(matches!(op, BooleanConnective::And));
+            assert_eq!(operands.len(), 2);
+
+            if let PredicateNode::Term(term) = &operands[0] {
+                assert!(matches!(term.lhs, Expression::FieldName(ref name) if name == "salary"));
+                assert!(matches!(
+                    term.rhs,
+                    Expression::Constant(Constant::Int(50000))
+                ));
+                assert!(matches!(term.comparison_op, ComparisonOp::GreaterThan));
+            }
+
+            if let PredicateNode::Term(term) = &operands[1] {
+                assert!(
+                    matches!(term.lhs, Expression::FieldName(ref name) if name == "department")
+                );
+                assert!(
+                    matches!(term.rhs, Expression::Constant(Constant::String(ref s)) if s == "IT")
+                );
+                assert!(matches!(term.comparison_op, ComparisonOp::Equal));
+            }
+        } else {
+            panic!("Expected Composite PredicateNode");
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SQLStatement {
+    CreateTableData(CreateTableData),
+    CreateViewData(CreateViewData),
+    CreateIndexData(CreateIndexData),
+    InsertData(InsertData),
+    DeleteData(DeleteData),
+    ModifyData(ModifyData),
+}
+
+#[derive(Debug)]
+struct ModifyData {
+    table_name: String,
+    field_name: String,
+    new_value: Constant,
+    predicate: Predicate,
+}
+
+impl ModifyData {
+    fn new(
+        table_name: String,
+        field_name: String,
+        new_value: Constant,
+        predicate: Predicate,
+    ) -> Self {
+        Self {
+            table_name,
+            field_name,
+            new_value,
+            predicate,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeleteData {
+    table_name: String,
+    predicate: Predicate,
+}
+
+impl DeleteData {
+    fn new(table_name: String, predicate: Predicate) -> Self {
+        Self {
+            table_name,
+            predicate,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InsertData {
+    table_name: String,
+    fields: Vec<String>,
+    values: Vec<Constant>,
+}
+
+impl InsertData {
+    fn new(table_name: String, fields: Vec<String>, values: Vec<Constant>) -> Self {
+        Self {
+            table_name,
+            fields,
+            values,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CreateTableData {
+    table_name: String,
+    schema: Schema,
+}
+
+impl CreateTableData {
+    fn new(table_name: String, schema: Schema) -> Self {
+        Self { table_name, schema }
+    }
+}
+
+#[derive(Debug)]
+struct CreateViewData {
+    view_name: String,
+    query_data: QueryData,
+}
+
+impl CreateViewData {
+    fn new(view_name: String, query_data: QueryData) -> Self {
+        Self {
+            view_name,
+            query_data,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CreateIndexData {
+    index_name: String,
+    table_name: String,
+    field_name: String,
+}
+
+impl CreateIndexData {
+    fn new(index_name: String, table_name: String, field_name: String) -> Self {
+        Self {
+            index_name,
+            table_name,
+            field_name,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -172,6 +595,11 @@ impl<'a> Lexer<'a> {
     const EQUAL: char = '=';
     const GREATER: char = '>';
     const LESS: char = '<';
+    const COMMA: char = ',';
+    const ROUND_OPEN: char = '(';
+    const ROUND_CLOSE: char = ')';
+    const CURLY_OPEN: char = '{';
+    const CURLY_CLOSE: char = '}';
 
     fn new(string: &'a str) -> Self {
         let keywords = [
@@ -232,7 +660,14 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<Token> {
         let c = self.input.peek().cloned()?;
         let token = match c {
-            Self::EQUAL | Self::GREATER | Self::LESS | ',' | '{' | '}' => {
+            Self::EQUAL
+            | Self::GREATER
+            | Self::LESS
+            | Self::COMMA
+            | Self::ROUND_OPEN
+            | Self::ROUND_CLOSE
+            | Self::CURLY_OPEN
+            | Self::CURLY_CLOSE => {
                 self.input.next();
                 Some(Token::Delimiter(c))
             } // delimiter

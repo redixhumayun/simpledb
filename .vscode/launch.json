@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "parser_tests",
+        "parser_tests::test_create_view",
         "--",
         "--nocapture"
       ],
