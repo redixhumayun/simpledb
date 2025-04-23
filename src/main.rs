@@ -27,6 +27,7 @@ struct SimpleDB {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
+    // metadata_manager: Arc<MetadataManager>,
 }
 
 impl SimpleDB {
@@ -45,12 +46,21 @@ impl SimpleDB {
             Arc::clone(&log_manager),
             num_buffers,
         )));
-        Self {
+        // let txn = Arc::new(Transaction::new(
+        //     Arc::clone(&file_manager),
+        //     Arc::clone(&log_manager),
+        //     Arc::clone(&buffer_manager),
+        // ));
+        // let metadata_manager = Arc::new(MetadataManager::new(true, Arc::clone(&txn)));
+        let db = Self {
             db_directory: path.as_ref().to_path_buf(),
             log_manager,
             file_manager,
             buffer_manager,
-        }
+            // metadata_manager,
+        };
+        // txn.commit().unwrap();
+        db
     }
 
     fn new_tx(&self) -> Transaction {
@@ -73,6 +83,239 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+}
+
+struct ProductPlan {
+    plan_1: Box<dyn Plan>,
+    plan_2: Box<dyn Plan>,
+    schema: Schema,
+}
+
+impl ProductPlan {
+    fn new(plan_1: Box<dyn Plan>, plan_2: Box<dyn Plan>) -> Self {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(&plan_1.schema());
+        schema.add_all_from_schema(&plan_2.schema());
+        Self {
+            plan_1,
+            plan_2,
+            schema,
+        }
+    }
+}
+
+impl Plan for ProductPlan {
+    fn open(&self) -> Box<dyn Scan> {
+        let scan_1 = self.plan_1.open();
+        let scan_2 = self.plan_2.open();
+        Box::new(ProductScan::new(scan_1, scan_2))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.plan_1.blocks_accessed() + self.plan_1.records_output() * self.plan_2.blocks_accessed()
+    }
+
+    fn records_output(&self) -> usize {
+        self.plan_1.records_output() * self.plan_2.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self
+            .plan_1
+            .schema()
+            .fields
+            .contains(&field_name.to_string())
+        {
+            return self.plan_1.distinct_values(field_name);
+        } else if self
+            .plan_2
+            .schema()
+            .fields
+            .contains(&field_name.to_string())
+        {
+            return self.plan_2.distinct_values(field_name);
+        }
+        0
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+}
+
+struct ProjectPlan {
+    plan: Box<dyn Plan>,
+    schema: Schema,
+}
+
+impl ProjectPlan {
+    fn new(plan: Box<dyn Plan>, fields_list: Vec<&str>) -> Self {
+        let mut schema = Schema::new();
+        for field in fields_list {
+            schema.add_from_schema(field, &plan.schema());
+        }
+        Self { plan, schema }
+    }
+}
+
+impl Plan for ProjectPlan {
+    fn open(&self) -> Box<dyn Scan> {
+        let scan = self.plan.open();
+        Box::new(ProjectScan::new(scan, self.schema.fields.clone()))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.plan.blocks_accessed()
+    }
+
+    fn records_output(&self) -> usize {
+        self.plan.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        self.plan.distinct_values(field_name)
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+}
+
+struct SelectPlan {
+    plan: Box<dyn Plan>,
+    predicate: Predicate,
+}
+
+impl SelectPlan {
+    fn new(plan: Box<dyn Plan>, predicate: Predicate) -> Self {
+        Self { plan, predicate }
+    }
+}
+
+impl Plan for SelectPlan {
+    fn open(&self) -> Box<dyn Scan> {
+        Box::new(SelectScan::new(self.plan.open(), self.predicate.clone()))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.plan.blocks_accessed()
+    }
+
+    fn records_output(&self) -> usize {
+        self.plan.records_output() / self.predicate.reduction_factor(&self.plan)
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self.predicate.equates_with_constant(field_name) {
+            return 1;
+        } else if let Some(field_name_2) = self.predicate.equates_with_field(field_name) {
+            return std::cmp::min(
+                self.plan.distinct_values(field_name),
+                self.plan.distinct_values(&field_name_2),
+            );
+        } else {
+            return self.plan.distinct_values(field_name);
+        }
+    }
+
+    fn schema(&self) -> Schema {
+        self.plan.schema()
+    }
+}
+
+struct TablePlan {
+    table_name: String,
+    txn: Arc<Transaction>,
+    layout: Layout,
+    stat_info: StatInfo,
+}
+
+impl TablePlan {
+    fn new(table_name: &str, txn: Arc<Transaction>, metadata_manager: MetadataManager) -> Self {
+        let layout = metadata_manager.get_layout(table_name, Arc::clone(&txn));
+        let stat_info =
+            metadata_manager.get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
+        Self {
+            table_name: table_name.to_string(),
+            txn,
+            layout,
+            stat_info,
+        }
+    }
+}
+
+impl Plan for TablePlan {
+    fn open(&self) -> Box<dyn Scan> {
+        Box::new(TableScan::new(
+            Arc::clone(&self.txn),
+            self.layout.clone(),
+            &self.table_name,
+        ))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.stat_info.num_blocks
+    }
+
+    fn records_output(&self) -> usize {
+        self.stat_info.num_records
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        self.stat_info.distinct_values(field_name)
+    }
+
+    fn schema(&self) -> Schema {
+        self.layout.schema.clone()
+    }
+}
+
+trait Plan {
+    fn open(&self) -> Box<dyn Scan>;
+    fn blocks_accessed(&self) -> usize;
+    fn records_output(&self) -> usize;
+    fn distinct_values(&self, field_name: &str) -> usize;
+    fn schema(&self) -> Schema;
+}
+
+#[cfg(test)]
+mod plan_test_single_table {
+    use crate::SimpleDB;
+
+    #[test]
+    fn plan_test_single_table() {
+        //  This is a test for the SQL query
+        //  SELECT sname, majorid, gradyear
+        //  FROM student
+        //  WHERE majorid = 10 AND gradyear = 2020;
+        let (db, test_dir) = SimpleDB::new_for_test(400, 3);
+    }
+}
+
+impl Scan for Box<dyn Scan> {
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).before_first()
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        (**self).get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        (**self).get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        (**self).get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        (**self).has_field(field_name)
+    }
+
+    fn close(&self) {
+        (**self).close()
     }
 }
 
@@ -588,7 +831,7 @@ mod select_scan_tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Predicate {
     root: PredicateNode,
 }
@@ -698,6 +941,70 @@ impl Predicate {
             }
         }
     }
+
+    fn reduction_factor(&self, plan: &Box<dyn Plan>) -> usize {
+        self.evaluate_reduction_factor(&self.root, plan)
+    }
+
+    fn evaluate_reduction_factor(&self, node: &PredicateNode, plan: &Box<dyn Plan>) -> usize {
+        match node {
+            PredicateNode::Empty => 1,
+            PredicateNode::Term(term) => term.reduction_factor(plan),
+            PredicateNode::Composite { op, operands } => {
+                let mut factor = 1;
+                for operand in operands {
+                    factor *= self.evaluate_reduction_factor(operand, plan);
+                }
+                match op {
+                    BooleanConnective::And => factor,
+                    BooleanConnective::Or => factor,
+                    BooleanConnective::Not => factor,
+                }
+            }
+        }
+    }
+
+    fn equates_with_constant(&self, field_name: &str) -> bool {
+        self.evaluate_equates_with_constant(&self.root, field_name)
+    }
+
+    fn evaluate_equates_with_constant(&self, node: &PredicateNode, field_name: &str) -> bool {
+        match node {
+            PredicateNode::Empty => false,
+            PredicateNode::Term(term) => term.equates_with_constant(field_name),
+            PredicateNode::Composite { op, operands } => {
+                for operand in operands {
+                    if self.evaluate_equates_with_constant(operand, field_name) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+
+    fn equates_with_field(&self, field_name: &str) -> Option<String> {
+        self.evaluate_equates_with_field(&self.root, field_name)
+    }
+
+    fn evaluate_equates_with_field(
+        &self,
+        node: &PredicateNode,
+        field_name: &str,
+    ) -> Option<String> {
+        match node {
+            PredicateNode::Empty => None,
+            PredicateNode::Term(term) => term.equates_with_field(field_name),
+            PredicateNode::Composite { op, operands } => {
+                for operand in operands {
+                    if let Some(field) = self.evaluate_equates_with_field(operand, field_name) {
+                        return Some(field);
+                    }
+                }
+                None
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -749,6 +1056,68 @@ impl Term {
             ComparisonOp::GreaterThanOrEqual => Ok(lhs >= rhs),
             ComparisonOp::NotEqual => Ok(lhs != rhs),
         }
+    }
+
+    /// Calculates the reduction factor for the term
+    fn reduction_factor(&self, plan: &Box<dyn Plan>) -> usize {
+        if self.lhs.is_field_name() && self.rhs.is_field_name() {
+            let lhs_field = self.lhs.get_field_name().unwrap();
+            let rhs_field = self.rhs.get_field_name().unwrap();
+            return std::cmp::max(
+                plan.distinct_values(&lhs_field),
+                plan.distinct_values(&rhs_field),
+            );
+        }
+
+        if self.lhs.is_field_name() {
+            let lhs_field = self.lhs.get_field_name().unwrap();
+            return plan.distinct_values(&lhs_field);
+        }
+
+        if self.rhs.is_field_name() {
+            let rhs_field = self.rhs.get_field_name().unwrap();
+            return plan.distinct_values(&rhs_field);
+        }
+
+        if self.lhs.get_constant_value().unwrap() == self.rhs.get_constant_value().unwrap() {
+            return 1;
+        }
+
+        usize::MAX
+    }
+
+    /// Checks if the term equates with a constant value of the form "F=c"
+    /// where F is the specified field and c is some constant
+    fn equates_with_constant(&self, field_name: &str) -> bool {
+        if self.lhs.is_field_name()
+            && (self.lhs.get_field_name().unwrap() == field_name)
+            && !self.rhs.is_field_name()
+        {
+            return true;
+        } else if self.rhs.is_field_name()
+            && (self.rhs.get_field_name().unwrap() == field_name)
+            && !self.lhs.is_field_name()
+        {
+            return true;
+        }
+        return false;
+    }
+
+    /// Checks if the term equates with a field name of the form "F=G"
+    /// where F is the specified field and G is some other field
+    fn equates_with_field(&self, field_name: &str) -> Option<String> {
+        if self.lhs.is_field_name()
+            && (self.lhs.get_field_name().unwrap() == field_name)
+            && self.rhs.is_field_name()
+        {
+            return self.rhs.get_field_name().cloned();
+        } else if self.rhs.is_field_name()
+            && (self.rhs.get_field_name().unwrap() == field_name)
+            && self.lhs.is_field_name()
+        {
+            return self.lhs.get_field_name().cloned();
+        }
+        return None;
     }
 }
 
@@ -803,6 +1172,24 @@ impl Expression {
             Expression::Constant(_) => Ok(true),
             Expression::FieldName(field_name) => Ok(schema.fields.contains(field_name)),
             _ => panic!("applies_to called for something that doesn't make sense"),
+        }
+    }
+
+    fn is_field_name(&self) -> bool {
+        matches!(self, Expression::FieldName(_))
+    }
+
+    fn get_field_name(&self) -> Option<&String> {
+        match self {
+            Expression::FieldName(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn get_constant_value(&self) -> Option<&Constant> {
+        match self {
+            Expression::Constant(value) => Some(value),
+            _ => None,
         }
     }
 }
