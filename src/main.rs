@@ -4754,7 +4754,7 @@ mod log_manager_tests {
         sync::{Arc, Mutex},
     };
 
-    use crate::{test_utils::TestDir, FileManager, LogManager, Page, SimpleDB};
+    use crate::{LogManager, Page, SimpleDB};
 
     fn create_log_record(s: &str, n: usize) -> Vec<u8> {
         let string_bytes = s.as_bytes();
