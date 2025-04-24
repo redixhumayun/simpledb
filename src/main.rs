@@ -27,7 +27,7 @@ struct SimpleDB {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
-    // metadata_manager: Arc<MetadataManager>,
+    metadata_manager: Arc<MetadataManager>,
 }
 
 impl SimpleDB {
@@ -37,30 +37,31 @@ impl SimpleDB {
         let file_manager = Arc::new(Mutex::new(
             FileManager::new(&path, block_size, clean).unwrap(),
         ));
+        let joined_path = path.as_ref().join(Self::LOG_FILE);
+        let log_path = joined_path.to_str().unwrap();
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
-            Self::LOG_FILE,
+            log_path,
         )));
         let buffer_manager = Arc::new(Mutex::new(BufferManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
             num_buffers,
         )));
-        // let txn = Arc::new(Transaction::new(
-        //     Arc::clone(&file_manager),
-        //     Arc::clone(&log_manager),
-        //     Arc::clone(&buffer_manager),
-        // ));
-        // let metadata_manager = Arc::new(MetadataManager::new(true, Arc::clone(&txn)));
-        let db = Self {
+        let txn = Arc::new(Transaction::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            Arc::clone(&buffer_manager),
+        ));
+        let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
+        txn.commit().unwrap();
+        Self {
             db_directory: path.as_ref().to_path_buf(),
             log_manager,
             file_manager,
             buffer_manager,
-            // metadata_manager,
-        };
-        // txn.commit().unwrap();
-        db
+            metadata_manager,
+        }
     }
 
     fn new_tx(&self) -> Transaction {
@@ -2001,11 +2002,16 @@ struct TableScan {
 
 impl TableScan {
     fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
-        let file_name = format!("{}.tbl", table_name);
+        let db_dir = {
+            let fm = txn.file_manager.lock().unwrap();
+            fm.db_directory.clone()
+        };
+        let path = db_dir.join(format!("{}.tbl", table_name));
+        let file_name = path.to_str().unwrap();
         let mut scan = Self {
             txn,
             layout,
-            file_name: file_name.clone(),
+            file_name: file_name.to_string(),
             record_page: None,
             current_slot: None,
         };
@@ -2022,7 +2028,7 @@ impl TableScan {
     fn move_to_block(&mut self, block_num: usize) {
         self.close();
         let block_id = BlockId::new(self.file_name.clone(), block_num);
-        let record_page = RecordPage::new(self.txn.clone(), block_id, self.layout.clone());
+        let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
     }
@@ -2031,7 +2037,7 @@ impl TableScan {
     fn move_to_new_block(&mut self) {
         self.close();
         let block = self.txn.append(&self.file_name);
-        let record_page = RecordPage::new(self.txn.clone(), block, self.layout.clone());
+        let record_page = RecordPage::new(Arc::clone(&self.txn), block, self.layout.clone());
         record_page.format();
         self.current_slot = None;
         self.record_page = Some(record_page);
@@ -2954,7 +2960,7 @@ mod transaction_tests {
     use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
 
     use crate::{
-        test_utils::{generate_filename, TestDir},
+        test_utils::{generate_filename, generate_random_number, TestDir},
         BlockId, SimpleDB, Transaction,
     };
 
@@ -3271,7 +3277,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_durability() {
         let file = generate_filename();
-        let dir = TestDir::new("/tmp/recovery_test");
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
 
         //  Phase 1: Create and populate database and then drop it
         {
@@ -3366,7 +3372,7 @@ impl LockTable {
             lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
 
             if Instant::now() >= deadline {
-                return Err("Timeout while waiting for lock".into());
+                return Err("Timeout while waiting for shared lock".into());
             }
         }
         lock_table_guard
@@ -3430,7 +3436,7 @@ impl LockTable {
 
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
-                return Err("Timeout while waiting for lock".into());
+                return Err("Timeout while waiting for write lock".into());
             }
             let (guard, timeout_reached) = self
                 .cond_var
@@ -3438,7 +3444,10 @@ impl LockTable {
                 .unwrap();
             lock_table_guard = guard;
             if timeout_reached.timed_out() {
-                return Err("Timeout while waiting for lock".into());
+                return Err(
+                    "Timeout while waiting for write lock and timeout exceeded after woken up"
+                        .into(),
+                );
             }
         }
         let state = lock_table_guard.get_mut(block_id).unwrap();
@@ -4575,131 +4584,6 @@ mod buffer_manager_tests {
     }
 }
 
-struct LogIterator {
-    file_manager: Arc<Mutex<FileManager>>,
-    current_block: BlockId,
-    page: Page,
-    current_pos: usize,
-    boundary: usize,
-}
-
-impl LogIterator {
-    fn new(file_manager: Arc<Mutex<FileManager>>, current_block: BlockId) -> Self {
-        let block_size = file_manager.lock().unwrap().blocksize;
-        let mut page = Page::new(block_size);
-        file_manager.lock().unwrap().read(&current_block, &mut page);
-        let boundary = page.get_int(0) as usize;
-
-        Self {
-            file_manager,
-            current_block,
-            page,
-            current_pos: boundary,
-            boundary,
-        }
-    }
-
-    fn move_to_block(&mut self) {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .read(&self.current_block, &mut self.page);
-        self.boundary = self.page.get_int(0) as usize;
-        self.current_pos = self.boundary;
-    }
-}
-
-impl Iterator for LogIterator {
-    type Item = Vec<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos >= self.file_manager.lock().unwrap().blocksize {
-            if self.current_block.block_num == 0 {
-                return None; //  no more blocks
-            }
-            self.current_block = BlockId {
-                filename: self.current_block.filename.to_string(),
-                block_num: self.current_block.block_num - 1,
-            };
-            self.move_to_block();
-        }
-        //  Read the record
-        let record = self.page.get_bytes(self.current_pos);
-        self.current_pos += Page::INT_BYTES + record.len();
-        Some(record)
-    }
-}
-
-impl IntoIterator for LogManager {
-    type Item = Vec<u8>;
-    type IntoIter = LogIterator;
-
-    fn into_iter(mut self) -> Self::IntoIter {
-        self.iterator()
-    }
-}
-
-#[cfg(test)]
-mod log_manager_tests {
-    use std::{
-        io::Write,
-        sync::{Arc, Mutex},
-    };
-
-    use crate::{LogManager, Page, SimpleDB};
-
-    fn create_log_record(s: &str, n: usize) -> Vec<u8> {
-        let string_bytes = s.as_bytes();
-        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
-        let mut record = Vec::with_capacity(total_size);
-
-        record
-            .write_all(&(string_bytes.len() as i32).to_be_bytes())
-            .unwrap();
-        record.write_all(&string_bytes).unwrap();
-        record.write_all(&n.to_be_bytes()).unwrap();
-        record
-    }
-
-    fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
-        dbg!("creating records");
-        for i in start..=end {
-            let record = create_log_record(&format!("record{i}"), i + 100);
-            let lsn = log_manager.lock().unwrap().append(record);
-            print!("{lsn} ");
-        }
-        dbg!("");
-    }
-
-    fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str) {
-        dbg!("{message}");
-        let iter = log_manager.lock().unwrap().iterator();
-
-        for record in iter {
-            let length = i32::from_be_bytes(record[..4].try_into().unwrap());
-            let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
-            let n = usize::from_be_bytes(record[4 + (length as usize)..].try_into().unwrap());
-            dbg!("{string} {n}");
-        }
-    }
-
-    #[test]
-    fn test_log_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 0);
-        let log_manager = db.log_manager;
-
-        print_log_records(Arc::clone(&log_manager), "The initial empty log file: ");
-        create_log_records(Arc::clone(&log_manager), 1, 35);
-        print_log_records(
-            Arc::clone(&log_manager),
-            "The log file now has these records:",
-        );
-        create_log_records(Arc::clone(&log_manager), 36, 70);
-        log_manager.lock().unwrap().flush_lsn(65);
-        print_log_records(log_manager, "The log file now has these records:");
-    }
-}
-
 struct LogManager {
     file_manager: Arc<Mutex<FileManager>>,
     log_file: String,
@@ -4796,6 +4680,139 @@ impl LogManager {
             Arc::clone(&self.file_manager),
             BlockId::new(self.log_file.clone(), self.current_block.block_num),
         )
+    }
+}
+
+struct LogIterator {
+    file_manager: Arc<Mutex<FileManager>>,
+    current_block: BlockId,
+    page: Page,
+    current_pos: usize,
+    boundary: usize,
+}
+
+impl LogIterator {
+    fn new(file_manager: Arc<Mutex<FileManager>>, current_block: BlockId) -> Self {
+        let block_size = file_manager.lock().unwrap().blocksize;
+        let mut page = Page::new(block_size);
+        file_manager.lock().unwrap().read(&current_block, &mut page);
+        let boundary = page.get_int(0) as usize;
+
+        Self {
+            file_manager,
+            current_block,
+            page,
+            current_pos: boundary,
+            boundary,
+        }
+    }
+
+    fn move_to_block(&mut self) {
+        self.file_manager
+            .lock()
+            .unwrap()
+            .read(&self.current_block, &mut self.page);
+        self.boundary = self.page.get_int(0) as usize;
+        self.current_pos = self.boundary;
+    }
+}
+
+impl Iterator for LogIterator {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_pos >= self.file_manager.lock().unwrap().blocksize {
+            if self.current_block.block_num == 0 {
+                return None; //  no more blocks
+            }
+            self.current_block = BlockId {
+                filename: self.current_block.filename.to_string(),
+                block_num: self.current_block.block_num - 1,
+            };
+            self.move_to_block();
+        }
+        //  Read the record
+        let record = self.page.get_bytes(self.current_pos);
+        self.current_pos += Page::INT_BYTES + record.len();
+        Some(record)
+    }
+}
+
+impl IntoIterator for LogManager {
+    type Item = Vec<u8>;
+    type IntoIter = LogIterator;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        self.iterator()
+    }
+}
+
+#[cfg(test)]
+mod log_manager_tests {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use crate::{test_utils::TestDir, FileManager, LogManager, Page, SimpleDB};
+
+    fn create_log_record(s: &str, n: usize) -> Vec<u8> {
+        let string_bytes = s.as_bytes();
+        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
+        let mut record = Vec::with_capacity(total_size);
+
+        record
+            .write_all(&(string_bytes.len() as i32).to_be_bytes())
+            .unwrap();
+        record.write_all(&string_bytes).unwrap();
+        record.write_all(&n.to_be_bytes()).unwrap();
+        record
+    }
+
+    fn create_log_records(log_manager: Arc<Mutex<LogManager>>, start: usize, end: usize) {
+        dbg!("creating records");
+        for i in start..=end {
+            let record = create_log_record(&format!("record{i}"), i + 100);
+            let lsn = log_manager.lock().unwrap().append(record);
+            print!("{lsn} ");
+        }
+        println!("");
+    }
+
+    /// Print the log records in the log file
+    /// This accepts a counter and uses that counter to decide when to break because the metadata manager writes some logs
+    /// into the log file and that complicates reading back logs for now
+    fn print_log_records(log_manager: Arc<Mutex<LogManager>>, message: &str, count: usize) {
+        dbg!("Message: ", &message);
+        let iter = log_manager.lock().unwrap().iterator();
+        let mut counter = 0;
+
+        for record in iter {
+            let length = i32::from_be_bytes(record[..4].try_into().unwrap());
+            let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
+            let n = usize::from_be_bytes(record[4 + length as usize..].try_into().unwrap());
+            dbg!("String: ", &string, "Int: ", &n);
+            counter += 1;
+            if counter == count {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_manager() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let log_manager = db.log_manager;
+
+        create_log_records(Arc::clone(&log_manager), 1, 35);
+        print_log_records(
+            Arc::clone(&log_manager),
+            "The log file now has these records:",
+            35,
+        );
+        create_log_records(Arc::clone(&log_manager), 36, 70);
+        log_manager.lock().unwrap().flush_lsn(65);
+        print_log_records(log_manager, "The log file now has these records:", 35);
     }
 }
 

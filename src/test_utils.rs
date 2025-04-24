@@ -8,7 +8,7 @@ use std::{
 /// A temporary directory that is deleted when it goes out of scope.
 /// Used for testing
 pub struct TestDir {
-    path: PathBuf,
+    pub path: PathBuf,
 }
 
 impl TestDir {

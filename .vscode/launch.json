@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "parser_tests::test_create_view",
+        "log_manager_tests::test_log_manager",
         "--",
         "--nocapture"
       ],
