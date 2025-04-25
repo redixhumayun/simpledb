@@ -94,15 +94,15 @@ struct ProductPlan {
 }
 
 impl ProductPlan {
-    fn new(plan_1: Box<dyn Plan>, plan_2: Box<dyn Plan>) -> Self {
+    fn new(plan_1: Box<dyn Plan>, plan_2: Box<dyn Plan>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
-        schema.add_all_from_schema(&plan_1.schema());
-        schema.add_all_from_schema(&plan_2.schema());
-        Self {
+        schema.add_all_from_schema(&plan_1.schema())?;
+        schema.add_all_from_schema(&plan_2.schema())?;
+        Ok(Self {
             plan_1,
             plan_2,
             schema,
-        }
+        })
     }
 }
 
@@ -151,12 +151,12 @@ struct ProjectPlan {
 }
 
 impl ProjectPlan {
-    fn new(plan: Box<dyn Plan>, fields_list: Vec<&str>) -> Self {
+    fn new(plan: Box<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
         for field in fields_list {
-            schema.add_from_schema(field, &plan.schema());
+            schema.add_from_schema(field, &plan.schema())?;
         }
-        Self { plan, schema }
+        Ok(Self { plan, schema })
     }
 }
 
@@ -233,7 +233,11 @@ struct TablePlan {
 }
 
 impl TablePlan {
-    fn new(table_name: &str, txn: Arc<Transaction>, metadata_manager: MetadataManager) -> Self {
+    fn new(
+        table_name: &str,
+        txn: Arc<Transaction>,
+        metadata_manager: Arc<MetadataManager>,
+    ) -> Self {
         let layout = metadata_manager.get_layout(table_name, Arc::clone(&txn));
         let stat_info =
             metadata_manager.get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
@@ -282,7 +286,18 @@ trait Plan {
 
 #[cfg(test)]
 mod plan_test_single_table {
-    use crate::SimpleDB;
+    use std::sync::Arc;
+
+    use crate::{Plan, Predicate, ProjectPlan, SelectPlan, SimpleDB, TablePlan, Term};
+
+    fn print_stats<T>(plan: &T, type_of_plan: &str)
+    where
+        T: Plan,
+    {
+        println!("Here are the stats for plan {type_of_plan}");
+        println!("B(p) -> {}", plan.blocks_accessed());
+        println!("R(p) -> {}", plan.records_output());
+    }
 
     #[test]
     fn plan_test_single_table() {
@@ -291,6 +306,46 @@ mod plan_test_single_table {
         //  FROM student
         //  WHERE majorid = 10 AND gradyear = 2020;
         let (db, test_dir) = SimpleDB::new_for_test(400, 3);
+
+        //  the table plan
+        let table = TablePlan::new(
+            "student",
+            Arc::new(db.new_tx()),
+            Arc::clone(&db.metadata_manager),
+        );
+        print_stats(&table, "table");
+
+        //  the select plan
+        let term_1 = Term::new(
+            crate::Expression::FieldName("majorid".to_string()),
+            crate::Expression::Constant(crate::Constant::Int(10)),
+        );
+        let term_2 = Term::new(
+            crate::Expression::FieldName("gradyear".to_string()),
+            crate::Expression::Constant(crate::Constant::Int(10)),
+        );
+        let predicate = Predicate::new(vec![term_1, term_2]);
+        let select = SelectPlan::new(Box::new(table), predicate);
+        print_stats(&select, "select");
+
+        //  the project plan
+        let project = ProjectPlan::new(Box::new(select), vec!["sname", "majorid", "gradyear"]);
+        assert!(project.is_err());
+
+        //  This will never run in the test, but that's okay for now. This test is mostly a sanity check to see that things compose together
+        if let Ok(project) = project {
+            // open the plan and initiate the scan now
+            let mut scan = project.open();
+            while let Some(_) = scan.next() {
+                println!(
+                    "sid {}, sname {}, majorid {}, gradyear {}",
+                    scan.get_int("sid").unwrap(),
+                    scan.get_string("sname").unwrap(),
+                    scan.get_int("majorid").unwrap(),
+                    scan.get_int("gradyear").unwrap()
+                );
+            }
+        }
     }
 }
 
@@ -1890,20 +1945,20 @@ impl TableManager {
     /// Return the physical [`Layout`] for a specific table defined in the table catalog metadata
     fn get_layout(&self, table_name: &str, tx: Arc<Transaction>) -> Layout {
         //  Get the slot size of the table
-        let slot_size = {
-            let mut table_scan = TableScan::new(
-                Arc::clone(&tx),
-                self.table_catalog_layout.clone(),
-                Self::TABLE_CAT_TABLE_NAME,
-            );
-            let mut slot_size = None;
-            while let Some(_) = table_scan.next() {
-                if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
-                    slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
-                }
-            }
-            slot_size.unwrap()
-        };
+        // let slot_size = {
+        //     let mut table_scan = TableScan::new(
+        //         Arc::clone(&tx),
+        //         self.table_catalog_layout.clone(),
+        //         Self::TABLE_CAT_TABLE_NAME,
+        //     );
+        //     let mut slot_size = None;
+        //     while let Some(_) = table_scan.next() {
+        //         if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
+        //             slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
+        //         }
+        //     }
+        //     slot_size
+        // };
 
         //  Construct the schema from the table so the layout can be created
         let schema = {
@@ -2711,24 +2766,38 @@ impl Schema {
         self.add_field(field_name, FieldType::STRING, length);
     }
 
-    fn add_from_schema(&mut self, field_name: &str, schema: &Schema) {
+    fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
         let field_type = schema
             .info
             .get(field_name)
             .and_then(|info| Some(info.field_type))
-            .unwrap();
+            .ok_or_else(|| {
+                format!(
+                    "Field {} not found in schema while looking for type",
+                    field_name
+                )
+            })?;
+        // .unwrap();
         let field_length = schema
             .info
             .get(field_name)
             .and_then(|info| Some(info.length))
-            .unwrap();
+            .ok_or_else(|| {
+                format!(
+                    "Field {} not found in schema while looking for length",
+                    field_name
+                )
+            })?;
+        // .unwrap();
         self.add_field(field_name, field_type, field_length);
+        Ok(())
     }
 
-    fn add_all_from_schema(&mut self, schema: &Schema) {
+    fn add_all_from_schema(&mut self, schema: &Schema) -> Result<(), Box<dyn Error>> {
         for field_name in schema.fields.iter() {
-            self.add_from_schema(field_name, schema);
+            self.add_from_schema(field_name, schema)?;
         }
+        Ok(())
     }
 }
 

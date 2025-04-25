@@ -5,6 +5,7 @@ use crate::{ComparisonOp, Constant, Expression, Predicate, Schema, Term};
 #[derive(Debug)]
 enum ParserError {
     BadSyntax,
+    Other(Box<dyn Error>),
 }
 
 impl Error for ParserError {}
@@ -13,6 +14,7 @@ impl Display for ParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParserError::BadSyntax => write!(f, "Bad syntax"),
+            ParserError::Other(err) => write!(f, "{}", err),
         }
     }
 }
@@ -194,10 +196,14 @@ impl<'a> Parser<'a> {
     /// Returns: Schema containing all field definitions
     fn field_defs(&mut self) -> Result<Schema, ParserError> {
         let mut schema = Schema::new();
-        schema.add_all_from_schema(&self.field_def()?);
+        schema
+            .add_all_from_schema(&self.field_def()?)
+            .map_err(ParserError::Other)?;
         while self.lexer.match_delim(',') {
             self.lexer.eat_delim(',')?;
-            schema.add_all_from_schema(&self.field_def()?);
+            schema
+                .add_all_from_schema(&self.field_def()?)
+                .map_err(ParserError::Other)?;
         }
         Ok(schema)
     }
