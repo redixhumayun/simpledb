@@ -9,12 +9,16 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, Write},
+    iter::zip,
     ops::Deref,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 mod test_utils;
+use parser::{
+    CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, QueryData,
+};
 #[cfg(test)]
 use test_utils::TestDir;
 mod parser;
@@ -87,6 +91,158 @@ impl SimpleDB {
     }
 }
 
+trait UpdatePlanner {
+    fn execute_insert(&self, data: InsertData, txn: Arc<Transaction>)
+        -> Result<(), Box<dyn Error>>;
+    fn execute_delete(
+        &self,
+        data: DeleteData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_modify(&self, data: ModifyData, txn: Arc<Transaction>)
+        -> Result<(), Box<dyn Error>>;
+    fn execute_create_table(
+        &self,
+        data: CreateTableData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>>;
+    fn execute_create_view(
+        &self,
+        data: CreateViewData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>>;
+    fn execute_create_index(
+        &self,
+        data: CreateIndexData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>>;
+}
+
+struct BasicUpdatePlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl UpdatePlanner for BasicUpdatePlanner {
+    fn execute_insert(
+        &self,
+        data: InsertData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>> {
+        let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let mut scan = plan.open();
+        for (field, value) in zip(data.fields, data.values) {
+            scan.insert().unwrap();
+            scan.set_value(&field, value).unwrap();
+        }
+        scan.close();
+        todo!()
+    }
+
+    fn execute_delete(
+        &self,
+        data: DeleteData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let plan = Box::new(TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        ));
+        let plan = SelectPlan::new(plan, data.predicate);
+        let mut scan = plan.open();
+        let mut count = 0;
+        while let Some(_) = scan.next() {
+            scan.delete().unwrap();
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn execute_modify(
+        &self,
+        data: ModifyData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn execute_create_table(
+        &self,
+        data: CreateTableData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn execute_create_view(
+        &self,
+        data: CreateViewData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn execute_create_index(
+        &self,
+        data: CreateIndexData,
+        txn: Arc<Transaction>,
+    ) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+}
+
+trait QueryPlanner {
+    fn create_plan(
+        &self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> Result<Box<dyn Plan>, Box<dyn Error>>;
+}
+
+struct BasicQueryPlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl QueryPlanner for BasicQueryPlanner {
+    /// Every query plan follows the same pattern:
+    /// 1. Create a TablePlan for every table
+    /// 2. Create a join of all tables
+    /// 3. Create a selection with the predicate
+    /// 4. Create a projection of the required columns
+    fn create_plan(
+        &self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+        let mut plans = Vec::new();
+
+        // 1. Create the table plans
+        for table in query_data.tables {
+            plans.push(Box::new(TablePlan::new(
+                &table,
+                Arc::clone(&txn),
+                Arc::clone(&self.metadata_manager),
+            )));
+        }
+
+        // 2. Create the product plan for joins
+        let mut plan: Box<dyn Plan> = plans.remove(0);
+        for next_plan in plans {
+            plan = Box::new(ProductPlan::new(plan, next_plan)?);
+        }
+
+        //  3. Create the selection with the predicate
+        plan = Box::new(SelectPlan::new(plan, query_data.predicate));
+
+        //  4. Create the projection
+        plan = Box::new(ProjectPlan::new(
+            plan,
+            query_data.fields.iter().map(AsRef::as_ref).collect(),
+        )?);
+        Ok(plan)
+    }
+}
+
 struct ProductPlan {
     plan_1: Box<dyn Plan>,
     plan_2: Box<dyn Plan>,
@@ -107,7 +263,7 @@ impl ProductPlan {
 }
 
 impl Plan for ProductPlan {
-    fn open(&self) -> Box<dyn Scan> {
+    fn open(&self) -> Box<dyn UpdateScan> {
         let scan_1 = self.plan_1.open();
         let scan_2 = self.plan_2.open();
         Box::new(ProductScan::new(scan_1, scan_2))
@@ -161,7 +317,7 @@ impl ProjectPlan {
 }
 
 impl Plan for ProjectPlan {
-    fn open(&self) -> Box<dyn Scan> {
+    fn open(&self) -> Box<dyn UpdateScan> {
         let scan = self.plan.open();
         Box::new(ProjectScan::new(scan, self.schema.fields.clone()))
     }
@@ -195,7 +351,7 @@ impl SelectPlan {
 }
 
 impl Plan for SelectPlan {
-    fn open(&self) -> Box<dyn Scan> {
+    fn open(&self) -> Box<dyn UpdateScan> {
         Box::new(SelectScan::new(self.plan.open(), self.predicate.clone()))
     }
 
@@ -251,7 +407,7 @@ impl TablePlan {
 }
 
 impl Plan for TablePlan {
-    fn open(&self) -> Box<dyn Scan> {
+    fn open(&self) -> Box<dyn UpdateScan> {
         Box::new(TableScan::new(
             Arc::clone(&self.txn),
             self.layout.clone(),
@@ -277,7 +433,7 @@ impl Plan for TablePlan {
 }
 
 trait Plan {
-    fn open(&self) -> Box<dyn Scan>;
+    fn open(&self) -> Box<dyn UpdateScan>;
     fn blocks_accessed(&self) -> usize;
     fn records_output(&self) -> usize;
     fn distinct_values(&self, field_name: &str) -> usize;
@@ -372,6 +528,62 @@ impl Scan for Box<dyn Scan> {
 
     fn close(&self) {
         (**self).close()
+    }
+}
+
+impl Scan for Box<dyn UpdateScan> {
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).before_first()
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        (**self).get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        (**self).get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        (**self).get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        (**self).has_field(field_name)
+    }
+
+    fn close(&self) {
+        (**self).close()
+    }
+}
+
+impl UpdateScan for Box<dyn UpdateScan> {
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        (**self).set_int(field_name, value)
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        (**self).set_string(field_name, value)
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        (**self).set_value(field_name, value)
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).insert()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).delete()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        (**self).get_rid()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        (**self).move_to_rid(rid)
     }
 }
 
@@ -482,8 +694,65 @@ where
     }
 }
 
+impl<S1, S2> UpdateScan for ProductScan<S1, S2>
+where
+    S1: UpdateScan,
+    S2: UpdateScan,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.set_int(field_name, value);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.set_int(field_name, value);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.set_string(field_name, value);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.set_string(field_name, value);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        if self.s1.has_field(field_name)? {
+            return self.s1.set_value(field_name, value);
+        }
+        if self.s2.has_field(field_name)? {
+            return self.s2.set_value(field_name, value);
+        }
+        Err(format!("Field {} not found in ProductScan", field_name).into())
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        //  no-op because no resources to clean up
+        panic!("Insert not supported in ProductScan");
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        //  no-op because no resources to clean up
+        panic!("Delete not supported in ProductScan");
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        //  no-op because no resources to clean up
+        panic!("Get RID not supported in ProductScan");
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        //  no-op because no resources to clean up
+        panic!("Move to RID not supported in ProductScan");
+    }
+}
+
 #[cfg(test)]
 mod product_scan_tests {
+    use super::UpdateScan;
     use std::sync::Arc;
 
     use crate::{
@@ -509,12 +778,12 @@ mod product_scan_tests {
             let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
             for i in 0..50 {
-                scan1.insert();
-                scan1.set_int("A", i as i32);
-                scan1.set_string("B", &format!("string{}", i));
-                scan2.insert();
-                scan2.set_int("C", i as i32);
-                scan2.set_string("D", &format!("string{}", i));
+                scan1.insert().unwrap();
+                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_string("B", format!("string{}", i)).unwrap();
+                scan2.insert().unwrap();
+                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_string("D", format!("string{}", i)).unwrap();
             }
         }
 
@@ -609,6 +878,39 @@ where
     }
 }
 
+impl<S> UpdateScan for ProjectScan<S>
+where
+    S: UpdateScan,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        self.scan.set_int(field_name, value)
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        self.scan.set_string(field_name, value)
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        self.scan.set_value(field_name, value)
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.insert()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan.delete()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        self.scan.get_rid()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        self.scan.move_to_rid(rid)
+    }
+}
+
 impl<S> Drop for ProjectScan<S>
 where
     S: Scan,
@@ -620,6 +922,7 @@ where
 
 #[cfg(test)]
 mod project_scan_tests {
+    use super::UpdateScan;
     use std::sync::Arc;
 
     use crate::{
@@ -645,9 +948,9 @@ mod project_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert();
-                    scan.set_int("A", 10);
-                    scan.set_string("B", &format!("string{}", 10));
+                    scan.insert().unwrap();
+                    scan.set_int("A", 10).unwrap();
+                    scan.set_string("B", format!("string{}", 10)).unwrap();
                     inserted_count += 1;
                     inserted_count_10 += 1;
                     continue;
@@ -655,9 +958,9 @@ mod project_scan_tests {
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert();
-                scan.set_int("A", number.try_into().unwrap());
-                scan.set_string("B", &format!("string{}", number));
+                scan.insert().unwrap();
+                scan.set_int("A", number.try_into().unwrap()).unwrap();
+                scan.set_string("B", format!("string{}", number)).unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -760,19 +1063,19 @@ impl<S> UpdateScan for SelectScan<S>
 where
     S: UpdateScan,
 {
-    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_int(field_name)
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        self.scan.set_int(field_name, value)
     }
 
-    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_string(field_name)
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        self.scan.set_string(field_name, value)
     }
 
-    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>> {
-        self.scan.set_value(field_name)
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        self.scan.set_value(field_name, value)
     }
 
-    fn insert(&self) -> Result<(), Box<dyn Error>> {
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
         self.scan.insert()
     }
 
@@ -800,6 +1103,7 @@ where
 
 #[cfg(test)]
 mod select_scan_tests {
+    use super::UpdateScan;
     use std::sync::Arc;
 
     use crate::{
@@ -825,9 +1129,9 @@ mod select_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert();
-                    scan.set_int("A", 10);
-                    scan.set_string("B", &format!("string{}", 10));
+                    scan.insert().unwrap();
+                    scan.set_int("A", 10).unwrap();
+                    scan.set_string("B", format!("string{}", 10)).unwrap();
                     inserted_count += 1;
                     inserted_count_10 += 1;
                     continue;
@@ -835,9 +1139,9 @@ mod select_scan_tests {
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert();
-                scan.set_int("A", number.try_into().unwrap());
-                scan.set_string("B", &format!("string{}", number));
+                scan.insert().unwrap();
+                scan.set_int("A", number.try_into().unwrap()).unwrap();
+                scan.set_string("B", format!("string{}", number)).unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -1339,6 +1643,7 @@ impl MetadataManager {
 
 #[cfg(test)]
 mod metadata_manager_tests {
+    use super::UpdateScan;
     use crate::{
         test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB, TableScan,
     };
@@ -1389,10 +1694,10 @@ mod metadata_manager_tests {
         {
             let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name);
             for _ in 0..50 {
-                table_scan.insert();
+                table_scan.insert().unwrap();
                 let n = (generate_random_number() % 50) + 1;
-                table_scan.set_int("A", n as i32);
-                table_scan.set_string("B", &format!("rec{}", n));
+                table_scan.set_int("A", n as i32).unwrap();
+                table_scan.set_string("B", format!("rec{}", n)).unwrap();
             }
 
             let stat_info = mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&tx));
@@ -1488,10 +1793,16 @@ impl IndexManager {
         txn: Arc<Transaction>,
     ) {
         let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME);
-        table_scan.insert();
-        table_scan.set_string(Self::INDEX_COL_NAME, index_name);
-        table_scan.set_string(Self::TABLE_COL_NAME, table_name);
-        table_scan.set_string(Self::TABLE_FIELD_NAME, field_name);
+        table_scan.insert().unwrap();
+        table_scan
+            .set_string(Self::INDEX_COL_NAME, index_name.to_string())
+            .unwrap();
+        table_scan
+            .set_string(Self::TABLE_COL_NAME, table_name.to_string())
+            .unwrap();
+        table_scan
+            .set_string(Self::TABLE_FIELD_NAME, field_name.to_string())
+            .unwrap();
     }
 
     fn get_index_info(
@@ -1660,17 +1971,23 @@ impl Index for HashIndex {
     fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
         self.before_first(data_val);
         let table_scan = self.table_scan.as_mut().unwrap();
-        table_scan.insert();
-        table_scan.set_int(IndexInfo::BLOCK_NUM_FIELD, data_rid.block_num as i32);
-        table_scan.set_int(IndexInfo::ID_FIELD, data_rid.slot as i32);
-        table_scan.set_value(IndexInfo::DATA_FIELD, data_val.clone());
+        table_scan.insert().unwrap();
+        table_scan
+            .set_int(IndexInfo::BLOCK_NUM_FIELD, data_rid.block_num as i32)
+            .unwrap();
+        table_scan
+            .set_int(IndexInfo::ID_FIELD, data_rid.slot as i32)
+            .unwrap();
+        table_scan
+            .set_value(IndexInfo::DATA_FIELD, data_val.clone())
+            .unwrap();
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
         self.before_first(data_val);
         while self.next() {
             if *data_rid == self.get_data_rid() {
-                self.table_scan.as_ref().unwrap().delete();
+                self.table_scan.as_mut().unwrap().delete().unwrap();
                 return;
             }
         }
@@ -1832,9 +2149,13 @@ impl ViewManager {
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
         let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
-        table_scan.insert();
-        table_scan.set_string(Self::VIEW_NAME_COL, view_name);
-        table_scan.set_string(Self::VIEW_DEF_COL, view_def);
+        table_scan.insert().unwrap();
+        table_scan
+            .set_string(Self::VIEW_NAME_COL, view_name.to_string())
+            .unwrap();
+        table_scan
+            .set_string(Self::VIEW_DEF_COL, view_def.to_string())
+            .unwrap();
     }
 
     /// Returns the view definition for a given view name
@@ -1918,9 +2239,13 @@ impl TableManager {
                 self.table_catalog_layout.clone(),
                 Self::TABLE_CAT_TABLE_NAME,
             );
-            table_scan.insert();
-            table_scan.set_string(Self::TABLE_NAME_COL, table_name);
-            table_scan.set_int(Self::SLOT_SIZE_COL, layout.slot_size as i32);
+            table_scan.insert().unwrap();
+            table_scan
+                .set_string(Self::TABLE_NAME_COL, table_name.to_string())
+                .unwrap();
+            table_scan
+                .set_int(Self::SLOT_SIZE_COL, layout.slot_size as i32)
+                .unwrap();
         }
 
         // insert the records for the fields into the field catalog table
@@ -1931,13 +2256,23 @@ impl TableManager {
                 Self::FIELD_CAT_TABLE_NAME,
             );
             for field in &schema.fields {
-                table_scan.insert();
-                table_scan.set_string(Self::TABLE_NAME_COL, table_name);
-                table_scan.set_string(Self::FIELD_NAME_COL, field);
+                table_scan.insert().unwrap();
+                table_scan
+                    .set_string(Self::TABLE_NAME_COL, table_name.to_string())
+                    .unwrap();
+                table_scan
+                    .set_string(Self::FIELD_NAME_COL, field.to_string())
+                    .unwrap();
                 let field_info = schema.info.get(field).unwrap();
-                table_scan.set_int(Self::FIELD_TYPE_COL, field_info.field_type as i32);
-                table_scan.set_int(Self::FIELD_LENGTH_COL, field_info.length as i32);
-                table_scan.set_int(Self::FIELD_OFFSET_COL, layout.offset(field).unwrap() as i32);
+                table_scan
+                    .set_int(Self::FIELD_TYPE_COL, field_info.field_type as i32)
+                    .unwrap();
+                table_scan
+                    .set_int(Self::FIELD_LENGTH_COL, field_info.length as i32)
+                    .unwrap();
+                table_scan
+                    .set_int(Self::FIELD_OFFSET_COL, layout.offset(field).unwrap() as i32)
+                    .unwrap();
             }
         }
     }
@@ -2108,67 +2443,6 @@ impl TableScan {
         self.move_to_block(0);
     }
 
-    /// Sets the integer value of a field in the current slot
-    fn set_int(&self, field_name: &str, value: i32) {
-        self.record_page.as_ref().unwrap().set_int(
-            *self.current_slot.as_ref().unwrap(),
-            field_name,
-            value,
-        )
-    }
-
-    /// Sets the string value of a field in the current slot
-    fn set_string(&self, field_name: &str, value: &str) {
-        self.record_page.as_ref().unwrap().set_string(
-            *self.current_slot.as_ref().unwrap(),
-            field_name,
-            value,
-        );
-    }
-
-    /// Tries to insert a new record into the table
-    fn insert(&mut self) {
-        let mut iterations = 0;
-        loop {
-            //  sanity check in case i runs into an infinite loop
-            iterations += 1;
-            assert!(
-                iterations <= 10000,
-                "Table scan insert failed for {} iterations",
-                iterations
-            );
-            match self
-                .record_page
-                .as_ref()
-                .unwrap()
-                .insert_after(self.current_slot)
-            {
-                Ok(slot) => {
-                    self.current_slot = Some(slot);
-                    break;
-                }
-                Err(_) => {
-                    if self.at_last_block() {
-                        self.move_to_new_block();
-                    } else {
-                        self.move_to_block(
-                            self.record_page.as_ref().unwrap().block_id.block_num + 1,
-                        );
-                    }
-                    continue;
-                }
-            }
-        }
-    }
-
-    /// Deletes the record pointed to by current slot from the table
-    fn delete(&self) {
-        self.record_page
-            .as_ref()
-            .unwrap()
-            .delete(*self.current_slot.as_ref().unwrap());
-    }
-
     fn move_to_row_id(&mut self, row_id: RID) {
         self.close();
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
@@ -2178,20 +2452,6 @@ impl TableScan {
             self.layout.clone(),
         ));
         self.current_slot = Some(row_id.slot);
-    }
-
-    fn get_row_id(&self) -> RID {
-        RID::new(
-            self.record_page.as_ref().unwrap().block_id.block_num,
-            *self.current_slot.as_ref().unwrap(),
-        )
-    }
-
-    fn set_value(&self, field_name: &str, value: Constant) {
-        match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => self.set_int(field_name, value.as_int()),
-            FieldType::STRING => self.set_string(field_name, value.as_str()),
-        }
     }
 }
 
@@ -2271,11 +2531,101 @@ impl Scan for TableScan {
     }
 }
 
+impl UpdateScan for TableScan {
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        self.record_page.as_ref().unwrap().set_int(
+            *self.current_slot.as_ref().unwrap(),
+            field_name,
+            value,
+        );
+        Ok(())
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        self.record_page.as_ref().unwrap().set_string(
+            *self.current_slot.as_ref().unwrap(),
+            field_name,
+            &value,
+        );
+        Ok(())
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        match self.layout.schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => self.set_int(field_name, value.as_int())?,
+            FieldType::STRING => self.set_string(field_name, value.as_str().to_string())?,
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut iterations = 0;
+        loop {
+            //  sanity check in case i runs into an infinite loop
+            iterations += 1;
+            assert!(
+                iterations <= 10000,
+                "Table scan insert failed for {} iterations",
+                iterations
+            );
+            match self
+                .record_page
+                .as_ref()
+                .unwrap()
+                .insert_after(self.current_slot)
+            {
+                Ok(slot) => {
+                    self.current_slot = Some(slot);
+                    break;
+                }
+                Err(_) => {
+                    if self.at_last_block() {
+                        self.move_to_new_block();
+                    } else {
+                        self.move_to_block(
+                            self.record_page.as_ref().unwrap().block_id.block_num + 1,
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        self.record_page
+            .as_ref()
+            .unwrap()
+            .delete(*self.current_slot.as_ref().unwrap());
+        Ok(())
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        Ok(RID::new(
+            self.record_page.as_ref().unwrap().block_id.block_num,
+            *self.current_slot.as_ref().unwrap(),
+        ))
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        self.close();
+        let block_id = BlockId::new(self.file_name.clone(), rid.block_num);
+        self.record_page = Some(RecordPage::new(
+            Arc::clone(&self.txn),
+            block_id,
+            self.layout.clone(),
+        ));
+        self.current_slot = Some(rid.slot);
+        Ok(())
+    }
+}
+
 trait UpdateScan: Scan {
-    fn set_int(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
-    fn set_string(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
-    fn set_value(&self, field_name: &str) -> Result<(), Box<dyn Error>>;
-    fn insert(&self) -> Result<(), Box<dyn Error>>;
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
+    fn insert(&mut self) -> Result<(), Box<dyn Error>>;
     fn delete(&mut self) -> Result<(), Box<dyn Error>>;
     fn get_rid(&self) -> Result<RID, Box<dyn Error>>;
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>>;
@@ -2292,6 +2642,7 @@ trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
 
 #[cfg(test)]
 mod table_scan_tests {
+    use super::UpdateScan;
     use std::sync::Arc;
 
     use crate::{test_utils::generate_random_number, Layout, Scan, Schema, SimpleDB, TableScan};
@@ -2310,10 +2661,12 @@ mod table_scan_tests {
         let mut inserted_count = 0;
         let mut table_scan = TableScan::new(txn, layout, "table");
         for i in 0..100 {
-            table_scan.insert();
+            table_scan.insert().unwrap();
             let number = (generate_random_number() % 100) + 1;
-            table_scan.set_int("A", number as i32);
-            table_scan.set_string("B", &format!("rec{}", number));
+            table_scan.set_int("A", number as i32).unwrap();
+            table_scan
+                .set_string("B", format!("rec{}", number))
+                .unwrap();
             dbg!(format!("Inserting number {}", number));
             inserted_count += 1;
         }
@@ -2331,7 +2684,7 @@ mod table_scan_tests {
             dbg!(format!("The number retrieved {}", number));
             if number < 25 {
                 deleted_count += 1;
-                table_scan.delete();
+                table_scan.delete().unwrap();
             }
         }
         dbg!(format!("Deleted {} records", deleted_count));

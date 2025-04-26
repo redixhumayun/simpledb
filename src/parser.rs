@@ -512,7 +512,7 @@ enum SQLStatement {
 }
 
 #[derive(Debug)]
-struct ModifyData {
+pub struct ModifyData {
     table_name: String,
     field_name: String,
     new_value: Constant,
@@ -536,9 +536,9 @@ impl ModifyData {
 }
 
 #[derive(Debug)]
-struct DeleteData {
-    table_name: String,
-    predicate: Predicate,
+pub struct DeleteData {
+    pub table_name: String,
+    pub predicate: Predicate,
 }
 
 impl DeleteData {
@@ -551,10 +551,10 @@ impl DeleteData {
 }
 
 #[derive(Debug)]
-struct InsertData {
-    table_name: String,
-    fields: Vec<String>,
-    values: Vec<Constant>,
+pub struct InsertData {
+    pub table_name: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Constant>,
 }
 
 impl InsertData {
@@ -568,7 +568,7 @@ impl InsertData {
 }
 
 #[derive(Debug)]
-struct CreateTableData {
+pub struct CreateTableData {
     table_name: String,
     schema: Schema,
 }
@@ -580,7 +580,7 @@ impl CreateTableData {
 }
 
 #[derive(Debug)]
-struct CreateViewData {
+pub struct CreateViewData {
     view_name: String,
     query_data: QueryData,
 }
@@ -595,7 +595,7 @@ impl CreateViewData {
 }
 
 #[derive(Debug)]
-struct CreateIndexData {
+pub struct CreateIndexData {
     index_name: String,
     table_name: String,
     field_name: String,
@@ -612,10 +612,10 @@ impl CreateIndexData {
 }
 
 #[derive(Debug)]
-struct QueryData {
-    fields: Vec<String>,
-    tables: Vec<String>,
-    predicate: Predicate,
+pub struct QueryData {
+    pub fields: Vec<String>,
+    pub tables: Vec<String>,
+    pub predicate: Predicate,
 }
 
 impl QueryData {
