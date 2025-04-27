@@ -92,15 +92,21 @@ impl SimpleDB {
 }
 
 trait UpdatePlanner {
-    fn execute_insert(&self, data: InsertData, txn: Arc<Transaction>)
-        -> Result<(), Box<dyn Error>>;
+    fn execute_insert(
+        &self,
+        data: InsertData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
     fn execute_delete(
         &self,
         data: DeleteData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>>;
-    fn execute_modify(&self, data: ModifyData, txn: Arc<Transaction>)
-        -> Result<(), Box<dyn Error>>;
+    fn execute_modify(
+        &self,
+        data: ModifyData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
     fn execute_create_table(
         &self,
         data: CreateTableData,
@@ -127,15 +133,17 @@ impl UpdatePlanner for BasicUpdatePlanner {
         &self,
         data: InsertData,
         txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<usize, Box<dyn Error>> {
+        let mut rows_inserted = 0;
         let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
         let mut scan = plan.open();
         for (field, value) in zip(data.fields, data.values) {
             scan.insert().unwrap();
             scan.set_value(&field, value).unwrap();
+            rows_inserted += 1;
         }
         scan.close();
-        todo!()
+        Ok(rows_inserted)
     }
 
     fn execute_delete(
@@ -150,20 +158,33 @@ impl UpdatePlanner for BasicUpdatePlanner {
         ));
         let plan = SelectPlan::new(plan, data.predicate);
         let mut scan = plan.open();
-        let mut count = 0;
+        let mut rows_deleted = 0;
         while let Some(_) = scan.next() {
             scan.delete().unwrap();
-            count += 1;
+            rows_deleted += 1;
         }
-        Ok(count)
+        Ok(rows_deleted)
     }
 
     fn execute_modify(
         &self,
         data: ModifyData,
         txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>> {
-        todo!()
+    ) -> Result<usize, Box<dyn Error>> {
+        let plan = Box::new(TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        ));
+        let plan = SelectPlan::new(plan, data.predicate);
+        let mut scan = plan.open();
+        let mut update_count = 0;
+        while let Some(_) = scan.next() {
+            let value = data.new_value.evaluate(&scan)?;
+            scan.set_value(&data.field_name, value)?;
+            update_count += 1;
+        }
+        Ok(update_count)
     }
 
     fn execute_create_table(
@@ -171,7 +192,9 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: CreateTableData,
         txn: Arc<Transaction>,
     ) -> Result<(), Box<dyn Error>> {
-        todo!()
+        self.metadata_manager
+            .create_table(&data.table_name, data.schema, Arc::clone(&txn));
+        Ok(())
     }
 
     fn execute_create_view(
@@ -179,7 +202,12 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: CreateViewData,
         txn: Arc<Transaction>,
     ) -> Result<(), Box<dyn Error>> {
-        todo!()
+        self.metadata_manager.create_view(
+            &data.view_name,
+            &data.query_data.to_sql(),
+            Arc::clone(&txn),
+        );
+        Ok(())
     }
 
     fn execute_create_index(
@@ -187,7 +215,13 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: CreateIndexData,
         txn: Arc<Transaction>,
     ) -> Result<(), Box<dyn Error>> {
-        todo!()
+        self.metadata_manager.create_index(
+            &data.index_name,
+            &data.table_name,
+            &data.field_name,
+            Arc::clone(&txn),
+        );
+        Ok(())
     }
 }
 
@@ -1231,6 +1265,10 @@ impl Predicate {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        matches!(self.root, PredicateNode::Empty)
+    }
+
     fn or(predicates: Vec<Predicate>) -> Self {
         Self {
             root: PredicateNode::Composite {
@@ -1365,6 +1403,30 @@ impl Predicate {
             }
         }
     }
+
+    fn to_sql(&self) -> String {
+        self.node_to_sql(&self.root)
+    }
+
+    fn node_to_sql(&self, node: &PredicateNode) -> String {
+        match node {
+            PredicateNode::Empty => String::new(),
+            PredicateNode::Term(term) => term.to_sql(),
+            PredicateNode::Composite { op, operands } => {
+                let op_str = match op {
+                    BooleanConnective::And => "AND",
+                    BooleanConnective::Or => "OR",
+                    BooleanConnective::Not => "NOT",
+                };
+                let terms: Vec<String> =
+                    operands.iter().map(|node| self.node_to_sql(node)).collect();
+                match op {
+                    BooleanConnective::Not => format!("{}({})", op_str, terms.join("")),
+                    _ => terms.join(op_str),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1479,9 +1541,23 @@ impl Term {
         }
         return None;
     }
+
+    fn to_sql(&self) -> String {
+        let lhs_sql = self.lhs.to_sql();
+        let rhs_sql = self.rhs.to_sql();
+        let op_str = match self.comparison_op {
+            ComparisonOp::Equal => "=",
+            ComparisonOp::LessThan => "<",
+            ComparisonOp::GreaterThan => ">",
+            ComparisonOp::LessThanOrEqual => "<=",
+            ComparisonOp::GreaterThanOrEqual => ">=",
+            ComparisonOp::NotEqual => "<>",
+        };
+        format!("{} {} {}", lhs_sql, op_str, rhs_sql)
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Expression {
     Constant(Constant),
     FieldName(String),
@@ -1552,9 +1628,33 @@ impl Expression {
             _ => None,
         }
     }
+
+    fn to_sql(&self) -> String {
+        match self {
+            Expression::Constant(constant) => match constant {
+                Constant::Int(value) => value.to_string(),
+                Constant::String(string) => string.to_string(),
+            },
+            Expression::FieldName(field_name) => field_name.clone(),
+            Expression::BinaryOp {
+                operator,
+                left,
+                right,
+            } => {
+                let op_str = match operator {
+                    BinaryOperator::Add => "+",
+                    BinaryOperator::Subtract => "-",
+                    BinaryOperator::Multiply => "*",
+                    BinaryOperator::Divide => "/",
+                    BinaryOperator::Modulo => "%",
+                };
+                format!("({} {} {})", left.to_sql(), op_str, right.to_sql())
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum BinaryOperator {
     Add,
     Subtract,

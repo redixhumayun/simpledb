@@ -285,7 +285,7 @@ impl<'a> Parser<'a> {
         self.lexer.eat_keyword("set")?;
         let field_name = self.lexer.eat_identifier()?;
         self.lexer.eat_delim('=')?;
-        let new_value = self.constant()?;
+        let new_value = self.expression()?;
         let predicate = {
             if self.lexer.match_keyword("where") {
                 self.lexer.eat_keyword("where")?;
@@ -404,7 +404,8 @@ mod parser_tests {
         if let SQLStatement::ModifyData(modify) = stmt {
             assert_eq!(modify.table_name, "employees");
             assert_eq!(modify.field_name, "salary");
-            assert_eq!(modify.new_value, Constant::Int(50000));
+            assert_eq!(modify.new_value, Expression::Constant(Constant::Int(50000)));
+            // assert_eq!(modify.new_value, Constant::Int(50000));
             if let PredicateNode::Term(term) = &modify.predicate.root {
                 assert!(
                     matches!(term.lhs, Expression::FieldName(ref name) if name == "department")
@@ -513,17 +514,17 @@ enum SQLStatement {
 
 #[derive(Debug)]
 pub struct ModifyData {
-    table_name: String,
-    field_name: String,
-    new_value: Constant,
-    predicate: Predicate,
+    pub table_name: String,
+    pub field_name: String,
+    pub new_value: Expression,
+    pub predicate: Predicate,
 }
 
 impl ModifyData {
     fn new(
         table_name: String,
         field_name: String,
-        new_value: Constant,
+        new_value: Expression,
         predicate: Predicate,
     ) -> Self {
         Self {
@@ -569,8 +570,8 @@ impl InsertData {
 
 #[derive(Debug)]
 pub struct CreateTableData {
-    table_name: String,
-    schema: Schema,
+    pub table_name: String,
+    pub schema: Schema,
 }
 
 impl CreateTableData {
@@ -581,8 +582,8 @@ impl CreateTableData {
 
 #[derive(Debug)]
 pub struct CreateViewData {
-    view_name: String,
-    query_data: QueryData,
+    pub view_name: String,
+    pub query_data: QueryData,
 }
 
 impl CreateViewData {
@@ -596,9 +597,9 @@ impl CreateViewData {
 
 #[derive(Debug)]
 pub struct CreateIndexData {
-    index_name: String,
-    table_name: String,
-    field_name: String,
+    pub index_name: String,
+    pub table_name: String,
+    pub field_name: String,
 }
 
 impl CreateIndexData {
@@ -625,6 +626,16 @@ impl QueryData {
             tables,
             predicate,
         }
+    }
+
+    pub fn to_sql(&self) -> String {
+        let mut sql = String::from("SELECT ");
+        sql.push_str(&self.fields.join(", "));
+        sql.push_str("FROM ");
+        sql.push_str(&self.tables.join(", "));
+
+        if !self.predicate.is_empty() {}
+        todo!()
     }
 }
 
