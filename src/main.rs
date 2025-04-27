@@ -17,7 +17,8 @@ use std::{
 };
 mod test_utils;
 use parser::{
-    CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, QueryData,
+    CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
+    QueryData,
 };
 #[cfg(test)]
 use test_utils::TestDir;
@@ -32,6 +33,7 @@ struct SimpleDB {
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     metadata_manager: Arc<MetadataManager>,
+    planner: Arc<Planner>,
 }
 
 impl SimpleDB {
@@ -58,6 +60,12 @@ impl SimpleDB {
             Arc::clone(&buffer_manager),
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
+        let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
+        let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
+        let planner = Arc::new(Planner::new(
+            Box::new(query_planner),
+            Box::new(update_planner),
+        ));
         txn.commit().unwrap();
         Self {
             db_directory: path.as_ref().to_path_buf(),
@@ -65,6 +73,7 @@ impl SimpleDB {
             file_manager,
             buffer_manager,
             metadata_manager,
+            planner,
         }
     }
 
@@ -91,41 +100,106 @@ impl SimpleDB {
     }
 }
 
-trait UpdatePlanner {
-    fn execute_insert(
+struct Planner {
+    query_planner: Box<dyn QueryPlanner>,
+    update_planner: Box<dyn UpdatePlanner>,
+}
+
+impl Planner {
+    fn new(query_planner: Box<dyn QueryPlanner>, update_planner: Box<dyn UpdatePlanner>) -> Self {
+        Self {
+            query_planner,
+            update_planner,
+        }
+    }
+
+    fn create_query_plan(
         &self,
-        data: InsertData,
+        query: String,
         txn: Arc<Transaction>,
-    ) -> Result<usize, Box<dyn Error>>;
-    fn execute_delete(
+    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+        let mut parser = Parser::new(&query);
+        let query_data = parser.query()?;
+        //  TODO: Verify the query. How?
+        self.query_planner.create_plan(query_data, txn)
+    }
+
+    fn execute_update(
         &self,
-        data: DeleteData,
+        command: String,
         txn: Arc<Transaction>,
-    ) -> Result<usize, Box<dyn Error>>;
-    fn execute_modify(
-        &self,
-        data: ModifyData,
-        txn: Arc<Transaction>,
-    ) -> Result<usize, Box<dyn Error>>;
-    fn execute_create_table(
-        &self,
-        data: CreateTableData,
-        txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>>;
-    fn execute_create_view(
-        &self,
-        data: CreateViewData,
-        txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>>;
-    fn execute_create_index(
-        &self,
-        data: CreateIndexData,
-        txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>>;
+    ) -> Result<usize, Box<dyn Error>> {
+        let mut parser = Parser::new(&command);
+        match parser.update_command()? {
+            parser::SQLStatement::CreateTableData(create_table_data) => self
+                .update_planner
+                .execute_create_table(create_table_data, Arc::clone(&txn)),
+            parser::SQLStatement::CreateViewData(create_view_data) => self
+                .update_planner
+                .execute_create_view(create_view_data, Arc::clone(&txn)),
+            parser::SQLStatement::CreateIndexData(create_index_data) => self
+                .update_planner
+                .execute_create_index(create_index_data, Arc::clone(&txn)),
+            parser::SQLStatement::InsertData(insert_data) => self
+                .update_planner
+                .execute_insert(insert_data, Arc::clone(&txn)),
+            parser::SQLStatement::DeleteData(delete_data) => self
+                .update_planner
+                .execute_delete(delete_data, Arc::clone(&txn)),
+            parser::SQLStatement::ModifyData(modify_data) => self
+                .update_planner
+                .execute_modify(modify_data, Arc::clone(&txn)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use std::sync::Arc;
+
+    use crate::SimpleDB;
+
+    #[test]
+    fn planner_test_single_table() {
+        //  Create the table T1
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let sql = "create table T1(A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        //  Insert the records into the table T1
+        let count = 200;
+        dbg!("inserting records", count);
+        for i in 0..count {
+            let sql = format!("insert into T1(A, B) values ({}, 'string{}')", i, i);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        //  Read the records back and make sure they exist
+        dbg!("reading records back");
+        let sql = format!("select B from T1 where A>10");
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        let mut scan = plan.open();
+        let mut retrieved_count = 0;
+        while let Some(_) = scan.next() {
+            scan.get_string("b").unwrap();
+            retrieved_count += 1;
+        }
+        assert_eq!(retrieved_count, 189);
+    }
+
+    #[test]
+    fn planner_test_multi_table() {}
 }
 
 struct BasicUpdatePlanner {
     metadata_manager: Arc<MetadataManager>,
+}
+
+impl BasicUpdatePlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
 }
 
 impl UpdatePlanner for BasicUpdatePlanner {
@@ -134,16 +208,13 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: InsertData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let mut rows_inserted = 0;
         let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
         let mut scan = plan.open();
-        for (field, value) in zip(data.fields, data.values) {
-            scan.insert().unwrap();
+        scan.insert()?;
+        for (field, value) in data.fields.iter().zip(data.values) {
             scan.set_value(&field, value).unwrap();
-            rows_inserted += 1;
         }
-        scan.close();
-        Ok(rows_inserted)
+        Ok(1)
     }
 
     fn execute_delete(
@@ -191,50 +262,81 @@ impl UpdatePlanner for BasicUpdatePlanner {
         &self,
         data: CreateTableData,
         txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<usize, Box<dyn Error>> {
         self.metadata_manager
             .create_table(&data.table_name, data.schema, Arc::clone(&txn));
-        Ok(())
+        Ok(0)
     }
 
     fn execute_create_view(
         &self,
         data: CreateViewData,
         txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<usize, Box<dyn Error>> {
         self.metadata_manager.create_view(
             &data.view_name,
             &data.query_data.to_sql(),
             Arc::clone(&txn),
         );
-        Ok(())
+        Ok(0)
     }
 
     fn execute_create_index(
         &self,
         data: CreateIndexData,
         txn: Arc<Transaction>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<usize, Box<dyn Error>> {
         self.metadata_manager.create_index(
             &data.index_name,
             &data.table_name,
             &data.field_name,
             Arc::clone(&txn),
         );
-        Ok(())
+        Ok(0)
     }
 }
 
-trait QueryPlanner {
-    fn create_plan(
+trait UpdatePlanner {
+    fn execute_insert(
         &self,
-        query_data: QueryData,
+        data: InsertData,
         txn: Arc<Transaction>,
-    ) -> Result<Box<dyn Plan>, Box<dyn Error>>;
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_delete(
+        &self,
+        data: DeleteData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_modify(
+        &self,
+        data: ModifyData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_create_table(
+        &self,
+        data: CreateTableData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_create_view(
+        &self,
+        data: CreateViewData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
+    fn execute_create_index(
+        &self,
+        data: CreateIndexData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>>;
 }
 
 struct BasicQueryPlanner {
     metadata_manager: Arc<MetadataManager>,
+}
+
+impl BasicQueryPlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
 }
 
 impl QueryPlanner for BasicQueryPlanner {
@@ -275,6 +377,14 @@ impl QueryPlanner for BasicQueryPlanner {
         )?);
         Ok(plan)
     }
+}
+
+trait QueryPlanner {
+    fn create_plan(
+        &self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> Result<Box<dyn Plan>, Box<dyn Error>>;
 }
 
 struct ProductPlan {
@@ -371,6 +481,17 @@ impl Plan for ProjectPlan {
     fn schema(&self) -> Schema {
         self.schema.clone()
     }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ ProjectPlan", prefix);
+        println!("{}├─ Fields: {:?}", prefix, self.schema.fields);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Child Plan:", prefix);
+        self.plan.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
 }
 
 struct SelectPlan {
@@ -413,6 +534,17 @@ impl Plan for SelectPlan {
     fn schema(&self) -> Schema {
         self.plan.schema()
     }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ SelectPlan", prefix);
+        println!("{}├─ Predicate: {}", prefix, self.predicate.to_sql());
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Child Plan:", prefix);
+        self.plan.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
 }
 
 struct TablePlan {
@@ -437,6 +569,16 @@ impl TablePlan {
             layout,
             stat_info,
         }
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ TablePlan", prefix);
+        println!("{}├─ Table: {}", prefix, self.table_name);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Schema: {:?}", prefix, self.schema().fields);
+        println!("{}╰─", prefix);
     }
 }
 
@@ -472,6 +614,17 @@ trait Plan {
     fn records_output(&self) -> usize;
     fn distinct_values(&self, field_name: &str) -> usize;
     fn schema(&self) -> Schema;
+    fn print_plan(&self, indent: usize) {
+        self.print_plan_internal(indent);
+    }
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ Plan Type: {}", prefix, std::any::type_name::<Self>());
+        println!("{}├─ Blocks Accessed: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records Output: {}", prefix, self.records_output());
+        println!("{}├─ Schema Fields: {:?}", prefix, self.schema().fields);
+        println!("{}╰─", prefix);
+    }
 }
 
 #[cfg(test)]
@@ -2143,19 +2296,19 @@ impl StatManager {
         layout: Layout,
         txn: Arc<Transaction>,
     ) -> StatInfo {
-        println!("getting stat info for {}", table_name);
+        dbg!("getting stat info for {}", table_name);
         self.num_calls += 1;
         if self.num_calls > 100 {
             self.refresh_stats(Arc::clone(&txn));
         }
 
         if let Some(stats) = self.table_stats.get(table_name) {
-            println!("found table stats {:?}", stats);
+            dbg!("found table stats {:?}", stats);
             stats.clone()
         } else {
-            println!("going to calculate table stats");
+            dbg!("going to calculate table stats");
             let table_stats = self.calculate_table_stats(table_name, layout, txn);
-            println!("table stats {:?}", table_stats);
+            dbg!("table stats {:?}", table_stats.clone());
             self.table_stats
                 .insert(table_name.to_string(), table_stats.clone());
             table_stats
@@ -2188,7 +2341,7 @@ impl StatManager {
         layout: Layout,
         txn: Arc<Transaction>,
     ) -> StatInfo {
-        println!("calculating table stats for {}", table_name);
+        dbg!("calculating table stats for {}", table_name);
         let mut table_scan = TableScan::new(txn, layout, table_name);
         let mut num_rec = 0;
         let mut num_blocks = 0;

@@ -8,28 +8,105 @@
 2. Store an ID table to manage offsets so that its easier to support variable length strings (similar to B-tree pages)
 
 
-### Notes
-The current error I'm facing for a few tests seems to be because of some file already existing
+### 📝 Converting “manual pin/unpin” to an RAII Buffer Guard  
 
-```shell
-cargo test transaction_tests::test_transaction_durability -- --nocapture
-   Compiling simpledb v0.1.0 (/Users/zaidhumayun/Desktop/Development.nosync/databases/simpledb)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
-     Running unittests src/main.rs (target/debug/deps/simpledb-fc979dcd7f8ea1ce)
+---
 
-running 1 test
+#### 0 · Goal
+Replace every `pin(&blk)` / `unpin(&blk)` pair with an object that:
+* pins in its constructor,
+* un‑pins in `Drop`,
+* carries the `Arc<Mutex<Buffer>>` for safe page access,  
+  eliminating double‑unpin and forgotten unpins.
 
-thread 'transaction_tests::test_transaction_durability' panicked at src/test_utils.rs:20:36:
-called `Result::unwrap()` on an `Err` value: Os { code: 17, kind: AlreadyExists, message: "File exists" }
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-test transaction_tests::test_transaction_durability ... FAILED
+---
 
-failures:
+#### 1 · Add the guard type (transaction layer)
 
-failures:
-    transaction_tests::test_transaction_durability
+```rust
+// transaction/buffer_guard.rs
+pub struct BufferGuard<'a> {
+    bm:   &'a BufferManager,   // ONLY buffer pool reference
+    blk:  BlockId,
+    pub buf: Arc<Mutex<Buffer>>,   // expose if callers need it
+}
 
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.00s
+impl<'a> Drop for BufferGuard<'a> {
+    fn drop(&mut self) { self.bm.unpin(&self.blk); }
+}
 ```
 
-Now, easiest to fix this by first making sure everything uses the harness to test rather than creating independent files. After that I can see why there are errors when creating the metadata manager.
+---
+
+#### 2 · Expose `Transaction::pin` that returns the guard
+
+```rust
+impl Transaction {
+    pub fn pin<'a>(&'a self, blk: &BlockId) -> BufferGuard<'a> {
+        let bm  = self.buffer_manager.lock().unwrap();
+        let buf = bm.pin(blk);                 // existing method, bumps pin‑cnt
+        BufferGuard { bm: &*bm, blk: blk.clone(), buf }
+    }
+}
+```
+
+*Remove the old `fn unpin(&self, blk: &BlockId)` from `Transaction`.*
+
+---
+
+#### 3 · Replace call‑sites
+
+| Before | After |
+|--------|-------|
+| `tx.pin(&blk); /*…*/ tx.unpin(&blk);` | `let guard = tx.pin(&blk); /* use guard.buf */` |
+
+> **Tip**: a 2‑pass `sed` / search‑replace:  
+> 1. replace `tx.pin(` with `let _g = tx.pin(`  
+> 2. delete `tx.unpin(` lines.
+
+---
+
+#### 4 · RecordPage tweaks (optional)
+
+*Change constructor to accept `&Arc<Mutex<Buffer>>` instead of pinning itself;*  
+if you prefer minimal churn, leave it unchanged—double‑pin is harmless.
+
+---
+
+#### 5 · TableScan integration
+
+```rust
+pub struct TableScan<'tx> {
+    guard: BufferGuard<'tx>,              // keeps page pinned
+    page:  RecordPage<'tx>,
+    /* rest unchanged */
+}
+
+fn jump_to_block(&mut self, n: usize) {
+    let blk = BlockId::new(self.file.clone(), n);
+    self.guard = self.tx.pin(&blk);       // old guard drops ⇒ old page unpinned
+    self.page  = RecordPage::new(&self.guard.buf, self.layout.clone());
+}
+```
+
+(Covers `move_to_block`, `move_to_new_block`, `move_to_row_id`.)
+
+---
+
+#### 6 · Delete every `close()` used only for unpinning
+* Traits `Scan` / `UpdateScan`  
+* Concrete scans’ noop impls  
+* Each lingering call site (compiler will flag them).
+
+---
+
+#### 7 · Run tests  
+All “unpin of non‑pinned buffer” assertions should vanish; no new leaks.
+
+---
+
+##### Return later
+* Split read‑ vs write‑guards if you want mutability discipline.  
+* Push pin‑logic fully into BufferManager (`pin_handle()` variant) for even cleaner layering.
+
+---

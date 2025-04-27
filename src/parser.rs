@@ -3,7 +3,7 @@ use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 use crate::{ComparisonOp, Constant, Expression, Predicate, Schema, Term};
 
 #[derive(Debug)]
-enum ParserError {
+pub enum ParserError {
     BadSyntax,
     Other(Box<dyn Error>),
 }
@@ -19,13 +19,13 @@ impl Display for ParserError {
     }
 }
 
-struct Parser<'a> {
+pub struct Parser<'a> {
     lexer: Lexer<'a>,
 }
 
 impl<'a> Parser<'a> {
     /// Creates a new Parser with the given SQL string
-    fn new(string: &'a str) -> Self {
+    pub fn new(string: &'a str) -> Self {
         Self {
             lexer: Lexer::new(string),
         }
@@ -123,7 +123,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a complete SELECT query
     /// Returns: QueryData containing fields, tables, and predicates
-    fn query(&mut self) -> Result<QueryData, ParserError> {
+    pub fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
         let select_list = self.field_list()?;
         self.lexer.eat_keyword("from")?;
@@ -143,7 +143,7 @@ impl<'a> Parser<'a> {
 
     /// Parses any SQL command that modifies the database
     /// Returns: SQLStatement enum variant
-    fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
+    pub fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
         if self.lexer.match_keyword("insert") {
             return Ok(SQLStatement::InsertData(self.insert()?));
         } else if self.lexer.match_keyword("delete") {
@@ -503,7 +503,7 @@ mod parser_tests {
 }
 
 #[derive(Debug)]
-enum SQLStatement {
+pub enum SQLStatement {
     CreateTableData(CreateTableData),
     CreateViewData(CreateViewData),
     CreateIndexData(CreateIndexData),
@@ -702,7 +702,7 @@ impl<'a> Lexer<'a> {
     fn parse_identifier_or_keyword(&mut self) -> Option<Token> {
         let mut string = String::new();
         while let Some(&c) = self.input.peek() {
-            if !c.is_alphabetic() && c != '_' {
+            if !c.is_alphanumeric() && c != '_' {
                 break;
             }
             string.push(c);

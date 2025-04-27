@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "log_manager_tests::test_log_manager",
+        "planner_tests::planner_test_single_table",
         "--",
         "--nocapture"
       ],
