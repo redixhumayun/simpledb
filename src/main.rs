@@ -9,7 +9,6 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, Write},
-    iter::zip,
     ops::Deref,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock},
