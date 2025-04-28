@@ -211,7 +211,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let mut scan = plan.open();
         scan.insert()?;
         for (field, value) in data.fields.iter().zip(data.values) {
-            scan.set_value(&field, value).unwrap();
+            scan.set_value(&field, value)?;
         }
         Ok(1)
     }
@@ -230,7 +230,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let mut scan = plan.open();
         let mut rows_deleted = 0;
         while let Some(_) = scan.next() {
-            scan.delete().unwrap();
+            scan.delete()?;
             rows_deleted += 1;
         }
         Ok(rows_deleted)
