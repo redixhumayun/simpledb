@@ -231,6 +231,89 @@ mod planner_tests {
         }
         assert_eq!(read_count, 200);
     }
+
+    #[test]
+    fn planner_test_single_table_delete() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        //  Creating the table t1
+        dbg!("Creating table t1");
+        let sql = "create table t1 (A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        //  Insert records into t1
+        let count = 200;
+        dbg!("Inserting {} records into t1", count);
+        for i in 0..count {
+            let sql = format!("insert into t1(A, B) values ({}, 'string{}')", i, i);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        //  Read the records in t1 back
+        dbg!("Reading all the records back");
+        let sql = "select A, B from t1".to_string();
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        let mut scan = plan.open();
+        let mut read_count = 0;
+        while let Some(_) = scan.next() {
+            let a = scan.get_int("a").unwrap();
+            let b = scan.get_string("b").unwrap();
+            read_count += 1;
+        }
+        assert_eq!(read_count, count);
+
+        //  Delete some records in t1 and then read back remaining
+        dbg!("Deleting some records in t1");
+        let sql = "delete from t1 where A < 100".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        let sql = "select A, B from t1".to_string();
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        let mut scan = plan.open();
+        let mut read_count = 0;
+        while let Some(_) = scan.next() {
+            let a = scan.get_int("a").unwrap();
+            let b = scan.get_string("b").unwrap();
+            assert!(a >= 100);
+            read_count += 1;
+        }
+        assert_eq!(read_count, count - 100);
+    }
+
+    #[test]
+    fn planner_test_single_table_modify() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        //  Create the table t1
+        dbg!("Creating table t1");
+        let sql = "create table t1 (A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        //  Insert records into t1
+        let count = 200;
+        dbg!("Inserting {} records into t1", count);
+        for i in 0..count {
+            let sql = format!("insert into t1(A, B) values ({}, 'string{}')", i, i);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        //  Modify some records in t1 and then read back remaining
+        dbg!("Modifying some records in t1");
+        let sql = "update t1 set B='modified' where A < 100".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        let sql = "select A, B from t1 where A < 100".to_string();
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        let mut scan = plan.open();
+        let mut read_count = 0;
+        while let Some(_) = scan.next() {
+            let a = scan.get_int("a").unwrap();
+            let b = scan.get_string("b").unwrap();
+            assert_eq!(b, "modified");
+            read_count += 1;
+        }
+        assert_eq!(read_count, 100);
+    }
 }
 
 struct BasicUpdatePlanner {
