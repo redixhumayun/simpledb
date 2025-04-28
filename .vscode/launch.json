@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "planner_tests::planner_test_single_table",
+        "planner_tests::planner_test_multi_table",
         "--",
         "--nocapture"
       ],

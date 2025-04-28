@@ -51,3 +51,13 @@ pub fn generate_random_number() -> usize {
     f.read_exact(&mut buf).unwrap();
     usize::from_le_bytes(buf)
 }
+
+/// Macro to debug
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if std::env::var("RUST_DEBUG").is_ok() {
+            eprintln!("[DEBUG] {}", format!($($arg)*))
+        }
+    };
+}

@@ -188,7 +188,49 @@ mod planner_tests {
     }
 
     #[test]
-    fn planner_test_multi_table() {}
+    fn planner_test_multi_table() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        //  Create table T1
+        dbg!("Creating table T1");
+        let sql = "create table T1(A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        //  Insert records in T1
+        let count = 200;
+        dbg!("Inserting records in T1", count);
+        for i in 0..count {
+            let sql = format!("insert into T1(A, B) values ({}, 'string{}')", i, i);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        //  Create table T2
+        dbg!("Creating table T2");
+        let sql = "create table T2(C int, D varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        //  Insert records into T2
+        dbg!("Inserting records in T2", count);
+        for i in (0..count).rev() {
+            let sql = format!("insert into T2(C, D) values ({}, 'string{}')", i, i);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        //  Join across T1 and T2 on A=C
+        dbg!("Joining T1 and T2");
+        let sql = "select B,D from T1,T2 where A=C".to_string();
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        plan.print_plan_internal(0);
+        dbg!("Reading records in join");
+        let mut scan = plan.open();
+        let mut read_count = 0;
+        while let Some(_) = scan.next() {
+            let lhs = scan.get_string("b").unwrap();
+            let rhs = scan.get_string("d").unwrap();
+            assert_eq!(lhs, rhs);
+            read_count += 1;
+        }
+        assert_eq!(read_count, 200);
+    }
 }
 
 struct BasicUpdatePlanner {
@@ -442,6 +484,19 @@ impl Plan for ProductPlan {
     fn schema(&self) -> Schema {
         self.schema.clone()
     }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ ProductPlan", prefix);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Schema: {:?}", prefix, self.schema.fields);
+        println!("{}├─ Left Plan:", prefix);
+        self.plan_1.print_plan(indent + 1);
+        println!("{}├─ Right Plan:", prefix);
+        self.plan_2.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
 }
 
 struct ProjectPlan {
@@ -569,16 +624,6 @@ impl TablePlan {
             stat_info,
         }
     }
-
-    fn print_plan_internal(&self, indent: usize) {
-        let prefix = "  ".repeat(indent);
-        println!("{}╭─ TablePlan", prefix);
-        println!("{}├─ Table: {}", prefix, self.table_name);
-        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
-        println!("{}├─ Records: {}", prefix, self.records_output());
-        println!("{}├─ Schema: {:?}", prefix, self.schema().fields);
-        println!("{}╰─", prefix);
-    }
 }
 
 impl Plan for TablePlan {
@@ -605,6 +650,16 @@ impl Plan for TablePlan {
     fn schema(&self) -> Schema {
         self.layout.schema.clone()
     }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ TablePlan", prefix);
+        println!("{}├─ Table: {}", prefix, self.table_name);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Schema: {:?}", prefix, self.schema().fields);
+        println!("{}╰─", prefix);
+    }
 }
 
 trait Plan {
@@ -616,14 +671,15 @@ trait Plan {
     fn print_plan(&self, indent: usize) {
         self.print_plan_internal(indent);
     }
-    fn print_plan_internal(&self, indent: usize) {
-        let prefix = "  ".repeat(indent);
-        println!("{}╭─ Plan Type: {}", prefix, std::any::type_name::<Self>());
-        println!("{}├─ Blocks Accessed: {}", prefix, self.blocks_accessed());
-        println!("{}├─ Records Output: {}", prefix, self.records_output());
-        println!("{}├─ Schema Fields: {:?}", prefix, self.schema().fields);
-        println!("{}╰─", prefix);
-    }
+    fn print_plan_internal(&self, indent: usize);
+    // fn print_plan_internal(&self, indent: usize) {
+    //     let prefix = "  ".repeat(indent);
+    //     println!("{}╭─ Plan Type: {}", prefix, std::any::type_name::<Self>());
+    //     println!("{}├─ Blocks Accessed: {}", prefix, self.blocks_accessed());
+    //     println!("{}├─ Records Output: {}", prefix, self.records_output());
+    //     println!("{}├─ Schema Fields: {:?}", prefix, self.schema().fields);
+    //     println!("{}╰─", prefix);
+    // }
 }
 
 #[cfg(test)]
@@ -788,7 +844,9 @@ where
     S2: Scan,
 {
     fn new(s1: S1, s2: S2) -> Self {
-        Self { s1, s2 }
+        let mut scan = Self { s1, s2 };
+        scan.before_first().unwrap();
+        scan
     }
 }
 
@@ -800,6 +858,7 @@ where
     type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on ProductScan");
         match self.s2.next() {
             Some(result) => match result {
                 Ok(_) => {
@@ -986,7 +1045,7 @@ mod product_scan_tests {
             let select_scan = SelectScan::new(product_scan, predicate);
             let mut project_scan =
                 ProjectScan::new(select_scan, vec!["B".to_string(), "D".to_string()]);
-            project_scan.before_first().unwrap();
+            // project_scan.before_first().unwrap();
             while let Some(_) = project_scan.next() {
                 let lhs = project_scan.get_string("B").unwrap();
                 let rhs = project_scan.get_string("D").unwrap();
@@ -1022,6 +1081,7 @@ where
     type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on ProjectScan");
         self.scan.next()
     }
 }
@@ -1202,6 +1262,7 @@ where
     type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on SelectScan");
         while let Some(result) = self.scan.next() {
             match result {
                 Ok(_) => match self.predicate.is_satisfied(&self.scan) {
@@ -2640,10 +2701,12 @@ struct TableScan {
     file_name: String,
     record_page: Option<RecordPage>,
     current_slot: Option<usize>,
+    table_name: String,
 }
 
 impl TableScan {
     fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
+        debug!("Creating table scan for {}", table_name);
         let db_dir = {
             let fm = txn.file_manager.lock().unwrap();
             fm.db_directory.clone()
@@ -2656,11 +2719,20 @@ impl TableScan {
             file_name: file_name.to_string(),
             record_page: None,
             current_slot: None,
+            table_name: table_name.to_string(),
         };
 
         if scan.txn.size(&file_name) == 0 {
+            debug!(
+                "TableScan for {} is empty, allocating new block",
+                table_name
+            );
             scan.move_to_new_block();
         } else {
+            debug!(
+                "TableScan for {} is not empty, moving to block 0",
+                table_name
+            );
             scan.move_to_block(0);
         }
         scan
@@ -2718,6 +2790,7 @@ impl Iterator for TableScan {
     type Item = Result<(), Box<dyn Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on TableScan for {}", self.table_name);
         loop {
             //  Check if there is a record page currently
             if let Some(record_page) = &self.record_page {
@@ -2748,16 +2821,44 @@ impl Scan for TableScan {
         Ok(self
             .record_page
             .as_ref()
-            .unwrap()
-            .get_int(*self.current_slot.as_ref().unwrap(), field_name))
+            .ok_or_else(|| {
+                format!(
+                    "No record page set when calling get_int for {}",
+                    self.table_name
+                )
+            })
+            .and_then(|page| {
+                self.current_slot
+                    .ok_or_else(|| {
+                        format!(
+                            "No current slot set when calling get_int for {}",
+                            self.table_name
+                        )
+                    })
+                    .map(|slot| page.get_int(slot, field_name))
+            })?)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
         Ok(self
             .record_page
             .as_ref()
-            .unwrap()
-            .get_string(*self.current_slot.as_ref().unwrap(), field_name))
+            .ok_or_else(|| {
+                format!(
+                    "No record page set when calling get_string for {}",
+                    self.table_name
+                )
+            })
+            .and_then(|page| {
+                self.current_slot
+                    .ok_or_else(|| {
+                        format!(
+                            "No current slot set when calling get_string for {}",
+                            self.table_name
+                        )
+                    })
+                    .map(|slot| page.get_string(slot, field_name))
+            })?)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
