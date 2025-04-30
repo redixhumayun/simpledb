@@ -17,7 +17,7 @@ impl TestDir {
         P: AsRef<Path>,
     {
         let path = path.as_ref().to_path_buf();
-        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir_all(&path).expect("Failure while creating test directory");
         Self { path }
     }
 }

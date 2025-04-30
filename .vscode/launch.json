@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "planner_tests::planner_test_multi_table",
+        "transaction_tests::test_transaction_durability",
         "--",
         "--nocapture"
       ],
