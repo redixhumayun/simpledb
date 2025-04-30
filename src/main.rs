@@ -21,6 +21,7 @@ use parser::{
 };
 #[cfg(test)]
 use test_utils::TestDir;
+mod btree;
 mod parser;
 
 type LSN = usize;
