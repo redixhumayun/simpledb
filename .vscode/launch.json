@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "btree_leaf_tests::test_insert_no_split",
+        "btree_leaf_tests::test_insert_with_split_different_keys",
         "--",
         "--nocapture"
       ],
