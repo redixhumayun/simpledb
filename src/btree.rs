@@ -2,6 +2,11 @@ use std::{error::Error, sync::Arc};
 
 use crate::{BlockId, Constant, FieldType, Layout, Transaction, RID};
 
+/// The [BTreeLeaf] struct. This is the page that contains all the actual pointers to [RID] in the heap tables
+/// It can have an overflow pointer to an overflow page, but overflow pages are special in that they have entries with the same value for the dataval field
+/// A [BTreeLeaf] that has an overflow page must have its first entry have the same dataval as all entries in the overflow block
+/// Main Page:          Overflow Block:
+/// [K5, K6]  ------->  [K5, K5, K5, K5]
 struct BTreeLeaf {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -42,18 +47,27 @@ impl BTreeLeaf {
         }
     }
 
+    /// This method will attempt to insert an entry into a [BTreeLeaf] page
+    /// If the leaf page has an overflow page, and the new entry is smaller than the first key
+    fn insert(&self, rid: RID) -> Option<InternalNodeEntry> {
+        //  If this page has an overflow page, and the key being inserted is less than the first key force a split
+        todo!()
+    }
+
+    /// This method will check to see if an overflow page is present for this block
+    /// An overflow page for a specific page will contain entries that are the same as the first key of the current page
+    /// If no overflow page can be found, just return. Otherwise swap out the current contents for the overflow contents
     fn try_overflow(&mut self) -> Result<Option<()>, Box<dyn Error>> {
         let first_key = self.contents.get_data_value(0)?;
+
         if first_key != self.search_key
-            || !matches!(self.contents.get_flag()?, PageType::Overflow(_))
+            || !matches!(self.contents.get_flag()?, PageType::Leaf(Some(_)))
         {
             return Ok(None);
         }
-        let PageType::Overflow(overflow_block_num) = self.contents.get_flag()? else {
-            panic!(
-                "Expected overflow block type, but got: {:?}",
-                self.contents.get_flag()?
-            );
+
+        let PageType::Leaf(Some(overflow_block_num)) = self.contents.get_flag()? else {
+            return Ok(None);
         };
 
         let overflow_contents = BTreePage::new(
@@ -90,16 +104,15 @@ struct InternalNodeEntry {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PageType {
     Internal,
-    Leaf,
-    Overflow(usize),
+    Leaf(Option<usize>),
 }
 
 impl From<i32> for PageType {
     fn from(value: i32) -> Self {
         match value {
             0 => PageType::Internal,
-            -1 => PageType::Leaf,
-            n if n > 0 => PageType::Overflow(n as usize),
+            -1 => PageType::Leaf(None),
+            n if n > 0 => PageType::Leaf(Some(n as usize)),
             _ => panic!("Invalid page type for value: {}", value),
         }
     }
@@ -109,8 +122,8 @@ impl From<PageType> for i32 {
     fn from(value: PageType) -> Self {
         match value {
             PageType::Internal => 0,
-            PageType::Leaf => -1,
-            PageType::Overflow(n) => n as i32,
+            PageType::Leaf(None) => -1,
+            PageType::Leaf(Some(n)) => n as i32,
         }
     }
 }
@@ -153,6 +166,9 @@ impl BTreePage {
         Ok(self.slot_pos(current_records + 1) > self.txn.block_size())
     }
 
+    /// This method splits the existing [BTreePage] and moves the records from [slot..]
+    /// into a new page and then returns the [BlockId] of the new page
+    /// The current page continues to be the same, with fewer records
     fn split(&self, slot: usize, page_type: PageType) -> Result<BlockId, Box<dyn Error>> {
         //  construct a new block, a new btree page and then pin the buffer
         let block_id = self.txn.append(&self.block_id.filename);
@@ -162,7 +178,7 @@ impl BTreePage {
         //  set the metadata on the new page
         new_btree_page.set_flag(page_type)?;
 
-        //  move the records from [slot..) to the new page
+        //  move the records from [slot..] to the new page
         let current_records = self.get_number_of_recs()?;
         let mut new_slot = 0;
         for i in slot..current_records {
@@ -407,9 +423,9 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf).unwrap();
+        page.format(PageType::Leaf(None)).unwrap();
 
-        assert_eq!(page.get_flag().unwrap(), PageType::Leaf);
+        assert_eq!(page.get_flag().unwrap(), PageType::Leaf(None));
         assert_eq!(page.get_number_of_recs().unwrap(), 0);
     }
 
@@ -421,7 +437,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf).unwrap();
+        page.format(PageType::Leaf(None)).unwrap();
 
         // Insert a record
         let rid = RID::new(1, 1);
@@ -445,7 +461,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
-        page.format(PageType::Leaf).unwrap();
+        page.format(PageType::Leaf(None)).unwrap();
 
         // Insert records until full
         let mut slot = 0;
@@ -457,7 +473,7 @@ mod btree_page_tests {
 
         // Split the page
         let split_point = slot / 2;
-        let new_block = page.split(split_point, PageType::Leaf).unwrap();
+        let new_block = page.split(split_point, PageType::Leaf(None)).unwrap();
 
         // Verify original page
         assert_eq!(page.get_number_of_recs().unwrap(), split_point);
@@ -475,7 +491,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf).unwrap();
+        page.format(PageType::Leaf(None)).unwrap();
 
         // Try to insert wrong type
         let result = page.set_value(0, "dataval", Constant::String("wrong type".to_string()));
@@ -508,7 +524,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf).unwrap();
+        page.format(PageType::Leaf(None)).unwrap();
 
         page.insert_leaf(0, Constant::Int(10), RID::new(1, 1))
             .unwrap();
