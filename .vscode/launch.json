@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "transaction_tests::test_transaction_durability",
+        "btree_page_tests::test_page_split",
         "--",
         "--nocapture"
       ],

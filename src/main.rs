@@ -3161,7 +3161,7 @@ impl Constant {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 struct RID {
     block_num: usize,
     slot: usize,

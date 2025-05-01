@@ -18,7 +18,7 @@ use crate::{BlockId, Constant, FieldType, Layout, Transaction, RID};
 /// | dataval     | child block num  |
 /// +-------------+------------------+
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PageType {
     Internal = 0,
     Leaf = 1,
@@ -64,17 +64,19 @@ impl BTreePage {
         Ok(self.slot_pos(current_records + 1) > self.txn.block_size())
     }
 
-    fn split(&self, slot: usize, page_type: PageType) -> Result<(), Box<dyn Error>> {
+    fn split(&self, slot: usize, page_type: PageType) -> Result<BlockId, Box<dyn Error>> {
         //  construct a new block, a new btree page and then pin the buffer
         let block_id = self.txn.append(&self.block_id.filename);
         let new_btree_page = BTreePage::new(
             page_type,
             Arc::clone(&self.txn),
-            block_id,
+            block_id.clone(),
             self.layout.clone(),
         );
+
         //  set the metadata on the new page
         new_btree_page.set_flag(page_type)?;
+
         //  move the records from [slot..) to the new page
         let current_records = self.get_number_of_recs()?;
         let mut new_slot = 0;
@@ -86,9 +88,8 @@ impl BTreePage {
             self.delete(i)?;
             new_slot += 1;
         }
-        //  close the new page
-        new_btree_page.close();
-        Ok(())
+
+        Ok(block_id)
     }
 
     fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
@@ -301,5 +302,125 @@ impl BTreePage {
 impl Drop for BTreePage {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod btree_page_tests {
+    use super::*;
+    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+
+    fn create_test_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("dataval");
+        schema.add_int_field("block");
+        schema.add_int_field("id");
+        Layout::new(schema)
+    }
+
+    #[test]
+    fn test_btree_page_format() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        page.format(PageType::Leaf).unwrap();
+
+        assert_eq!(page.get_flag().unwrap(), PageType::Leaf);
+        assert_eq!(page.get_number_of_recs().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_leaf_insert_and_delete() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        page.format(PageType::Leaf).unwrap();
+
+        // Insert a record
+        let rid = RID::new(1, 1);
+        page.insert_leaf(0, Constant::Int(10), rid).unwrap();
+
+        // Verify record
+        assert_eq!(page.get_number_of_recs().unwrap(), 1);
+        assert_eq!(page.get_data_value(0).unwrap(), Constant::Int(10));
+        assert_eq!(page.get_rid(0).unwrap(), rid);
+
+        // Delete record
+        page.delete(0).unwrap();
+        assert_eq!(page.get_number_of_recs().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_page_split() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(
+            PageType::Leaf,
+            Arc::clone(&tx),
+            block.clone(),
+            layout.clone(),
+        );
+        page.format(PageType::Leaf).unwrap();
+
+        // Insert records until full
+        let mut slot = 0;
+        while !page.is_full().unwrap() {
+            page.insert_leaf(slot, Constant::Int(slot as i32), RID::new(1, slot))
+                .unwrap();
+            slot += 1;
+        }
+
+        // Split the page
+        let split_point = slot / 2;
+        let new_block = page.split(split_point, PageType::Leaf).unwrap();
+
+        // Verify original page
+        assert_eq!(page.get_number_of_recs().unwrap(), split_point);
+
+        // Verify new page
+        let new_page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), new_block, layout);
+        assert_eq!(new_page.get_number_of_recs().unwrap(), slot - split_point);
+    }
+
+    #[test]
+    fn test_type_safety() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        page.format(PageType::Leaf).unwrap();
+
+        // Try to insert wrong type
+        let result = page.set_value(0, "dataval", Constant::String("wrong type".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_internal_node_operations() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(PageType::Internal, Arc::clone(&tx), block, layout);
+        page.format(PageType::Internal).unwrap();
+
+        // Insert directory entry
+        page.insert_dir(0, Constant::Int(10), 2).unwrap();
+
+        // Verify entry
+        assert_eq!(page.get_data_value(0).unwrap(), Constant::Int(10));
+        assert_eq!(page.get_child_block_num(0).unwrap(), 2);
     }
 }
