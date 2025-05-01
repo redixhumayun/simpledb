@@ -17,6 +17,8 @@ struct BTreeLeaf {
 }
 
 impl BTreeLeaf {
+    /// Creates a new [BTreeLeaf] with the given transaction, block ID, layout, search key and filename
+    /// The page is initialized with an appropriate slot based on the search key position
     fn new(
         txn: Arc<Transaction>,
         block_id: BlockId,
@@ -36,6 +38,9 @@ impl BTreeLeaf {
         })
     }
 
+    /// Advances to the next record that matches the search key
+    /// If we've reached the end of the current page, attempts to follow the overflow chain
+    /// Returns Some(()) if a matching record is found, None otherwise
     fn next(&mut self) -> Result<Option<()>, Box<dyn Error>> {
         self.current_slot = {
             match self.current_slot {
@@ -52,6 +57,9 @@ impl BTreeLeaf {
         }
     }
 
+    /// Deletes the record with the specified RID from this leaf page or its overflow chain
+    /// Returns Ok(()) if the record was found and deleted, error otherwise
+    /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
         assert!(self.current_slot.is_some());
         while let Some(_) = self.next()? {
@@ -378,6 +386,7 @@ impl BTreePage {
     const BLOCK_NUM_COLUMN: &'static str = "block";
     const SLOT_NUM_COLUMN: &'static str = "id";
 
+    /// Creates a new [BTreePage] by pinning the specified block and initializing it with the given layout
     fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         txn.pin(&block_id);
         Self {
@@ -387,6 +396,9 @@ impl BTreePage {
         }
     }
 
+    /// Finds the rightmost slot position before where the search key should be inserted
+    /// Returns None if the search key belongs at the start of the page
+    /// Returns Some(pos) where pos is the index of the rightmost record less than search_key
     fn find_slot_before(&self, search_key: Constant) -> Result<Option<usize>, Box<dyn Error>> {
         let mut current_slot = 0;
         while current_slot < self.get_number_of_recs()?
@@ -401,13 +413,14 @@ impl BTreePage {
         }
     }
 
-    /// Helper method for tests since just checking [BTreePage::is_full] leads to issues because
-    /// the [BTreeLeaf::insert] does that check itself and splits the page before the test can do anything
+    /// Returns true if adding two more records would exceed the block size
+    /// Used primarily for testing to detect splits before they occur
     fn is_one_off_full(&self) -> Result<bool, Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         Ok(self.slot_pos(current_records + 2) > self.txn.block_size())
     }
 
+    /// Returns true if adding one more record would exceed the block size
     fn is_full(&self) -> Result<bool, Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         Ok(self.slot_pos(current_records + 1) > self.txn.block_size())
@@ -445,6 +458,8 @@ impl BTreePage {
         Ok(block_id)
     }
 
+    /// Formats a new page by initializing its flag and record count
+    /// Sets all record slots to their zero values based on field types
     fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
         self.txn
             .set_int(&self.block_id, 0, page_type.into(), true)?;
@@ -466,31 +481,38 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Retrieves the page type flag from the header
     fn get_flag(&self) -> Result<PageType, Box<dyn Error>> {
         self.txn.get_int(&self.block_id, 0).map(PageType::from)
     }
 
+    /// Updates the page type flag in the header
     fn set_flag(&self, value: PageType) -> Result<(), Box<dyn Error>> {
         self.txn.set_int(&self.block_id, 0, value.into(), true)
     }
 
+    /// Gets the data value at the specified slot
     fn get_data_value(&self, slot: usize) -> Result<Constant, Box<dyn Error>> {
         let value = self.get_value(slot, Self::DATA_VAL_COLUMN)?;
         Ok(value)
     }
 
+    /// Gets the child block number at the specified slot (for internal nodes)
     fn get_child_block_num(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
         let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
         Ok(block_num)
     }
 
+    /// Gets the RID stored at the specified slot (for leaf nodes)
     fn get_rid(&self, slot: usize) -> Result<RID, Box<dyn Error>> {
         let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
         let slot_num = self.get_int(slot, Self::SLOT_NUM_COLUMN)? as usize;
         Ok(RID::new(block_num, slot_num))
     }
 
-    fn insert_dir(
+    /// Inserts a directory entry at the specified slot (for internal nodes)
+    /// Directory entries contain a data value and child block number
+    fn insert_internal(
         &self,
         slot: usize,
         value: Constant,
@@ -502,6 +524,8 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Inserts a leaf entry at the specified slot
+    /// Leaf entries contain a data value and RID pointing to the actual record
     fn insert_leaf(&self, slot: usize, value: Constant, rid: RID) -> Result<(), Box<dyn Error>> {
         self.insert(slot)?;
         self.set_value(slot, Self::DATA_VAL_COLUMN, value)?;
@@ -510,6 +534,8 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Inserts space for a new record at the specified slot
+    /// Shifts all following records right by one position
     fn insert(&self, slot: usize) -> Result<(), Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         for i in (slot..current_records).rev() {
@@ -520,6 +546,8 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Deletes the record at the specified slot
+    /// Shifts all following records left by one position
     fn delete(&self, slot: usize) -> Result<(), Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         for i in slot + 1..current_records {
@@ -529,6 +557,7 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Copies all fields from one record slot to another
     fn copy_record(&self, from: usize, to: usize) -> Result<(), Box<dyn Error>> {
         for field in &self.layout.schema.fields {
             self.set_value(to, field, self.get_value(from, field)?)?;
@@ -536,12 +565,14 @@ impl BTreePage {
         Ok(())
     }
 
+    /// Gets the number of records currently stored in the page
     fn get_number_of_recs(&self) -> Result<usize, Box<dyn Error>> {
         self.txn
             .get_int(&self.block_id, Self::INT_BYTES)
             .map(|v| v as usize)
     }
 
+    /// Updates the number of records stored in the page
     fn set_number_of_recs(&self, num: usize) -> Result<(), Box<dyn Error>> {
         self.txn
             .set_int(&self.block_id, Self::INT_BYTES, num as i32, true)
@@ -635,14 +666,17 @@ impl BTreePage {
         }
     }
 
+    /// Calculates the byte position of a field within a record slot
     fn field_position(&self, slot: usize, field_name: &str) -> usize {
         self.slot_pos(slot) + self.layout.offset(field_name).unwrap()
     }
 
+    /// Calculates the starting byte position of a record slot
     fn slot_pos(&self, slot: usize) -> usize {
         Self::INT_BYTES + Self::INT_BYTES + slot * self.layout.slot_size
     }
 
+    /// Unpins the page's block from the buffer manager
     fn close(&self) {
         self.txn.unpin(&self.block_id);
     }
@@ -760,8 +794,8 @@ mod btree_page_tests {
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Internal).unwrap();
 
-        // Insert directory entry
-        page.insert_dir(0, Constant::Int(10), 2).unwrap();
+        // Insert internal entry
+        page.insert_internal(0, Constant::Int(10), 2).unwrap();
 
         // Verify entry
         assert_eq!(page.get_data_value(0).unwrap(), Constant::Int(10));
