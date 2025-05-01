@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "btree_page_tests::test_page_split",
+        "btree_leaf_tests::test_insert_no_split",
         "--",
         "--nocapture"
       ],
