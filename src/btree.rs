@@ -20,15 +20,17 @@ use crate::{BlockId, Constant, FieldType, Layout, Transaction, RID};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PageType {
-    Internal = 0,
-    Leaf = 1,
+    Internal,
+    Leaf,
+    Overflow(usize),
 }
 
 impl From<i32> for PageType {
     fn from(value: i32) -> Self {
         match value {
             0 => PageType::Internal,
-            1 => PageType::Leaf,
+            -1 => PageType::Leaf,
+            n if n > 0 => PageType::Overflow(n as usize),
             _ => panic!("Invalid page type for value: {}", value),
         }
     }
@@ -36,7 +38,11 @@ impl From<i32> for PageType {
 
 impl From<PageType> for i32 {
     fn from(value: PageType) -> Self {
-        value as i32
+        match value {
+            PageType::Internal => 0,
+            PageType::Leaf => -1,
+            PageType::Overflow(n) => n as i32,
+        }
     }
 }
 
