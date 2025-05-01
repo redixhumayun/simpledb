@@ -71,6 +71,16 @@ impl BTreePage {
         }
     }
 
+    fn find_slot_before(&self, search_key: Constant) -> Result<usize, Box<dyn Error>> {
+        let mut current_slot = 0;
+        while current_slot < self.get_number_of_recs()?
+            && self.get_data_value(current_slot)? < search_key
+        {
+            current_slot += 1;
+        }
+        Ok(current_slot - 1)
+    }
+
     fn is_full(&self) -> Result<bool, Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         Ok(self.slot_pos(current_records + 1) > self.txn.block_size())
@@ -434,5 +444,27 @@ mod btree_page_tests {
         // Verify entry
         assert_eq!(page.get_data_value(0).unwrap(), Constant::Int(10));
         assert_eq!(page.get_child_block_num(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_find_slot_before() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+
+        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        page.format(PageType::Leaf).unwrap();
+
+        page.insert_leaf(0, Constant::Int(10), RID::new(1, 1))
+            .unwrap();
+        page.insert_leaf(1, Constant::Int(20), RID::new(1, 2))
+            .unwrap();
+        page.insert_leaf(2, Constant::Int(30), RID::new(1, 3))
+            .unwrap();
+
+        assert_eq!(page.find_slot_before(Constant::Int(15)).unwrap(), 0);
+        assert_eq!(page.find_slot_before(Constant::Int(20)).unwrap(), 0);
+        assert_eq!(page.find_slot_before(Constant::Int(25)).unwrap(), 1);
     }
 }
