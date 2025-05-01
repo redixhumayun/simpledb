@@ -2,6 +2,75 @@ use std::{error::Error, sync::Arc};
 
 use crate::{BlockId, Constant, FieldType, Layout, Transaction, RID};
 
+struct BTreeLeaf {
+    txn: Arc<Transaction>,
+    layout: Layout,
+    search_key: Constant,
+    contents: BTreePage,
+    current_slot: usize,
+    file_name: String,
+}
+
+impl BTreeLeaf {
+    fn new(
+        txn: Arc<Transaction>,
+        block_id: BlockId,
+        layout: Layout,
+        search_key: Constant,
+        file_name: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let contents = BTreePage::new(Arc::clone(&txn), block_id, layout.clone());
+        let current_slot = contents.find_slot_before(search_key.clone())?;
+        Ok(Self {
+            txn,
+            layout,
+            search_key,
+            contents,
+            current_slot,
+            file_name,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<()>, Box<dyn Error>> {
+        self.current_slot += 1;
+        if self.current_slot >= self.contents.get_number_of_recs()? {
+            return self.try_overflow();
+        } else if self.contents.get_data_value(self.current_slot)? == self.search_key {
+            return Ok(Some(()));
+        } else {
+            return self.try_overflow();
+        }
+    }
+
+    fn try_overflow(&mut self) -> Result<Option<()>, Box<dyn Error>> {
+        let first_key = self.contents.get_data_value(0)?;
+        if first_key != self.search_key
+            || !matches!(self.contents.get_flag()?, PageType::Overflow(_))
+        {
+            return Ok(None);
+        }
+        let PageType::Overflow(overflow_block_num) = self.contents.get_flag()? else {
+            panic!(
+                "Expected overflow block type, but got: {:?}",
+                self.contents.get_flag()?
+            );
+        };
+
+        let overflow_contents = BTreePage::new(
+            Arc::clone(&self.txn),
+            BlockId::new(self.file_name.clone(), overflow_block_num),
+            self.layout.clone(),
+        );
+        self.contents = overflow_contents;
+        Ok(Some(()))
+    }
+}
+
+struct InternalNodeEntry {
+    dataval: Constant,
+    block_num: usize,
+}
+
 /// The general format of the BTreePage
 /// +--------------------+----------------------+----------------------+
 /// | flag (4 bytes)     | record count (4B)    | record slots [...]   |
@@ -47,7 +116,6 @@ impl From<PageType> for i32 {
 }
 
 struct BTreePage {
-    page_type: PageType,
     txn: Arc<Transaction>,
     block_id: BlockId,
     layout: Layout,
@@ -61,10 +129,9 @@ impl BTreePage {
     const BLOCK_NUM_COLUMN: &'static str = "block";
     const SLOT_NUM_COLUMN: &'static str = "id";
 
-    fn new(page_type: PageType, txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
+    fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         txn.pin(&block_id);
         Self {
-            page_type,
             txn,
             block_id,
             layout,
@@ -89,12 +156,8 @@ impl BTreePage {
     fn split(&self, slot: usize, page_type: PageType) -> Result<BlockId, Box<dyn Error>> {
         //  construct a new block, a new btree page and then pin the buffer
         let block_id = self.txn.append(&self.block_id.filename);
-        let new_btree_page = BTreePage::new(
-            page_type,
-            Arc::clone(&self.txn),
-            block_id.clone(),
-            self.layout.clone(),
-        );
+        let new_btree_page =
+            BTreePage::new(Arc::clone(&self.txn), block_id.clone(), self.layout.clone());
 
         //  set the metadata on the new page
         new_btree_page.set_flag(page_type)?;
@@ -149,13 +212,11 @@ impl BTreePage {
     }
 
     fn get_child_block_num(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        matches!(self.page_type, PageType::Internal);
         let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
         Ok(block_num)
     }
 
     fn get_rid(&self, slot: usize) -> Result<RID, Box<dyn Error>> {
-        matches!(self.page_type, PageType::Leaf);
         let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
         let slot_num = self.get_int(slot, Self::SLOT_NUM_COLUMN)? as usize;
         Ok(RID::new(block_num, slot_num))
@@ -167,7 +228,6 @@ impl BTreePage {
         value: Constant,
         block_num: usize,
     ) -> Result<(), Box<dyn Error>> {
-        matches!(self.page_type, PageType::Internal);
         self.insert(slot)?;
         self.set_value(slot, Self::DATA_VAL_COLUMN, value)?;
         self.set_int(slot, Self::BLOCK_NUM_COLUMN, block_num as i32)?;
@@ -175,7 +235,6 @@ impl BTreePage {
     }
 
     fn insert_leaf(&self, slot: usize, value: Constant, rid: RID) -> Result<(), Box<dyn Error>> {
-        matches!(self.page_type, PageType::Leaf);
         self.insert(slot)?;
         self.set_value(slot, Self::DATA_VAL_COLUMN, value)?;
         self.set_int(slot, Self::BLOCK_NUM_COLUMN, rid.block_num as i32)?;
@@ -347,7 +406,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Leaf).unwrap();
 
         assert_eq!(page.get_flag().unwrap(), PageType::Leaf);
@@ -361,7 +420,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Leaf).unwrap();
 
         // Insert a record
@@ -385,12 +444,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(
-            PageType::Leaf,
-            Arc::clone(&tx),
-            block.clone(),
-            layout.clone(),
-        );
+        let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
         page.format(PageType::Leaf).unwrap();
 
         // Insert records until full
@@ -409,7 +463,7 @@ mod btree_page_tests {
         assert_eq!(page.get_number_of_recs().unwrap(), split_point);
 
         // Verify new page
-        let new_page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), new_block, layout);
+        let new_page = BTreePage::new(Arc::clone(&tx), new_block, layout);
         assert_eq!(new_page.get_number_of_recs().unwrap(), slot - split_point);
     }
 
@@ -420,7 +474,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Leaf).unwrap();
 
         // Try to insert wrong type
@@ -435,7 +489,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(PageType::Internal, Arc::clone(&tx), block, layout);
+        let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Internal).unwrap();
 
         // Insert directory entry
@@ -453,7 +507,7 @@ mod btree_page_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        let page = BTreePage::new(PageType::Leaf, Arc::clone(&tx), block, layout);
+        let page = BTreePage::new(Arc::clone(&tx), block, layout);
         page.format(PageType::Leaf).unwrap();
 
         page.insert_leaf(0, Constant::Int(10), RID::new(1, 1))
