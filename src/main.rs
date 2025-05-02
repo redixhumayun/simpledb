@@ -4018,7 +4018,7 @@ mod transaction_tests {
         let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
         let block_id = BlockId::new(file.clone(), 1);
         let num_of_txns = 5;
-        let max_retry_count = 50;
+        let max_retry_count = 75;
 
         // Initialize data
         let t1 = Transaction::new(

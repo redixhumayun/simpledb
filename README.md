@@ -110,3 +110,7 @@ All “unpin of non‑pinned buffer” assertions should vanish; no new leaks.
 * Push pin‑logic fully into BufferManager (`pin_handle()` variant) for even cleaner layering.
 
 ---
+
+
+### BTree
+Support range scans for BTree

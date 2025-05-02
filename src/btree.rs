@@ -1,6 +1,267 @@
 use std::{error::Error, sync::Arc};
 
-use crate::{debug, BlockId, Constant, FieldType, Layout, Transaction, RID};
+use crate::{debug, BlockId, Constant, FieldType, Index, Layout, Schema, Transaction, RID};
+
+struct BTreeIndex {
+    txn: Arc<Transaction>,
+    index_name: String,
+    internal_layout: Layout,
+    leaf_layout: Layout,
+    leaf_table_name: String,
+    leaf: Option<BTreeLeaf>,
+    root_block: BlockId,
+}
+
+impl BTreeIndex {
+    fn new(
+        txn: Arc<Transaction>,
+        index_name: String,
+        leaf_layout: Layout,
+    ) -> Result<Self, Box<dyn Error>> {
+        //  Create the leaf file with the schema provided
+        let leaf_table_name = format!("{}leaf", index_name);
+        if txn.size(&leaf_table_name) == 0 {
+            let block_id = txn.append(&leaf_table_name);
+            let btree_page = BTreePage::new(Arc::clone(&txn), block_id, leaf_layout.clone());
+            btree_page.format(PageType::Leaf(None))?;
+        }
+
+        //  Create the internal file with the schema required
+        let internal_table_name = format!("{}internal", index_name);
+        let mut internal_schema = Schema::new();
+        internal_schema.add_from_schema("block", &leaf_layout.schema)?;
+        internal_schema.add_from_schema("dataval", &leaf_layout.schema)?;
+        let internal_layout = Layout::new(internal_schema.clone());
+        if txn.size(&internal_table_name) == 0 {
+            let block_id = txn.append(&internal_table_name);
+            let internal_page = BTreePage::new(Arc::clone(&txn), block_id, internal_layout.clone());
+            internal_page.format(PageType::Internal(None))?;
+            let field_type = internal_schema.info.get("dataval").unwrap().field_type;
+            let min_val = match field_type {
+                FieldType::INT => Constant::Int(i32::MIN),
+                FieldType::STRING => Constant::String("".to_string()),
+            };
+            internal_page.insert_internal(0, min_val, 0)?;
+        }
+        Ok(Self {
+            txn,
+            index_name,
+            internal_layout,
+            leaf_layout,
+            leaf_table_name,
+            leaf: None,
+            root_block: BlockId::new(internal_table_name, 0),
+        })
+    }
+}
+
+#[cfg(test)]
+mod btree_index_tests {
+    use super::*;
+    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+
+    fn create_test_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("dataval");
+        schema.add_int_field("block");
+        schema.add_int_field("id");
+        Layout::new(schema)
+    }
+
+    fn setup_index(db: &SimpleDB) -> BTreeIndex {
+        let tx = Arc::new(db.new_tx());
+        let layout = create_test_layout();
+        let index_name = generate_filename();
+        BTreeIndex::new(Arc::clone(&tx), index_name, layout).unwrap()
+    }
+
+    #[test]
+    fn test_btree_index_construction() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let index = setup_index(&db);
+
+        // Verify internal node file exists with minimum value entry
+        let root = BTreeInternal::new(
+            Arc::clone(&index.txn),
+            index.root_block.clone(),
+            index.internal_layout.clone(),
+            index.root_block.filename.clone(),
+        );
+        assert_eq!(root.contents.get_number_of_recs().unwrap(), 1);
+        assert_eq!(
+            root.contents.get_data_value(0).unwrap(),
+            Constant::Int(i32::MIN)
+        );
+    }
+
+    #[test]
+    fn test_simple_insert_and_search() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let mut index = setup_index(&db);
+
+        // Insert some values
+        index.insert(&Constant::Int(10), &RID::new(1, 1));
+        index.insert(&Constant::Int(20), &RID::new(1, 2));
+        index.insert(&Constant::Int(30), &RID::new(1, 3));
+
+        // Search for inserted values
+        index.before_first(&Constant::Int(20));
+        assert!(index.next());
+        assert_eq!(index.get_data_rid(), RID::new(1, 2));
+
+        index.before_first(&Constant::Int(10));
+        assert!(index.next());
+        assert_eq!(index.get_data_rid(), RID::new(1, 1));
+    }
+
+    #[test]
+    fn test_duplicate_keys() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let mut index = setup_index(&db);
+
+        // Insert duplicate keys
+        index.insert(&Constant::Int(10), &RID::new(1, 1));
+        index.insert(&Constant::Int(10), &RID::new(1, 2));
+        index.insert(&Constant::Int(10), &RID::new(1, 3));
+
+        // Search and verify all duplicates are found
+        index.before_first(&Constant::Int(10));
+
+        let mut found_rids = Vec::new();
+        while index.next() {
+            found_rids.push(index.get_data_rid());
+        }
+
+        assert_eq!(found_rids.len(), 3);
+        assert!(found_rids.contains(&RID::new(1, 1)));
+        assert!(found_rids.contains(&RID::new(1, 2)));
+        assert!(found_rids.contains(&RID::new(1, 3)));
+    }
+
+    #[test]
+    fn test_delete() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let mut index = setup_index(&db);
+
+        // Insert and then delete a value
+        index.insert(&Constant::Int(10), &RID::new(1, 1));
+        index.delete(&Constant::Int(10), &RID::new(1, 1));
+
+        // Verify value is gone
+        index.before_first(&Constant::Int(10));
+        assert!(!index.next());
+
+        // Insert multiple values and delete one
+        index.insert(&Constant::Int(20), &RID::new(1, 1));
+        index.insert(&Constant::Int(20), &RID::new(1, 2));
+        index.delete(&Constant::Int(20), &RID::new(1, 1));
+
+        // Verify only one remains
+        index.before_first(&Constant::Int(20));
+        assert!(index.next());
+        assert_eq!(index.get_data_rid(), RID::new(1, 2));
+        assert!(!index.next());
+    }
+
+    #[test]
+    fn test_btree_split() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let mut index = setup_index(&db);
+
+        // Insert enough values to force splits
+        for i in 0..24 {
+            index.insert(&Constant::Int(i), &RID::new(1, i as usize));
+        }
+
+        // Verify we can still find values after splits
+        for i in 0..24 {
+            index.before_first(&Constant::Int(i));
+            assert!(index.next());
+            assert_eq!(index.get_data_rid(), RID::new(1, i as usize));
+        }
+    }
+}
+
+impl Index for BTreeIndex {
+    fn before_first(&mut self, search_key: &Constant) {
+        self.close();
+        let mut root = BTreeInternal::new(
+            Arc::clone(&self.txn),
+            self.root_block.clone(),
+            self.internal_layout.clone(),
+            self.root_block.filename.clone(),
+        );
+        let leaf_block_num = root.search(search_key).unwrap();
+        let leaf_block_id = BlockId::new(self.leaf_table_name.clone(), leaf_block_num);
+        self.leaf = Some(
+            BTreeLeaf::new(
+                Arc::clone(&self.txn),
+                leaf_block_id.clone(),
+                self.leaf_layout.clone(),
+                search_key.clone(),
+                leaf_block_id.filename,
+            )
+            .unwrap(),
+        );
+    }
+
+    fn next(&mut self) -> bool {
+        match self
+            .leaf
+            .as_mut()
+            .expect("Leaf not initialized")
+            .next()
+            .expect("Next failed")
+        {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn get_data_rid(&self) -> RID {
+        self.leaf.as_ref().unwrap().get_data_rid().unwrap()
+    }
+
+    fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
+        debug!(
+            "Inserting value {:?} for rid {:?} into index",
+            data_val, data_rid
+        );
+        self.before_first(data_val);
+        let int_node_id = self.leaf.as_mut().unwrap().insert(*data_rid).unwrap();
+        if int_node_id.is_none() {
+            return;
+        }
+        debug!("Insert in index caused a split");
+        let int_node_id = int_node_id.unwrap();
+        let root = BTreeInternal::new(
+            Arc::clone(&self.txn),
+            self.root_block.clone(),
+            self.internal_layout.clone(),
+            self.root_block.filename.clone(),
+        );
+        let root_split_entry = root.insert_entry(int_node_id).unwrap();
+        if root_split_entry.is_none() {
+            return;
+        }
+        debug!("Insert in index caused a root split");
+        let root_split_entry = root_split_entry.unwrap();
+        root.make_new_root(root_split_entry).unwrap();
+    }
+
+    fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.before_first(data_val);
+        self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
+        //  TODO: Should the leaf be set to None here?
+        self.leaf = None;
+    }
+
+    fn close(&mut self) {
+        if self.leaf.is_some() {
+            self.leaf = None;
+        }
+    }
+}
 
 struct BTreeInternal {
     txn: Arc<Transaction>,
@@ -8,6 +269,17 @@ struct BTreeInternal {
     layout: Layout,
     contents: BTreePage,
     file_name: String,
+}
+
+impl std::fmt::Display for BTreeInternal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "\n=== BTreeInternal Debug ===")?;
+        writeln!(f, "Block ID: {:?}", self.block_id)?;
+        writeln!(f, "File Name: {}", self.file_name)?;
+        writeln!(f, "\nContents:")?;
+        write!(f, "{}", self.contents)?;
+        Ok(())
+    }
 }
 
 impl BTreeInternal {
@@ -25,7 +297,7 @@ impl BTreeInternal {
     /// This method will search for a given key in the [BTreeInternal] node
     /// It will find the child block that contains the key
     /// It will return the block ID of the child block
-    fn search(&mut self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
+    fn search(&mut self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
         let mut child_block = self.find_child_block(search_key)?;
         while !matches!(self.contents.get_flag()?, PageType::Internal(None)) {
             self.contents = BTreePage::new(
@@ -35,7 +307,7 @@ impl BTreeInternal {
             );
             child_block = self.find_child_block(search_key)?;
         }
-        Ok(child_block)
+        Ok(child_block.block_num)
     }
 
     /// This method will create a new root for the BTree
@@ -283,8 +555,8 @@ mod btree_internal_tests {
         assert!(split_result.is_some());
 
         // Verify the split maintained tree properties
-        let search_result = internal.search(&Constant::Int(3)).unwrap();
-        assert!(search_result.block_num > 0);
+        let leaf_block_num = internal.search(&Constant::Int(3)).unwrap();
+        assert!(leaf_block_num > 0);
     }
 
     #[test]
@@ -347,6 +619,18 @@ struct BTreeLeaf {
     file_name: String,
 }
 
+impl std::fmt::Display for BTreeLeaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "\n=== BTreeLeaf Debug ===")?;
+        writeln!(f, "Search Key: {:?}", self.search_key)?;
+        writeln!(f, "Current Slot: {:?}", self.current_slot)?;
+        writeln!(f, "File Name: {}", self.file_name)?;
+        writeln!(f, "\nContents:")?;
+        write!(f, "{}", self.contents)?;
+        Ok(())
+    }
+}
+
 impl BTreeLeaf {
     /// Creates a new [BTreeLeaf] with the given transaction, block ID, layout, search key and filename
     /// The page is initialized with an appropriate slot based on the search key position
@@ -392,7 +676,6 @@ impl BTreeLeaf {
     /// Returns Ok(()) if the record was found and deleted, error otherwise
     /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        assert!(self.current_slot.is_some());
         while let Some(_) = self.next()? {
             if self.contents.get_rid(self.current_slot.unwrap())? == rid {
                 self.contents.delete(self.current_slot.unwrap())?;
@@ -404,6 +687,7 @@ impl BTreeLeaf {
 
     /// This method will attempt to insert an entry into a [BTreeLeaf] page
     /// If the leaf page has an overflow page, and the new entry is smaller than the first key, split the page
+    /// If the page splits, return the [InternalNodeEntry] identifier to the new page
     fn insert(&mut self, rid: RID) -> Result<Option<InternalNodeEntry>, Box<dyn Error>> {
         //  If this page has an overflow page, and the key being inserted is less than the first key force a split
         //  This is done to ensure that overflow pages are linked to a page with the first key the same as entries in overflow pages
@@ -450,6 +734,7 @@ impl BTreeLeaf {
         //  If the split key is identical to the first key, move it right because all identical keys need to stay together
         //  If the split key is not identical to the first key, move it left until the the first instance of the split key is found
         debug!("Splitting BTreeLeaf");
+        debug!("State of BTreeLeaf before split {}", self.contents);
         let first_key = self.contents.get_data_value(0)?;
         let last_key = self
             .contents
@@ -481,6 +766,7 @@ impl BTreeLeaf {
         }
         debug!("Splitting at {}", split_point);
         let new_block_id = self.contents.split(split_point, PageType::Leaf(None))?;
+
         Ok(Some(InternalNodeEntry {
             dataval: split_record,
             block_num: new_block_id.block_num,
@@ -510,6 +796,13 @@ impl BTreeLeaf {
         );
         self.contents = overflow_contents;
         Ok(Some(()))
+    }
+
+    fn get_data_rid(&self) -> Result<RID, Box<dyn Error>> {
+        self.contents.get_rid(
+            self.current_slot
+                .expect("Current slot not set in BTreeLeaf::get_data_rid"),
+        )
     }
 }
 
@@ -788,15 +1081,14 @@ impl BTreePage {
         new_btree_page.set_flag(page_type)?;
 
         //  move the records from [slot..] to the new page
-        let current_records = self.get_number_of_recs()?;
-        let mut new_slot = 0;
-        for i in slot..current_records {
-            new_btree_page.insert(new_slot)?;
+        let mut dest_slot = 0;
+        while slot < self.get_number_of_recs()? {
+            new_btree_page.insert(dest_slot)?;
             for field in &self.layout.schema.fields {
-                new_btree_page.set_value(new_slot, field, self.get_value(i, field)?)?;
+                new_btree_page.set_value(dest_slot, field, self.get_value(slot, field)?)?;
             }
-            self.delete(i)?;
-            new_slot += 1;
+            self.delete(slot)?;
+            dest_slot += 1;
         }
 
         Ok(block_id)

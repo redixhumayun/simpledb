@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "btree_internal_tests::test_edge_cases",
+        "btree_index_tests::test_range_search",
         "--",
         "--nocapture"
       ],
