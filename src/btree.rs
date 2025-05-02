@@ -2,6 +2,337 @@ use std::{error::Error, sync::Arc};
 
 use crate::{debug, BlockId, Constant, FieldType, Layout, Transaction, RID};
 
+struct BTreeInternal {
+    txn: Arc<Transaction>,
+    block_id: BlockId,
+    layout: Layout,
+    contents: BTreePage,
+    file_name: String,
+}
+
+impl BTreeInternal {
+    fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout, file_name: String) -> Self {
+        let contents = BTreePage::new(Arc::clone(&txn), block_id.clone(), layout.clone());
+        Self {
+            txn,
+            block_id,
+            layout,
+            contents,
+            file_name,
+        }
+    }
+
+    /// This method will search for a given key in the [BTreeInternal] node
+    /// It will find the child block that contains the key
+    /// It will return the block ID of the child block
+    fn search(&mut self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
+        let mut child_block = self.find_child_block(search_key)?;
+        while !matches!(self.contents.get_flag()?, PageType::Internal(None)) {
+            self.contents = BTreePage::new(
+                Arc::clone(&self.txn),
+                child_block.clone(),
+                self.layout.clone(),
+            );
+            child_block = self.find_child_block(search_key)?;
+        }
+        Ok(child_block)
+    }
+
+    /// This method will create a new root for the BTree
+    /// It will take the entry that needs to be inserted after the split, move its existing
+    /// entries into a new block and then insert both the newly created block with its old entries and the new block
+    /// This is done so that the root is always at block 0 of the file
+    fn make_new_root(&self, entry: InternalNodeEntry) -> Result<(), Box<dyn Error>> {
+        let first_value = self.contents.get_data_value(0)?;
+        let page_type = self.contents.get_flag()?;
+        let level = match page_type {
+            PageType::Internal(None) => 0,
+            PageType::Internal(Some(n)) => n,
+            _ => panic!("Invalid page type for new root"),
+        };
+        let new_block_id = self.contents.split(0, page_type)?;
+        let new_block_entry = InternalNodeEntry {
+            dataval: first_value,
+            block_num: new_block_id.block_num,
+        };
+        self.insert_entry(new_block_entry)?;
+        self.insert_entry(entry)?;
+        self.contents
+            .set_flag(PageType::Internal(Some(level + 1)))?;
+        Ok(())
+    }
+
+    /// This method will insert a new entry into the [BTreeInternal] node
+    /// It works in conjunction with [BTreeInternal::insert_internal_node_entry] to do the insertion
+    /// This method will find the correct child block to insert it into and the [BTreeInternal::insert_internal_node_entry] will do the actual
+    /// insertion into the specific block
+    fn insert_entry(
+        &self,
+        entry: InternalNodeEntry,
+    ) -> Result<Option<InternalNodeEntry>, Box<dyn Error>> {
+        if matches!(self.contents.get_flag()?, PageType::Internal(None)) {
+            return self.insert_internal_node_entry(entry);
+        }
+        let child_block = self.find_child_block(&entry.dataval)?;
+        let child_internal_node = BTreeInternal::new(
+            Arc::clone(&self.txn),
+            child_block,
+            self.layout.clone(),
+            self.file_name.clone(),
+        );
+        let new_entry = child_internal_node.insert_entry(entry)?;
+        match new_entry {
+            Some(entry) => {
+                return self.insert_internal_node_entry(entry);
+            }
+            None => return Ok(None),
+        }
+    }
+
+    /// This method will insert a new entry into the [BTreeInternal] node
+    /// It will find the appropriate slot for the new entry
+    /// If the page is full, it will split the page and return the new entry
+    fn insert_internal_node_entry(
+        &self,
+        entry: InternalNodeEntry,
+    ) -> Result<Option<InternalNodeEntry>, Box<dyn Error>> {
+        let slot = match self.contents.find_slot_before(&entry.dataval)? {
+            Some(slot) => slot + 1, //  move to the insertion point
+            None => 0,              //  the insertion point is at the first slot
+        };
+        self.contents
+            .insert_internal(slot, entry.dataval, entry.block_num)?;
+
+        if !self.contents.is_full()? {
+            return Ok(None);
+        }
+
+        let page_type = self.contents.get_flag()?;
+        let split_point = self.contents.get_number_of_recs()? / 2;
+        let split_record = self.contents.get_data_value(split_point)?;
+        let new_block_id = self.contents.split(split_point, page_type)?;
+        return Ok(Some(InternalNodeEntry {
+            dataval: split_record,
+            block_num: new_block_id.block_num,
+        }));
+    }
+
+    /// This method will find the child block for a given search key in a [BTreeInternal] node
+    /// It will search for the rightmost slot before the search key
+    /// If the search key is found in the slot, it will return the next slot
+    fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
+        let mut slot = match self.contents.find_slot_before(&search_key)? {
+            Some(slot) => slot,
+            None => 0,
+        };
+        if self.contents.get_data_value(slot + 1)? == *search_key {
+            slot += 1;
+        }
+        let block_num = self.contents.get_child_block_num(slot)?;
+        Ok(BlockId::new(self.file_name.clone(), block_num))
+    }
+}
+
+#[cfg(test)]
+mod btree_internal_tests {
+    use super::*;
+    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+
+    fn create_test_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(BTreePage::DATA_VAL_COLUMN);
+        schema.add_int_field(BTreePage::BLOCK_NUM_COLUMN);
+        schema.add_int_field(BTreePage::SLOT_NUM_COLUMN);
+        Layout::new(schema)
+    }
+
+    fn setup_internal_node(db: &SimpleDB) -> (Arc<Transaction>, BTreeInternal) {
+        let tx = Arc::new(db.new_tx());
+        let block = tx.append(&generate_filename());
+        let layout = create_test_layout();
+        let filename = generate_filename();
+
+        // Format the page as internal node
+        let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
+        page.format(PageType::Internal(None)).unwrap();
+
+        let internal = BTreeInternal::new(Arc::clone(&tx), block, layout, filename);
+        (tx, internal)
+    }
+
+    #[test]
+    fn test_search_simple_path() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let (_, internal) = setup_internal_node(&db);
+
+        // Insert some entries to create a simple path
+        internal
+            .contents
+            .insert_internal(0, Constant::Int(10), 2)
+            .unwrap();
+        internal
+            .contents
+            .insert_internal(1, Constant::Int(20), 3)
+            .unwrap();
+        internal
+            .contents
+            .insert_internal(2, Constant::Int(30), 4)
+            .unwrap();
+
+        // Search for a value - should return correct child block
+        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        assert_eq!(result.block_num, 2); // Should return block 2 since 15 < 20
+
+        let result = internal.find_child_block(&Constant::Int(25)).unwrap();
+        assert_eq!(result.block_num, 3); // Should return block 3 since 20 < 25 < 30
+    }
+
+    #[test]
+    fn test_insert_with_split() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let (_, internal) = setup_internal_node(&db);
+
+        // Fill the node until just before splitting
+        let mut block_num = 0;
+        while !internal.contents.is_one_off_full().unwrap() {
+            let entry = InternalNodeEntry {
+                dataval: Constant::Int(block_num),
+                block_num: block_num as usize,
+            };
+            internal.insert_entry(entry).unwrap();
+            block_num += 1;
+        }
+
+        // Insert one more entry to force split
+        let entry = InternalNodeEntry {
+            dataval: Constant::Int(block_num),
+            block_num: block_num as usize,
+        };
+
+        let split_result = internal.insert_entry(entry).unwrap();
+        assert!(split_result.is_some());
+
+        let split_entry = split_result.unwrap();
+        assert!(split_entry.block_num > 0); // Should be a new block number
+
+        // Verify middle key was chosen for split
+        let mid_val = ((block_num + 1) / 2) as i32;
+        assert_eq!(split_entry.dataval, Constant::Int(mid_val));
+    }
+
+    #[test]
+    fn test_make_new_root() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let (_, internal) = setup_internal_node(&db);
+
+        // Setup initial entries
+        internal
+            .contents
+            .insert_internal(0, Constant::Int(10), 2)
+            .unwrap();
+        internal
+            .contents
+            .insert_internal(1, Constant::Int(20), 3)
+            .unwrap();
+
+        // Create a new entry that will be part of new root
+        let new_entry = InternalNodeEntry {
+            dataval: Constant::Int(30),
+            block_num: 4,
+        };
+
+        // Make new root
+        internal.make_new_root(new_entry).unwrap();
+
+        // Verify root structure
+        assert!(matches!(
+            internal.contents.get_flag().unwrap(),
+            PageType::Internal(Some(1))
+        ));
+        assert_eq!(internal.contents.get_number_of_recs().unwrap(), 2);
+
+        // First entry should point to block with original entries
+        assert!(internal.contents.get_child_block_num(0).unwrap() > 0);
+        // Second entry should be our new entry
+        assert_eq!(internal.contents.get_child_block_num(1).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_insert_recursive_split() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let (_, mut internal) = setup_internal_node(&db);
+
+        // Create a multi-level tree by filling and splitting nodes
+        let mut value = 1;
+        while !internal.contents.is_one_off_full().unwrap() {
+            let entry = InternalNodeEntry {
+                dataval: Constant::Int(value),
+                block_num: value as usize,
+            };
+            internal.insert_entry(entry).unwrap();
+            value += 1;
+        }
+
+        // Insert one more to force recursive split
+        let entry = InternalNodeEntry {
+            dataval: Constant::Int(value),
+            block_num: value as usize,
+        };
+
+        let split_result = internal.insert_entry(entry).unwrap();
+        assert!(split_result.is_some());
+
+        // Verify the split maintained tree properties
+        let search_result = internal.search(&Constant::Int(3)).unwrap();
+        assert!(search_result.block_num > 0);
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let (db, _dir) = SimpleDB::new_for_test(400, 8);
+        let (_, internal) = setup_internal_node(&db);
+
+        // Test inserting duplicate keys
+        internal
+            .insert_entry(InternalNodeEntry {
+                dataval: Constant::Int(10),
+                block_num: 1,
+            })
+            .unwrap();
+        internal
+            .insert_entry(InternalNodeEntry {
+                dataval: Constant::Int(10),
+                block_num: 2,
+            })
+            .unwrap();
+
+        println!("the page contents {}", internal.contents);
+
+        //  NOTE: It looks like the numbers are reversed here in the sense that the block numbers asserted are backwards
+        //  but they are correct because the insertion into the node results in a page that looks like this where block 2
+        //  is in slot 0
+        //  === BTreePage Debug ===
+        //  Block: BlockId { filename: "test_file_1746190249550660000_ThreadId(2)", block_num: 0 }
+        //  Page Type: Internal(None)
+        //  Record Count: 2
+        //  Entries:
+        //  Slot 0: Key=Int(10), Child Block=2
+        //  Slot 1: Key=Int(10), Child Block=1
+        //  ====================
+        // Search should return the rightmost child for duplicate key
+        let result = internal.find_child_block(&Constant::Int(10)).unwrap();
+        assert_eq!(result.block_num, 1);
+
+        // Test searching for key less than all entries
+        let result = internal.find_child_block(&Constant::Int(5)).unwrap();
+        assert_eq!(result.block_num, 2);
+
+        // Test searching for key greater than all entries
+        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        assert_eq!(result.block_num, 1);
+    }
+}
+
 /// The [BTreeLeaf] struct. This is the page that contains all the actual pointers to [RID] in the heap tables
 /// It can have an overflow pointer to an overflow page, but overflow pages are special in that they have entries with the same value for the dataval field
 /// A [BTreeLeaf] that has an overflow page must have its first entry have the same dataval as all entries in the overflow block
@@ -27,7 +358,7 @@ impl BTreeLeaf {
         file_name: String,
     ) -> Result<Self, Box<dyn Error>> {
         let contents = BTreePage::new(Arc::clone(&txn), block_id, layout.clone());
-        let current_slot = contents.find_slot_before(search_key.clone())?;
+        let current_slot = contents.find_slot_before(&search_key)?;
         Ok(Self {
             txn,
             layout,
@@ -412,10 +743,10 @@ impl BTreePage {
     /// Finds the rightmost slot position before where the search key should be inserted
     /// Returns None if the search key belongs at the start of the page
     /// Returns Some(pos) where pos is the index of the rightmost record less than search_key
-    fn find_slot_before(&self, search_key: Constant) -> Result<Option<usize>, Box<dyn Error>> {
+    fn find_slot_before(&self, search_key: &Constant) -> Result<Option<usize>, Box<dyn Error>> {
         let mut current_slot = 0;
         while current_slot < self.get_number_of_recs()?
-            && self.get_data_value(current_slot)? < search_key
+            && self.get_data_value(current_slot)? < *search_key
         {
             current_slot += 1;
         }
@@ -701,6 +1032,51 @@ impl Drop for BTreePage {
     }
 }
 
+impl std::fmt::Display for BTreePage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "\n=== BTreePage Debug ===")?;
+        writeln!(f, "Block: {:?}", self.block_id)?;
+        match self.get_flag() {
+            Ok(flag) => writeln!(f, "Page Type: {:?}", flag)?,
+            Err(e) => writeln!(f, "Error getting flag: {}", e)?,
+        }
+
+        match self.get_number_of_recs() {
+            Ok(count) => {
+                writeln!(f, "Record Count: {}", count)?;
+                writeln!(f, "Entries:")?;
+                match self.get_flag() {
+                    Ok(PageType::Internal(_)) => {
+                        for slot in 0..count {
+                            if let (Ok(key), Ok(child)) =
+                                (self.get_data_value(slot), self.get_child_block_num(slot))
+                            {
+                                writeln!(f, "Slot {}: Key={:?}, Child Block={}", slot, key, child)?;
+                            }
+                        }
+                    }
+                    Ok(PageType::Leaf(_)) => {
+                        for slot in 0..count {
+                            if let (Ok(key), Ok(rid)) =
+                                (self.get_data_value(slot), self.get_rid(slot))
+                            {
+                                writeln!(
+                                    f,
+                                    "Slot {}: Key={:?}, RID=(block={}, slot={})",
+                                    slot, key, rid.block_num, rid.slot
+                                )?;
+                            }
+                        }
+                    }
+                    Err(e) => writeln!(f, "Error getting page type: {}", e)?,
+                }
+            }
+            Err(e) => writeln!(f, "Error getting record count: {}", e)?,
+        }
+        writeln!(f, "====================")
+    }
+}
+
 #[cfg(test)]
 mod btree_page_tests {
     use super::*;
@@ -833,15 +1209,15 @@ mod btree_page_tests {
             .unwrap();
 
         assert_eq!(
-            page.find_slot_before(Constant::Int(15)).unwrap().unwrap(),
+            page.find_slot_before(&Constant::Int(15)).unwrap().unwrap(),
             0
         );
         assert_eq!(
-            page.find_slot_before(Constant::Int(20)).unwrap().unwrap(),
+            page.find_slot_before(&Constant::Int(20)).unwrap().unwrap(),
             0
         );
         assert_eq!(
-            page.find_slot_before(Constant::Int(25)).unwrap().unwrap(),
+            page.find_slot_before(&Constant::Int(25)).unwrap().unwrap(),
             1
         );
     }
