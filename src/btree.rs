@@ -347,27 +347,40 @@ struct InternalNodeEntry {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PageType {
-    Internal,
+    Internal(Option<usize>),
     Leaf(Option<usize>),
 }
 
 impl From<i32> for PageType {
     fn from(value: i32) -> Self {
-        match value {
-            0 => PageType::Internal,
-            -1 => PageType::Leaf(None),
-            n if n > 0 => PageType::Leaf(Some(n as usize)),
-            _ => panic!("Invalid page type for value: {}", value),
+        const TYPE_MASK: i32 = 1 << 31;
+        const VALUE_MASK: i32 = !(1 << 31);
+        let is_internal = value & TYPE_MASK == 0;
+        if is_internal {
+            if value == 0 {
+                return PageType::Internal(None);
+            } else {
+                return PageType::Internal(Some((value & VALUE_MASK) as usize));
+            }
+        } else {
+            let val = value & VALUE_MASK;
+            if val == 0 {
+                return PageType::Leaf(None);
+            } else {
+                return PageType::Leaf(Some(val as usize));
+            }
         }
     }
 }
 
 impl From<PageType> for i32 {
     fn from(value: PageType) -> Self {
+        const TYPE_MASK: i32 = 1 << 31;
         match value {
-            PageType::Internal => 0,
-            PageType::Leaf(None) => -1,
-            PageType::Leaf(Some(n)) => n as i32,
+            PageType::Internal(None) => 0,
+            PageType::Internal(Some(n)) => n as i32,
+            PageType::Leaf(None) => TYPE_MASK,
+            PageType::Leaf(Some(n)) => TYPE_MASK | (n as i32),
         }
     }
 }
@@ -792,7 +805,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Internal).unwrap();
+        page.format(PageType::Internal(None)).unwrap();
 
         // Insert internal entry
         page.insert_internal(0, Constant::Int(10), 2).unwrap();
