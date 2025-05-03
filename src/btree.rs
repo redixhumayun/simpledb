@@ -53,6 +53,93 @@ impl BTreeIndex {
             root_block: BlockId::new(internal_table_name, 0),
         })
     }
+
+    fn search_cost(num_of_blocks: usize, records_per_block: usize) -> usize {
+        (1 + num_of_blocks.ilog(records_per_block))
+            .try_into()
+            .unwrap()
+    }
+}
+
+impl Index for BTreeIndex {
+    fn before_first(&mut self, search_key: &Constant) {
+        self.close();
+        let mut root = BTreeInternal::new(
+            Arc::clone(&self.txn),
+            self.root_block.clone(),
+            self.internal_layout.clone(),
+            self.root_block.filename.clone(),
+        );
+        let leaf_block_num = root.search(search_key).unwrap();
+        let leaf_block_id = BlockId::new(self.leaf_table_name.clone(), leaf_block_num);
+        self.leaf = Some(
+            BTreeLeaf::new(
+                Arc::clone(&self.txn),
+                leaf_block_id.clone(),
+                self.leaf_layout.clone(),
+                search_key.clone(),
+                leaf_block_id.filename,
+            )
+            .unwrap(),
+        );
+    }
+
+    fn next(&mut self) -> bool {
+        match self
+            .leaf
+            .as_mut()
+            .expect("Leaf not initialized")
+            .next()
+            .expect("Next failed")
+        {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    fn get_data_rid(&self) -> RID {
+        self.leaf.as_ref().unwrap().get_data_rid().unwrap()
+    }
+
+    fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
+        debug!(
+            "Inserting value {:?} for rid {:?} into index",
+            data_val, data_rid
+        );
+        self.before_first(data_val);
+        let int_node_id = self.leaf.as_mut().unwrap().insert(*data_rid).unwrap();
+        if int_node_id.is_none() {
+            return;
+        }
+        debug!("Insert in index caused a split");
+        let int_node_id = int_node_id.unwrap();
+        let root = BTreeInternal::new(
+            Arc::clone(&self.txn),
+            self.root_block.clone(),
+            self.internal_layout.clone(),
+            self.root_block.filename.clone(),
+        );
+        let root_split_entry = root.insert_entry(int_node_id).unwrap();
+        if root_split_entry.is_none() {
+            return;
+        }
+        debug!("Insert in index caused a root split");
+        let root_split_entry = root_split_entry.unwrap();
+        root.make_new_root(root_split_entry).unwrap();
+    }
+
+    fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.before_first(data_val);
+        self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
+        //  TODO: Should the leaf be set to None here?
+        self.leaf = None;
+    }
+
+    fn close(&mut self) {
+        if self.leaf.is_some() {
+            self.leaf = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -178,87 +265,6 @@ mod btree_index_tests {
             index.before_first(&Constant::Int(i));
             assert!(index.next());
             assert_eq!(index.get_data_rid(), RID::new(1, i as usize));
-        }
-    }
-}
-
-impl Index for BTreeIndex {
-    fn before_first(&mut self, search_key: &Constant) {
-        self.close();
-        let mut root = BTreeInternal::new(
-            Arc::clone(&self.txn),
-            self.root_block.clone(),
-            self.internal_layout.clone(),
-            self.root_block.filename.clone(),
-        );
-        let leaf_block_num = root.search(search_key).unwrap();
-        let leaf_block_id = BlockId::new(self.leaf_table_name.clone(), leaf_block_num);
-        self.leaf = Some(
-            BTreeLeaf::new(
-                Arc::clone(&self.txn),
-                leaf_block_id.clone(),
-                self.leaf_layout.clone(),
-                search_key.clone(),
-                leaf_block_id.filename,
-            )
-            .unwrap(),
-        );
-    }
-
-    fn next(&mut self) -> bool {
-        match self
-            .leaf
-            .as_mut()
-            .expect("Leaf not initialized")
-            .next()
-            .expect("Next failed")
-        {
-            Some(_) => true,
-            None => false,
-        }
-    }
-
-    fn get_data_rid(&self) -> RID {
-        self.leaf.as_ref().unwrap().get_data_rid().unwrap()
-    }
-
-    fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
-        debug!(
-            "Inserting value {:?} for rid {:?} into index",
-            data_val, data_rid
-        );
-        self.before_first(data_val);
-        let int_node_id = self.leaf.as_mut().unwrap().insert(*data_rid).unwrap();
-        if int_node_id.is_none() {
-            return;
-        }
-        debug!("Insert in index caused a split");
-        let int_node_id = int_node_id.unwrap();
-        let root = BTreeInternal::new(
-            Arc::clone(&self.txn),
-            self.root_block.clone(),
-            self.internal_layout.clone(),
-            self.root_block.filename.clone(),
-        );
-        let root_split_entry = root.insert_entry(int_node_id).unwrap();
-        if root_split_entry.is_none() {
-            return;
-        }
-        debug!("Insert in index caused a root split");
-        let root_split_entry = root_split_entry.unwrap();
-        root.make_new_root(root_split_entry).unwrap();
-    }
-
-    fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
-        self.before_first(data_val);
-        self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
-        //  TODO: Should the leaf be set to None here?
-        self.leaf = None;
-    }
-
-    fn close(&mut self) {
-        if self.leaf.is_some() {
-            self.leaf = None;
         }
     }
 }
