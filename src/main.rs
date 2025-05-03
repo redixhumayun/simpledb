@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 
 use std::{
+    any::Any,
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
@@ -15,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod test_utils;
+use btree::BTreeIndex;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
     QueryData,
@@ -314,6 +316,107 @@ mod planner_tests {
             read_count += 1;
         }
         assert_eq!(read_count, 100);
+    }
+}
+
+struct IndexUpdatePlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl IndexUpdatePlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
+}
+
+impl UpdatePlanner for IndexUpdatePlanner {
+    fn execute_insert(
+        &self,
+        data: InsertData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let indexes = self
+            .metadata_manager
+            .get_index_info(&data.table_name, Arc::clone(&txn));
+        let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let mut scan = plan.open();
+        scan.insert()?;
+
+        for (field, value) in data.fields.iter().zip(data.values) {
+            scan.set_value(field, value.clone())?;
+            if let Some(ii) = indexes.get(field) {
+                let mut index = ii.open();
+                index.insert(&value, &scan.get_rid()?);
+            }
+        }
+        Ok(1)
+    }
+
+    fn execute_delete(
+        &self,
+        data: DeleteData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let indexes = self
+            .metadata_manager
+            .get_index_info(&data.table_name, Arc::clone(&txn));
+        let plan = Box::new(TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        ));
+        let plan = SelectPlan::new(plan, data.predicate);
+        let mut scan = plan.open();
+        let mut rows_deleted = 0;
+
+        while let Some(_) = scan.next() {
+            let rid = scan.get_rid()?;
+            for field in indexes.keys() {
+                let mut index = indexes.get(field).unwrap().open();
+                index.delete(&scan.get_value(field)?, &rid);
+            }
+            scan.delete()?;
+            rows_deleted += 1;
+        }
+
+        Ok(rows_deleted)
+    }
+
+    fn execute_modify(
+        &self,
+        data: ModifyData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let plan = Box::new(TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        ));
+        todo!()
+    }
+
+    fn execute_create_table(
+        &self,
+        data: CreateTableData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        todo!()
+    }
+
+    fn execute_create_view(
+        &self,
+        data: CreateViewData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        todo!()
+    }
+
+    fn execute_create_index(
+        &self,
+        data: CreateIndexData,
+        txn: Arc<Transaction>,
+    ) -> Result<usize, Box<dyn Error>> {
+        todo!()
     }
 }
 
@@ -632,6 +735,63 @@ impl Plan for ProjectPlan {
     }
 }
 
+struct IndexSelectPlan {
+    plan: Box<dyn Plan>,
+    ii: IndexInfo,
+    value: Constant,
+}
+
+impl IndexSelectPlan {
+    fn new(plan: Box<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
+        Self { plan, ii, value }
+    }
+}
+
+impl Plan for IndexSelectPlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let scan = self
+            .plan
+            .open()
+            .as_any()
+            .downcast_ref::<TableScan>()
+            .cloned()
+            .expect("IndexSelectPlan must be used with a TableScan");
+        Box::new(IndexSelectScan::new(
+            scan,
+            self.ii.open(),
+            self.value.clone(),
+        ))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.ii.blocks_accessed() + self.records_output()
+    }
+
+    fn records_output(&self) -> usize {
+        self.ii.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        self.ii.distinct_values(field_name)
+    }
+
+    fn schema(&self) -> Schema {
+        self.plan.schema()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ IndexSelectPlan", prefix);
+        println!("{}├─ Index: {}", prefix, self.ii.index_name);
+        println!("{}├─ Search Value: {:?}", prefix, self.value);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Child Plan:", prefix);
+        self.plan.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
+}
+
 struct SelectPlan {
     plan: Box<dyn Plan>,
     predicate: Predicate,
@@ -756,14 +916,6 @@ trait Plan {
         self.print_plan_internal(indent);
     }
     fn print_plan_internal(&self, indent: usize);
-    // fn print_plan_internal(&self, indent: usize) {
-    //     let prefix = "  ".repeat(indent);
-    //     println!("{}╭─ Plan Type: {}", prefix, std::any::type_name::<Self>());
-    //     println!("{}├─ Blocks Accessed: {}", prefix, self.blocks_accessed());
-    //     println!("{}├─ Records Output: {}", prefix, self.records_output());
-    //     println!("{}├─ Schema Fields: {:?}", prefix, self.schema().fields);
-    //     println!("{}╰─", prefix);
-    // }
 }
 
 #[cfg(test)]
@@ -1025,8 +1177,8 @@ where
 
 impl<S1, S2> UpdateScan for ProductScan<S1, S2>
 where
-    S1: UpdateScan,
-    S2: UpdateScan,
+    S1: UpdateScan + 'static,
+    S2: UpdateScan + 'static,
 {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
         if self.s1.has_field(field_name)? {
@@ -1210,7 +1362,7 @@ where
 
 impl<S> UpdateScan for ProjectScan<S>
 where
-    S: UpdateScan,
+    S: UpdateScan + 'static,
 {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
         self.scan.set_int(field_name, value)
@@ -1322,6 +1474,215 @@ mod project_scan_tests {
     }
 }
 
+struct IndexJoinScan<S, I>
+where
+    S: Scan,
+    I: Index,
+{
+    lhs: S,
+    rhs: TableScan,
+    index: I,
+    join_field: String,
+}
+
+impl<S, I> IndexJoinScan<S, I>
+where
+    S: Scan,
+    I: Index,
+{
+    fn new(lhs: S, index: I, rhs: TableScan, join_field: String) -> Self {
+        Self {
+            lhs,
+            rhs,
+            index,
+            join_field,
+        }
+    }
+
+    fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
+        Ok(self
+            .index
+            .before_first(&self.lhs.get_value(&self.join_field)?))
+    }
+}
+
+impl<S, I> Iterator for IndexJoinScan<S, I>
+where
+    S: Scan,
+    I: Index,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on IndexJoinScan");
+        loop {
+            if self.index.next() {
+                self.rhs.move_to_row_id(self.index.get_data_rid());
+                return Some(Ok(()));
+            }
+            if let None = self.lhs.next() {
+                return None;
+            }
+            self.reset_index().unwrap();
+        }
+    }
+}
+
+impl<S, I> Scan for IndexJoinScan<S, I>
+where
+    S: Scan,
+    I: Index,
+{
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.lhs.before_first()?;
+        self.lhs.next();
+        self.reset_index()
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_int(field_name);
+        }
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.get_int(field_name);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_string(field_name);
+        }
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.get_string(field_name);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_value(field_name);
+        }
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.get_value(field_name);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        if self.rhs.has_field(field_name)? {
+            return Ok(true);
+        }
+        if self.lhs.has_field(field_name)? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn close(&self) {
+        //  no-op because no resources to clean up
+    }
+}
+
+struct IndexSelectScan<I>
+where
+    I: Index,
+{
+    scan: TableScan,
+    index: I,
+    value: Constant,
+}
+
+impl<I> IndexSelectScan<I>
+where
+    I: Index,
+{
+    fn new(scan: TableScan, index: I, value: Constant) -> Self {
+        Self { scan, index, value }
+    }
+}
+
+impl<I> Iterator for IndexSelectScan<I>
+where
+    I: Index,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.index.next();
+        if result {
+            let rid = self.index.get_data_rid();
+            self.scan.move_to_row_id(rid);
+            return Some(Ok(()));
+        }
+        None
+    }
+}
+
+impl<I> Scan for IndexSelectScan<I>
+where
+    I: Index,
+{
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.index.before_first(&self.value);
+        Ok(())
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        self.scan.get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        self.scan.get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        self.scan.get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        self.scan.has_field(field_name)
+    }
+
+    fn close(&self) {
+        //  no-op because no resources to clean up
+        //  the index will be cleaned up automatically once its dropped
+    }
+}
+
+impl<I> UpdateScan for IndexSelectScan<I>
+where
+    I: Index + 'static,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        todo!()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+}
+
 struct SelectScan<S>
 where
     S: Scan,
@@ -1392,7 +1753,7 @@ where
 
 impl<S> UpdateScan for SelectScan<S>
 where
-    S: UpdateScan,
+    S: UpdateScan + 'static,
 {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
         self.scan.set_int(field_name, value)
@@ -1420,15 +1781,6 @@ where
 
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
         self.scan.move_to_rid(rid)
-    }
-}
-
-impl<S> Drop for SelectScan<S>
-where
-    S: Scan,
-{
-    fn drop(&mut self) {
-        //  no-op because no resources to cleanup
     }
 }
 
@@ -2282,6 +2634,20 @@ impl IndexInfo {
         }
     }
 
+    fn open(&self) -> impl Index {
+        // HashIndex::new(
+        //     Arc::clone(&self.txn),
+        //     &self.index_name,
+        //     self.index_layout.clone(),
+        // )
+        BTreeIndex::new(
+            Arc::clone(&self.txn),
+            &self.index_name,
+            self.index_layout.clone(),
+        )
+        .unwrap()
+    }
+
     /// This function returns the number of blocks that would need to be searched for this index on a specific field
     fn blocks_accessed(&self) -> usize {
         let records_per_block = self.txn.block_size() / self.index_layout.slot_size;
@@ -2779,6 +3145,7 @@ mod table_manager_tests {
     }
 }
 
+#[derive(Clone)]
 struct TableScan {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -3058,7 +3425,22 @@ impl UpdateScan for TableScan {
     }
 }
 
-trait UpdateScan: Scan {
+trait AsAny {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+trait UpdateScan: Scan + AsAny {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
@@ -3224,6 +3606,7 @@ enum SlotPresence {
     USED,
 }
 
+#[derive(Clone)]
 struct RecordPage {
     tx: Arc<Transaction>,
     block_id: BlockId,

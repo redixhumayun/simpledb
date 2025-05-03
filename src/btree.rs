@@ -2,7 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use crate::{debug, BlockId, Constant, FieldType, Index, Layout, Schema, Transaction, RID};
 
-struct BTreeIndex {
+pub struct BTreeIndex {
     txn: Arc<Transaction>,
     index_name: String,
     internal_layout: Layout,
@@ -13,9 +13,9 @@ struct BTreeIndex {
 }
 
 impl BTreeIndex {
-    fn new(
+    pub fn new(
         txn: Arc<Transaction>,
-        index_name: String,
+        index_name: &str,
         leaf_layout: Layout,
     ) -> Result<Self, Box<dyn Error>> {
         //  Create the leaf file with the schema provided
@@ -45,7 +45,7 @@ impl BTreeIndex {
         }
         Ok(Self {
             txn,
-            index_name,
+            index_name: index_name.to_string(),
             internal_layout,
             leaf_layout,
             leaf_table_name,
@@ -159,7 +159,7 @@ mod btree_index_tests {
         let tx = Arc::new(db.new_tx());
         let layout = create_test_layout();
         let index_name = generate_filename();
-        BTreeIndex::new(Arc::clone(&tx), index_name, layout).unwrap()
+        BTreeIndex::new(Arc::clone(&tx), &index_name, layout).unwrap()
     }
 
     #[test]
