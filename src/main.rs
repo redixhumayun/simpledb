@@ -387,12 +387,30 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: ModifyData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
+        let indexes = self
+            .metadata_manager
+            .get_index_info(&data.table_name, Arc::clone(&txn));
         let plan = Box::new(TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
         ));
-        todo!()
+        let plan = SelectPlan::new(plan, data.predicate);
+        let mut scan = plan.open();
+        let mut update_count = 0;
+
+        while let Some(_) = scan.next() {
+            let old_value = scan.get_value(&data.field_name)?;
+            let new_value = data.new_value.evaluate(&scan)?;
+            scan.set_value(&data.field_name, new_value.clone())?;
+            if let Some(ii) = indexes.get(&data.field_name) {
+                let mut index = ii.open();
+                index.delete(&old_value, &scan.get_rid()?);
+                index.insert(&new_value, &scan.get_rid()?);
+            }
+            update_count += 1;
+        }
+        Ok(update_count)
     }
 
     fn execute_create_table(
@@ -400,7 +418,9 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: CreateTableData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        todo!()
+        self.metadata_manager
+            .create_table(&data.table_name, data.schema, Arc::clone(&txn));
+        Ok(0)
     }
 
     fn execute_create_view(
@@ -408,7 +428,12 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: CreateViewData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        todo!()
+        self.metadata_manager.create_view(
+            &data.view_name,
+            &data.query_data.to_sql(),
+            Arc::clone(&txn),
+        );
+        Ok(0)
     }
 
     fn execute_create_index(
@@ -416,7 +441,13 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: CreateIndexData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        todo!()
+        self.metadata_manager.create_index(
+            &data.index_name,
+            &data.table_name,
+            &data.field_name,
+            Arc::clone(&txn),
+        );
+        Ok(0)
     }
 }
 
