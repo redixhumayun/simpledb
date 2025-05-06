@@ -1035,7 +1035,7 @@ impl Scan for Box<dyn Scan> {
         (**self).has_field(field_name)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         (**self).close()
     }
 }
@@ -1061,7 +1061,7 @@ impl Scan for Box<dyn UpdateScan> {
         (**self).has_field(field_name)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         (**self).close()
     }
 }
@@ -1201,7 +1201,7 @@ where
         Ok(false)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         //  no-op because no resources to clean up
     }
 }
@@ -1382,7 +1382,7 @@ where
         self.scan.has_field(field_name)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         //  no-op because no resources to clean up
     }
 
@@ -1610,7 +1610,7 @@ where
         Ok(false)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         //  no-op because no resources to clean up
     }
 }
@@ -1675,7 +1675,7 @@ where
         self.scan.has_field(field_name)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         //  no-op because no resources to clean up
         //  the index will be cleaned up automatically once its dropped
     }
@@ -1773,7 +1773,7 @@ where
         self.scan.has_field(field_name)
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         //  no-op because no resources to clean up
     }
 
@@ -2788,7 +2788,7 @@ impl Index for HashIndex {
     }
 
     fn close(&mut self) {
-        self.table_scan.as_ref().and_then(|ts| Some(ts.close()));
+        self.table_scan.as_mut().and_then(|ts| Some(ts.close()));
     }
 }
 
@@ -3354,9 +3354,10 @@ impl Scan for TableScan {
         Ok(self.layout.schema.fields.contains(&field_name.to_string()))
     }
 
-    fn close(&self) {
+    fn close(&mut self) {
         if let Some(record_page) = &self.record_page {
             self.txn.unpin(&record_page.block_id);
+            self.record_page = None;
         }
     }
 
@@ -3487,7 +3488,7 @@ trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
-    fn close(&self);
+    fn close(&mut self);
 }
 
 #[cfg(test)]
