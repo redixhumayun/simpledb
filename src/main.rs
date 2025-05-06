@@ -1686,31 +1686,111 @@ where
     I: Index + 'static,
 {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        todo!()
+        unreachable!()
     }
 
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod index_select_scan_tests {
+    use super::UpdateScan;
+    use std::sync::Arc;
+
+    use crate::{
+        test_utils::generate_random_number, Constant, Index, IndexInfo, IndexSelectScan, Layout,
+        Scan, Schema, SimpleDB, StatInfo, TableScan,
+    };
+
+    #[test]
+    fn index_select_scan_test() {
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(simple_db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("A");
+        schema.add_string_field("B", 10);
+        let layout = Layout::new(schema.clone());
+
+        let mut inserted_count = 0;
+        let mut inserted_count_10 = 0;
+        let index_info = IndexInfo::new(
+            "test_index",
+            "A",
+            Arc::clone(&txn),
+            schema,
+            StatInfo::new(0, 0),
+        );
+        //  insertion block
+        {
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            for i in 0..50 {
+                if i % 10 == 0 {
+                    dbg!("Inserting number {}", 10);
+                    scan.insert().unwrap();
+                    scan.set_int("A", 10).unwrap();
+                    scan.set_string("B", format!("string{}", 10)).unwrap();
+                    dbg!("Inserting the index entry when value is 10");
+                    let mut index = index_info.open();
+                    index.insert(&Constant::Int(10), &scan.get_rid().unwrap());
+                    inserted_count += 1;
+                    inserted_count_10 += 1;
+                    continue;
+                }
+
+                let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
+                dbg!("Inserting number {} into table", number);
+                scan.insert().unwrap();
+                scan.set_int("A", number.try_into().unwrap()).unwrap();
+                scan.set_string("B", format!("string{}", number)).unwrap();
+                dbg!("Inserting the index entry");
+                let mut index = index_info.open();
+                index.insert(
+                    &Constant::Int(number.try_into().unwrap()),
+                    &scan.get_rid().unwrap(),
+                );
+                inserted_count += 1;
+            }
+            dbg!("Inserted count {}", inserted_count);
+        }
+
+        //  read block via index
+        {
+            let mut selection_count = 0;
+            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let value = Constant::Int(10);
+            let index = index_info.open();
+            let mut index_select_scan = IndexSelectScan::new(scan, index, value);
+            index_select_scan.before_first().unwrap();
+            while let Some(Ok(())) = index_select_scan.next() {
+                assert_eq!(index_select_scan.get_int("A").unwrap(), 10);
+                selection_count += 1;
+            }
+            assert_eq!(selection_count, 5);
+        }
+        txn.commit().unwrap();
     }
 }
 
@@ -2630,7 +2710,7 @@ struct IndexInfo {
 }
 
 impl IndexInfo {
-    const BLOCK_NUM_FIELD: &str = "block_num"; //   the block number
+    const BLOCK_NUM_FIELD: &str = "block"; //   the block number
     const ID_FIELD: &str = "id"; //  the record id (slot number)
     const DATA_FIELD: &str = "dataval"; //  the data field
     fn new(
@@ -2640,18 +2720,17 @@ impl IndexInfo {
         table_schema: Schema,
         stat_info: StatInfo,
     ) -> Self {
+        //  Construct the schema for the index
         let mut schema = Schema::new();
         schema.add_int_field(Self::BLOCK_NUM_FIELD);
         schema.add_int_field(Self::ID_FIELD);
         match table_schema.info.get(field_name).unwrap().field_type {
             FieldType::INT => {
-                schema.add_int_field(field_name);
+                schema.add_int_field(Self::DATA_FIELD);
             }
             FieldType::STRING => {
-                schema.add_string_field(
-                    field_name,
-                    table_schema.info.get(field_name).unwrap().length,
-                );
+                let field_length = table_schema.info.get(field_name).unwrap().length;
+                schema.add_string_field(Self::DATA_FIELD, field_length);
             }
         };
         let index_layout = Layout::new(schema);
@@ -6138,12 +6217,6 @@ impl Page {
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
     }
 
-    /// Get the raw bytes from the page at the given offset for the given length
-    fn get_raw_bytes(&self, offset: usize, length: usize) -> Vec<u8> {
-        let bytes = &self.contents[offset..offset + length];
-        bytes.to_vec()
-    }
-
     /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
     fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
         let length_bytes = &self.contents[offset..offset + Self::INT_BYTES];
@@ -6343,4 +6416,6 @@ mod file_manager_tests {
     }
 }
 
-fn main() {}
+fn main() {
+    let db = SimpleDB::new("random", 800, 4, true);
+}

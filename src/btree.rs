@@ -1,6 +1,8 @@
 use std::{error::Error, sync::Arc};
 
-use crate::{debug, BlockId, Constant, FieldType, Index, Layout, Schema, Transaction, RID};
+use crate::{
+    debug, BlockId, Constant, FieldType, Index, IndexInfo, Layout, Schema, Transaction, RID,
+};
 
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
@@ -18,7 +20,7 @@ impl BTreeIndex {
         index_name: &str,
         leaf_layout: Layout,
     ) -> Result<Self, Box<dyn Error>> {
-        //  Create the leaf file with the schema provided
+        //  Create the leaf file with the schema provided if it does not exist
         let leaf_table_name = format!("{}leaf", index_name);
         if txn.size(&leaf_table_name) == 0 {
             let block_id = txn.append(&leaf_table_name);
@@ -26,17 +28,22 @@ impl BTreeIndex {
             btree_page.format(PageType::Leaf(None))?;
         }
 
-        //  Create the internal file with the schema required
+        //  Create the internal file with the schema required if it does not exist
         let internal_table_name = format!("{}internal", index_name);
         let mut internal_schema = Schema::new();
-        internal_schema.add_from_schema("block", &leaf_layout.schema)?;
-        internal_schema.add_from_schema("dataval", &leaf_layout.schema)?;
+        internal_schema.add_from_schema(IndexInfo::BLOCK_NUM_FIELD, &leaf_layout.schema)?;
+        internal_schema.add_from_schema(IndexInfo::DATA_FIELD, &leaf_layout.schema)?;
         let internal_layout = Layout::new(internal_schema.clone());
         if txn.size(&internal_table_name) == 0 {
             let block_id = txn.append(&internal_table_name);
             let internal_page = BTreePage::new(Arc::clone(&txn), block_id, internal_layout.clone());
             internal_page.format(PageType::Internal(None))?;
-            let field_type = internal_schema.info.get("dataval").unwrap().field_type;
+            //  insert initial entry
+            let field_type = internal_schema
+                .info
+                .get(IndexInfo::DATA_FIELD)
+                .unwrap()
+                .field_type;
             let min_val = match field_type {
                 FieldType::INT => Constant::Int(i32::MIN),
                 FieldType::STRING => Constant::String("".to_string()),
@@ -88,7 +95,7 @@ impl Index for BTreeIndex {
         match self
             .leaf
             .as_mut()
-            .expect("Leaf not initialized")
+            .expect("Leaf not initialized, did you forget to call before_first?")
             .next()
             .expect("Next failed")
         {
@@ -418,9 +425,9 @@ mod btree_internal_tests {
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
-        schema.add_int_field(BTreePage::DATA_VAL_COLUMN);
-        schema.add_int_field(BTreePage::BLOCK_NUM_COLUMN);
-        schema.add_int_field(BTreePage::SLOT_NUM_COLUMN);
+        schema.add_int_field(IndexInfo::DATA_FIELD);
+        schema.add_int_field(IndexInfo::BLOCK_NUM_FIELD);
+        schema.add_int_field(IndexInfo::ID_FIELD);
         Layout::new(schema)
     }
 
@@ -819,9 +826,9 @@ mod btree_leaf_tests {
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
-        schema.add_int_field(BTreePage::DATA_VAL_COLUMN);
-        schema.add_int_field(BTreePage::BLOCK_NUM_COLUMN);
-        schema.add_int_field(BTreePage::SLOT_NUM_COLUMN);
+        schema.add_int_field(IndexInfo::DATA_FIELD);
+        schema.add_int_field(IndexInfo::BLOCK_NUM_FIELD);
+        schema.add_int_field(IndexInfo::ID_FIELD);
         Layout::new(schema)
     }
 
@@ -1025,9 +1032,9 @@ impl BTreePage {
     const INT_BYTES: usize = 4;
 
     // Column name constants
-    const DATA_VAL_COLUMN: &'static str = "dataval";
-    const BLOCK_NUM_COLUMN: &'static str = "block";
-    const SLOT_NUM_COLUMN: &'static str = "id";
+    // const DATA_VAL_COLUMN: &'static str = "dataval";
+    // const BLOCK_NUM_COLUMN: &'static str = "block";
+    // const SLOT_NUM_COLUMN: &'static str = "id";
 
     /// Creates a new [BTreePage] by pinning the specified block and initializing it with the given layout
     fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
@@ -1135,20 +1142,20 @@ impl BTreePage {
 
     /// Gets the data value at the specified slot
     fn get_data_value(&self, slot: usize) -> Result<Constant, Box<dyn Error>> {
-        let value = self.get_value(slot, Self::DATA_VAL_COLUMN)?;
+        let value = self.get_value(slot, IndexInfo::DATA_FIELD)?;
         Ok(value)
     }
 
     /// Gets the child block number at the specified slot (for internal nodes)
     fn get_child_block_num(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
+        let block_num = self.get_int(slot, IndexInfo::BLOCK_NUM_FIELD)? as usize;
         Ok(block_num)
     }
 
     /// Gets the RID stored at the specified slot (for leaf nodes)
     fn get_rid(&self, slot: usize) -> Result<RID, Box<dyn Error>> {
-        let block_num = self.get_int(slot, Self::BLOCK_NUM_COLUMN)? as usize;
-        let slot_num = self.get_int(slot, Self::SLOT_NUM_COLUMN)? as usize;
+        let block_num = self.get_int(slot, IndexInfo::BLOCK_NUM_FIELD)? as usize;
+        let slot_num = self.get_int(slot, IndexInfo::ID_FIELD)? as usize;
         Ok(RID::new(block_num, slot_num))
     }
 
@@ -1161,8 +1168,8 @@ impl BTreePage {
         block_num: usize,
     ) -> Result<(), Box<dyn Error>> {
         self.insert(slot)?;
-        self.set_value(slot, Self::DATA_VAL_COLUMN, value)?;
-        self.set_int(slot, Self::BLOCK_NUM_COLUMN, block_num as i32)?;
+        self.set_value(slot, IndexInfo::DATA_FIELD, value)?;
+        self.set_int(slot, IndexInfo::BLOCK_NUM_FIELD, block_num as i32)?;
         Ok(())
     }
 
@@ -1170,9 +1177,9 @@ impl BTreePage {
     /// Leaf entries contain a data value and RID pointing to the actual record
     fn insert_leaf(&self, slot: usize, value: Constant, rid: RID) -> Result<(), Box<dyn Error>> {
         self.insert(slot)?;
-        self.set_value(slot, Self::DATA_VAL_COLUMN, value)?;
-        self.set_int(slot, Self::BLOCK_NUM_COLUMN, rid.block_num as i32)?;
-        self.set_int(slot, Self::SLOT_NUM_COLUMN, rid.slot as i32)?;
+        self.set_value(slot, IndexInfo::DATA_FIELD, value)?;
+        self.set_int(slot, IndexInfo::BLOCK_NUM_FIELD, rid.block_num as i32)?;
+        self.set_int(slot, IndexInfo::ID_FIELD, rid.slot as i32)?;
         Ok(())
     }
 
@@ -1382,9 +1389,9 @@ mod btree_page_tests {
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
-        schema.add_int_field(BTreePage::DATA_VAL_COLUMN);
-        schema.add_int_field(BTreePage::BLOCK_NUM_COLUMN);
-        schema.add_int_field(BTreePage::SLOT_NUM_COLUMN);
+        schema.add_int_field(IndexInfo::DATA_FIELD);
+        schema.add_int_field(IndexInfo::BLOCK_NUM_FIELD);
+        schema.add_int_field(IndexInfo::ID_FIELD);
         Layout::new(schema)
     }
 
