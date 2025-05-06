@@ -1615,6 +1615,101 @@ where
     }
 }
 
+#[cfg(test)]
+mod index_join_scan_tests {
+    use super::UpdateScan;
+    use std::sync::Arc;
+
+    use crate::{
+        Constant, Index, IndexInfo, IndexJoinScan, Layout, Scan, Schema, SimpleDB, StatInfo,
+        TableScan,
+    };
+
+    #[test]
+    fn index_join_scan_test() {
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(simple_db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("A");
+        schema1.add_string_field("B", 10);
+        let layout1 = Layout::new(schema1.clone());
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("C");
+        schema2.add_string_field("D", 10);
+        let layout2 = Layout::new(schema2.clone());
+
+        // Create index info for join field
+        let index_info = IndexInfo::new(
+            "test_index",
+            "C",
+            Arc::clone(&txn),
+            schema2,
+            StatInfo::new(0, 0),
+        );
+
+        // Insert data into both tables
+        let mut inserted_count = 0;
+        {
+            // First table
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            // Second table with index
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+
+            for i in 0..50 {
+                // Insert into first table
+                scan1.insert().unwrap();
+                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_string("B", format!("string{}", i)).unwrap();
+
+                // Insert into second table with matching values
+                scan2.insert().unwrap();
+                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_string("D", format!("string{}", i)).unwrap();
+
+                // Create index entry
+                let mut index = index_info.open();
+                index.insert(&Constant::Int(i as i32), &scan2.get_rid().unwrap());
+
+                inserted_count += 1;
+            }
+            dbg!("Inserted {} records in each table", inserted_count);
+        }
+
+        // Test the index join
+        {
+            let mut join_count = 0;
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let index = index_info.open();
+
+            let mut index_join_scan = IndexJoinScan::new(scan1, index, scan2, "A".to_string());
+            index_join_scan.before_first().unwrap();
+
+            while let Some(Ok(())) = index_join_scan.next() {
+                // Verify join condition A = C
+                let a_val = index_join_scan.get_int("A").unwrap();
+                let c_val = index_join_scan.get_int("C").unwrap();
+                assert_eq!(a_val, c_val);
+
+                // Verify corresponding strings match
+                let b_val = index_join_scan.get_string("B").unwrap();
+                let d_val = index_join_scan.get_string("D").unwrap();
+                assert_eq!(b_val, d_val);
+
+                join_count += 1;
+            }
+
+            // Should find all matches
+            assert_eq!(join_count, inserted_count);
+        }
+
+        txn.commit().unwrap();
+    }
+}
+
 struct IndexSelectScan<I>
 where
     I: Index,
