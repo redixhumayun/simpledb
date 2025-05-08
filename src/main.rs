@@ -63,10 +63,11 @@ impl SimpleDB {
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
         let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
-        let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
+        // let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
+        let index_update_planner = IndexUpdatePlanner::new(Arc::clone(&metadata_manager));
         let planner = Arc::new(Planner::new(
             Box::new(query_planner),
-            Box::new(update_planner),
+            Box::new(index_update_planner),
         ));
         txn.commit().unwrap();
         Self {
@@ -159,10 +160,10 @@ impl Planner {
 mod planner_tests {
     use std::sync::Arc;
 
-    use crate::SimpleDB;
+    use crate::{Constant, Index, Plan, SimpleDB, TablePlan};
 
     #[test]
-    fn planner_test_single_table() {
+    fn test_planner_single_table() {
         //  Create the table T1
         let (db, test_dir) = SimpleDB::new_for_test(400, 8);
         let txn = Arc::new(db.new_tx());
@@ -191,7 +192,7 @@ mod planner_tests {
     }
 
     #[test]
-    fn planner_test_multi_table() {
+    fn test_planner_multi_table() {
         let (db, test_dir) = SimpleDB::new_for_test(400, 8);
         let txn = Arc::new(db.new_tx());
 
@@ -236,7 +237,7 @@ mod planner_tests {
     }
 
     #[test]
-    fn planner_test_single_table_delete() {
+    fn test_planner_single_table_delete() {
         let (db, test_dir) = SimpleDB::new_for_test(400, 8);
         let txn = Arc::new(db.new_tx());
 
@@ -284,7 +285,7 @@ mod planner_tests {
     }
 
     #[test]
-    fn planner_test_single_table_modify() {
+    fn test_planner_single_table_modify() {
         let (db, test_dir) = SimpleDB::new_for_test(400, 8);
         let txn = Arc::new(db.new_tx());
 
@@ -316,6 +317,183 @@ mod planner_tests {
             read_count += 1;
         }
         assert_eq!(read_count, 100);
+    }
+
+    #[test]
+    fn test_planner_index_retrieval() {
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        //  Create the student table
+        let sql = "create table student(sid int, sname varchar(10), majorid int, gradyear int)"
+            .to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Create an index on majorid
+        let sql = "create index idx_major on student (majorid)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert some test records
+        let students = vec![
+            (1, "joe", 10, 2021),
+            (2, "amy", 20, 2020),
+            (3, "max", 20, 2022),
+            (4, "bob", 20, 2020),
+            (5, "sue", 30, 2021),
+        ];
+
+        for (sid, sname, majorid, gradyear) in students {
+            let sql = format!(
+                "insert into student(sid, sname, majorid, gradyear) values ({}, '{}', {}, {})",
+                sid, sname, majorid, gradyear
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Get the index info
+        let indexes = db
+            .metadata_manager
+            .get_index_info("student", Arc::clone(&txn));
+        let major_index = indexes.get("majorid").expect("Index not found");
+
+        // Open table scan for student table
+        let table_plan = TablePlan::new(
+            "student",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        );
+        let mut table_scan = table_plan.open();
+
+        // Open the index
+        let mut index = major_index.open();
+
+        // Find all students with majorid = 20
+        let target_major = Constant::Int(20);
+        index.before_first(&target_major);
+
+        let mut found_students = Vec::new();
+        while index.next() {
+            let rid = index.get_data_rid();
+            table_scan.move_to_rid(rid).unwrap();
+            found_students.push(table_scan.get_string("sname").unwrap());
+        }
+
+        assert_eq!(found_students.len(), 3);
+
+        // Sort for consistent comparison
+        found_students.sort();
+
+        // We should find amy, bob, and max
+        let mut expected = vec!["amy", "bob", "max"];
+        expected.sort();
+
+        assert_eq!(found_students, expected);
+
+        //  TODO: I'm leaving this commented out in here as a reminder to implement the RAII guard feature
+        //  If I uncomment this, this test fails because of double release of pinned buffers
+        // txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_planner_index_updates() {
+        // Setup database with test data
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the student table
+        let sql = "create table student_alt(sid int, sname varchar(10), majorid int, gradyear int)"
+            .to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Create indexes on all fields
+        let sql = "create index idx_sid_alt on student_alt(sid)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        let sql = "create index idx_major_alt on student_alt(majorid)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        let sql = "create index idx_year_alt on student_alt(gradyear)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert initial test data
+        let students = vec![
+            (1, "joe", 10, 2021),
+            (2, "amy", 20, 2020),
+            (3, "max", 20, 2022),
+        ];
+
+        for (sid, sname, majorid, gradyear) in students {
+            let sql = format!(
+                "insert into student_alt(sid, sname, majorid, gradyear) values ({}, '{}', {}, {})",
+                sid, sname, majorid, gradyear
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Task 1: Insert Sam using index-update planner
+        let sql =
+            "insert into student_alt(sid, sname, majorid, gradyear) values (11, 'sam', 30, 2023)"
+                .to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Task 2: Delete Joe's record using index-update planner
+        let sql = "delete from student_alt where sname = 'joe'".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Verify the updates through a query
+        let sql = "select sname, sid from student_alt".to_string();
+        let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+        let mut scan = plan.open();
+
+        let mut results = Vec::new();
+        while let Some(_) = scan.next() {
+            let name = scan.get_string("sname").unwrap();
+            let id = scan.get_int("sid").unwrap();
+            results.push((name, id));
+        }
+
+        // Sort results for consistent comparison
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut expected = vec![
+            ("amy".to_string(), 2),
+            ("max".to_string(), 3),
+            ("sam".to_string(), 11),
+        ];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(results, expected);
+
+        // Verify that indexes are correct by checking majorid index
+        let indexes = db
+            .metadata_manager
+            .get_index_info("student_alt", Arc::clone(&txn));
+        let major_index = indexes.get("majorid").expect("Index not found");
+        let mut index = major_index.open();
+
+        // Check for major=30 (Sam's major)
+        let target_major = Constant::Int(30);
+        index.before_first(&target_major);
+
+        let mut found = false;
+        while index.next() {
+            let rid = index.get_data_rid();
+            let mut table_scan = TablePlan::new(
+                "student_alt",
+                Arc::clone(&txn),
+                Arc::clone(&db.metadata_manager),
+            )
+            .open();
+            table_scan.move_to_rid(rid).unwrap();
+            if table_scan.get_string("sname").unwrap() == "sam" {
+                found = true;
+                break;
+            }
+        }
+
+        assert!(found, "Sam's record not found in majorid index");
+
+        // txn.commit().unwrap();
     }
 }
 
@@ -442,8 +620,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
         self.metadata_manager.create_index(
-            &data.index_name,
             &data.table_name,
+            &data.index_name,
             &data.field_name,
             Arc::clone(&txn),
         );
@@ -2571,7 +2749,7 @@ impl MetadataManager {
         field_name: &str,
         txn: Arc<Transaction>,
     ) {
-        println!(
+        debug!(
             "Creating index {} on table {} for field {}",
             index_name, table_name, field_name
         );
@@ -2584,7 +2762,7 @@ impl MetadataManager {
         table_name: &str,
         txn: Arc<Transaction>,
     ) -> HashMap<String, IndexInfo> {
-        println!("Fetching indices for table {}", table_name);
+        debug!("Fetching indices for table {}", table_name);
         self.index_manager.get_index_info(table_name, txn)
     }
 
@@ -2795,6 +2973,7 @@ impl IndexManager {
     }
 }
 
+#[derive(Debug)]
 struct IndexInfo {
     index_name: String,
     field_name: String,
@@ -4222,6 +4401,7 @@ impl TxIdGenerator {
 
 static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
+#[derive(Debug)]
 struct Transaction {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -4758,6 +4938,7 @@ mod transaction_tests {
     }
 }
 
+#[derive(Debug)]
 struct LockState {
     readers: HashSet<TransactionID>, //  keep track of which transaction id's have a reader lock here
     writer: Option<TransactionID>,   //  keep track of the transaction writing to a specific block
@@ -4765,6 +4946,7 @@ struct LockState {
 }
 
 /// Global struct used by all transactions to keep track of locks
+#[derive(Debug)]
 struct LockTable {
     lock_table: Mutex<HashMap<BlockId, LockState>>,
     cond_var: Condvar,
@@ -5045,11 +5227,13 @@ mod lock_table_tests {
 /// The static instance of the lock table
 static LOCK_TABLE_GENERATOR: OnceLock<Arc<LockTable>> = OnceLock::new();
 
+#[derive(Debug)]
 enum LockType {
     Shared,
     Exclusive,
 }
 
+#[derive(Debug)]
 struct ConcurrencyManager {
     lock_table: Arc<LockTable>,
     locks: RefCell<HashMap<BlockId, LockType>>,
@@ -5118,6 +5302,7 @@ impl ConcurrencyManager {
 
 /// The container for the recovery manager - a [`Transaction`] uses a unique instance of this to
 /// manage writing records to WAL and handling recovery & rollback
+#[derive(Debug)]
 struct RecoveryManager {
     tx_num: usize,
     log_manager: Arc<Mutex<LogManager>>,
@@ -5673,6 +5858,7 @@ impl LogRecord {
 }
 
 /// Wrapper for the value contained in the hash map of the [`BufferList`]
+#[derive(Debug)]
 struct HashMapValue {
     buffer: Arc<Mutex<Buffer>>,
     count: usize,
@@ -5680,6 +5866,7 @@ struct HashMapValue {
 
 /// A wrapper to maintain the list of [`Buffer`] being used by the [`Transaction`]
 /// It uses the [`BufferManager`] internally to maintain metadata
+#[derive(Debug)]
 struct BufferList {
     buffers: RefCell<HashMap<BlockId, HashMapValue>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
@@ -5775,6 +5962,7 @@ mod buffer_list_tests {
     }
 }
 
+#[derive(Debug)]
 struct Buffer {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -5853,6 +6041,7 @@ impl Buffer {
     }
 }
 
+#[derive(Debug)]
 struct BufferManager {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
@@ -6032,6 +6221,7 @@ mod buffer_manager_tests {
     }
 }
 
+#[derive(Debug)]
 struct LogManager {
     file_manager: Arc<Mutex<FileManager>>,
     log_file: String,
@@ -6281,6 +6471,7 @@ impl BlockId {
 }
 
 /// The page struct that contains the contents of a page
+#[derive(Debug)]
 pub struct Page {
     pub contents: Vec<u8>,
 }
@@ -6372,6 +6563,7 @@ mod page_tests {
 }
 
 /// The file manager struct that manages the files in the database
+#[derive(Debug)]
 struct FileManager {
     db_directory: PathBuf,
     blocksize: usize,

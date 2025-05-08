@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "index_select_scan_tests::index_select_scan_test",
+        "planner_tests::test_planner_index_retrieval",
         "--",
         "--nocapture"
       ],

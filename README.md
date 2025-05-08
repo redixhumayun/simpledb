@@ -10,6 +10,8 @@
 
 ### 📝 Converting “manual pin/unpin” to an RAII Buffer Guard  
 
+Note: [Another conversation](https://claude.ai/chat/60c71699-fd13-48dc-ae25-34cc0c5d5eb3) with Claude about how to do this well
+
 ---
 
 #### 0 · Goal
