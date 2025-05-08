@@ -12,7 +12,10 @@ use std::{
     io::{self, Read, Seek, Write},
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc, Condvar, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc, Condvar, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 mod test_utils;
@@ -100,6 +103,90 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+}
+
+struct MaterializePlan {
+    source_plan: Box<dyn Plan>,
+    txn: Arc<Transaction>,
+}
+
+impl Plan for MaterializePlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let mut source_scan = self.source_plan.open();
+        let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let mut temp_table_scan = temp_table.open();
+        while let Some(result) = source_scan.next() {
+            if result.is_err() {
+                panic!("Error while materializing the plan");
+            }
+            temp_table_scan.insert().unwrap();
+            for field in self.source_plan.schema().fields {
+                temp_table_scan
+                    .set_value(&field, source_scan.get_value(&field).unwrap())
+                    .unwrap();
+            }
+        }
+        temp_table_scan.before_first().unwrap();
+        Box::new(temp_table_scan)
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        let layout = Layout::new(self.source_plan.schema());
+        let rpb = self.txn.block_size() / layout.slot_size;
+        self.source_plan.records_output() / rpb
+    }
+
+    fn records_output(&self) -> usize {
+        self.source_plan.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        self.source_plan.distinct_values(field_name)
+    }
+
+    fn schema(&self) -> Schema {
+        self.source_plan.schema()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ MaterializePlan", prefix);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!(
+            "{}├─ Schema: {:?}",
+            prefix,
+            self.source_plan.schema().fields
+        );
+        println!("{}├─ Source Plan:", prefix);
+        self.source_plan.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
+}
+
+static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
+
+struct TempTable {
+    txn: Arc<Transaction>,
+    table_name: String,
+    layout: Layout,
+}
+
+impl TempTable {
+    fn new(txn: Arc<Transaction>, schema: Schema) -> Self {
+        let table_id = TEMP_TABLE_ID_GENERATOR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let table_name = format!("TempTable{}", table_id);
+        let layout = Layout::new(schema);
+        Self {
+            txn,
+            table_name,
+            layout,
+        }
+    }
+
+    fn open(&self) -> TableScan {
+        TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name)
     }
 }
 
