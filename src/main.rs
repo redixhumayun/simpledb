@@ -111,9 +111,16 @@ struct MaterializePlan {
     txn: Arc<Transaction>,
 }
 
+impl MaterializePlan {
+    fn new(source_plan: Box<dyn Plan>, txn: Arc<Transaction>) -> Self {
+        Self { source_plan, txn }
+    }
+}
+
 impl Plan for MaterializePlan {
     fn open(&self) -> Box<dyn UpdateScan> {
         let mut source_scan = self.source_plan.open();
+        println!("The schema retrieved {:?}", self.source_plan.schema());
         let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
         let mut temp_table_scan = temp_table.open();
         while let Some(result) = source_scan.next() {
@@ -162,6 +169,128 @@ impl Plan for MaterializePlan {
         println!("{}├─ Source Plan:", prefix);
         self.source_plan.print_plan(indent + 1);
         println!("{}╰─", prefix);
+    }
+}
+
+#[cfg(test)]
+mod materialize_plan_tests {
+    use crate::{MaterializePlan, Plan, Scan, SimpleDB, TablePlan};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_materialize_plan() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the source table using SQL
+        let sql = "create table source_table(A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert test data using SQL
+        let test_data = vec![
+            (1, "first"),
+            (2, "second"),
+            (3, "third"),
+            (4, "fourth"),
+            (5, "fifth"),
+        ];
+
+        for (a_val, b_val) in test_data.iter() {
+            let sql = format!(
+                "insert into source_table(A, B) values ({}, '{}')",
+                a_val, b_val
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+        println!("DONE INSERTING DATA");
+
+        // Create source plan
+        let table_plan = TablePlan::new(
+            "source_table",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        );
+
+        // Create materialize plan
+        let materialize_plan = MaterializePlan::new(Box::new(table_plan), Arc::clone(&txn));
+
+        // Open the materialized scan
+        let mut materialized_scan = materialize_plan.open();
+
+        // Verify all records were materialized correctly
+        let mut count = 0;
+        while let Some(result) = materialized_scan.next() {
+            assert!(result.is_ok());
+            let a_val = materialized_scan.get_int("a").unwrap();
+            let b_val = materialized_scan.get_string("b").unwrap();
+
+            // Verify against original data
+            assert_eq!(b_val, test_data[count].1);
+            assert_eq!(a_val, test_data[count].0);
+            count += 1;
+        }
+
+        assert_eq!(count, test_data.len(), "All records should be materialized");
+
+        // Test that the materialized data persists after source is modified
+        let sql = "delete from source_table".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Verify materialized data still exists
+        materialized_scan.before_first().unwrap();
+        let mut count = 0;
+        while let Some(result) = materialized_scan.next() {
+            assert!(result.is_ok());
+            let a_val = materialized_scan.get_int("a").unwrap();
+            let b_val = materialized_scan.get_string("b").unwrap();
+
+            // Verify against original data
+            assert_eq!(b_val, test_data[count].1);
+            assert_eq!(a_val, test_data[count].0);
+            count += 1;
+        }
+
+        assert_eq!(count, test_data.len(), "Materialized data should persist");
+
+        // Test schema matches
+        let materialized_schema = materialize_plan.schema();
+        assert_eq!(materialized_schema.fields.len(), 2);
+        assert!(materialized_schema.fields.contains(&"a".to_string()));
+        assert!(materialized_schema.fields.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_materialize_plan_empty_source() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create empty table using SQL
+        let sql = "create table empty_table(A int, B varchar(10))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Create source plan
+        let sql = "select A, B from empty_table".to_string();
+        let source_plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
+
+        // Create materialize plan
+        let materialize_plan = MaterializePlan::new(source_plan, Arc::clone(&txn));
+
+        // Open the materialized scan
+        let mut materialized_scan = materialize_plan.open();
+
+        // Verify no records exist
+        let mut count = 0;
+        while let Some(result) = materialized_scan.next() {
+            assert!(result.is_ok());
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 0,
+            "No records should be materialized from empty source"
+        );
     }
 }
 
@@ -1581,7 +1710,6 @@ mod product_scan_tests {
             while let Some(_) = project_scan.next() {
                 let lhs = project_scan.get_string("B").unwrap();
                 let rhs = project_scan.get_string("D").unwrap();
-                println!("{}, {}", lhs, rhs);
                 assert_eq!(lhs, rhs);
             }
         }

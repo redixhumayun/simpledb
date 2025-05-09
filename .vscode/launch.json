@@ -39,7 +39,7 @@
         }
       },
       "args": [
-        "planner_tests::test_planner_index_retrieval",
+        "materialize_plan_tests::test_materialize_plan",
         "--",
         "--nocapture"
       ],
