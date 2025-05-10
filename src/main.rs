@@ -4,6 +4,7 @@
 use std::{
     any::Any,
     cell::RefCell,
+    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
@@ -103,6 +104,392 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+}
+
+struct SortPlan {
+    source_plan: Box<dyn Plan>,
+    txn: Arc<Transaction>,
+    field_list: Vec<String>,
+    schema: Schema,
+}
+
+impl SortPlan {
+    fn new(source_plan: Box<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
+        let schema = source_plan.schema();
+        Self {
+            source_plan,
+            txn,
+            field_list,
+            schema,
+        }
+    }
+}
+
+enum SortScanState {
+    BeforeFirst,
+    OnFirst,
+    OnSecond,
+    OnlyFirst,
+    OnlySecond,
+    Done,
+}
+
+struct SortScan {
+    s1: TableScan,
+    s2: Option<TableScan>,
+    current_scan: SortScanState,
+    record_comparator: RecordComparator,
+}
+
+impl SortScan {
+    fn new(mut runs: Vec<TempTable>, record_comparator: RecordComparator) -> Self {
+        assert!(runs.len() <= 2);
+        let s1 = runs.remove(0).open();
+        let s2 = runs.pop().map(|t| t.open());
+        Self {
+            s1,
+            s2,
+            current_scan: SortScanState::BeforeFirst,
+            record_comparator,
+        }
+    }
+
+    fn set_current_scan(&mut self) -> Result<(), Box<dyn Error>> {
+        match self
+            .record_comparator
+            .compare(&self.s1, self.s2.as_ref().unwrap())
+        {
+            Ok(ordering) => match ordering {
+                Ordering::Less => {
+                    self.current_scan = SortScanState::OnFirst;
+                    Ok(())
+                }
+                Ordering::Equal => {
+                    self.current_scan = SortScanState::OnFirst;
+                    Ok(())
+                }
+                Ordering::Greater => {
+                    self.current_scan = SortScanState::OnSecond;
+                    Ok(())
+                }
+            },
+            Err(e) => {
+                self.current_scan = SortScanState::Done;
+                Err(format!("Error in SortScan while comparing records: {}", e).into())
+            }
+        }
+    }
+}
+
+impl Iterator for SortScan {
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.current_scan {
+            SortScanState::BeforeFirst => {
+                match (self.s1.next(), self.s2.as_mut().and_then(|s| s.next())) {
+                    (None, None) => {
+                        self.current_scan = SortScanState::Done;
+                        return None;
+                    }
+                    (Some(Ok(_)), None) => {
+                        self.current_scan = SortScanState::OnlyFirst;
+                        return Some(Ok(()));
+                    }
+                    (None, Some(Ok(_))) => {
+                        self.current_scan = SortScanState::OnlySecond;
+                        return Some(Ok(()));
+                    }
+                    (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                        self.current_scan = SortScanState::Done;
+                        return Some(Err(e));
+                    }
+                    (Some(_), Some(_)) => match self.set_current_scan() {
+                        Ok(_) => Some(Ok(())),
+                        Err(e) => Some(Err(e)),
+                    },
+                }
+            }
+            SortScanState::OnFirst => match self.s1.next() {
+                Some(Ok(_)) => {
+                    return match self.set_current_scan() {
+                        Ok(_) => Some(Ok(())),
+                        Err(e) => Some(Err(e)),
+                    };
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    self.current_scan = SortScanState::OnlySecond;
+                    self.s1.close();
+                    return Some(Ok(()));
+                }
+            },
+            SortScanState::OnlyFirst => match self.s1.next() {
+                Some(Ok(_)) => return Some(Ok(())),
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    self.current_scan = SortScanState::Done;
+                    return None;
+                }
+            },
+            SortScanState::OnSecond => match self.s2.as_mut().unwrap().next() {
+                Some(Ok(_)) => {
+                    return match self.set_current_scan() {
+                        Ok(_) => Some(Ok(())),
+                        Err(e) => Some(Err(e)),
+                    };
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    self.s2.as_mut().and_then(|s| Some(s.close()));
+                    self.s2 = None;
+                    self.current_scan = SortScanState::OnlyFirst;
+                    return Some(Ok(()));
+                }
+            },
+            SortScanState::OnlySecond => match self.s2.as_mut().unwrap().next() {
+                Some(Ok(_)) => return Some(Ok(())),
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    self.current_scan = SortScanState::Done;
+                    return None;
+                }
+            },
+            SortScanState::Done => {
+                return None;
+            }
+        }
+    }
+}
+
+impl Scan for SortScan {
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.current_scan = SortScanState::BeforeFirst;
+        self.s1.before_first()?;
+        if let Some(s2) = &mut self.s2 {
+            s2.before_first()?;
+        }
+        Ok(())
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        match self.current_scan {
+            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_int(field_name),
+            SortScanState::OnSecond | SortScanState::OnlySecond => {
+                self.s2.as_ref().unwrap().get_int(field_name)
+            }
+            _ => Err("No current record".into()),
+        }
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        match self.current_scan {
+            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_string(field_name),
+            SortScanState::OnSecond | SortScanState::OnlySecond => {
+                self.s2.as_ref().unwrap().get_string(field_name)
+            }
+            _ => Err("No current record".into()),
+        }
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        match self.current_scan {
+            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_value(field_name),
+            SortScanState::OnSecond | SortScanState::OnlySecond => {
+                self.s2.as_ref().unwrap().get_value(field_name)
+            }
+            _ => Err("No current record".into()),
+        }
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        match self.current_scan {
+            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.has_field(field_name),
+            SortScanState::OnSecond | SortScanState::OnlySecond => {
+                self.s2.as_ref().unwrap().has_field(field_name)
+            }
+            _ => Err("No current record".into()),
+        }
+    }
+
+    fn close(&mut self) {
+        self.s1.close();
+        if let Some(s2) = &mut self.s2 {
+            s2.close();
+        }
+    }
+}
+
+#[cfg(test)]
+mod sort_scan_tests {
+    use std::sync::Arc;
+
+    use crate::{
+        Layout, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable, UpdateScan,
+    };
+
+    #[test]
+    fn test_sort_scan_basic() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schema and layout
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        schema.add_string_field("name", 10);
+        let layout = Layout::new(schema);
+
+        // Create two temp tables with test data
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+
+        // Insert test data into first temp table
+        {
+            let mut scan = temp_table1.open();
+            for i in [1, 3, 5] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        // Insert test data into second temp table
+        {
+            let mut scan = temp_table2.open();
+            for i in [2, 4, 6] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        // Create record comparator for sorting on id field
+        let record_comparator = RecordComparator::new(vec!["id".to_string()]);
+
+        // Create sort scan
+        let mut sort_scan = SortScan::new(vec![temp_table1, temp_table2], record_comparator);
+
+        // Verify records come back in sorted order
+        let mut prev_id = None;
+        let mut count = 0;
+
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            let curr_id = sort_scan.get_int("id").unwrap();
+
+            if let Some(prev) = prev_id {
+                assert!(
+                    curr_id > prev,
+                    "Records should be in ascending order which is not upheld for {} and {}",
+                    curr_id,
+                    prev
+                );
+            }
+
+            count += 1;
+            prev_id = Some(curr_id);
+        }
+
+        assert_eq!(count, 6, "Should have retrieved all records");
+
+        sort_scan.close();
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_sort_scan_single_table() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        let layout = Layout::new(schema);
+
+        // Create single temp table with unsorted data
+        let mut temp_table = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+
+        {
+            let mut scan = temp_table.open();
+            for i in [1, 2, 3, 4, 5] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+            }
+        }
+
+        let record_comparator = RecordComparator::new(vec!["id".to_string()]);
+        let mut sort_scan = SortScan::new(vec![temp_table], record_comparator);
+
+        let mut prev_id = None;
+        let mut count = 0;
+
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            let curr_id = sort_scan.get_int("id").unwrap();
+
+            if let Some(prev) = prev_id {
+                assert!(curr_id > prev);
+            }
+
+            count += 1;
+            prev_id = Some(curr_id);
+        }
+
+        assert_eq!(count, 5);
+
+        sort_scan.close();
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_sort_scan_empty_tables() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        let layout = Layout::new(schema);
+
+        // Create empty temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+
+        let record_comparator = RecordComparator::new(vec!["id".to_string()]);
+        let mut sort_scan = SortScan::new(vec![temp_table1, temp_table2], record_comparator);
+
+        let mut count = 0;
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            count += 1;
+        }
+
+        assert_eq!(count, 0, "No records should be returned for empty tables");
+
+        sort_scan.close();
+        txn.commit().unwrap();
+    }
+}
+
+struct RecordComparator {
+    field_list: Vec<String>,
+}
+
+impl RecordComparator {
+    fn new(field_list: Vec<String>) -> Self {
+        Self { field_list }
+    }
+
+    fn compare<S1: Scan, S2: Scan>(&self, s1: &S1, s2: &S2) -> Result<Ordering, Box<dyn Error>> {
+        for field in &self.field_list {
+            let value_1 = s1.get_value(field)?;
+            let value_2 = s2.get_value(field)?;
+            let cmp = value_1.cmp(&value_2);
+            if cmp != std::cmp::Ordering::Equal {
+                return Ok(cmp);
+            }
+        }
+        Ok(Ordering::Equal)
     }
 }
 
@@ -296,6 +683,7 @@ mod materialize_plan_tests {
 
 static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
 struct TempTable {
     txn: Arc<Transaction>,
     table_name: String,
