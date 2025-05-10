@@ -408,7 +408,7 @@ mod sort_scan_tests {
         let layout = Layout::new(schema);
 
         // Create single temp table with unsorted data
-        let mut temp_table = TempTable::new(Arc::clone(&txn), layout.schema.clone());
+        let temp_table = TempTable::new(Arc::clone(&txn), layout.schema.clone());
 
         {
             let mut scan = temp_table.open();
