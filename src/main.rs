@@ -107,6 +107,184 @@ impl SimpleDB {
     }
 }
 
+enum MergeJoinScanState {
+    BeforeFirst,
+    AdvanceScans,
+}
+
+struct MergeJoinScan<S>
+where
+    S: Scan,
+{
+    scan_1: S,
+    scan_2: SortScan,
+    field_name_1: String,
+    field_name_2: String,
+    join_value: Option<Constant>,
+    scan_state: MergeJoinScanState,
+    at_new_group: bool,
+}
+
+impl<S> MergeJoinScan<S>
+where
+    S: Scan,
+{
+    fn new(
+        scan_1: S,
+        scan_2: SortScan,
+        field_name_1: String,
+        field_name_2: String,
+        join_value: Option<Constant>,
+    ) -> Self {
+        Self {
+            scan_1,
+            scan_2,
+            field_name_1,
+            field_name_2,
+            join_value,
+            scan_state: MergeJoinScanState::BeforeFirst,
+            at_new_group: false,
+        }
+    }
+}
+
+impl<S> Iterator for MergeJoinScan<S>
+where
+    S: Scan,
+{
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match &self.scan_state {
+                MergeJoinScanState::BeforeFirst => {
+                    //  the value of join_value is not set, so do that first
+                    match (self.scan_1.next(), self.scan_2.next()) {
+                        (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
+                        (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
+                        (Some(Err(e1)), Some(Err(e2))) => {
+                            return Some(Err(format!(
+                                "Error in both scans - First error: {}, Second error: {}",
+                                e1, e2
+                            )
+                            .into()))
+                        }
+                        (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
+                            return Some(Err(e))
+                        }
+                        (Some(Ok(_)), Some(Ok(_))) => {
+                            let value_1 = self.scan_1.get_value(&self.field_name_1).unwrap();
+                            let value_2 = self.scan_2.get_value(&self.field_name_2).unwrap();
+                            self.at_new_group = false;
+                            self.scan_state = MergeJoinScanState::AdvanceScans;
+                            match value_1.cmp(&value_2) {
+                                Ordering::Equal => {
+                                    self.join_value = Some(value_2);
+                                    self.scan_2.save_position().unwrap();
+                                    return Some(Ok(()));
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
+                MergeJoinScanState::AdvanceScans => {
+                    let value_1 = self.scan_1.get_value(&self.field_name_1).unwrap();
+                    let value_2 = self.scan_2.get_value(&self.field_name_2).unwrap();
+                    match value_1.cmp(&value_2) {
+                        Ordering::Equal => {
+                            if self.join_value.is_none() || self.at_new_group {
+                                self.join_value = Some(value_2);
+                                self.scan_2.save_position().unwrap();
+                            }
+                            self.at_new_group = false;
+                            match self.scan_2.next() {
+                                Some(Ok(_)) => return Some(Ok(())),
+                                Some(Err(e)) => return Some(Err(e)),
+                                None => return None,
+                            }
+                        }
+                        Ordering::Less => match self.scan_1.next() {
+                            Some(_) => {
+                                self.at_new_group = true;
+                                let value_1_new =
+                                    self.scan_1.get_value(&self.field_name_1).unwrap();
+                                if value_1_new == *self.join_value.as_ref().unwrap() {
+                                    match self.scan_2.restore_position() {
+                                        Ok(_) => return Some(Ok(())),
+                                        Err(e) => return Some(Err(e)),
+                                    }
+                                }
+                                continue;
+                            }
+                            None => return None,
+                        },
+                        Ordering::Greater => match self.scan_2.next() {
+                            Some(_) => {
+                                self.at_new_group = true;
+                                continue;
+                            }
+                            None => return None,
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S> Scan for MergeJoinScan<S>
+where
+    S: Scan,
+{
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.scan_1.before_first()?;
+        self.scan_2.before_first()?;
+        Ok(())
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        if field_name == self.field_name_1 {
+            return self.scan_1.get_int(field_name);
+        } else if field_name == self.field_name_2 {
+            return self.scan_2.get_int(field_name);
+        }
+        Err(format!("Field {} not found", field_name).into())
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        if field_name == self.field_name_1 {
+            return self.scan_1.get_string(field_name);
+        } else if field_name == self.field_name_2 {
+            return self.scan_2.get_string(field_name);
+        }
+        Err(format!("Field {} not found", field_name).into())
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        if field_name == self.field_name_1 {
+            return self.scan_1.get_value(field_name);
+        } else if field_name == self.field_name_2 {
+            return self.scan_2.get_value(field_name);
+        }
+        Err(format!("Field {} not found", field_name).into())
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        if field_name == self.field_name_1 {
+            return self.scan_1.has_field(field_name);
+        } else if field_name == self.field_name_2 {
+            return self.scan_2.has_field(field_name);
+        }
+        Err(format!("Field {} not found", field_name).into())
+    }
+
+    fn close(&mut self) {
+        self.scan_1.close();
+        self.scan_2.close();
+    }
+}
+
 struct SortPlan {
     source_plan: Box<dyn Plan>,
     txn: Arc<Transaction>,
@@ -632,6 +810,7 @@ struct SortScan {
     s2: Option<TableScan>,
     current_scan: SortScanState,
     record_comparator: RecordComparator,
+    saved_rids: [Option<RID>; 2],
 }
 
 impl SortScan {
@@ -644,6 +823,7 @@ impl SortScan {
             s2,
             current_scan: SortScanState::BeforeFirst,
             record_comparator,
+            saved_rids: [None, None],
         }
     }
 
@@ -671,6 +851,29 @@ impl SortScan {
                 Err(format!("Error in SortScan while comparing records: {}", e).into())
             }
         }
+    }
+
+    fn save_position(&mut self) -> Result<(), Box<dyn Error>> {
+        let rid_1 = self.s1.get_rid()?;
+        let rid_2 = self.s2.as_ref().map(|s| s.get_rid()).transpose()?;
+        self.saved_rids[0] = Some(rid_1);
+        self.saved_rids[1] = rid_2;
+        Ok(())
+    }
+
+    fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
+        let rid_1 =
+            self.saved_rids[0].ok_or_else(|| format!("Error getting saved RID from first scan"))?;
+        self.s1.move_to_row_id(rid_1);
+        match (self.s2.as_mut(), self.saved_rids[1]) {
+            (None, None) => (),
+            (None, Some(_)) => return Err("Second scan is not defined in SortScan".into()),
+            (Some(_), None) => return Err("Second RID is not defined in SortScan".into()),
+            (Some(s2), Some(rid)) => {
+                s2.move_to_row_id(rid);
+            }
+        }
+        Ok(())
     }
 }
 
