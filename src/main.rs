@@ -110,19 +110,511 @@ impl SimpleDB {
 struct SortPlan {
     source_plan: Box<dyn Plan>,
     txn: Arc<Transaction>,
-    field_list: Vec<String>,
     schema: Schema,
+    record_comparator: RecordComparator,
 }
 
 impl SortPlan {
     fn new(source_plan: Box<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
         let schema = source_plan.schema();
+        let record_comparator = RecordComparator::new(field_list);
         Self {
             source_plan,
             txn,
-            field_list,
             schema,
+            record_comparator,
         }
+    }
+
+    fn copy<Source, Dest>(
+        &self,
+        source: &Source,
+        destination: &mut Dest,
+    ) -> Result<(), Box<dyn Error>>
+    where
+        Source: Scan,
+        Dest: UpdateScan,
+    {
+        destination.insert()?;
+        for field in &self.schema.fields {
+            let value = source.get_value(&field)?;
+            destination.set_value(&field, value)?;
+        }
+        Ok(())
+    }
+
+    fn split_into_runs(
+        &self,
+        mut source_scan: Box<dyn UpdateScan>,
+    ) -> Result<Vec<TempTable>, Box<dyn Error>> {
+        let mut temp_tables: Vec<TempTable> = Vec::new();
+        source_scan.before_first()?;
+        let current_temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let mut current_scan = current_temp_table.open();
+        temp_tables.push(current_temp_table);
+
+        //  Copy over first record as is
+        match source_scan.next() {
+            Some(Ok(_)) => self.copy(&source_scan, &mut current_scan)?,
+            Some(Err(e)) => return Err(e),
+            None => {
+                current_scan.close();
+                return Ok(temp_tables);
+            }
+        };
+
+        //  Loop over the current scan and keep adding records
+        //  Split into a new temp table when the invariant is brokern
+        loop {
+            match source_scan.next() {
+                Some(Ok(_)) => {
+                    match self.record_comparator.compare(&current_scan, &source_scan) {
+                        Ok(ordering) => match ordering {
+                            Ordering::Greater => {
+                                let new_temp_table = TempTable::new(
+                                    Arc::clone(&self.txn),
+                                    self.source_plan.schema(),
+                                );
+                                current_scan = new_temp_table.open();
+                                temp_tables.push(new_temp_table);
+                                self.copy(&source_scan, &mut current_scan)?;
+                            }
+                            Ordering::Equal | Ordering::Less => {
+                                self.copy(&source_scan, &mut current_scan)?;
+                            }
+                        },
+                        Err(_) => return Err("Error comparing records".into()),
+                    };
+                }
+                Some(Err(e)) => return Err(e),
+                None => {
+                    break;
+                }
+            };
+        }
+        Ok(temp_tables)
+    }
+
+    fn do_merge_iters(
+        &self,
+        mut temp_tables: Vec<TempTable>,
+    ) -> Result<Vec<TempTable>, Box<dyn Error>> {
+        if temp_tables.len() <= 2 {
+            return Ok(temp_tables);
+        }
+        while temp_tables.len() > 2 {
+            let temp_table_1 = temp_tables.remove(0);
+            let temp_table_2 = temp_tables.remove(0);
+            let sorted_temp_table = self.merge(temp_table_1, temp_table_2)?;
+            temp_tables.push(sorted_temp_table);
+        }
+        Ok(temp_tables)
+    }
+
+    fn merge(&self, table_1: TempTable, table_2: TempTable) -> Result<TempTable, Box<dyn Error>> {
+        let mut scan_1 = Some(table_1.open());
+        let mut scan_2 = Some(table_2.open());
+        let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let mut current_scan = temp_table.open();
+
+        enum MergeState {
+            DoCompare, //  compare the two scan values at this point
+            First,     //  copy over value from scan_1 and call next() on it
+            Second,    //  copy over value from scan_2 and call next() on it
+            Done,      //  break out of loop
+        }
+
+        let mut merge_state = MergeState::DoCompare;
+
+        //  Do the initial next() call and handle situations where either scan is empty
+        if let Some(inner_scan_1) = scan_1.as_mut() {
+            match inner_scan_1.next() {
+                Some(Ok(_)) => (),
+                Some(Err(e)) => {
+                    return Err(e);
+                }
+                None => {
+                    scan_1 = None;
+                    merge_state = MergeState::Done;
+                }
+            }
+        }
+        if let Some(inner_scan_2) = scan_2.as_mut() {
+            match inner_scan_2.next() {
+                Some(Ok(_)) => (),
+                Some(Err(e)) => {
+                    return Err(e);
+                }
+                None => {
+                    scan_2 = None;
+                    merge_state = MergeState::Done;
+                }
+            }
+        }
+
+        loop {
+            match merge_state {
+                MergeState::DoCompare => {
+                    if let (Some(inner_scan_1), Some(inner_scan_2)) =
+                        (scan_1.as_mut(), scan_2.as_mut())
+                    {
+                        match self.record_comparator.compare(inner_scan_1, inner_scan_2) {
+                            Ok(ordering) => match ordering {
+                                Ordering::Less => {
+                                    merge_state = MergeState::First;
+                                }
+                                Ordering::Equal => {
+                                    merge_state = MergeState::First;
+                                }
+                                Ordering::Greater => {
+                                    merge_state = MergeState::Second;
+                                }
+                            },
+                            Err(e) => return Err(e),
+                        };
+                    }
+                }
+                MergeState::First => {
+                    let Some(inner_scan_1) = scan_1.as_mut() else {
+                        return Err("Scan 1 is None during MergeState::First".into());
+                    };
+                    self.copy(inner_scan_1, &mut current_scan)?;
+                    match inner_scan_1.next() {
+                        Some(Ok(_)) => {
+                            merge_state = MergeState::DoCompare;
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            return Err(e);
+                        }
+                        None => {
+                            scan_1 = None;
+                            merge_state = MergeState::Done;
+                        }
+                    }
+                }
+                MergeState::Second => {
+                    let Some(inner_scan_2) = scan_2.as_mut() else {
+                        return Err("Scan 2 is None during MergeState::Second".into());
+                    };
+                    self.copy(inner_scan_2, &mut current_scan)?;
+                    match inner_scan_2.next() {
+                        Some(Ok(_)) => {
+                            merge_state = MergeState::DoCompare;
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            return Err(e);
+                        }
+                        None => {
+                            scan_2 = None;
+                            merge_state = MergeState::Done;
+                        }
+                    }
+                }
+                MergeState::Done => {
+                    break;
+                }
+            }
+        }
+
+        //  Either one of the scans is still valid or both are invalid
+        if let Some(inner_scan_1) = scan_1.as_mut() {
+            self.copy(inner_scan_1, &mut current_scan)?;
+            loop {
+                match inner_scan_1.next() {
+                    Some(Ok(_)) => {
+                        self.copy(inner_scan_1, &mut current_scan)?;
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                }
+            }
+        }
+
+        if let Some(inner_scan_2) = scan_2.as_mut() {
+            self.copy(inner_scan_2, &mut current_scan)?;
+            loop {
+                match inner_scan_2.next() {
+                    Some(Ok(_)) => {
+                        self.copy(inner_scan_2, &mut current_scan)?;
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                }
+            }
+        }
+
+        //  Close the scans
+        Ok(temp_table)
+    }
+}
+
+impl Plan for SortPlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let source_scan = self.source_plan.open();
+        let runs = self.split_into_runs(source_scan).unwrap();
+        let merged_runs = self.do_merge_iters(runs).unwrap();
+        return Box::new(SortScan::new(merged_runs, self.record_comparator.clone()));
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        //  TODO: This is incorrect, it should be using MaterializePlan::blocks_accessed()
+        //  however, that requires clone on the Plan trait
+        // let materialize_plan =
+        //     MaterializePlan::new((*self.source_plan).clone(), Arc::clone(&self.txn));
+        // materialize_plan.blocks_accessed()
+        self.source_plan.blocks_accessed()
+    }
+
+    fn records_output(&self) -> usize {
+        self.source_plan.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        self.source_plan.distinct_values(field_name)
+    }
+
+    fn schema(&self) -> Schema {
+        self.source_plan.schema()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ SortPlan", prefix);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!(
+            "{}├─ Schema: {:?}",
+            prefix,
+            self.source_plan.schema().fields
+        );
+        println!("{}├─ Source Plan:", prefix);
+        self.source_plan.print_plan(indent + 1);
+        println!("{}╰─", prefix);
+    }
+}
+
+#[cfg(test)]
+mod sort_plan_tests {
+    use crate::{Plan, SimpleDB, SortPlan, TablePlan};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_basic_sort() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the table using SQL
+        let sql = "create table numbers(id int, value int)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert unsorted test data
+        let test_data = vec![(5, 50), (3, 30), (1, 10), (4, 40), (2, 20)];
+
+        for (id, value) in &test_data {
+            let sql = format!("insert into numbers(id, value) values ({}, {})", id, value);
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Create source plan
+        let table_plan = Box::new(TablePlan::new(
+            "numbers",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+
+        // Create sort plan sorting by id
+        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
+
+        // Open the sort scan
+        let mut sort_scan = sort_plan.open();
+
+        // Verify records come back in sorted order
+        let mut prev_id = None;
+        let mut count = 0;
+
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            let curr_id = sort_scan.get_int("id").unwrap();
+
+            if let Some(prev) = prev_id {
+                assert!(curr_id > prev, "Records should be in ascending order");
+            }
+
+            count += 1;
+            prev_id = Some(curr_id);
+        }
+
+        assert_eq!(count, test_data.len(), "Should have retrieved all records");
+    }
+
+    #[test]
+    fn test_sort_with_duplicates() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the table
+        let sql = "create table students_sort(grade int, name varchar(20))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert test data with duplicate grades
+        let test_data = vec![
+            (85, "Alice"),
+            (90, "Bob"),
+            (85, "Charlie"),
+            (95, "David"),
+            (90, "Eve"),
+        ];
+
+        for (grade, name) in &test_data {
+            let sql = format!(
+                "insert into students_sort(grade, name) values ({}, '{}')",
+                grade, name
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Create sort plan sorting by grade
+        let table_plan = Box::new(TablePlan::new(
+            "students_sort",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["grade".to_string()]);
+
+        // Open the sort scan
+        let mut sort_scan = sort_plan.open();
+
+        // Verify records come back in sorted order
+        let mut prev_grade = None;
+        let mut count = 0;
+        let mut grade_counts = std::collections::HashMap::new();
+
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            let curr_grade = sort_scan.get_int("grade").unwrap();
+
+            if let Some(prev) = prev_grade {
+                assert!(curr_grade >= prev, "Records should be in ascending order");
+            }
+
+            *grade_counts.entry(curr_grade).or_insert(0) += 1;
+            count += 1;
+            prev_grade = Some(curr_grade);
+        }
+
+        assert_eq!(count, test_data.len(), "Should have retrieved all records");
+        assert_eq!(
+            *grade_counts.get(&85).unwrap(),
+            2,
+            "Should have 2 records with grade 85"
+        );
+        assert_eq!(
+            *grade_counts.get(&90).unwrap(),
+            2,
+            "Should have 2 records with grade 90"
+        );
+    }
+
+    #[test]
+    fn test_multi_field_sort() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the table
+        let sql = "create table employees(dept int, salary int, name varchar(20))".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Insert test data
+        let test_data = vec![
+            (1, 50000, "Alice"),
+            (2, 60000, "Bob"),
+            (1, 55000, "Charlie"),
+            (2, 55000, "David"),
+            (1, 60000, "Eve"),
+        ];
+
+        for (dept, salary, name) in &test_data {
+            let sql = format!(
+                "insert into employees(dept, salary, name) values ({}, {}, '{}')",
+                dept, salary, name
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Create sort plan sorting by dept and salary
+        let table_plan = Box::new(TablePlan::new(
+            "employees",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let sort_plan = SortPlan::new(
+            table_plan,
+            Arc::clone(&txn),
+            vec!["dept".to_string(), "salary".to_string()],
+        );
+
+        // Open the sort scan
+        let mut sort_scan = sort_plan.open();
+
+        // Verify records come back in sorted order
+        let mut prev_dept = None;
+        let mut prev_salary = None;
+        let mut count = 0;
+
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            let curr_dept = sort_scan.get_int("dept").unwrap();
+            let curr_salary = sort_scan.get_int("salary").unwrap();
+
+            if let (Some(pd), Some(ps)) = (prev_dept, prev_salary) {
+                assert!(
+                    curr_dept > pd || (curr_dept == pd && curr_salary >= ps),
+                    "Records should be sorted by dept then salary"
+                );
+            }
+
+            count += 1;
+            prev_dept = Some(curr_dept);
+            prev_salary = Some(curr_salary);
+        }
+
+        assert_eq!(count, test_data.len(), "Should have retrieved all records");
+    }
+
+    #[test]
+    fn test_sort_empty_table() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create empty table
+        let sql = "create table empty_table(id int, value int)".to_string();
+        db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+
+        // Create sort plan
+        let table_plan = Box::new(TablePlan::new(
+            "empty_table",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
+
+        // Open the sort scan
+        let mut sort_scan = sort_plan.open();
+
+        // Verify no records are returned
+        let mut count = 0;
+        while let Some(result) = sort_scan.next() {
+            assert!(result.is_ok());
+            count += 1;
+        }
+
+        assert_eq!(count, 0, "Should have no records in empty table");
     }
 }
 
@@ -321,6 +813,36 @@ impl Scan for SortScan {
     }
 }
 
+impl UpdateScan for SortScan {
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        todo!()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod sort_scan_tests {
     use std::sync::Arc;
@@ -471,6 +993,7 @@ mod sort_scan_tests {
     }
 }
 
+#[derive(Clone)]
 struct RecordComparator {
     field_list: Vec<String>,
 }
@@ -779,6 +1302,7 @@ mod planner_tests {
         dbg!("inserting records", count);
         for i in 0..count {
             let sql = format!("insert into T1(A, B) values ({}, 'string{}')", i, i);
+            println!("the sql {:?}", sql);
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3370,6 +3894,7 @@ impl MetadataManager {
     }
 
     fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
+        println!("Calling get_stat_info to acquire stat_manager lock");
         self.stat_manager
             .lock()
             .unwrap()
@@ -3469,7 +3994,6 @@ mod metadata_manager_tests {
         println!("V(indexA,A) = {}", idx_a.distinct_values("A"));
         println!("V(indexA,B) = {}", idx_a.distinct_values("B"));
 
-        // assert!(idx_a.blocks_accessed() >= 0); //  TODO: is there a better way to assert this?
         assert_eq!(idx_a.records_output(), 2);
         assert!(idx_a.distinct_values("A") == 1); //  we have an index on A
 
@@ -3480,7 +4004,6 @@ mod metadata_manager_tests {
         println!("V(indexB,A) = {}", idx_b.distinct_values("A"));
         println!("V(indexB,B) = {}", idx_b.distinct_values("B"));
 
-        // assert!(idx_b.blocks_accessed() >= 0); //  TODO: Is there a better way to assert this?
         assert_eq!(idx_b.records_output(), 2);
         assert!(idx_b.distinct_values("B") == 1); //  we have an index on B
 
@@ -5070,11 +5593,8 @@ impl Transaction {
 
     /// Recover the database on start-up or after a crash
     fn recover(&self) -> Result<(), Box<dyn Error>> {
-        //  Perform a database recovery
         self.recovery_manager.recover(self).unwrap();
-        //  TODO: Release all locks associated with this transaction
         self.concurrency_manager.release()?;
-        //  Unpin all buffers and release metadata
         self.buffer_list.unpin_all();
         Ok(())
     }
@@ -5164,7 +5684,6 @@ impl Transaction {
 
     /// Get the size of this file in blocks
     fn size(&self, file_name: &str) -> usize {
-        //  TODO: Insert a shared lock here to ensure the length read is accurate
         self.file_manager
             .lock()
             .unwrap()
@@ -5173,7 +5692,6 @@ impl Transaction {
 
     /// Append a block to the file
     fn append(&self, file_name: &str) -> BlockId {
-        //  TODO: Insert a write lock here to ensure this write is safe
         self.file_manager
             .lock()
             .unwrap()
