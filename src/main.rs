@@ -109,7 +109,8 @@ impl SimpleDB {
 
 enum MergeJoinScanState {
     BeforeFirst,
-    AdvanceScans,
+    SeekMatch,
+    InGroup(Constant),
 }
 
 struct MergeJoinScan<S>
@@ -120,7 +121,6 @@ where
     scan_2: SortScan,
     field_name_1: String,
     field_name_2: String,
-    join_value: Option<Constant>,
     scan_state: MergeJoinScanState,
     at_new_group: bool,
 }
@@ -129,19 +129,12 @@ impl<S> MergeJoinScan<S>
 where
     S: Scan,
 {
-    fn new(
-        scan_1: S,
-        scan_2: SortScan,
-        field_name_1: String,
-        field_name_2: String,
-        join_value: Option<Constant>,
-    ) -> Self {
+    fn new(scan_1: S, scan_2: SortScan, field_name_1: String, field_name_2: String) -> Self {
         Self {
             scan_1,
             scan_2,
             field_name_1,
             field_name_2,
-            join_value,
             scan_state: MergeJoinScanState::BeforeFirst,
             at_new_group: false,
         }
@@ -157,77 +150,75 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match &self.scan_state {
-                MergeJoinScanState::BeforeFirst => {
-                    //  the value of join_value is not set, so do that first
-                    match (self.scan_1.next(), self.scan_2.next()) {
-                        (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
-                        (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
-                        (Some(Err(e1)), Some(Err(e2))) => {
-                            return Some(Err(format!(
-                                "Error in both scans - First error: {}, Second error: {}",
-                                e1, e2
-                            )
-                            .into()))
-                        }
-                        (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
-                            return Some(Err(e))
-                        }
-                        (Some(Ok(_)), Some(Ok(_))) => {
-                            let value_1 = self.scan_1.get_value(&self.field_name_1).unwrap();
-                            let value_2 = self.scan_2.get_value(&self.field_name_2).unwrap();
-                            self.at_new_group = false;
-                            self.scan_state = MergeJoinScanState::AdvanceScans;
-                            match value_1.cmp(&value_2) {
-                                Ordering::Equal => {
-                                    self.join_value = Some(value_2);
-                                    self.scan_2.save_position().unwrap();
-                                    return Some(Ok(()));
-                                }
-                                _ => continue,
-                            }
-                        }
+                MergeJoinScanState::BeforeFirst => match (self.scan_1.next(), self.scan_2.next()) {
+                    (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
+                    (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
+                    (Some(Err(e1)), Some(Err(e2))) => {
+                        return Some(Err(format!(
+                            "Error in both scans - First error: {}, Second error: {}",
+                            e1, e2
+                        )
+                        .into()))
                     }
-                }
-                MergeJoinScanState::AdvanceScans => {
+                    (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
+                        return Some(Err(e))
+                    }
+                    (Some(Ok(_)), Some(Ok(_))) => {
+                        self.scan_state = MergeJoinScanState::SeekMatch;
+                        continue;
+                    }
+                },
+                MergeJoinScanState::SeekMatch => {
                     let value_1 = self.scan_1.get_value(&self.field_name_1).unwrap();
                     let value_2 = self.scan_2.get_value(&self.field_name_2).unwrap();
                     match value_1.cmp(&value_2) {
-                        Ordering::Equal => {
-                            if self.join_value.is_none() || self.at_new_group {
-                                self.join_value = Some(value_2);
-                                self.scan_2.save_position().unwrap();
+                        Ordering::Less => match self.scan_1.next() {
+                            Some(Ok(_)) => {
+                                continue;
                             }
-                            self.at_new_group = false;
-                            match self.scan_2.next() {
-                                Some(Ok(_)) => return Some(Ok(())),
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => return None,
+                        },
+                        Ordering::Greater => match self.scan_2.next() {
+                            Some(Ok(_)) => {
+                                continue;
+                            }
+                            Some(Err(e)) => return Some(Err(e)),
+                            None => return None,
+                        },
+                        Ordering::Equal => {
+                            self.scan_2.save_position().unwrap();
+                            self.scan_state = MergeJoinScanState::InGroup(value_2);
+                            return Some(Ok(()));
+                        }
+                    }
+                }
+                MergeJoinScanState::InGroup(join_value) => match self.scan_2.next() {
+                    Some(Ok(_)) => {
+                        let value_2 = self.scan_2.get_value(&self.field_name_2).unwrap();
+                        if value_2 == *join_value {
+                            return Some(Ok(()));
+                        } else {
+                            match self.scan_1.next() {
+                                Some(Ok(_)) => {
+                                    let value_1 =
+                                        self.scan_1.get_value(&self.field_name_1).unwrap();
+                                    if value_1 == *join_value {
+                                        self.scan_2.restore_position().unwrap();
+                                        return Some(Ok(()));
+                                    } else {
+                                        self.scan_state = MergeJoinScanState::SeekMatch;
+                                        continue;
+                                    }
+                                }
                                 Some(Err(e)) => return Some(Err(e)),
                                 None => return None,
                             }
                         }
-                        Ordering::Less => match self.scan_1.next() {
-                            Some(_) => {
-                                self.at_new_group = true;
-                                let value_1_new =
-                                    self.scan_1.get_value(&self.field_name_1).unwrap();
-                                if value_1_new == *self.join_value.as_ref().unwrap() {
-                                    match self.scan_2.restore_position() {
-                                        Ok(_) => return Some(Ok(())),
-                                        Err(e) => return Some(Err(e)),
-                                    }
-                                }
-                                continue;
-                            }
-                            None => return None,
-                        },
-                        Ordering::Greater => match self.scan_2.next() {
-                            Some(_) => {
-                                self.at_new_group = true;
-                                continue;
-                            }
-                            None => return None,
-                        },
                     }
-                }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => return None,
+                },
             }
         }
     }
@@ -244,37 +235,37 @@ where
     }
 
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if field_name == self.field_name_1 {
+        if self.scan_1.has_field(field_name)? {
             return self.scan_1.get_int(field_name);
-        } else if field_name == self.field_name_2 {
+        } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_int(field_name);
         }
         Err(format!("Field {} not found", field_name).into())
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if field_name == self.field_name_1 {
+        if self.scan_1.has_field(field_name)? {
             return self.scan_1.get_string(field_name);
-        } else if field_name == self.field_name_2 {
+        } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_string(field_name);
         }
         Err(format!("Field {} not found", field_name).into())
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
-        if field_name == self.field_name_1 {
+        if self.scan_1.has_field(field_name)? {
             return self.scan_1.get_value(field_name);
-        } else if field_name == self.field_name_2 {
+        } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_value(field_name);
         }
         Err(format!("Field {} not found", field_name).into())
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
-        if field_name == self.field_name_1 {
-            return self.scan_1.has_field(field_name);
-        } else if field_name == self.field_name_2 {
-            return self.scan_2.has_field(field_name);
+        if self.scan_1.has_field(field_name)? {
+            return Ok(true);
+        } else if self.scan_2.has_field(field_name)? {
+            return Ok(true);
         }
         Err(format!("Field {} not found", field_name).into())
     }
@@ -282,6 +273,437 @@ where
     fn close(&mut self) {
         self.scan_1.close();
         self.scan_2.close();
+    }
+}
+
+#[cfg(test)]
+mod merge_join_scan_tests {
+
+    use std::sync::Arc;
+
+    use crate::{
+        Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable,
+        UpdateScan,
+    };
+
+    #[test]
+    fn test_basic_merge_join() {
+        // Create test database
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        schema1.add_string_field("name", 10);
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        schema2.add_string_field("dept", 10);
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert sorted test data into first table
+        {
+            let mut scan = temp_table1.open();
+            for i in [1, 2, 3, 5, 7] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        // Insert sorted test data into second table
+        {
+            let mut scan = temp_table2.open();
+            for i in [2, 3, 5, 7, 9] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("dept", format!("dept{}", i)).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join
+        let mut join_count = 0;
+        let expected_ids = vec![2, 3, 5, 7];
+        let mut matched_ids = Vec::new();
+
+        while let Some(result) = merge_join_scan.next() {
+            assert!(result.is_ok(), "Join should succeed");
+            let id1 = merge_join_scan.get_int("id").unwrap();
+            let name = merge_join_scan.get_string("name").unwrap();
+            let dept = merge_join_scan.get_string("dept").unwrap();
+
+            assert_eq!(format!("name{}", id1), name);
+            assert_eq!(format!("dept{}", id1), dept);
+
+            matched_ids.push(id1);
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 4, "Should find all matching records");
+        assert_eq!(matched_ids, expected_ids, "Should match expected IDs");
+    }
+
+    #[test]
+    fn test_merge_join_no_matches() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        schema1.add_string_field("name", 10);
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        schema2.add_string_field("dept", 10);
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert non-overlapping data
+        {
+            let mut scan = temp_table1.open();
+            for i in [1, 3, 5, 7, 9] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        {
+            let mut scan = temp_table2.open();
+            for i in [2, 4, 6, 8, 10] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("dept", format!("dept{}", i)).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join - should find no matches
+        let mut join_count = 0;
+        while let Some(result) = merge_join_scan.next() {
+            assert!(result.is_ok());
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 0, "Should find no matching records");
+    }
+
+    #[test]
+    fn test_merge_join_duplicate_values() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        schema1.add_string_field("name", 10);
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        schema2.add_string_field("dept", 10);
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert data with duplicates
+        {
+            let mut scan = temp_table1.open();
+            // Insert id=5 twice
+            for i in [1, 3, 5, 5, 7] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        {
+            let mut scan = temp_table2.open();
+            // Insert id=5 three times
+            for i in [2, 5, 5, 5, 8] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("dept", format!("dept{}", i)).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join - should find 2*3=6 matches for id=5
+        let mut join_count = 0;
+        while let Some(result) = merge_join_scan.next() {
+            assert!(result.is_ok());
+            let id = merge_join_scan.get_int("id").unwrap();
+            assert_eq!(id, 5, "Only id=5 should match");
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 6, "Should find 2*3=6 matching records for id=5");
+    }
+
+    #[test]
+    fn test_merge_join_empty_tables() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        let layout2 = Layout::new(schema2);
+
+        // Create empty temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join - should find no matches
+        let mut join_count = 0;
+        while let Some(_) = merge_join_scan.next() {
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 0, "Should find no matches with empty tables");
+    }
+
+    #[test]
+    fn test_merge_join_one_empty_table() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables - one empty, one with data
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert data into only the second table
+        {
+            let mut scan = temp_table2.open();
+            for i in 1..5 {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join - should find no matches
+        let mut join_count = 0;
+        while let Some(_) = merge_join_scan.next() {
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 0, "Should find no matches with one empty table");
+    }
+
+    #[test]
+    fn test_merge_join_single_record_match() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        schema1.add_string_field("name", 10);
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        schema2.add_string_field("dept", 10);
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert data with just one matching record
+        {
+            let mut scan = temp_table1.open();
+            for i in [1, 3, 5, 7] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("name", format!("name{}", i)).unwrap();
+            }
+        }
+
+        {
+            let mut scan = temp_table2.open();
+            for i in [5, 8, 10] {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+                scan.set_string("dept", format!("dept{}", i)).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // Test the join - should find exactly one match
+        let mut join_count = 0;
+        while let Some(result) = merge_join_scan.next() {
+            assert!(result.is_ok());
+            let id = merge_join_scan.get_int("id").unwrap();
+            let name = merge_join_scan.get_string("name").unwrap();
+            let dept = merge_join_scan.get_string("dept").unwrap();
+
+            assert_eq!(id, 5);
+            assert_eq!(name, "name5");
+            assert_eq!(dept, "dept5");
+
+            join_count += 1;
+        }
+
+        assert_eq!(join_count, 1, "Should find exactly one matching record");
+    }
+
+    #[test]
+    fn test_merge_join_before_first() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create schemas for both tables
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("id");
+        let layout1 = Layout::new(schema1);
+
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("id");
+        let layout2 = Layout::new(schema2);
+
+        // Create temp tables
+        let temp_table1 = TempTable::new(Arc::clone(&txn), layout1.schema.clone());
+        let temp_table2 = TempTable::new(Arc::clone(&txn), layout2.schema.clone());
+
+        // Insert matching data
+        {
+            let mut scan = temp_table1.open();
+            for i in 1..4 {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+            }
+        }
+
+        {
+            let mut scan = temp_table2.open();
+            for i in 1..4 {
+                scan.insert().unwrap();
+                scan.set_int("id", i).unwrap();
+            }
+        }
+
+        // Create SortScans
+        let record_comparator1 = RecordComparator::new(vec!["id".to_string()]);
+        let record_comparator2 = RecordComparator::new(vec!["id".to_string()]);
+        let sort_scan1 = SortScan::new(vec![temp_table1], record_comparator1);
+        let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
+
+        // Create MergeJoinScan
+        let mut merge_join_scan =
+            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+
+        // First read all records
+        let mut first_pass_count = 0;
+        while let Some(_) = merge_join_scan.next() {
+            first_pass_count += 1;
+        }
+
+        assert_eq!(first_pass_count, 3, "Should find 3 matches in first pass");
+
+        // Reset and read again
+        merge_join_scan.before_first().unwrap();
+
+        // Second pass should get the same results
+        let mut second_pass_count = 0;
+        while let Some(_) = merge_join_scan.next() {
+            second_pass_count += 1;
+        }
+
+        assert_eq!(second_pass_count, 3, "Should find 3 matches after reset");
+        assert_eq!(
+            first_pass_count, second_pass_count,
+            "Both passes should return the same number of records"
+        );
     }
 }
 
