@@ -107,6 +107,194 @@ impl SimpleDB {
     }
 }
 
+struct MergeJoinPlan {
+    plan_1: Box<dyn Plan>,
+    plan_2: Box<dyn Plan>,
+    field_name_1: String,
+    field_name_2: String,
+    txn: Arc<Transaction>,
+    schema: Schema,
+}
+
+impl MergeJoinPlan {
+    fn new(
+        plan_1: Box<dyn Plan>,
+        plan_2: Box<dyn Plan>,
+        txn: Arc<Transaction>,
+        field_name_1: String,
+        field_name_2: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(&plan_1.schema())?;
+        schema.add_all_from_schema(&plan_2.schema())?;
+        Ok(Self {
+            plan_1,
+            plan_2,
+            field_name_1,
+            field_name_2,
+            txn,
+            schema,
+        })
+    }
+}
+
+impl Plan for MergeJoinPlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let scan_1 = self.plan_1.open();
+        let scan_2 = self.plan_2.open();
+        let sort_scan_2: SortScan = *(scan_2 as Box<dyn Any>)
+            .downcast()
+            .expect("Failed to downcast");
+        let scan = MergeJoinScan::new(
+            scan_1,
+            sort_scan_2,
+            self.field_name_1.clone(),
+            self.field_name_2.clone(),
+        );
+        Box::new(scan)
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        let blocks_1 = self.plan_1.blocks_accessed();
+        let blocks_2 = self.plan_2.blocks_accessed();
+        blocks_1 + blocks_2
+    }
+
+    fn records_output(&self) -> usize {
+        let max_vals = std::cmp::max(
+            self.distinct_values(&self.field_name_1),
+            self.distinct_values(&self.field_name_2),
+        );
+        (self.plan_1.records_output() * self.plan_2.records_output()) / max_vals
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self.plan_1.schema().fields.contains(&self.field_name_1) {
+            self.plan_1.distinct_values(field_name)
+        } else if self.plan_2.schema().fields.contains(&self.field_name_2) {
+            self.plan_2.distinct_values(field_name)
+        } else {
+            0
+        }
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let indent_str = " ".repeat(indent);
+        println!("{}MergeJoinPlan", indent_str);
+        println!("{}  Field 1: {}", indent_str, self.field_name_1);
+        println!("{}  Field 2: {}", indent_str, self.field_name_2);
+        println!("{}  Plan 1:", indent_str);
+        self.plan_1.print_plan_internal(indent + 2);
+        println!("{}  Plan 2:", indent_str);
+        self.plan_2.print_plan_internal(indent + 2);
+    }
+}
+
+#[cfg(test)]
+mod merge_join_plan_tests {
+    use std::sync::Arc;
+
+    use crate::{MergeJoinPlan, Plan, SimpleDB, SortPlan, TablePlan};
+
+    #[test]
+    fn test_merge_join_plan_with_real_tables() {
+        // Create test database
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create the tables using SQL
+        let sql1 = "create table employees(id int, name varchar(20))".to_string();
+        db.planner.execute_update(sql1, Arc::clone(&txn)).unwrap();
+
+        let sql2 = "create table departments(depid int, deptname varchar(20))".to_string();
+        db.planner.execute_update(sql2, Arc::clone(&txn)).unwrap();
+
+        // Insert test data
+        let employees = vec![(1, "Alice"), (2, "Bob"), (3, "Charlie"), (4, "David")];
+        let departments = vec![(2, "Engineering"), (3, "Sales"), (5, "Marketing")];
+
+        for (id, name) in &employees {
+            let sql = format!(
+                "insert into employees(id, name) values ({}, '{}')",
+                id, name
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        for (id, dept) in &departments {
+            let sql = format!(
+                "insert into departments(depid, deptname) values ({}, '{}')",
+                id, dept
+            );
+            db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
+        }
+
+        // Create table plans
+        let plan1 = Box::new(TablePlan::new(
+            "employees",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+
+        let plan2 = Box::new(TablePlan::new(
+            "departments",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+
+        // Create sort plans
+        let sort_plan1 = Box::new(SortPlan::new(
+            plan1,
+            Arc::clone(&txn),
+            vec!["id".to_string()],
+        ));
+
+        let sort_plan2 = Box::new(SortPlan::new(
+            plan2,
+            Arc::clone(&txn),
+            vec!["depid".to_string()],
+        ));
+
+        // Create merge join plan
+        let merge_join_plan = MergeJoinPlan::new(
+            sort_plan1,
+            sort_plan2,
+            Arc::clone(&txn),
+            "id".to_string(),
+            "depid".to_string(),
+        )
+        .unwrap();
+
+        // Open the plan and test
+        let mut scan = merge_join_plan.open();
+
+        let mut results = Vec::new();
+        while let Some(result) = scan.next() {
+            assert!(result.is_ok());
+            let id = scan.get_int("id").unwrap();
+            let name = scan.get_string("name").unwrap();
+            let dept = scan.get_string("deptname").unwrap();
+            results.push((id, name, dept));
+        }
+
+        assert_eq!(results.len(), 2, "Should find 2 matching records");
+
+        // Sort results for consistent comparison
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Expected matches: Bob-Engineering, Charlie-Sales
+        assert_eq!(
+            results[0],
+            (2, "Bob".to_string(), "Engineering".to_string())
+        );
+        assert_eq!(results[1], (3, "Charlie".to_string(), "Sales".to_string()));
+    }
+}
+
 enum MergeJoinScanState {
     BeforeFirst,
     SeekMatch,
@@ -273,6 +461,39 @@ where
     fn close(&mut self) {
         self.scan_1.close();
         self.scan_2.close();
+    }
+}
+
+impl<S> UpdateScan for MergeJoinScan<S>
+where
+    S: Scan + 'static,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        todo!()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        todo!()
     }
 }
 
@@ -1218,6 +1439,7 @@ mod sort_plan_tests {
     }
 }
 
+#[derive(Clone, Copy)]
 enum SortScanState {
     BeforeFirst,
     OnFirst,
@@ -1227,6 +1449,7 @@ enum SortScanState {
     Done,
 }
 
+#[derive(Clone)]
 struct SortScan {
     s1: TableScan,
     s2: Option<TableScan>,
@@ -2711,13 +2934,10 @@ impl IndexSelectPlan {
 
 impl Plan for IndexSelectPlan {
     fn open(&self) -> Box<dyn UpdateScan> {
-        let scan = self
-            .plan
-            .open()
-            .as_any()
-            .downcast_ref::<TableScan>()
-            .cloned()
-            .expect("IndexSelectPlan must be used with a TableScan");
+        let scan = self.plan.open();
+        let scan: TableScan = *(scan as Box<dyn Any>)
+            .downcast()
+            .expect("Failed to downcast to TableScan");
         Box::new(IndexSelectScan::new(
             scan,
             self.ii.open(),
@@ -5561,22 +5781,7 @@ impl UpdateScan for TableScan {
     }
 }
 
-trait AsAny {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-}
-
-impl<T: Any> AsAny for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-trait UpdateScan: Scan + AsAny {
+trait UpdateScan: Scan + Any {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
