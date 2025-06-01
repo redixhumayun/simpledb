@@ -109,6 +109,96 @@ impl SimpleDB {
     }
 }
 
+struct MultiBufferProductPlan {
+    txn: Arc<Transaction>,
+    lhs: Box<dyn Plan>,
+    rhs: Box<dyn Plan>,
+    schema: Schema,
+}
+
+impl MultiBufferProductPlan {
+    fn new(txn: Arc<Transaction>, lhs: Box<dyn Plan>, rhs: Box<dyn Plan>) -> SimpleDBResult<Self> {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(&lhs.schema())?;
+        schema.add_all_from_schema(&rhs.schema())?;
+        let lhs = Box::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
+        Ok(Self {
+            txn,
+            lhs,
+            rhs,
+            schema,
+        })
+    }
+
+    fn create_temp_table(&self, plan: &Box<dyn Plan>) -> SimpleDBResult<TempTable> {
+        let temp_table = TempTable::new(Arc::clone(&self.txn), plan.schema());
+        let mut source_scan = plan.open();
+        let mut table_scan = temp_table.open();
+        while let Some(result) = source_scan.next() {
+            result?;
+            table_scan.insert()?;
+            for field in plan.schema().fields {
+                table_scan.set_value(&field, source_scan.get_value(&field)?)?;
+            }
+        }
+        source_scan.close();
+        table_scan.close();
+        Ok(temp_table)
+    }
+}
+
+impl Plan for MultiBufferProductPlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let scan_1 = self.lhs.open();
+        let table_scan: TableScan = *(scan_1 as Box<dyn Any>)
+            .downcast()
+            .expect("Failed to downcast to TableScan");
+        let scan_2 = self.create_temp_table(&self.rhs).unwrap();
+        let scan = MultiBufferProductScan::new(
+            Arc::clone(&self.txn),
+            table_scan,
+            &scan_2.table_name,
+            scan_2.layout,
+        );
+        Box::new(scan)
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        let available_buffs = self.txn.available_buffs();
+        //  TODO: This is copied over from [MaterializePlan::blocks_accessed] because there is no way
+        //  to pass ownership to MaterializePlan right now of self.rhs
+        let num_blocks = {
+            let layout = Layout::new(self.rhs.schema());
+            let records_per_block = self.txn.block_size() / layout.slot_size;
+            self.rhs.records_output() / records_per_block
+        };
+        let num_chunks = num_blocks / available_buffs;
+        self.rhs.blocks_accessed() + (self.lhs.blocks_accessed() * num_chunks)
+    }
+
+    fn records_output(&self) -> usize {
+        self.lhs.records_output() * self.rhs.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self.lhs.schema().fields.contains(&field_name.to_string()) {
+            return self.lhs.distinct_values(field_name);
+        } else {
+            return self.rhs.distinct_values(field_name);
+        }
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        println!("{}MultiBufferProductPlan", " ".repeat(indent));
+        self.lhs.print_plan_internal(indent + 2);
+        self.rhs.print_plan_internal(indent + 2);
+    }
+}
+
 struct MultiBufferProductScan<S1>
 where
     S1: Scan + Clone,
