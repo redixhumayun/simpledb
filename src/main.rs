@@ -18,6 +18,7 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
+    usize,
 };
 mod test_utils;
 use btree::BTreeIndex;
@@ -31,6 +32,7 @@ mod btree;
 mod parser;
 
 type LSN = usize;
+type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 /// The database struct
 struct SimpleDB {
@@ -105,6 +107,815 @@ impl SimpleDB {
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
     }
+}
+
+struct MultiBufferProductScan<S1>
+where
+    S1: Scan + Clone,
+{
+    txn: Arc<Transaction>,
+    s1: S1,
+    s2: Option<ChunkScan>,
+    product_scan: Option<ProductScan<S1, ChunkScan>>,
+    chunk_size: usize,
+    table_name: String,
+    file_name: String,
+    layout: Layout,
+    next_start_block_num: usize,
+}
+
+impl<S1> MultiBufferProductScan<S1>
+where
+    S1: Scan + Clone,
+{
+    fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
+        debug!("Creating multi buffer product scan for {}.tbl", table_name);
+        let db_dir = {
+            let fm = txn.file_manager.lock().unwrap();
+            fm.db_directory.clone()
+        };
+        let path = db_dir.join(format!("{}.tbl", table_name));
+        let file_name = path.to_str().unwrap();
+        let available_buffers = txn.available_buffs();
+        let rhs_file_size = txn.size(file_name);
+        let chunk_size = best_factor(available_buffers, rhs_file_size);
+        debug!(
+            "The chunk size for the multi buffer product plan is {}",
+            chunk_size
+        );
+
+        let mut scan = MultiBufferProductScan {
+            txn,
+            s1,
+            s2: None,
+            product_scan: None,
+            chunk_size,
+            table_name: table_name.to_string(),
+            file_name: file_name.to_string(),
+            layout: layout.clone(),
+            next_start_block_num: 0,
+        };
+        scan.before_first().unwrap();
+        scan.load_next_set_of_chunks();
+        scan
+    }
+
+    fn load_next_set_of_chunks(&mut self) -> bool {
+        if self.next_start_block_num >= self.txn.size(&self.file_name) {
+            return false;
+        }
+        let new_last_block_num = std::cmp::min(
+            self.next_start_block_num + self.chunk_size - 1,
+            self.txn.size(&self.file_name) - 1,
+        );
+
+        //  Drop all old values to make room in the buffer pool
+        self.product_scan.take();
+        self.s2.take();
+
+        self.s1.before_first().unwrap();
+        let chunk_scan = ChunkScan::new(
+            Arc::clone(&self.txn),
+            self.layout.clone(),
+            &self.table_name,
+            self.next_start_block_num,
+            new_last_block_num,
+        );
+        self.s2 = Some(chunk_scan);
+        self.product_scan = Some(ProductScan::new(
+            self.s1.clone(),
+            self.s2.as_ref().unwrap().clone(),
+        ));
+        self.next_start_block_num = new_last_block_num + 1;
+        return true;
+    }
+}
+
+impl<S1> Iterator for MultiBufferProductScan<S1>
+where
+    S1: Scan + Clone,
+{
+    type Item = SimpleDBResult<()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on MultiBufferProductScan");
+        loop {
+            if let Some(prod_scan) = self.product_scan.as_mut() {
+                match prod_scan.next() {
+                    Some(result) => match result {
+                        Ok(_) => return Some(Ok(())),
+                        Err(e) => return Some(Err(e)),
+                    },
+                    None => {
+                        if !self.load_next_set_of_chunks() {
+                            return None;
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+    }
+}
+
+impl<S1> Scan for MultiBufferProductScan<S1>
+where
+    S1: Scan + Clone,
+{
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.next_start_block_num = 0;
+        self.load_next_set_of_chunks();
+        Ok(())
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        self.product_scan.as_ref().unwrap().get_int(field_name)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        self.product_scan.as_ref().unwrap().get_string(field_name)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        self.product_scan.as_ref().unwrap().get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        self.product_scan.as_ref().unwrap().has_field(field_name)
+    }
+
+    fn close(&mut self) {
+        self.product_scan.as_mut().unwrap().close();
+    }
+}
+
+impl<S1> UpdateScan for MultiBufferProductScan<S1>
+where
+    S1: UpdateScan + Clone + 'static,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod multi_buffer_product_scan_tests {
+    use super::*;
+
+    fn create_test_tables(db: &SimpleDB, txn: Arc<Transaction>) -> (Layout, Layout) {
+        // Create schema for first table (employees)
+        let mut schema1 = Schema::new();
+        schema1.add_int_field("emp_id");
+        schema1.add_string_field("name", 10);
+        let layout1 = Layout::new(schema1.clone());
+        db.metadata_manager
+            .create_table("emp", schema1, Arc::clone(&txn));
+
+        // Create schema for second table (departments)
+        let mut schema2 = Schema::new();
+        schema2.add_int_field("dept_id");
+        schema2.add_string_field("dept_name", 10);
+        let layout2 = Layout::new(schema2.clone());
+        db.metadata_manager
+            .create_table("dept", schema2, Arc::clone(&txn));
+
+        (layout1, layout2)
+    }
+
+    fn insert_test_records(
+        emp_scan: &mut TableScan,
+        emp_size: usize,
+        dept_scan: &mut TableScan,
+        dept_size: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        // Insert employee records
+        for i in 0..emp_size {
+            emp_scan.insert()?;
+            emp_scan.set_int("emp_id", i as i32)?;
+            emp_scan.set_string("name", format!("emp{}", i))?;
+        }
+
+        // Insert department records
+        for i in 0..dept_size {
+            dept_scan.insert()?;
+            dept_scan.set_int("dept_id", i as i32)?;
+            dept_scan.set_string("dept_name", format!("dept{}", i))?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_buffer_product_basic() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
+
+        // Insert test records
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
+        emp_scan.close();
+        dept_scan.close();
+
+        // Create MultiBufferProductScan
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+
+        // Count total combinations (should be 500 * 3000 = 1,500,000)
+        let mut count = 0;
+        for result in mbp_scan {
+            result?;
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 150,
+            "Should produce 150 combinations (5 employees * 30 departments)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_buffer_product_empty_tables() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
+
+        // Create empty scans
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+
+        let mut count = 0;
+        for result in mbp_scan {
+            result?;
+            count += 1;
+        }
+
+        assert_eq!(count, 0, "Should produce no combinations with empty tables");
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_buffer_product_field_access() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
+
+        // Insert test records
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
+        emp_scan.close();
+        dept_scan.close();
+
+        // Create MultiBufferProductScan
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let mut mbp_scan =
+            MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+
+        // Test first combination
+        if let Some(result) = mbp_scan.next() {
+            result?;
+            let emp_id = mbp_scan.get_int("emp_id")?;
+            let name = mbp_scan.get_string("name")?;
+            let dept_id = mbp_scan.get_int("dept_id")?;
+            let dept_name = mbp_scan.get_string("dept_name")?;
+
+            assert_eq!(emp_id, 0, "First employee ID should be 0");
+            assert_eq!(name, "emp0", "First employee name should be emp0");
+            assert_eq!(dept_id, 0, "First department ID should be 0");
+            assert_eq!(dept_name, "dept0", "First department name should be dept0");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multi_buffer_product_before_first() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
+
+        // Insert test records
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
+        emp_scan.close();
+        dept_scan.close();
+
+        // Create MultiBufferProductScan
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let mut mbp_scan =
+            MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+
+        // Read some records
+        mbp_scan.next();
+        mbp_scan.next();
+
+        // Reset to beginning
+        mbp_scan.before_first()?;
+
+        // Count all combinations again
+        let mut count = 0;
+        for result in mbp_scan {
+            result?;
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 150,
+            "Should read all combinations after before_first"
+        );
+        Ok(())
+    }
+}
+
+struct ChunkScan {
+    txn: Arc<Transaction>,
+    layout: Layout,
+    file_name: String,
+    table_name: String,
+    first_block_num: usize,
+    last_block_num: usize,
+    current_block_num: usize,
+    current_record_page: Option<usize>,
+    current_slot: Option<usize>,
+    buffer_list: Vec<RecordPage>,
+}
+
+impl Clone for ChunkScan {
+    fn clone(&self) -> Self {
+        for block_num in self.first_block_num..=self.last_block_num {
+            let block_id = BlockId::new(self.file_name.clone(), block_num);
+            self.txn.pin(&block_id);
+        }
+
+        Self {
+            txn: Arc::clone(&self.txn),
+            layout: self.layout.clone(),
+            file_name: self.file_name.clone(),
+            table_name: self.table_name.clone(),
+            first_block_num: self.first_block_num.clone(),
+            last_block_num: self.last_block_num.clone(),
+            current_block_num: self.current_block_num.clone(),
+            current_record_page: self.current_record_page.clone(),
+            current_slot: self.current_slot.clone(),
+            buffer_list: self.buffer_list.clone(),
+        }
+    }
+}
+
+impl ChunkScan {
+    fn new(
+        txn: Arc<Transaction>,
+        layout: Layout,
+        table_name: &str,
+        first_block_num: usize,
+        last_block_num: usize,
+    ) -> Self {
+        assert!(
+            first_block_num <= last_block_num,
+            "{} is not less than or equal to {}",
+            first_block_num,
+            last_block_num
+        );
+        debug!(
+            "Creating chunk scan for {}.tbl for blocks from {} to {}",
+            table_name, first_block_num, last_block_num
+        );
+        let db_dir = {
+            let fm = txn.file_manager.lock().unwrap();
+            fm.db_directory.clone()
+        };
+        let path = db_dir.join(format!("{}.tbl", table_name));
+        let file_name = path.to_str().unwrap();
+        let mut buffer_list = Vec::new();
+        for block_num in first_block_num..=last_block_num {
+            let block_id = BlockId::new(file_name.to_string(), block_num);
+            let record_page = RecordPage::new(Arc::clone(&txn), block_id, layout.clone());
+            buffer_list.push(record_page);
+        }
+
+        let mut scan = Self {
+            txn,
+            layout,
+            file_name: file_name.to_string(),
+            table_name: table_name.to_string(),
+            first_block_num,
+            last_block_num,
+            current_block_num: first_block_num,
+            current_record_page: None,
+            current_slot: None,
+            buffer_list,
+        };
+        scan.move_to_block(first_block_num);
+        return scan;
+    }
+
+    fn move_to_block(&mut self, block_num: usize) {
+        let offset = block_num - self.first_block_num;
+        debug!(
+            "Moving chunk scan to block {} which is offset {}",
+            block_num, offset
+        );
+        self.current_record_page = Some(offset);
+        self.current_slot = None;
+    }
+}
+
+impl Drop for ChunkScan {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl Iterator for ChunkScan {
+    type Item = SimpleDBResult<()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on ChunkScan for {}", self.table_name);
+        assert!(self.buffer_list.len() != 0);
+        loop {
+            if let Some(record_page_idx) = &self.current_record_page {
+                let record_page = &self.buffer_list[*record_page_idx];
+                let next_slot = match self.current_slot {
+                    None => record_page.iter_used_slots().next(),
+                    Some(slot) => record_page
+                        .iter_used_slots()
+                        .skip_while(|s| *s <= slot)
+                        .next(),
+                };
+
+                //  There are still slots to iterate in the current record page
+                if let Some(slot) = next_slot {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
+                }
+
+                //  There are no more slots in the current record page. Check if there are more record pages
+                if *record_page_idx < self.buffer_list.len() - 1 {
+                    self.current_record_page = Some(*record_page_idx + 1);
+                    self.current_slot = None;
+                    continue;
+                }
+            }
+
+            //  There are no more record pages left
+            return None;
+        }
+    }
+}
+
+impl Scan for ChunkScan {
+    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+        self.move_to_block(self.first_block_num);
+        Ok(())
+    }
+
+    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
+        let record_page = &self.buffer_list[self.current_record_page.ok_or_else(|| {
+            format!(
+                "No record page number in ChunkScan set when calling get_int for {}",
+                self.table_name
+            )
+        })?];
+        Ok(self
+            .current_slot
+            .ok_or_else(|| {
+                format!(
+                    "No current slot set in ChunkScan when calling get_int for {}",
+                    self.table_name
+                )
+            })
+            .map(|slot| record_page.get_int(slot, field_name))?)
+    }
+
+    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
+        let record_page = &self.buffer_list[self.current_record_page.ok_or_else(|| {
+            format!(
+                "No record page number set in ChunkScan when calling get_string for {}",
+                self.table_name
+            )
+        })?];
+        Ok(self
+            .current_slot
+            .ok_or_else(|| {
+                format!(
+                    "No current slot set in ChunkScan when calling get_string for {}",
+                    self.table_name
+                )
+            })
+            .map(|slot| record_page.get_string(slot, field_name))?)
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        match self.layout.schema.info.get(field_name).unwrap().field_type {
+            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+        }
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.layout.schema.fields.contains(&field_name.to_string()))
+    }
+
+    fn close(&mut self) {
+        for record_page in &self.buffer_list {
+            self.txn.unpin(&record_page.block_id);
+        }
+        self.current_record_page = None;
+    }
+}
+
+impl UpdateScan for ChunkScan {
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        unimplemented!()
+    }
+
+    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+        unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod chunk_scan_tests {
+    use super::*;
+
+    fn create_test_table(db: &SimpleDB, txn: Arc<Transaction>) -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        schema.add_string_field("name", 10);
+
+        let layout = Layout::new(schema.clone());
+        db.metadata_manager
+            .create_table("test_table", schema, Arc::clone(&txn));
+        layout
+    }
+
+    fn insert_test_records(table_scan: &mut TableScan, count: usize) -> Result<(), Box<dyn Error>> {
+        for i in 0..count {
+            table_scan.insert()?;
+            table_scan.set_int("id", i as i32)?;
+            table_scan.set_string("name", format!("name{}", i))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_scan_basic() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let layout = create_test_table(&db, Arc::clone(&txn));
+
+        // Insert some test records using TableScan
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        insert_test_records(&mut table_scan, 10)?;
+        table_scan.close();
+
+        // Test ChunkScan over all blocks
+        let mut chunk_scan = ChunkScan::new(
+            Arc::clone(&txn),
+            layout.clone(),
+            "test_table",
+            0,
+            2, // Assuming records spread across first 3 blocks
+        );
+
+        let mut count = 0;
+        let mut last_id = -1;
+
+        while let Some(result) = chunk_scan.next() {
+            result?;
+            let id = chunk_scan.get_int("id")?;
+            let name = chunk_scan.get_string("name")?;
+
+            assert!(id > last_id, "Records should be read in order");
+            assert_eq!(name, format!("name{}", id));
+
+            last_id = id;
+            count += 1;
+        }
+
+        assert_eq!(count, 10, "Should have read all 10 records");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_scan_basic_multiple_blocks() -> SimpleDBResult<()> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let layout = create_test_table(&db, Arc::clone(&txn));
+
+        // Insert some test records using TableScan
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        insert_test_records(&mut table_scan, 100)?;
+        table_scan.close();
+
+        // Test ChunkScan over all blocks
+        let mut chunk_scan = ChunkScan::new(
+            Arc::clone(&txn),
+            layout.clone(),
+            "test_table",
+            0,
+            6, // Each block holds 18 records, 100 / 18 ≈ 6
+        );
+
+        let mut count = 0;
+        let mut last_id = -1;
+
+        while let Some(result) = chunk_scan.next() {
+            result?;
+            let id = chunk_scan.get_int("id")?;
+            let name = chunk_scan.get_string("name")?;
+
+            assert!(id > last_id, "Records should be read in order");
+            assert_eq!(name, format!("name{}", id));
+
+            last_id = id;
+            count += 1;
+        }
+
+        assert_eq!(count, 100, "Should have read all 100 records");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_scan_partial_blocks() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let layout = create_test_table(&db, Arc::clone(&txn));
+
+        // Insert test records
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        insert_test_records(&mut table_scan, 100)?;
+        table_scan.close();
+
+        // Test ChunkScan over middle blocks only
+        let mut chunk_scan = ChunkScan::new(
+            Arc::clone(&txn),
+            layout.clone(),
+            "test_table",
+            1, // Start from second block
+            2, // End at third block
+        );
+
+        let mut records = Vec::new();
+        while let Some(result) = chunk_scan.next() {
+            result?;
+            let id = chunk_scan.get_int("id")?;
+            records.push(id);
+        }
+
+        assert!(
+            !records.is_empty(),
+            "Should have found some records in middle blocks"
+        );
+        assert!(
+            records.windows(2).all(|w| w[0] < w[1]),
+            "Records should be in order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_scan_empty_blocks() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let layout = create_test_table(&db, Arc::clone(&txn));
+
+        // Create empty table
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        table_scan.close();
+
+        // Test ChunkScan over empty blocks
+        let chunk_scan = ChunkScan::new(Arc::clone(&txn), layout.clone(), "test_table", 0, 1);
+
+        let mut count = 0;
+        for result in chunk_scan {
+            result?;
+            count += 1;
+        }
+
+        assert_eq!(count, 0, "Should not find any records in empty blocks");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_scan_before_first() -> Result<(), Box<dyn Error>> {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        let layout = create_test_table(&db, Arc::clone(&txn));
+
+        // Insert test records
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        insert_test_records(&mut table_scan, 5)?;
+        table_scan.close();
+
+        // Test before_first functionality
+        let mut chunk_scan = ChunkScan::new(Arc::clone(&txn), layout.clone(), "test_table", 0, 1);
+
+        // Read some records
+        chunk_scan.next();
+        chunk_scan.next();
+
+        // Call before_first
+        chunk_scan.before_first()?;
+
+        // Should start from beginning again
+        let mut ids = Vec::new();
+        while let Some(result) = chunk_scan.next() {
+            result?;
+            ids.push(chunk_scan.get_int("id")?);
+        }
+        assert_eq!(ids.len(), 5, "Should read all records after before_first");
+        assert_eq!(
+            ids,
+            (0..5).collect::<Vec<i32>>(),
+            "Should read records in order from start"
+        );
+        Ok(())
+    }
+}
+
+/// This function finds the best root for doing a multibuffer mergejoin
+/// We are trying to find the number of buffers to reserve and how many blocks
+/// of the input record to read
+/// This is a root because the cost of the merge side of merge join is logarithmic
+fn best_root(available_buffers: usize, num_of_blocks: usize) -> usize {
+    let buffers = available_buffers - 2; //  reserve some buffers
+    if buffers <= 1 {
+        return buffers;
+    }
+    let mut k = usize::MAX;
+    let mut root = 1;
+    while k > buffers {
+        root += 1;
+        k = num_of_blocks.pow(1 / root);
+    }
+    k
+}
+
+/// This function finds the best factor for doing a multibuffer productjoin
+/// We are trying to find the number of buffers to reserve and how many blocks
+/// of the input record to read
+/// This is a factor because the cost of the productscan is linear
+fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
+    let buffers = available_buffers - 2; // reserve some buffers
+    if buffers <= 1 {
+        return buffers;
+    }
+    let mut k = num_of_blocks;
+    let mut factor = 1;
+    while k > buffers {
+        factor += 1;
+        k = num_of_blocks / factor;
+    }
+    k
 }
 
 struct MergeJoinPlan {
@@ -469,31 +1280,31 @@ where
     S: Scan + 'static,
 {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        todo!()
+        unimplemented!()
     }
 }
 
@@ -1449,7 +2260,6 @@ enum SortScanState {
     Done,
 }
 
-#[derive(Clone)]
 struct SortScan {
     s1: TableScan,
     s2: Option<TableScan>,
@@ -3279,9 +4089,7 @@ where
         debug!("Calling next on ProductScan");
         match self.s2.next() {
             Some(result) => match result {
-                Ok(_) => {
-                    return Some(Ok(()));
-                }
+                Ok(_) => return Some(Ok(())),
                 Err(e) => return Some(Err(e)),
             },
             //  s2 cannot be advanced
@@ -3393,22 +4201,18 @@ where
     }
 
     fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        //  no-op because no resources to clean up
         panic!("Insert not supported in ProductScan");
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
-        //  no-op because no resources to clean up
         panic!("Delete not supported in ProductScan");
     }
 
     fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        //  no-op because no resources to clean up
         panic!("Get RID not supported in ProductScan");
     }
 
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        //  no-op because no resources to clean up
         panic!("Move to RID not supported in ProductScan");
     }
 }
@@ -5500,7 +6304,6 @@ mod table_manager_tests {
     }
 }
 
-#[derive(Clone)]
 struct TableScan {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -5508,6 +6311,26 @@ struct TableScan {
     record_page: Option<RecordPage>,
     current_slot: Option<usize>,
     table_name: String,
+}
+
+impl Clone for TableScan {
+    fn clone(&self) -> Self {
+        if let Some(block_id) = self
+            .record_page
+            .as_ref()
+            .map(|record_page| &record_page.block_id)
+        {
+            self.txn.pin(block_id);
+        }
+        Self {
+            txn: Arc::clone(&self.txn),
+            layout: self.layout.clone(),
+            file_name: self.file_name.clone(),
+            record_page: self.record_page.clone(),
+            current_slot: self.current_slot.clone(),
+            table_name: self.table_name.clone(),
+        }
+    }
 }
 
 impl TableScan {
