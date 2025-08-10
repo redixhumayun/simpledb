@@ -199,6 +199,144 @@ impl Plan for MultiBufferProductPlan {
     }
 }
 
+#[cfg(test)]
+mod multi_buffer_product_plan_tests {
+    use std::sync::Arc;
+
+    use crate::{MultiBufferProductPlan, Plan, SimpleDB, TablePlan, Transaction};
+
+    fn setup_emp_dept(db: &SimpleDB, txn: Arc<Transaction>) {
+        db.planner
+            .execute_update(
+                "create table emp(emp_id int, name varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update(
+                "create table dept(dept_id int, dept_name varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+    }
+
+    fn insert_emp(db: &SimpleDB, txn: Arc<Transaction>, n: usize) {
+        for i in 0..n {
+            db.planner
+                .execute_update(
+                    format!("insert into emp(emp_id, name) values ({}, 'emp{}')", i, i),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+    }
+
+    fn insert_dept(db: &SimpleDB, txn: Arc<Transaction>, n: usize) {
+        for i in 0..n {
+            db.planner
+                .execute_update(
+                    format!(
+                        "insert into dept(dept_id, dept_name) values ({}, 'dept{}')",
+                        i, i
+                    ),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+    }
+
+    fn build_plan(db: &SimpleDB, txn: Arc<Transaction>) -> MultiBufferProductPlan {
+        let lhs = Box::new(TablePlan::new(
+            "emp",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let rhs = Box::new(TablePlan::new(
+            "dept",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        MultiBufferProductPlan::new(Arc::clone(&txn), lhs, rhs).unwrap()
+    }
+
+    #[test]
+    fn test_mbp_plan_basic_count() {
+        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        setup_emp_dept(&db, Arc::clone(&txn));
+        insert_emp(&db, Arc::clone(&txn), 5);
+        insert_dept(&db, Arc::clone(&txn), 30);
+
+        let mbp = build_plan(&db, Arc::clone(&txn));
+        let mut scan = mbp.open();
+
+        let mut count = 0;
+        while let Some(res) = scan.next() {
+            res.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 150, "5 x 30 combinations expected");
+    }
+
+    #[test]
+    fn test_mbp_plan_empty_tables() {
+        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        setup_emp_dept(&db, Arc::clone(&txn));
+        // no inserts
+
+        let mbp = build_plan(&db, Arc::clone(&txn));
+        let mut scan = mbp.open();
+
+        let mut count = 0;
+        while let Some(res) = scan.next() {
+            res.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 0, "No combinations for empty tables");
+    }
+
+    #[test]
+    fn test_mbp_plan_before_first() {
+        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        setup_emp_dept(&db, Arc::clone(&txn));
+        insert_emp(&db, Arc::clone(&txn), 5);
+        insert_dept(&db, Arc::clone(&txn), 30);
+
+        let mbp = build_plan(&db, Arc::clone(&txn));
+        let mut scan = mbp.open();
+
+        // consume a few
+        scan.next();
+        scan.next();
+
+        scan.before_first().unwrap();
+
+        let mut count = 0;
+        while let Some(res) = scan.next() {
+            res.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 150, "Should re-iterate all combinations");
+    }
+
+    #[test]
+    fn test_mbp_plan_schema_union() {
+        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        setup_emp_dept(&db, Arc::clone(&txn));
+
+        let mbp = build_plan(&db, Arc::clone(&txn));
+        let schema = mbp.schema();
+
+        assert!(schema.fields.contains(&"emp_id".to_string()));
+        assert!(schema.fields.contains(&"name".to_string()));
+        assert!(schema.fields.contains(&"dept_id".to_string()));
+        assert!(schema.fields.contains(&"dept_name".to_string()));
+    }
+}
+
 struct MultiBufferProductScan<S1>
 where
     S1: Scan + Clone,
