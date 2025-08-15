@@ -4687,6 +4687,13 @@ mod project_scan_tests {
     }
 }
 
+enum IndexJoinScanState {
+    Init,
+    Probe,
+    Advance,
+    Done,
+}
+
 struct IndexJoinScan<S, I>
 where
     S: Scan,
@@ -4696,6 +4703,7 @@ where
     rhs: TableScan,
     index: I,
     join_field: String,
+    state: IndexJoinScanState,
 }
 
 impl<S, I> IndexJoinScan<S, I>
@@ -4709,6 +4717,7 @@ where
             rhs,
             index,
             join_field,
+            state: IndexJoinScanState::Init,
         }
     }
 
@@ -4728,15 +4737,55 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on IndexJoinScan");
+
         loop {
-            if self.index.next() {
-                self.rhs.move_to_row_id(self.index.get_data_rid());
-                return Some(Ok(()));
+            match self.state {
+                IndexJoinScanState::Init => {
+                    if let Err(e) = self.lhs.before_first() {
+                        return Some(Err(e));
+                    }
+                    match self.lhs.next() {
+                        Some(Ok(())) => {
+                            if let Err(e) = self.reset_index() {
+                                return Some(Err(e));
+                            };
+                            self.state = IndexJoinScanState::Probe;
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            return Some(Err(e));
+                        }
+                        None => {
+                            self.state = IndexJoinScanState::Done;
+                            continue;
+                        }
+                    }
+                }
+                IndexJoinScanState::Probe => {
+                    if self.index.next() {
+                        let rid = self.index.get_data_rid();
+                        self.rhs.move_to_row_id(rid);
+                        return Some(Ok(()));
+                    } else {
+                        self.state = IndexJoinScanState::Advance;
+                    }
+                }
+                IndexJoinScanState::Advance => match self.lhs.next() {
+                    Some(Ok(())) => {
+                        if let Err(e) = self.reset_index() {
+                            return Some(Err(e));
+                        }
+                        self.state = IndexJoinScanState::Probe;
+                        continue;
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {
+                        self.state = IndexJoinScanState::Done;
+                        continue;
+                    }
+                },
+                IndexJoinScanState::Done => return None,
             }
-            if let None = self.lhs.next() {
-                return None;
-            }
-            self.reset_index().unwrap();
         }
     }
 }
@@ -4747,37 +4796,36 @@ where
     I: Index,
 {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
-        self.lhs.before_first()?;
-        self.lhs.next();
-        self.reset_index()
+        self.state = IndexJoinScanState::Init;
+        Ok(())
     }
 
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.get_int(field_name);
-        }
         if self.lhs.has_field(field_name)? {
             return self.lhs.get_int(field_name);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_int(field_name);
         }
         Err(format!("Field {} not found in IndexJoinScan", field_name).into())
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.get_string(field_name);
-        }
         if self.lhs.has_field(field_name)? {
             return self.lhs.get_string(field_name);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_string(field_name);
         }
         Err(format!("Field {} not found in IndexJoinScan", field_name).into())
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.get_value(field_name);
-        }
         if self.lhs.has_field(field_name)? {
             return self.lhs.get_value(field_name);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.get_value(field_name);
         }
         Err(format!("Field {} not found in IndexJoinScan", field_name).into())
     }
