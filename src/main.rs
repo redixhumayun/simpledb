@@ -1334,6 +1334,172 @@ mod merge_join_plan_tests {
     }
 }
 
+#[cfg(test)]
+mod index_join_plan_tests {
+    use std::sync::Arc;
+
+    use crate::{IndexJoinPlan, Plan, SimpleDB, TablePlan};
+
+    #[test]
+    fn test_index_join_plan_with_real_tables() {
+        // Setup DB
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create tables
+        db.planner
+            .execute_update(
+                "create table employees(id int, name varchar(20))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update(
+                "create table departments(depid int, deptname varchar(20))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+
+        // Create index on departments.depid (join target)
+        db.planner
+            .execute_update(
+                "create index idx_depid on departments(depid)".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+
+        // Insert data
+        for (id, name) in &[(1, "Alice"), (2, "Bob"), (3, "Charlie"), (4, "David")] {
+            db.planner
+                .execute_update(
+                    format!(
+                        "insert into employees(id, name) values ({}, '{}')",
+                        id, name
+                    ),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+        for (id, dept) in &[(2, "Engineering"), (3, "Sales"), (5, "Marketing")] {
+            db.planner
+                .execute_update(
+                    format!(
+                        "insert into departments(depid, deptname) values ({}, '{}')",
+                        id, dept
+                    ),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+
+        // Build plans
+        let lhs = Box::new(TablePlan::new(
+            "employees",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let rhs = Box::new(TablePlan::new(
+            "departments",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+
+        // Get IndexInfo for departments.depid
+        let idx_info = db
+            .metadata_manager
+            .get_index_info("departments", Arc::clone(&txn))
+            .remove("depid")
+            .expect("expected index on departments.depid");
+
+        // Create plan: join employees.id = departments.depid using index on departments.depid
+        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "id".to_string()).unwrap();
+
+        // Execute
+        let mut scan = plan.open();
+        let mut results = Vec::new();
+        while let Some(res) = scan.next() {
+            assert!(res.is_ok());
+            let id = scan.get_int("id").unwrap();
+            let name = scan.get_string("name").unwrap();
+            let dept = scan.get_string("deptname").unwrap();
+            results.push((id, name, dept));
+        }
+
+        // Expect Bob-Engineering, Charlie-Sales
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            (2, "Bob".to_string(), "Engineering".to_string())
+        );
+        assert_eq!(results[1], (3, "Charlie".to_string(), "Sales".to_string()));
+    }
+
+    #[test]
+    fn test_index_join_plan_no_matches() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        db.planner
+            .execute_update(
+                "create table t1(a int, b varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update(
+                "create table t2(c int, d varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update("create index idx_c on t2(c)".to_string(), Arc::clone(&txn))
+            .unwrap();
+
+        for i in 0..5 {
+            db.planner
+                .execute_update(
+                    format!("insert into t1(a, b) values ({}, 'x{}')", i, i),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+        for i in 100..105 {
+            db.planner
+                .execute_update(
+                    format!("insert into t2(c, d) values ({}, 'y{}')", i, i),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+
+        let lhs = Box::new(TablePlan::new(
+            "t1",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let rhs = Box::new(TablePlan::new(
+            "t2",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let idx_info = db
+            .metadata_manager
+            .get_index_info("t2", Arc::clone(&txn))
+            .remove("c")
+            .expect("expected index on t2.c");
+
+        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
+        let mut scan = plan.open();
+        let mut count = 0;
+        while let Some(res) = scan.next() {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 0);
+    }
+}
+
 enum MergeJoinScanState {
     BeforeFirst,
     SeekMatch,
@@ -4687,6 +4853,88 @@ mod project_scan_tests {
     }
 }
 
+struct IndexJoinPlan {
+    plan_1: Box<dyn Plan>,
+    plan_2: Box<dyn Plan>,
+    index_info: IndexInfo,
+    schema: Schema,
+    join_field: String,
+}
+
+impl IndexJoinPlan {
+    fn new(
+        plan_1: Box<dyn Plan>,
+        plan_2: Box<dyn Plan>,
+        index_info: IndexInfo,
+        join_field: String,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(&plan_1.schema())?;
+        schema.add_all_from_schema(&plan_2.schema())?;
+        Ok(Self {
+            plan_1,
+            plan_2,
+            index_info,
+            schema,
+            join_field,
+        })
+    }
+}
+
+impl Plan for IndexJoinPlan {
+    fn open(&self) -> Box<dyn UpdateScan> {
+        let lhs = self.plan_1.open();
+        let scan = self.plan_2.open();
+        let scan: TableScan = *(scan as Box<dyn Any>)
+            .downcast()
+            .expect("Failed to downcast to TableScan in IndexJoinPlan");
+        let idx = self.index_info.open();
+        Box::new(IndexJoinScan::new(lhs, idx, scan, self.join_field.clone()))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.plan_1.blocks_accessed()
+            + (self.plan_2.records_output() * self.index_info.blocks_accessed())
+            + self.records_output()
+    }
+
+    fn records_output(&self) -> usize {
+        self.plan_1.records_output() * self.index_info.records_output()
+    }
+
+    fn distinct_values(&self, field_name: &str) -> usize {
+        if self
+            .plan_1
+            .schema()
+            .fields
+            .contains(&field_name.to_string())
+        {
+            return self.plan_1.distinct_values(field_name);
+        }
+        if self
+            .plan_2
+            .schema()
+            .fields
+            .contains(&field_name.to_string())
+        {
+            return self.plan_2.distinct_values(field_name);
+        }
+        panic!("Field {} not found in IndexJoinPlan", field_name);
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        self.plan_1.print_plan_internal(indent);
+        self.plan_2.print_plan_internal(indent);
+        println!("{}IndexJoinPlan", " ".repeat(indent));
+        println!("{}  IndexInfo: {}", " ".repeat(indent), self.index_info);
+        println!("{}  JoinField: {}", " ".repeat(indent), self.join_field);
+    }
+}
+
 enum IndexJoinScanState {
     Init,
     Probe,
@@ -4842,6 +5090,58 @@ where
 
     fn close(&mut self) {
         //  no-op because no resources to clean up
+    }
+}
+
+impl<S, I> UpdateScan for IndexJoinScan<S, I>
+where
+    S: UpdateScan + 'static,
+    I: Index + 'static,
+{
+    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.set_int(field_name, value);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.set_int(field_name, value);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.set_string(field_name, value);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.set_string(field_name, value);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+        if self.lhs.has_field(field_name)? {
+            return self.lhs.set_value(field_name, value);
+        }
+        if self.rhs.has_field(field_name)? {
+            return self.rhs.set_value(field_name, value);
+        }
+        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+    }
+
+    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+        panic!("Insert not supported in IndexJoinScan");
+    }
+
+    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+        panic!("Delete not supported in IndexJoinScan");
+    }
+
+    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+        panic!("Get RID not supported in IndexJoinScan");
+    }
+
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+        panic!("Move to RID not supported in IndexJoinScan");
     }
 }
 
@@ -6032,6 +6332,16 @@ struct IndexInfo {
     table_schema: Schema,
     index_layout: Layout,
     stat_info: StatInfo,
+}
+
+impl std::fmt::Display for IndexInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IndexInfo(name={}, field={})",
+            self.index_name, self.field_name
+        )
+    }
 }
 
 impl IndexInfo {
