@@ -1334,172 +1334,6 @@ mod merge_join_plan_tests {
     }
 }
 
-#[cfg(test)]
-mod index_join_plan_tests {
-    use std::sync::Arc;
-
-    use crate::{IndexJoinPlan, Plan, SimpleDB, TablePlan};
-
-    #[test]
-    fn test_index_join_plan_with_real_tables() {
-        // Setup DB
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
-        let txn = Arc::new(db.new_tx());
-
-        // Create tables
-        db.planner
-            .execute_update(
-                "create table employees(id int, name varchar(20))".to_string(),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-        db.planner
-            .execute_update(
-                "create table departments(depid int, deptname varchar(20))".to_string(),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-
-        // Create index on departments.depid (join target)
-        db.planner
-            .execute_update(
-                "create index idx_depid on departments(depid)".to_string(),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-
-        // Insert data
-        for (id, name) in &[(1, "Alice"), (2, "Bob"), (3, "Charlie"), (4, "David")] {
-            db.planner
-                .execute_update(
-                    format!(
-                        "insert into employees(id, name) values ({}, '{}')",
-                        id, name
-                    ),
-                    Arc::clone(&txn),
-                )
-                .unwrap();
-        }
-        for (id, dept) in &[(2, "Engineering"), (3, "Sales"), (5, "Marketing")] {
-            db.planner
-                .execute_update(
-                    format!(
-                        "insert into departments(depid, deptname) values ({}, '{}')",
-                        id, dept
-                    ),
-                    Arc::clone(&txn),
-                )
-                .unwrap();
-        }
-
-        // Build plans
-        let lhs = Box::new(TablePlan::new(
-            "employees",
-            Arc::clone(&txn),
-            Arc::clone(&db.metadata_manager),
-        ));
-        let rhs = Box::new(TablePlan::new(
-            "departments",
-            Arc::clone(&txn),
-            Arc::clone(&db.metadata_manager),
-        ));
-
-        // Get IndexInfo for departments.depid
-        let idx_info = db
-            .metadata_manager
-            .get_index_info("departments", Arc::clone(&txn))
-            .remove("depid")
-            .expect("expected index on departments.depid");
-
-        // Create plan: join employees.id = departments.depid using index on departments.depid
-        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "id".to_string()).unwrap();
-
-        // Execute
-        let mut scan = plan.open();
-        let mut results = Vec::new();
-        while let Some(res) = scan.next() {
-            assert!(res.is_ok());
-            let id = scan.get_int("id").unwrap();
-            let name = scan.get_string("name").unwrap();
-            let dept = scan.get_string("deptname").unwrap();
-            results.push((id, name, dept));
-        }
-
-        // Expect Bob-Engineering, Charlie-Sales
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(results.len(), 2);
-        assert_eq!(
-            results[0],
-            (2, "Bob".to_string(), "Engineering".to_string())
-        );
-        assert_eq!(results[1], (3, "Charlie".to_string(), "Sales".to_string()));
-    }
-
-    #[test]
-    fn test_index_join_plan_no_matches() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
-        let txn = Arc::new(db.new_tx());
-
-        db.planner
-            .execute_update(
-                "create table t1(a int, b varchar(10))".to_string(),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-        db.planner
-            .execute_update(
-                "create table t2(c int, d varchar(10))".to_string(),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-        db.planner
-            .execute_update("create index idx_c on t2(c)".to_string(), Arc::clone(&txn))
-            .unwrap();
-
-        for i in 0..5 {
-            db.planner
-                .execute_update(
-                    format!("insert into t1(a, b) values ({}, 'x{}')", i, i),
-                    Arc::clone(&txn),
-                )
-                .unwrap();
-        }
-        for i in 100..105 {
-            db.planner
-                .execute_update(
-                    format!("insert into t2(c, d) values ({}, 'y{}')", i, i),
-                    Arc::clone(&txn),
-                )
-                .unwrap();
-        }
-
-        let lhs = Box::new(TablePlan::new(
-            "t1",
-            Arc::clone(&txn),
-            Arc::clone(&db.metadata_manager),
-        ));
-        let rhs = Box::new(TablePlan::new(
-            "t2",
-            Arc::clone(&txn),
-            Arc::clone(&db.metadata_manager),
-        ));
-        let idx_info = db
-            .metadata_manager
-            .get_index_info("t2", Arc::clone(&txn))
-            .remove("c")
-            .expect("expected index on t2.c");
-
-        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
-        let mut scan = plan.open();
-        let mut count = 0;
-        while let Some(res) = scan.next() {
-            assert!(res.is_ok());
-            count += 1;
-        }
-        assert_eq!(count, 0);
-    }
-}
-
 enum MergeJoinScanState {
     BeforeFirst,
     SeekMatch,
@@ -3946,6 +3780,182 @@ trait UpdatePlanner {
     ) -> Result<usize, Box<dyn Error>>;
 }
 
+/// This is the "physical" portion of the optimizer. It decides on the physical implementation of a node to use
+/// For instance, whether to use an [IndexSelectPlan] or a regular [SelectPlan] depending on the availability of certain resources
+struct TablePlanner {
+    table_name: String,
+    predicate: Predicate,
+    txn: Arc<Transaction>,
+    metadata_manager: Arc<MetadataManager>,
+    schema: Schema,
+    indexes: HashMap<String, IndexInfo>,
+}
+
+impl TablePlanner {
+    fn new(
+        table_name: String,
+        predicate: Predicate,
+        txn: Arc<Transaction>,
+        metadata_manager: Arc<MetadataManager>,
+    ) -> Self {
+        let plan = TablePlan::new(
+            table_name.as_str(),
+            Arc::clone(&txn),
+            Arc::clone(&metadata_manager),
+        );
+        let indexes = metadata_manager.get_index_info(&table_name, Arc::clone(&txn));
+        Self {
+            table_name,
+            predicate,
+            txn: Arc::clone(&txn),
+            metadata_manager,
+            schema: plan.schema(),
+            indexes,
+        }
+    }
+
+    /// Create a [SelectPlan] for this table using the available predicate. This applies heuristic 6
+    /// Ideally try to create an [IndexSelectPlan]
+    /// If that is not possible, create a [SelectPlan] with the predicate applied if possible
+    fn make_select_plan(&self) -> Box<dyn Plan> {
+        todo!()
+    }
+
+    /// Create a join plan with the current_plan provided in the function signature. Use heuristic 7
+    /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
+    /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
+    fn make_join_plan(&self, current_plan: &Box<dyn Plan>) -> Option<Box<dyn Plan>> {
+        todo!()
+    }
+
+    /// Construct a [MultiBufferProductPlan] with the provided plan
+    fn make_product_plan(&self, current_plan: &Box<dyn Plan>) -> Box<dyn Plan> {
+        todo!()
+    }
+}
+
+/// This struct applies a bunch of heuristics on a query to construct a logical query tree
+/// It performs logical optimizations while depending on [TablePlanner] to perform physical optimizations
+/// Both these optimizations happen in lockstep
+struct HeuristicQueryPlanner {
+    table_planners: Vec<TablePlanner>,
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl HeuristicQueryPlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self {
+            table_planners: Vec::new(),
+            metadata_manager,
+        }
+    }
+
+    /// The entry point function which will go through a list of heuristics and attempt to apply them to the provided query
+    /// It constructs a left-deep query plan by applying the following heuristics
+    /// 1. Heuristic 5a - Choose the table producing the smallest output when deciding join order
+    /// 2. Heuristic 4 - Join only previously chosen tables and try to produce smallest possible output
+    /// 3. Heuristic 8 - Apply projection nodes to reduce the output, especially at the output of materialized nodes
+    fn create_plan(
+        &mut self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Box<dyn Plan>> {
+        //  Construct all instances of [TablePlanner]
+        for table_name in query_data.tables {
+            let table_planner = TablePlanner::new(
+                table_name.clone(),
+                query_data.predicate.clone(),
+                Arc::clone(&txn),
+                Arc::clone(&self.metadata_manager),
+            );
+            self.table_planners.push(table_planner);
+        }
+
+        //  Find the table producing the smallest output first
+        let mut current_plan = self.get_lowest_select_plan()?;
+
+        //  Find the lowest cost join plan, and failing that find the lowest cost product plan and failing that just error out
+        while !self.table_planners.is_empty() {
+            match self.get_lowest_join_plan(&current_plan) {
+                Ok(new_plan) => {
+                    current_plan = new_plan;
+                }
+                Err(e) => match self.get_lowest_product_plan(current_plan) {
+                    Ok(new_plan) => {
+                        current_plan = new_plan;
+                    }
+                    Err(_) => return Err(e),
+                },
+            }
+        }
+
+        Ok(Box::new(ProjectPlan::new(
+            current_plan,
+            query_data.fields.iter().map(String::as_str).collect(),
+        )?))
+    }
+
+    /// Find the [SelectPlan] with the lowest record output
+    /// This will apply heuristic 5a
+    fn get_lowest_select_plan(&mut self) -> SimpleDBResult<Box<dyn Plan>> {
+        let (idx, plan) = self
+            .table_planners
+            .iter()
+            .enumerate()
+            .map(|(idx, tp)| (idx, tp.make_select_plan()))
+            .min_by_key(|(_, p)| p.records_output())
+            .ok_or("there were no plans provided to the get_lowest_select_plan function")?;
+        self.table_planners.remove(idx);
+        Ok(plan)
+    }
+
+    /// Find the right table to construct a join plan with and construct the best join plan
+    /// Choose the table to join with current_plan by minimizing the current output
+    /// This will apply heuristic 4
+    fn get_lowest_join_plan(
+        &mut self,
+        current_plan: &Box<dyn Plan>,
+    ) -> SimpleDBResult<Box<dyn Plan>> {
+        let (idx, plan) = self
+            .table_planners
+            .iter()
+            .enumerate()
+            .map(|(idx, tp)| (idx, tp.make_join_plan(current_plan)))
+            .filter(|(idx, p)| p.is_some())
+            .map(|(idx, p)| (idx, p.unwrap()))
+            .min_by_key(|(_, p)| p.records_output())
+            .ok_or("could not construct any join plans")?;
+        self.table_planners.remove(idx);
+        Ok(plan)
+    }
+
+    /// FInd the right table to construct a product product plan with and construct it
+    /// Choose the table to do a product with current_plan by minimizing the output
+    fn get_lowest_product_plan(
+        &mut self,
+        current_plan: Box<dyn Plan>,
+    ) -> SimpleDBResult<Box<dyn Plan>> {
+        let (idx, plan) = self
+            .table_planners
+            .iter()
+            .enumerate()
+            .map(|(idx, tp)| (idx, tp.make_product_plan(&current_plan)))
+            .min_by_key(|(_, p)| p.records_output())
+            .ok_or("could not construct any product plan")?;
+        Ok(plan)
+    }
+}
+
+impl QueryPlanner for HeuristicQueryPlanner {
+    fn create_plan(
+        &self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+        todo!()
+    }
+}
+
 struct BasicQueryPlanner {
     metadata_manager: Arc<MetadataManager>,
 }
@@ -4203,7 +4213,7 @@ impl Plan for SelectPlan {
     }
 
     fn distinct_values(&self, field_name: &str) -> usize {
-        if self.predicate.equates_with_constant(field_name) {
+        if self.predicate.equates_with_constant(field_name).is_some() {
             return 1;
         } else if let Some(field_name_2) = self.predicate.equates_with_field(field_name) {
             return std::cmp::min(
@@ -4932,6 +4942,172 @@ impl Plan for IndexJoinPlan {
         println!("{}IndexJoinPlan", " ".repeat(indent));
         println!("{}  IndexInfo: {}", " ".repeat(indent), self.index_info);
         println!("{}  JoinField: {}", " ".repeat(indent), self.join_field);
+    }
+}
+
+#[cfg(test)]
+mod index_join_plan_tests {
+    use std::sync::Arc;
+
+    use crate::{IndexJoinPlan, Plan, SimpleDB, TablePlan};
+
+    #[test]
+    fn test_index_join_plan_with_real_tables() {
+        // Setup DB
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        // Create tables
+        db.planner
+            .execute_update(
+                "create table employees(id int, name varchar(20))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update(
+                "create table departments(depid int, deptname varchar(20))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+
+        // Create index on departments.depid (join target)
+        db.planner
+            .execute_update(
+                "create index idx_depid on departments(depid)".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+
+        // Insert data
+        for (id, name) in &[(1, "Alice"), (2, "Bob"), (3, "Charlie"), (4, "David")] {
+            db.planner
+                .execute_update(
+                    format!(
+                        "insert into employees(id, name) values ({}, '{}')",
+                        id, name
+                    ),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+        for (id, dept) in &[(2, "Engineering"), (3, "Sales"), (5, "Marketing")] {
+            db.planner
+                .execute_update(
+                    format!(
+                        "insert into departments(depid, deptname) values ({}, '{}')",
+                        id, dept
+                    ),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+
+        // Build plans
+        let lhs = Box::new(TablePlan::new(
+            "employees",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let rhs = Box::new(TablePlan::new(
+            "departments",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+
+        // Get IndexInfo for departments.depid
+        let idx_info = db
+            .metadata_manager
+            .get_index_info("departments", Arc::clone(&txn))
+            .remove("depid")
+            .expect("expected index on departments.depid");
+
+        // Create plan: join employees.id = departments.depid using index on departments.depid
+        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "id".to_string()).unwrap();
+
+        // Execute
+        let mut scan = plan.open();
+        let mut results = Vec::new();
+        while let Some(res) = scan.next() {
+            assert!(res.is_ok());
+            let id = scan.get_int("id").unwrap();
+            let name = scan.get_string("name").unwrap();
+            let dept = scan.get_string("deptname").unwrap();
+            results.push((id, name, dept));
+        }
+
+        // Expect Bob-Engineering, Charlie-Sales
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            (2, "Bob".to_string(), "Engineering".to_string())
+        );
+        assert_eq!(results[1], (3, "Charlie".to_string(), "Sales".to_string()));
+    }
+
+    #[test]
+    fn test_index_join_plan_no_matches() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+
+        db.planner
+            .execute_update(
+                "create table t1(a int, b varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update(
+                "create table t2(c int, d varchar(10))".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        db.planner
+            .execute_update("create index idx_c on t2(c)".to_string(), Arc::clone(&txn))
+            .unwrap();
+
+        for i in 0..5 {
+            db.planner
+                .execute_update(
+                    format!("insert into t1(a, b) values ({}, 'x{}')", i, i),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+        for i in 100..105 {
+            db.planner
+                .execute_update(
+                    format!("insert into t2(c, d) values ({}, 'y{}')", i, i),
+                    Arc::clone(&txn),
+                )
+                .unwrap();
+        }
+
+        let lhs = Box::new(TablePlan::new(
+            "t1",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let rhs = Box::new(TablePlan::new(
+            "t2",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        ));
+        let idx_info = db
+            .metadata_manager
+            .get_index_info("t2", Arc::clone(&txn))
+            .remove("c")
+            .expect("expected index on t2.c");
+
+        let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
+        let mut scan = plan.open();
+        let mut count = 0;
+        while let Some(res) = scan.next() {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 0);
     }
 }
 
@@ -5747,21 +5923,25 @@ impl Predicate {
         }
     }
 
-    fn equates_with_constant(&self, field_name: &str) -> bool {
+    fn equates_with_constant(&self, field_name: &str) -> Option<Constant> {
         self.evaluate_equates_with_constant(&self.root, field_name)
     }
 
-    fn evaluate_equates_with_constant(&self, node: &PredicateNode, field_name: &str) -> bool {
+    fn evaluate_equates_with_constant(
+        &self,
+        node: &PredicateNode,
+        field_name: &str,
+    ) -> Option<Constant> {
         match node {
-            PredicateNode::Empty => false,
+            PredicateNode::Empty => None,
             PredicateNode::Term(term) => term.equates_with_constant(field_name),
             PredicateNode::Composite { op, operands } => {
                 for operand in operands {
-                    if self.evaluate_equates_with_constant(operand, field_name) {
-                        return true;
+                    if let Some(val) = self.evaluate_equates_with_constant(operand, field_name) {
+                        return Some(val);
                     }
                 }
-                return false;
+                return None;
             }
         }
     }
@@ -5895,19 +6075,19 @@ impl Term {
 
     /// Checks if the term equates with a constant value of the form "F=c"
     /// where F is the specified field and c is some constant
-    fn equates_with_constant(&self, field_name: &str) -> bool {
+    fn equates_with_constant(&self, field_name: &str) -> Option<Constant> {
         if self.lhs.is_field_name()
             && (self.lhs.get_field_name().unwrap() == field_name)
             && !self.rhs.is_field_name()
         {
-            return true;
+            return self.rhs.get_constant_value().cloned();
         } else if self.rhs.is_field_name()
             && (self.rhs.get_field_name().unwrap() == field_name)
             && !self.lhs.is_field_name()
         {
-            return true;
+            return self.lhs.get_constant_value().cloned();
         }
-        return false;
+        return None;
     }
 
     /// Checks if the term equates with a field name of the form "F=G"
