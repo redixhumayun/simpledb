@@ -3814,23 +3814,84 @@ impl TablePlanner {
         }
     }
 
-    /// Create a [SelectPlan] for this table using the available predicate. This applies heuristic 6
-    /// Ideally try to create an [IndexSelectPlan]
-    /// If that is not possible, create a [SelectPlan] with the predicate applied if possible
-    fn make_select_plan(&self) -> Box<dyn Plan> {
-        todo!()
+    fn build_base_plan(&self) -> Box<dyn Plan> {
+        Box::new(TablePlan::new(
+            &self.table_name,
+            Arc::clone(&self.txn),
+            Arc::clone(&self.metadata_manager),
+        ))
     }
 
-    /// Create a join plan with the current_plan provided in the function signature. Use heuristic 7
+    /// Create a [SelectPlan] for this table using the available predicate. This applies heuristic 6
+    /// First, try to apply indexes and create an [IndexSelectPlan]
+    /// Next, push down predicates and create a [SelectPlan] with the sub-predicate
+    fn make_select_plan(&self) -> Box<dyn Plan> {
+        let base_plan = Box::new(TablePlan::new(
+            &self.table_name,
+            Arc::clone(&self.txn),
+            Arc::clone(&self.metadata_manager),
+        ));
+        let new_plan = self.make_index_select_plan(base_plan);
+        self.push_down_predicate(new_plan)
+    }
+
+    /// Create a join plan with the current_plan provided in the function signature. Uses heuristic 7
     /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
     /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
-    fn make_join_plan(&self, current_plan: &Box<dyn Plan>) -> Option<Box<dyn Plan>> {
+    fn make_join_plan(
+        &self,
+        current_plan: &Box<dyn Plan>,
+    ) -> SimpleDBResult<Option<Box<dyn Plan>>> {
+        let mut unioned_schema = Schema::new();
+        unioned_schema.add_all_from_schema(&self.schema)?;
+        unioned_schema.add_all_from_schema(&current_plan.schema())?;
+        let sub_pred = self.predicate.sub_predicate_for_join(
+            &self.schema,
+            &current_plan.schema(),
+            &unioned_schema,
+        );
+        if sub_pred.is_empty() {
+            return Ok(None);
+        }
+
         todo!()
     }
 
     /// Construct a [MultiBufferProductPlan] with the provided plan
     fn make_product_plan(&self, current_plan: &Box<dyn Plan>) -> Box<dyn Plan> {
         todo!()
+    }
+
+    /// Loop through fields which have indexes and for the first field which has an index
+    /// and is part of the predicate in the form F=c, construct an [IndexSelectPlan]
+    /// Using the first index is a pedgagogical simplification
+    /// TODO: Fix this to use the most selective index and to use more than one index
+    fn make_index_select_plan(&self, plan: Box<dyn Plan>) -> Box<dyn Plan> {
+        for field in self.indexes.keys() {
+            match self.predicate.equates_with_constant(&field) {
+                Some(value) => {
+                    return Box::new(IndexSelectPlan::new(
+                        plan,
+                        self.indexes.get(field).unwrap().clone(),
+                        value,
+                    ));
+                }
+                None => continue,
+            }
+        }
+        plan
+    }
+
+    /// This function will take the [Predicate] and construct a subset of the [Predicate]
+    /// which applies to the schema of the table associated with this plan
+    /// It will then use that [Predicate] to construct a [SelectPlan]
+    /// If no part of the predicate applies, it will return the original plan
+    fn push_down_predicate(&self, plan: Box<dyn Plan>) -> Box<dyn Plan> {
+        let sub_pred = self.predicate.sub_predicate_for_select(&self.schema);
+        if sub_pred.is_empty() {
+            return plan;
+        }
+        Box::new(SelectPlan::new(plan, sub_pred))
     }
 }
 
@@ -3916,15 +3977,19 @@ impl HeuristicQueryPlanner {
         &mut self,
         current_plan: &Box<dyn Plan>,
     ) -> SimpleDBResult<Box<dyn Plan>> {
-        let (idx, plan) = self
+        let candidates: Vec<(usize, Box<dyn Plan>)> = self
             .table_planners
             .iter()
             .enumerate()
-            .map(|(idx, tp)| (idx, tp.make_join_plan(current_plan)))
-            .filter(|(idx, p)| p.is_some())
-            .map(|(idx, p)| (idx, p.unwrap()))
+            .map(|(idx, tp)| Ok((idx, tp.make_join_plan(current_plan)?)))
+            .collect::<SimpleDBResult<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(idx, opt)| opt.map(|p| (idx, p)))
+            .collect();
+        let (idx, plan) = candidates
+            .into_iter()
             .min_by_key(|(_, p)| p.records_output())
-            .ok_or("could not construct any join plans")?;
+            .ok_or_else(|| "could not construct any join plans")?;
         self.table_planners.remove(idx);
         Ok(plan)
     }
@@ -5969,6 +6034,135 @@ impl Predicate {
         }
     }
 
+    /// Construct a sub-predicate which will apply to the union of the two schemas provided
+    /// but will not apply to either individually. This is done to avoid redundant predicates
+    /// which would have already been applied by individual select sub-predicates on a specific relation
+    fn sub_predicate_for_join(
+        &self,
+        schema_1: &Schema,
+        schema_2: &Schema,
+        unioned_schema: &Schema,
+    ) -> Predicate {
+        let term_ok = |term: &Term| {
+            !term.applies_to(schema_1)
+                && !term.applies_to(&schema_2)
+                && term.applies_to(unioned_schema)
+        };
+        Predicate {
+            root: self.filter_node(&self.root, &term_ok),
+        }
+    }
+
+    /// This function will take in a schema and evaluate which parts of this predicate apply
+    /// to that schema. It will construct and return a new sub-predicate
+    fn sub_predicate_for_select(&self, schema: &Schema) -> Predicate {
+        let term_ok = |term: &Term| term.applies_to(schema);
+        Predicate {
+            root: self.filter_node(&self.root, &term_ok),
+        }
+    }
+
+    /// Determines whether the [PredicateNode] fully applies to the given schema
+    /// Used to determine whether the [BooleanConnective::Or] and [BooleanConnective::Not] can be applied to the schema
+    fn node_applies_to<F>(&self, node: &PredicateNode, term_ok: &F) -> bool
+    where
+        F: Fn(&Term) -> bool,
+    {
+        match node {
+            PredicateNode::Empty => false,
+            PredicateNode::Term(term) => term_ok(term),
+            PredicateNode::Composite { op, operands } => match op {
+                BooleanConnective::Not => {
+                    assert!(operands.len() == 1);
+                    self.node_applies_to(operands.get(0).unwrap(), term_ok)
+                }
+                _ => operands
+                    .iter()
+                    .all(|node| self.node_applies_to(node, term_ok)),
+            },
+        }
+    }
+
+    /// Recursively decide whether this node is valid to keep. The following rules are applied:
+    /// 1. If [Term] is encountered, check if it applies on this [Schema]
+    /// 2. If [BooleanConnective::And] is encountered, keep parts of conjunct that apply
+    /// 3. If [BooleanConnective::Or] is encountered, all parts of disjunct must apply
+    /// 4. If [BooleanConnective::Not] is encountered, the sole term must apply
+    /// Technically, it is not required for the [BooleanConnective::Or] disjuncts to apply. Take, for instance,
+    /// P = (R.a = 1 ∧ S.b = 2) ∨ (R.c = 3), pushing to R
+    /// (R.a = 1 ∧ S.b = 2) filters to R.a = 1
+    /// (R.c = 3) stays R.c = 3
+    /// OR as (R.a = 1) ∨ (R.c = 3)
+    /// This would lead to a partial application of the disjuncts but would not be incorrect
+    /// However, the same is not true for NOT because
+    /// P = NOT(R.a = 1 ∧ S.b = 2), pushing to R.
+    /// Inner on R partially applies: (R.a = 1 ∧ S.b = 2) ⇒ R.a = 1
+    /// Consider a row r with a=1 and some s with b≠2
+    /// Pushed-down filter NOT(a=1) removes r before join, losing valid results.
+    /// TODO: An alternative is to rewrite the rules using De Morgan's Laws
+    fn filter_node<F>(&self, node: &PredicateNode, term_ok: &F) -> PredicateNode
+    where
+        F: Fn(&Term) -> bool,
+    {
+        match node {
+            PredicateNode::Empty => PredicateNode::Empty,
+            PredicateNode::Term(term) => {
+                if term_ok(term) {
+                    PredicateNode::Term(term.clone())
+                } else {
+                    PredicateNode::Empty
+                }
+            }
+            PredicateNode::Composite { op, operands } => {
+                return match op {
+                    BooleanConnective::And => {
+                        let kept: Vec<PredicateNode> = operands
+                            .iter()
+                            .map(|node| self.filter_node(node, term_ok))
+                            .filter(|node| !matches!(node, PredicateNode::Empty))
+                            .collect();
+                        match kept.is_empty() {
+                            true => PredicateNode::Empty,
+                            false => PredicateNode::Composite {
+                                op: BooleanConnective::And,
+                                operands: kept,
+                            },
+                        }
+                    }
+                    BooleanConnective::Or => {
+                        if operands
+                            .iter()
+                            .all(|node| self.node_applies_to(node, term_ok))
+                        {
+                            let kept: Vec<PredicateNode> = operands
+                                .iter()
+                                .map(|node| self.filter_node(node, term_ok))
+                                .collect();
+                            PredicateNode::Composite {
+                                op: BooleanConnective::Or,
+                                operands: kept,
+                            }
+                        } else {
+                            PredicateNode::Empty
+                        }
+                    }
+                    BooleanConnective::Not => {
+                        assert!(operands.len() == 1);
+                        let inner = &operands[0];
+                        if self.node_applies_to(inner, term_ok) {
+                            let kept = self.filter_node(inner, term_ok);
+                            return PredicateNode::Composite {
+                                op: BooleanConnective::Not,
+                                operands: vec![kept],
+                            };
+                        }
+                        PredicateNode::Empty
+                    }
+                };
+            }
+        }
+    }
+
     fn to_sql(&self) -> String {
         self.node_to_sql(&self.root)
     }
@@ -6107,6 +6301,11 @@ impl Term {
         return None;
     }
 
+    /// Check that both sides of this expression apply to the provided [Schema]
+    fn applies_to(&self, schema: &Schema) -> bool {
+        self.lhs.applies_to(schema) && self.rhs.applies_to(schema)
+    }
+
     fn to_sql(&self) -> String {
         let lhs_sql = self.lhs.to_sql();
         let rhs_sql = self.rhs.to_sql();
@@ -6168,10 +6367,12 @@ impl Expression {
         }
     }
 
-    fn applies_to(&self, schema: &Schema) -> Result<bool, Box<dyn Error>> {
+    /// Check if this expression applies to the given schema
+    /// If the expression is of type [Expression::Constant] the schema will always apply
+    fn applies_to(&self, schema: &Schema) -> bool {
         match self {
-            Expression::Constant(_) => Ok(true),
-            Expression::FieldName(field_name) => Ok(schema.fields.contains(field_name)),
+            Expression::Constant(_) => true,
+            Expression::FieldName(field_name) => schema.fields.contains(field_name),
             _ => panic!("applies_to called for something that doesn't make sense"),
         }
     }
@@ -6504,7 +6705,7 @@ impl IndexManager {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IndexInfo {
     index_name: String,
     field_name: String,
