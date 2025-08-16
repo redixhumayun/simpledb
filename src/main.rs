@@ -3835,19 +3835,16 @@ impl TablePlanner {
         self.push_down_predicate(new_plan)
     }
 
-    /// Create a join plan with the current_plan provided in the function signature. Uses heuristic 7
+    /// Create a join plan with the other_plan provided in the function signature. Uses heuristic 7
     /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
     /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
-    fn make_join_plan(
-        &self,
-        current_plan: &Box<dyn Plan>,
-    ) -> SimpleDBResult<Option<Box<dyn Plan>>> {
+    fn make_join_plan(&self, other_plan: &Box<dyn Plan>) -> SimpleDBResult<Option<Box<dyn Plan>>> {
         let mut unioned_schema = Schema::new();
         unioned_schema.add_all_from_schema(&self.schema)?;
-        unioned_schema.add_all_from_schema(&current_plan.schema())?;
+        unioned_schema.add_all_from_schema(&other_plan.schema())?;
         let sub_pred = self.predicate.sub_predicate_for_join(
             &self.schema,
-            &current_plan.schema(),
+            &other_plan.schema(),
             &unioned_schema,
         );
         if sub_pred.is_empty() {
@@ -3860,6 +3857,32 @@ impl TablePlanner {
     /// Construct a [MultiBufferProductPlan] with the provided plan
     fn make_product_plan(&self, current_plan: &Box<dyn Plan>) -> Box<dyn Plan> {
         todo!()
+    }
+
+    /// Takes the plan and the plan to join with and tries to construct an [IndexJoinPlan]
+    /// The conditions for the [IndexJoinPlan] are that:
+    /// 1. There needs to exist an index on the field
+    /// 2. A subpredicate of the [Predicate] should contain the field
+    /// 3. The other plan's schema must also contain the field
+    fn make_index_join_plan(
+        &self,
+        plan: Box<dyn Plan>,
+        other_plan: Box<dyn Plan>,
+    ) -> SimpleDBResult<Option<Box<dyn Plan>>> {
+        let plan_schema = &self.schema;
+        let other_plan_schema = &other_plan.schema();
+        for field in self.indexes.keys() {
+            if plan_schema.fields.contains(field)
+                && other_plan_schema.fields.contains(field)
+                && self.predicate.equates_with_field(field).is_some()
+            {
+                let index_info = self.indexes.get(field).cloned().unwrap();
+                let index_join_plan =
+                    IndexJoinPlan::new(plan, other_plan, index_info, field.to_string())?;
+                return Ok(Some(Box::new(index_join_plan)));
+            }
+        }
+        Ok(None)
     }
 
     /// Loop through fields which have indexes and for the first field which has an index
@@ -6011,10 +6034,27 @@ impl Predicate {
         }
     }
 
+    /// Return the name of the other field if this predicate contains an equality
+    /// between `field_name` and another field.
+    ///
+    /// Behavior:
+    /// - Traverses the predicate tree and finds a term of the form `field_name = X`
+    ///   or `X = field_name`, where `X` is another field name.
+    /// - Returns `Some(other_field_name)` for the first match encountered
+    ///   (depth-first), otherwise `None` if no such equality exists.
+    /// - Non-equality comparisons and equalities with constants are ignored.
     fn equates_with_field(&self, field_name: &str) -> Option<String> {
         self.evaluate_equates_with_field(&self.root, field_name)
     }
 
+    /// Helper used by [equates_with_field] to recursively search the predicate tree
+    /// for an equality between `field_name` and another field.
+    ///
+    /// Behavior:
+    /// - `PredicateNode::Term`: delegate to `Term::equates_with_field`.
+    /// - `PredicateNode::Composite`: recursively visit operands in order and
+    ///   return the first match found.
+    /// - `PredicateNode::Empty`: returns `None`.
     fn evaluate_equates_with_field(
         &self,
         node: &PredicateNode,
@@ -8071,28 +8111,17 @@ impl Schema {
     }
 
     fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
-        let field_type = schema
+        let (field_type, field_length) = schema
             .info
             .get(field_name)
-            .and_then(|info| Some(info.field_type))
+            .and_then(|info| Some((info.field_type, info.length)))
             .ok_or_else(|| {
                 format!(
                     "Field {} not found in schema while looking for type",
                     field_name
                 )
             })?;
-        // .unwrap();
-        let field_length = schema
-            .info
-            .get(field_name)
-            .and_then(|info| Some(info.length))
-            .ok_or_else(|| {
-                format!(
-                    "Field {} not found in schema while looking for length",
-                    field_name
-                )
-            })?;
-        // .unwrap();
+
         self.add_field(field_name, field_type, field_length);
         Ok(())
     }
