@@ -49,4 +49,4 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - Include what was implemented
    - Note any breaking changes
 
-6. **Address feedback as separate commits**)
+6. **Address feedback as separate commits**
