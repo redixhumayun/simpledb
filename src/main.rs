@@ -111,17 +111,17 @@ impl SimpleDB {
 
 struct MultiBufferProductPlan {
     txn: Arc<Transaction>,
-    lhs: Box<dyn Plan>,
-    rhs: Box<dyn Plan>,
+    lhs: Arc<dyn Plan>,
+    rhs: Arc<dyn Plan>,
     schema: Schema,
 }
 
 impl MultiBufferProductPlan {
-    fn new(txn: Arc<Transaction>, lhs: Box<dyn Plan>, rhs: Box<dyn Plan>) -> SimpleDBResult<Self> {
+    fn new(txn: Arc<Transaction>, lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>) -> SimpleDBResult<Self> {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
-        let lhs = Box::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
+        let lhs = Arc::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
         Ok(Self {
             txn,
             lhs,
@@ -130,7 +130,7 @@ impl MultiBufferProductPlan {
         })
     }
 
-    fn create_temp_table(&self, plan: &Box<dyn Plan>) -> SimpleDBResult<TempTable> {
+    fn create_temp_table(&self, plan: &Arc<dyn Plan>) -> SimpleDBResult<TempTable> {
         let temp_table = TempTable::new(Arc::clone(&self.txn), plan.schema());
         let mut source_scan = plan.open();
         let mut table_scan = temp_table.open();
@@ -246,12 +246,12 @@ mod multi_buffer_product_plan_tests {
     }
 
     fn build_plan(db: &SimpleDB, txn: Arc<Transaction>) -> MultiBufferProductPlan {
-        let lhs = Box::new(TablePlan::new(
+        let lhs = Arc::new(TablePlan::new(
             "emp",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let rhs = Box::new(TablePlan::new(
+        let rhs = Arc::new(TablePlan::new(
             "dept",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -1147,8 +1147,8 @@ fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
 }
 
 struct MergeJoinPlan {
-    plan_1: Box<dyn Plan>,
-    plan_2: Box<dyn Plan>,
+    plan_1: Arc<dyn Plan>,
+    plan_2: Arc<dyn Plan>,
     field_name_1: String,
     field_name_2: String,
     txn: Arc<Transaction>,
@@ -1157,8 +1157,8 @@ struct MergeJoinPlan {
 
 impl MergeJoinPlan {
     fn new(
-        plan_1: Box<dyn Plan>,
-        plan_2: Box<dyn Plan>,
+        plan_1: Arc<dyn Plan>,
+        plan_2: Arc<dyn Plan>,
         txn: Arc<Transaction>,
         field_name_1: String,
         field_name_2: String,
@@ -1273,26 +1273,26 @@ mod merge_join_plan_tests {
         }
 
         // Create table plans
-        let plan1 = Box::new(TablePlan::new(
+        let plan1 = Arc::new(TablePlan::new(
             "employees",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
 
-        let plan2 = Box::new(TablePlan::new(
+        let plan2 = Arc::new(TablePlan::new(
             "departments",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
 
         // Create sort plans
-        let sort_plan1 = Box::new(SortPlan::new(
+        let sort_plan1 = Arc::new(SortPlan::new(
             plan1,
             Arc::clone(&txn),
             vec!["id".to_string()],
         ));
 
-        let sort_plan2 = Box::new(SortPlan::new(
+        let sort_plan2 = Arc::new(SortPlan::new(
             plan2,
             Arc::clone(&txn),
             vec!["depid".to_string()],
@@ -1968,14 +1968,14 @@ mod merge_join_scan_tests {
 }
 
 struct SortPlan {
-    source_plan: Box<dyn Plan>,
+    source_plan: Arc<dyn Plan>,
     txn: Arc<Transaction>,
     schema: Schema,
     record_comparator: RecordComparator,
 }
 
 impl SortPlan {
-    fn new(source_plan: Box<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
+    fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
         let schema = source_plan.schema();
         let record_comparator = RecordComparator::new(field_list);
         Self {
@@ -2279,7 +2279,7 @@ mod sort_plan_tests {
         }
 
         // Create source plan
-        let table_plan = Box::new(TablePlan::new(
+        let table_plan = Arc::new(TablePlan::new(
             "numbers",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -2338,7 +2338,7 @@ mod sort_plan_tests {
         }
 
         // Create sort plan sorting by grade
-        let table_plan = Box::new(TablePlan::new(
+        let table_plan = Arc::new(TablePlan::new(
             "students_sort",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -2407,7 +2407,7 @@ mod sort_plan_tests {
         }
 
         // Create sort plan sorting by dept and salary
-        let table_plan = Box::new(TablePlan::new(
+        let table_plan = Arc::new(TablePlan::new(
             "employees",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -2457,7 +2457,7 @@ mod sort_plan_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
 
         // Create sort plan
-        let table_plan = Box::new(TablePlan::new(
+        let table_plan = Arc::new(TablePlan::new(
             "empty_table",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -2903,12 +2903,12 @@ impl RecordComparator {
 }
 
 struct MaterializePlan {
-    source_plan: Box<dyn Plan>,
+    source_plan: Arc<dyn Plan>,
     txn: Arc<Transaction>,
 }
 
 impl MaterializePlan {
-    fn new(source_plan: Box<dyn Plan>, txn: Arc<Transaction>) -> Self {
+    fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>) -> Self {
         Self { source_plan, txn }
     }
 }
@@ -3009,7 +3009,7 @@ mod materialize_plan_tests {
         );
 
         // Create materialize plan
-        let materialize_plan = MaterializePlan::new(Box::new(table_plan), Arc::clone(&txn));
+        let materialize_plan = MaterializePlan::new(Arc::new(table_plan), Arc::clone(&txn));
 
         // Open the materialized scan
         let mut materialized_scan = materialize_plan.open();
@@ -3133,7 +3133,7 @@ impl Planner {
         &self,
         query: String,
         txn: Arc<Transaction>,
-    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+    ) -> Result<Arc<dyn Plan>, Box<dyn Error>> {
         let mut parser = Parser::new(&query);
         let query_data = parser.query()?;
         //  TODO: Verify the query. How?
@@ -3552,7 +3552,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         let indexes = self
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
-        let plan = Box::new(TablePlan::new(
+        let plan = Arc::new(TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
@@ -3582,7 +3582,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         let indexes = self
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
-        let plan = Box::new(TablePlan::new(
+        let plan = Arc::new(TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
@@ -3673,7 +3673,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: DeleteData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let plan = Box::new(TablePlan::new(
+        let plan = Arc::new(TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
@@ -3693,7 +3693,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: ModifyData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let plan = Box::new(TablePlan::new(
+        let plan = Arc::new(TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
@@ -3814,8 +3814,8 @@ impl TablePlanner {
         }
     }
 
-    fn build_base_plan(&self) -> Box<dyn Plan> {
-        Box::new(TablePlan::new(
+    fn build_base_plan(&self) -> Arc<dyn Plan> {
+        Arc::new(TablePlan::new(
             &self.table_name,
             Arc::clone(&self.txn),
             Arc::clone(&self.metadata_manager),
@@ -3825,8 +3825,8 @@ impl TablePlanner {
     /// Create a [SelectPlan] for this table using the available predicate. This applies heuristic 6
     /// First, try to apply indexes and create an [IndexSelectPlan]
     /// Next, push down predicates and create a [SelectPlan] with the sub-predicate
-    fn make_select_plan(&self) -> Box<dyn Plan> {
-        let base_plan = Box::new(TablePlan::new(
+    fn make_select_plan(&self) -> Arc<dyn Plan> {
+        let base_plan = Arc::new(TablePlan::new(
             &self.table_name,
             Arc::clone(&self.txn),
             Arc::clone(&self.metadata_manager),
@@ -3838,7 +3838,7 @@ impl TablePlanner {
     /// Create a join plan with the other_plan provided in the function signature. Uses heuristic 7
     /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
     /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
-    fn make_join_plan(&self, other_plan: &Box<dyn Plan>) -> SimpleDBResult<Option<Box<dyn Plan>>> {
+    fn make_join_plan(&self, other_plan: &Arc<dyn Plan>) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
         let mut unioned_schema = Schema::new();
         unioned_schema.add_all_from_schema(&self.schema)?;
         unioned_schema.add_all_from_schema(&other_plan.schema())?;
@@ -3855,7 +3855,7 @@ impl TablePlanner {
     }
 
     /// Construct a [MultiBufferProductPlan] with the provided plan
-    fn make_product_plan(&self, current_plan: &Box<dyn Plan>) -> Box<dyn Plan> {
+    fn make_product_plan(&self, current_plan: &Arc<dyn Plan>) -> Arc<dyn Plan> {
         todo!()
     }
 
@@ -3866,9 +3866,9 @@ impl TablePlanner {
     /// 3. The other plan's schema must also contain the field
     fn make_index_join_plan(
         &self,
-        plan: Box<dyn Plan>,
-        other_plan: Box<dyn Plan>,
-    ) -> SimpleDBResult<Option<Box<dyn Plan>>> {
+        plan: Arc<dyn Plan>,
+        other_plan: Arc<dyn Plan>,
+    ) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
         let plan_schema = &self.schema;
         let other_plan_schema = &other_plan.schema();
         for field in self.indexes.keys() {
@@ -3879,7 +3879,7 @@ impl TablePlanner {
                 let index_info = self.indexes.get(field).cloned().unwrap();
                 let index_join_plan =
                     IndexJoinPlan::new(plan, other_plan, index_info, field.to_string())?;
-                return Ok(Some(Box::new(index_join_plan)));
+                return Ok(Some(Arc::new(index_join_plan)));
             }
         }
         Ok(None)
@@ -3889,11 +3889,11 @@ impl TablePlanner {
     /// and is part of the predicate in the form F=c, construct an [IndexSelectPlan]
     /// Using the first index is a pedgagogical simplification
     /// TODO: Fix this to use the most selective index and to use more than one index
-    fn make_index_select_plan(&self, plan: Box<dyn Plan>) -> Box<dyn Plan> {
+    fn make_index_select_plan(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         for field in self.indexes.keys() {
             match self.predicate.equates_with_constant(&field) {
                 Some(value) => {
-                    return Box::new(IndexSelectPlan::new(
+                    return Arc::new(IndexSelectPlan::new(
                         plan,
                         self.indexes.get(field).unwrap().clone(),
                         value,
@@ -3909,12 +3909,12 @@ impl TablePlanner {
     /// which applies to the schema of the table associated with this plan
     /// It will then use that [Predicate] to construct a [SelectPlan]
     /// If no part of the predicate applies, it will return the original plan
-    fn push_down_predicate(&self, plan: Box<dyn Plan>) -> Box<dyn Plan> {
+    fn push_down_predicate(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         let sub_pred = self.predicate.sub_predicate_for_select(&self.schema);
         if sub_pred.is_empty() {
             return plan;
         }
-        Box::new(SelectPlan::new(plan, sub_pred))
+        Arc::new(SelectPlan::new(plan, sub_pred))
     }
 }
 
@@ -3943,7 +3943,7 @@ impl HeuristicQueryPlanner {
         &mut self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> SimpleDBResult<Box<dyn Plan>> {
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
         //  Construct all instances of [TablePlanner]
         for table_name in query_data.tables {
             let table_planner = TablePlanner::new(
@@ -3973,7 +3973,7 @@ impl HeuristicQueryPlanner {
             }
         }
 
-        Ok(Box::new(ProjectPlan::new(
+        Ok(Arc::new(ProjectPlan::new(
             current_plan,
             query_data.fields.iter().map(String::as_str).collect(),
         )?))
@@ -3981,7 +3981,7 @@ impl HeuristicQueryPlanner {
 
     /// Find the [SelectPlan] with the lowest record output
     /// This will apply heuristic 5a
-    fn get_lowest_select_plan(&mut self) -> SimpleDBResult<Box<dyn Plan>> {
+    fn get_lowest_select_plan(&mut self) -> SimpleDBResult<Arc<dyn Plan>> {
         let (idx, plan) = self
             .table_planners
             .iter()
@@ -3998,9 +3998,9 @@ impl HeuristicQueryPlanner {
     /// This will apply heuristic 4
     fn get_lowest_join_plan(
         &mut self,
-        current_plan: &Box<dyn Plan>,
-    ) -> SimpleDBResult<Box<dyn Plan>> {
-        let candidates: Vec<(usize, Box<dyn Plan>)> = self
+        current_plan: &Arc<dyn Plan>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let candidates: Vec<(usize, Arc<dyn Plan>)> = self
             .table_planners
             .iter()
             .enumerate()
@@ -4021,8 +4021,8 @@ impl HeuristicQueryPlanner {
     /// Choose the table to do a product with current_plan by minimizing the output
     fn get_lowest_product_plan(
         &mut self,
-        current_plan: Box<dyn Plan>,
-    ) -> SimpleDBResult<Box<dyn Plan>> {
+        current_plan: Arc<dyn Plan>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
         let (idx, plan) = self
             .table_planners
             .iter()
@@ -4039,7 +4039,7 @@ impl QueryPlanner for HeuristicQueryPlanner {
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+    ) -> Result<Arc<dyn Plan>, Box<dyn Error>> {
         todo!()
     }
 }
@@ -4064,12 +4064,12 @@ impl QueryPlanner for BasicQueryPlanner {
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Box<dyn Plan>, Box<dyn Error>> {
+    ) -> Result<Arc<dyn Plan>, Box<dyn Error>> {
         let mut plans = Vec::new();
 
         // 1. Create the table plans
         for table in query_data.tables {
-            plans.push(Box::new(TablePlan::new(
+            plans.push(Arc::new(TablePlan::new(
                 &table,
                 Arc::clone(&txn),
                 Arc::clone(&self.metadata_manager),
@@ -4077,16 +4077,16 @@ impl QueryPlanner for BasicQueryPlanner {
         }
 
         // 2. Create the product plan for joins
-        let mut plan: Box<dyn Plan> = plans.remove(0);
+        let mut plan: Arc<dyn Plan> = plans.remove(0);
         for next_plan in plans {
-            plan = Box::new(ProductPlan::new(plan, next_plan)?);
+            plan = Arc::new(ProductPlan::new(plan, next_plan)?);
         }
 
         //  3. Create the selection with the predicate
-        plan = Box::new(SelectPlan::new(plan, query_data.predicate));
+        plan = Arc::new(SelectPlan::new(plan, query_data.predicate));
 
         //  4. Create the projection
-        plan = Box::new(ProjectPlan::new(
+        plan = Arc::new(ProjectPlan::new(
             plan,
             query_data.fields.iter().map(AsRef::as_ref).collect(),
         )?);
@@ -4099,17 +4099,17 @@ trait QueryPlanner {
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Box<dyn Plan>, Box<dyn Error>>;
+    ) -> Result<Arc<dyn Plan>, Box<dyn Error>>;
 }
 
 struct ProductPlan {
-    plan_1: Box<dyn Plan>,
-    plan_2: Box<dyn Plan>,
+    plan_1: Arc<dyn Plan>,
+    plan_2: Arc<dyn Plan>,
     schema: Schema,
 }
 
 impl ProductPlan {
-    fn new(plan_1: Box<dyn Plan>, plan_2: Box<dyn Plan>) -> Result<Self, Box<dyn Error>> {
+    fn new(plan_1: Arc<dyn Plan>, plan_2: Arc<dyn Plan>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&plan_1.schema())?;
         schema.add_all_from_schema(&plan_2.schema())?;
@@ -4174,12 +4174,12 @@ impl Plan for ProductPlan {
 }
 
 struct ProjectPlan {
-    plan: Box<dyn Plan>,
+    plan: Arc<dyn Plan>,
     schema: Schema,
 }
 
 impl ProjectPlan {
-    fn new(plan: Box<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
+    fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
         for field in fields_list {
             schema.add_from_schema(field, &plan.schema())?;
@@ -4223,13 +4223,13 @@ impl Plan for ProjectPlan {
 }
 
 struct IndexSelectPlan {
-    plan: Box<dyn Plan>,
+    plan: Arc<dyn Plan>,
     ii: IndexInfo,
     value: Constant,
 }
 
 impl IndexSelectPlan {
-    fn new(plan: Box<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
+    fn new(plan: Arc<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
         Self { plan, ii, value }
     }
 }
@@ -4277,12 +4277,12 @@ impl Plan for IndexSelectPlan {
 }
 
 struct SelectPlan {
-    plan: Box<dyn Plan>,
+    plan: Arc<dyn Plan>,
     predicate: Predicate,
 }
 
 impl SelectPlan {
-    fn new(plan: Box<dyn Plan>, predicate: Predicate) -> Self {
+    fn new(plan: Arc<dyn Plan>, predicate: Predicate) -> Self {
         Self { plan, predicate }
     }
 }
@@ -4443,11 +4443,11 @@ mod plan_test_single_table {
             crate::Expression::Constant(crate::Constant::Int(10)),
         );
         let predicate = Predicate::new(vec![term_1, term_2]);
-        let select = SelectPlan::new(Box::new(table), predicate);
+        let select = SelectPlan::new(Arc::new(table), predicate);
         print_stats(&select, "select");
 
         //  the project plan
-        let project = ProjectPlan::new(Box::new(select), vec!["sname", "majorid", "gradyear"]);
+        let project = ProjectPlan::new(Arc::new(select), vec!["sname", "majorid", "gradyear"]);
         assert!(project.is_err());
 
         //  This will never run in the test, but that's okay for now. This test is mostly a sanity check to see that things compose together
@@ -4952,8 +4952,8 @@ mod project_scan_tests {
 }
 
 struct IndexJoinPlan {
-    plan_1: Box<dyn Plan>,
-    plan_2: Box<dyn Plan>,
+    plan_1: Arc<dyn Plan>,
+    plan_2: Arc<dyn Plan>,
     index_info: IndexInfo,
     schema: Schema,
     join_field: String,
@@ -4961,8 +4961,8 @@ struct IndexJoinPlan {
 
 impl IndexJoinPlan {
     fn new(
-        plan_1: Box<dyn Plan>,
-        plan_2: Box<dyn Plan>,
+        plan_1: Arc<dyn Plan>,
+        plan_2: Arc<dyn Plan>,
         index_info: IndexInfo,
         join_field: String,
     ) -> Result<Self, Box<dyn Error>> {
@@ -5092,12 +5092,12 @@ mod index_join_plan_tests {
         }
 
         // Build plans
-        let lhs = Box::new(TablePlan::new(
+        let lhs = Arc::new(TablePlan::new(
             "employees",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let rhs = Box::new(TablePlan::new(
+        let rhs = Arc::new(TablePlan::new(
             "departments",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -5172,12 +5172,12 @@ mod index_join_plan_tests {
                 .unwrap();
         }
 
-        let lhs = Box::new(TablePlan::new(
+        let lhs = Arc::new(TablePlan::new(
             "t1",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let rhs = Box::new(TablePlan::new(
+        let rhs = Arc::new(TablePlan::new(
             "t2",
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
@@ -5989,11 +5989,11 @@ impl Predicate {
         }
     }
 
-    fn reduction_factor(&self, plan: &Box<dyn Plan>) -> usize {
+    fn reduction_factor(&self, plan: &Arc<dyn Plan>) -> usize {
         self.evaluate_reduction_factor(&self.root, plan)
     }
 
-    fn evaluate_reduction_factor(&self, node: &PredicateNode, plan: &Box<dyn Plan>) -> usize {
+    fn evaluate_reduction_factor(&self, node: &PredicateNode, plan: &Arc<dyn Plan>) -> usize {
         match node {
             PredicateNode::Empty => 1,
             PredicateNode::Term(term) => term.reduction_factor(plan),
@@ -6280,7 +6280,7 @@ impl Term {
     }
 
     /// Calculates the reduction factor for the term
-    fn reduction_factor(&self, plan: &Box<dyn Plan>) -> usize {
+    fn reduction_factor(&self, plan: &Arc<dyn Plan>) -> usize {
         if self.lhs.is_field_name() && self.rhs.is_field_name() {
             let lhs_field = self.lhs.get_field_name().unwrap();
             let rhs_field = self.rhs.get_field_name().unwrap();
