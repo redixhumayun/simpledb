@@ -4481,6 +4481,115 @@ mod heuristic_equivalence_tests {
     }
 }
 
+#[cfg(test)]
+mod heuristic_efficiency_tests {
+    use super::*;
+
+    fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
+        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        (db, txn, dir)
+    }
+
+    fn basic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(BasicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn heuristic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(HeuristicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn exec(planner: &Planner, txn: Arc<Transaction>, sql: &str) {
+        planner.execute_update(sql.to_string(), txn).unwrap();
+    }
+
+    fn plan_costs(planner: &Planner, txn: Arc<Transaction>, sql: &str) -> (usize, usize) {
+        let plan = planner.create_query_plan(sql.to_string(), txn).unwrap();
+        (plan.blocks_accessed(), plan.records_output())
+    }
+
+    #[test]
+    fn efficiency_student_enroll_query() {
+        let (db, txn, _dir) = setup_db();
+        let bp = basic_planner(&db);
+        let hp = heuristic_planner(&db);
+
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "create table student(sid int, name varchar(20), gradyear int)",
+        );
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "create table enroll(sid2 int, cid int)",
+        );
+
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "create index idx_student_sid on student(sid)",
+        );
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "create index idx_enroll_sid2 on enroll(sid2)",
+        );
+
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "insert into student(sid,name,gradyear) values (1,'John',2025)",
+        );
+        exec(
+            &bp,
+            Arc::clone(&txn),
+            "insert into student(sid,name,gradyear) values (2,'Alice',2024)",
+        );
+
+        for i in 0..200 {
+            let sid = if i % 2 == 0 { 1 } else { 2 };
+            exec(
+                &bp,
+                Arc::clone(&txn),
+                &format!("insert into enroll(sid2,cid) values ({}, {})", sid, 2025),
+            );
+        }
+
+        let sql = "select name from student, enroll \
+                   where sid = sid2 and name = 'john' and gradyear = cid";
+
+        let (b_blocks, b_rows) = plan_costs(&bp, Arc::clone(&txn), sql);
+        let (h_blocks, h_rows) = plan_costs(&hp, Arc::clone(&txn), sql);
+
+        let b_plan = bp
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        println!("Basic plan:");
+        b_plan.print_plan(0);
+        let h_plan = hp
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        println!("Heuristic plan:");
+        h_plan.print_plan(0);
+
+        assert_eq!(b_rows, h_rows);
+        println!("h_blocks: {}, b_blocks: {}", h_blocks, b_blocks);
+        assert!(
+            h_blocks <= b_blocks,
+            "heuristic blocks {} > basic blocks {}",
+            h_blocks,
+            b_blocks
+        );
+    }
+}
+
 trait QueryPlanner {
     fn create_plan(
         &self,
@@ -5412,11 +5521,17 @@ impl Plan for IndexJoinPlan {
     }
 
     fn print_plan_internal(&self, indent: usize) {
-        self.plan_1.print_plan_internal(indent);
-        self.plan_2.print_plan_internal(indent);
-        println!("{}IndexJoinPlan", " ".repeat(indent));
-        println!("{}  IndexInfo: {}", " ".repeat(indent), self.index_info);
-        println!("{}  JoinField: {}", " ".repeat(indent), self.join_field);
+        let prefix = "  ".repeat(indent);
+        println!("{}╭─ IndexJoinPlan", prefix);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{}├─ Records: {}", prefix, self.records_output());
+        println!("{}├─ Index: {}", prefix, self.index_info);
+        println!("{}├─ JoinField: {}", prefix, self.join_field);
+        println!("{}├─ Left Plan:", prefix);
+        self.plan_1.print_plan(indent + 1);
+        println!("{}├─ Right Plan:", prefix);
+        self.plan_2.print_plan(indent + 1);
+        println!("{}╰─", prefix);
     }
 }
 
