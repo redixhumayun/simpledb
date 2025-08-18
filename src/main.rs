@@ -110,14 +110,14 @@ impl SimpleDB {
 }
 
 struct MultiBufferProductPlan {
-    txn: Arc<Transaction>,
     lhs: Arc<dyn Plan>,
     rhs: Arc<dyn Plan>,
+    txn: Arc<Transaction>,
     schema: Schema,
 }
 
 impl MultiBufferProductPlan {
-    fn new(txn: Arc<Transaction>, lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>) -> SimpleDBResult<Self> {
+    fn new(lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>, txn: Arc<Transaction>) -> SimpleDBResult<Self> {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
@@ -256,7 +256,7 @@ mod multi_buffer_product_plan_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        MultiBufferProductPlan::new(Arc::clone(&txn), lhs, rhs).unwrap()
+        MultiBufferProductPlan::new(lhs, rhs, Arc::clone(&txn)).unwrap()
     }
 
     #[test]
@@ -3789,6 +3789,7 @@ struct TablePlanner {
     metadata_manager: Arc<MetadataManager>,
     schema: Schema,
     indexes: HashMap<String, IndexInfo>,
+    plan: Arc<dyn Plan>,
 }
 
 impl TablePlanner {
@@ -3798,11 +3799,11 @@ impl TablePlanner {
         txn: Arc<Transaction>,
         metadata_manager: Arc<MetadataManager>,
     ) -> Self {
-        let plan = TablePlan::new(
+        let plan = Arc::new(TablePlan::new(
             table_name.as_str(),
             Arc::clone(&txn),
             Arc::clone(&metadata_manager),
-        );
+        ));
         let indexes = metadata_manager.get_index_info(&table_name, Arc::clone(&txn));
         Self {
             table_name,
@@ -3811,6 +3812,7 @@ impl TablePlanner {
             metadata_manager,
             schema: plan.schema(),
             indexes,
+            plan,
         }
     }
 
@@ -3826,18 +3828,14 @@ impl TablePlanner {
     /// First, try to apply indexes and create an [IndexSelectPlan]
     /// Next, push down predicates and create a [SelectPlan] with the sub-predicate
     fn make_select_plan(&self) -> Arc<dyn Plan> {
-        let base_plan = Arc::new(TablePlan::new(
-            &self.table_name,
-            Arc::clone(&self.txn),
-            Arc::clone(&self.metadata_manager),
-        ));
-        let new_plan = self.make_index_select_plan(base_plan);
-        self.push_down_predicate(new_plan)
+        let new_plan = self.make_index_select_plan(Arc::clone(&self.plan));
+        self.add_select_predicate(new_plan)
     }
 
     /// Create a join plan with the other_plan provided in the function signature. Uses heuristic 7
     /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
     /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
+    /// with a join predicate on top
     fn make_join_plan(&self, other_plan: &Arc<dyn Plan>) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
         let mut unioned_schema = Schema::new();
         unioned_schema.add_all_from_schema(&self.schema)?;
@@ -3850,13 +3848,21 @@ impl TablePlanner {
         if sub_pred.is_empty() {
             return Ok(None);
         }
-
-        todo!()
+        let plan = self
+            .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(&other_plan))?
+            .map(Ok)
+            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(&other_plan)))?;
+        Ok(Some(plan))
     }
 
     /// Construct a [MultiBufferProductPlan] with the provided plan
-    fn make_product_plan(&self, current_plan: &Arc<dyn Plan>) -> Arc<dyn Plan> {
-        todo!()
+    fn make_product_plan(&self, other_plan: Arc<dyn Plan>) -> SimpleDBResult<Arc<dyn Plan>> {
+        let filtered_plan = self.add_select_predicate(Arc::clone(&self.plan));
+        Ok(Arc::new(MultiBufferProductPlan::new(
+            other_plan,
+            filtered_plan,
+            Arc::clone(&self.txn),
+        )?))
     }
 
     /// Takes the plan and the plan to join with and tries to construct an [IndexJoinPlan]
@@ -3872,17 +3878,29 @@ impl TablePlanner {
         let plan_schema = &self.schema;
         let other_plan_schema = &other_plan.schema();
         for field in self.indexes.keys() {
-            if plan_schema.fields.contains(field)
-                && other_plan_schema.fields.contains(field)
-                && self.predicate.equates_with_field(field).is_some()
-            {
-                let index_info = self.indexes.get(field).cloned().unwrap();
-                let index_join_plan =
-                    IndexJoinPlan::new(plan, other_plan, index_info, field.to_string())?;
-                return Ok(Some(Arc::new(index_join_plan)));
+            if let Some(lhs_field) = self.predicate.equates_with_field(&field) {
+                if plan_schema.fields.contains(field)
+                    && other_plan_schema.fields.contains(&lhs_field)
+                {
+                    let index_info = self.indexes.get(field).cloned().unwrap();
+                    let plan =
+                        IndexJoinPlan::new(Arc::clone(&other_plan), plan, index_info, lhs_field)
+                            .map(Arc::new)
+                            .map(|p| self.add_select_predicate(p))
+                            .and_then(|p| self.add_join_predicate(p, &other_plan))?;
+                    return Ok(Some(plan));
+                }
             }
         }
         Ok(None)
+    }
+
+    /// This function constructs a [MultiBufferProductPlan] and then adds two plans on top
+    /// 1. [SelectPlan] with [Predicate] filtering for this table
+    /// 2. [SelectPlan] with [Predicate] filtering for the cross-table join condition
+    fn make_product_join_plan(&self, other_plan: Arc<dyn Plan>) -> SimpleDBResult<Arc<dyn Plan>> {
+        self.make_product_plan(Arc::clone(&other_plan))
+            .and_then(|p| self.add_join_predicate(p, &other_plan))
     }
 
     /// Loop through fields which have indexes and for the first field which has an index
@@ -3909,12 +3927,35 @@ impl TablePlanner {
     /// which applies to the schema of the table associated with this plan
     /// It will then use that [Predicate] to construct a [SelectPlan]
     /// If no part of the predicate applies, it will return the original plan
-    fn push_down_predicate(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
+    fn add_select_predicate(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         let sub_pred = self.predicate.sub_predicate_for_select(&self.schema);
         if sub_pred.is_empty() {
             return plan;
         }
         Arc::new(SelectPlan::new(plan, sub_pred))
+    }
+
+    /// This function will take the [Predicate] and construct a subset of the [Predicate]
+    /// which applies to the union of the schemas for this table and the joining table
+    /// It will then use that [Predicate] to construct a [SelectPlan]
+    /// If no part of the predicate applies, it will return the original plan
+    fn add_join_predicate(
+        &self,
+        plan: Arc<dyn Plan>,
+        other_plan: &Arc<dyn Plan>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let mut unioned_schema = Schema::new();
+        unioned_schema.add_all_from_schema(&self.schema)?;
+        unioned_schema.add_all_from_schema(&other_plan.schema())?;
+        let sub_pred = self.predicate.sub_predicate_for_join(
+            &self.schema,
+            &other_plan.schema(),
+            &unioned_schema,
+        );
+        if sub_pred.is_empty() {
+            return Ok(plan);
+        }
+        Ok(Arc::new(SelectPlan::new(plan, sub_pred)))
     }
 }
 
@@ -3935,11 +3976,11 @@ impl HeuristicQueryPlanner {
     }
 
     /// The entry point function which will go through a list of heuristics and attempt to apply them to the provided query
-    /// It constructs a left-deep query plan by applying the following heuristics
+    /// It constructs a left-deep query tree by applying the following heuristics
     /// 1. Heuristic 5a - Choose the table producing the smallest output when deciding join order
     /// 2. Heuristic 4 - Join only previously chosen tables and try to produce smallest possible output
     /// 3. Heuristic 8 - Apply projection nodes to reduce the output, especially at the output of materialized nodes
-    fn create_plan(
+    fn create_plan_internal(
         &mut self,
         query_data: QueryData,
         txn: Arc<Transaction>,
@@ -4017,7 +4058,7 @@ impl HeuristicQueryPlanner {
         Ok(plan)
     }
 
-    /// FInd the right table to construct a product product plan with and construct it
+    /// Find the right table to construct a product plan with
     /// Choose the table to do a product with current_plan by minimizing the output
     fn get_lowest_product_plan(
         &mut self,
@@ -4027,9 +4068,15 @@ impl HeuristicQueryPlanner {
             .table_planners
             .iter()
             .enumerate()
-            .map(|(idx, tp)| (idx, tp.make_product_plan(&current_plan)))
+            .map(|(idx, tp)| {
+                tp.make_product_plan(Arc::clone(&current_plan))
+                    .map(|p| (idx, p))
+            })
+            .collect::<SimpleDBResult<Vec<_>>>()?
+            .into_iter()
             .min_by_key(|(_, p)| p.records_output())
             .ok_or("could not construct any product plan")?;
+        self.table_planners.remove(idx);
         Ok(plan)
     }
 }
@@ -4039,8 +4086,9 @@ impl QueryPlanner for HeuristicQueryPlanner {
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Arc<dyn Plan>, Box<dyn Error>> {
-        todo!()
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let mut hp = HeuristicQueryPlanner::new(Arc::clone(&self.metadata_manager));
+        hp.create_plan_internal(query_data, txn)
     }
 }
 
@@ -4064,7 +4112,7 @@ impl QueryPlanner for BasicQueryPlanner {
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Arc<dyn Plan>, Box<dyn Error>> {
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
         let mut plans = Vec::new();
 
         // 1. Create the table plans
@@ -4094,12 +4142,351 @@ impl QueryPlanner for BasicQueryPlanner {
     }
 }
 
+#[cfg(test)]
+mod basic_query_planner_tests {
+    use super::*;
+
+    fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
+        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        (db, txn, dir)
+    }
+
+    fn basic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(BasicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn exec(planner: &Planner, txn: Arc<Transaction>, sql: &str) {
+        planner.execute_update(sql.to_string(), txn).unwrap();
+    }
+
+    fn fetch_rows(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        fields: &[&str],
+    ) -> Vec<Vec<Constant>> {
+        let plan = planner.create_query_plan(sql.to_string(), txn).unwrap();
+        let mut scan = plan.open();
+        let mut out = Vec::new();
+        scan.before_first().unwrap();
+        while let Some(Ok(())) = scan.next() {
+            let mut row = Vec::new();
+            for &f in fields {
+                row.push(scan.get_value(f).unwrap());
+            }
+            out.push(row);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn basic_single_table_select_and_project() {
+        let (db, txn, _dir) = setup_db();
+        let planner = basic_planner(&db);
+
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "create table t(a int, b varchar(10))",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (1,'x')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (2,'y')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (3,'z')",
+        );
+
+        let rows = fetch_rows(
+            &planner,
+            Arc::clone(&txn),
+            "select b from t where a = 2",
+            &["b"],
+        );
+
+        assert_eq!(rows, vec![vec![Constant::String("y".into())]]);
+    }
+
+    #[test]
+    fn basic_two_table_product_then_filter() {
+        let (db, txn, _dir) = setup_db();
+        let planner = basic_planner(&db);
+
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "create table e(id int, name varchar(20))",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "create table d(depid int, dept varchar(20))",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (1,'a')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (2,'b')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (2,'x')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (3,'y')",
+        );
+
+        // Basic planner builds product + select
+        let rows = fetch_rows(
+            &planner,
+            Arc::clone(&txn),
+            "select name, dept from e, d where id = depid",
+            &["name", "dept"],
+        );
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                Constant::String("b".into()),
+                Constant::String("x".into())
+            ]]
+        );
+    }
+
+    #[test]
+    fn basic_single_table_or_predicate() {
+        let (db, txn, _dir) = setup_db();
+        let planner = basic_planner(&db);
+
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "create table t(a int, b varchar(10))",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (1,'x')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (2,'y')",
+        );
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "insert into t(a,b) values (3,'z')",
+        );
+
+        let rows = fetch_rows(
+            &planner,
+            Arc::clone(&txn),
+            "select b from t where a = 2 or a = 3",
+            &["b"],
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Constant::String("y".into())],
+                vec![Constant::String("z".into())]
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod heuristic_equivalence_tests {
+    use super::*;
+
+    fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
+        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let txn = Arc::new(db.new_tx());
+        (db, txn, dir)
+    }
+
+    fn basic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(BasicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn heuristic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(HeuristicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn exec(planner: &Planner, txn: Arc<Transaction>, sql: &str) {
+        planner.execute_update(sql.to_string(), txn).unwrap();
+    }
+
+    fn fetch_rows(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        fields: &[&str],
+    ) -> Vec<Vec<Constant>> {
+        let plan = planner.create_query_plan(sql.to_string(), txn).unwrap();
+        let mut scan = plan.open();
+        let mut out = Vec::new();
+        scan.before_first().unwrap();
+        while let Some(Ok(())) = scan.next() {
+            let mut row = Vec::new();
+            for &f in fields {
+                row.push(scan.get_value(f).unwrap());
+            }
+            out.push(row);
+        }
+        out.sort();
+        out
+    }
+
+    fn assert_equivalent(db: &SimpleDB, txn: Arc<Transaction>, sql: &str, fields: &[&str]) {
+        let bp = basic_planner(db);
+        let hp = heuristic_planner(db);
+        let left = fetch_rows(&bp, Arc::clone(&txn), sql, fields);
+        let right = fetch_rows(&hp, Arc::clone(&txn), sql, fields);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn eq_single_table_or_select() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        exec(&p, Arc::clone(&txn), "insert into t(a,b) values (1,'x')");
+        exec(&p, Arc::clone(&txn), "insert into t(a,b) values (2,'y')");
+        exec(&p, Arc::clone(&txn), "insert into t(a,b) values (3,'z')");
+
+        assert_equivalent(
+            &db,
+            Arc::clone(&txn),
+            "select b from t where a = 2 or a = 3",
+            &["b"],
+        );
+    }
+
+    #[test]
+    fn eq_two_table_join_without_index() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "create table e(id int, name varchar(20))",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "create table d(depid int, dept varchar(20))",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (1,'a')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (2,'b')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (2,'x')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (3,'y')",
+        );
+
+        assert_equivalent(
+            &db,
+            Arc::clone(&txn),
+            "select name, dept from e, d where id = depid",
+            &["name", "dept"],
+        );
+    }
+
+    #[test]
+    fn eq_two_table_join_with_index() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "create table e(id int, name varchar(20))",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "create table d(depid int, dept varchar(20))",
+        );
+        exec(&p, Arc::clone(&txn), "create index idx_d_depid on d(depid)");
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (1,'a')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into e(id,name) values (2,'b')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (2,'x')",
+        );
+        exec(
+            &p,
+            Arc::clone(&txn),
+            "insert into d(depid,dept) values (3,'y')",
+        );
+
+        assert_equivalent(
+            &db,
+            Arc::clone(&txn),
+            "select name, dept from e, d where id = depid",
+            &["name", "dept"],
+        );
+    }
+}
+
 trait QueryPlanner {
     fn create_plan(
         &self,
         query_data: QueryData,
         txn: Arc<Transaction>,
-    ) -> Result<Arc<dyn Plan>, Box<dyn Error>>;
+    ) -> SimpleDBResult<Arc<dyn Plan>>;
 }
 
 struct ProductPlan {

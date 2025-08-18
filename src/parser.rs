@@ -131,9 +131,7 @@ impl<'a> Parser<'a> {
         let predicate = {
             if self.lexer.match_keyword("where") {
                 self.lexer.eat_keyword("where")?;
-                let terms = self.terms()?;
-                let predicate = Predicate::new(terms);
-                predicate
+                self.parse_predicate()?
             } else {
                 Predicate::new(Vec::new())
             }
@@ -267,9 +265,7 @@ impl<'a> Parser<'a> {
         let predicate = {
             if self.lexer.match_keyword("where") {
                 self.lexer.eat_keyword("where")?;
-                let terms = self.terms()?;
-                let predicate = Predicate::new(terms);
-                predicate
+                self.parse_predicate()?
             } else {
                 Predicate::new(Vec::new())
             }
@@ -289,9 +285,7 @@ impl<'a> Parser<'a> {
         let predicate = {
             if self.lexer.match_keyword("where") {
                 self.lexer.eat_keyword("where")?;
-                let terms = self.terms()?;
-                let predicate = Predicate::new(terms);
-                predicate
+                self.parse_predicate()?
             } else {
                 Predicate::new(Vec::new())
             }
@@ -299,6 +293,62 @@ impl<'a> Parser<'a> {
         Ok(ModifyData::new(
             table_name, field_name, new_value, predicate,
         ))
+    }
+
+    /// Parses a full predicate with proper precedence: NOT > AND > OR.
+    fn parse_predicate(&mut self) -> Result<Predicate, ParserError> {
+        self.parse_or()
+    }
+
+    /// Parses OR-chains: and-expr (OR and-expr)*
+    fn parse_or(&mut self) -> Result<Predicate, ParserError> {
+        let mut operands: Vec<Predicate> = Vec::new();
+        operands.push(self.parse_and()?);
+        while self.lexer.match_keyword("or") {
+            self.lexer.eat_keyword("or")?;
+            operands.push(self.parse_and()?);
+        }
+        if operands.len() == 1 {
+            return Ok(operands.remove(0));
+        }
+        Ok(Predicate::or(operands))
+    }
+
+    /// Parses AND-chains: not-expr (AND not-expr)*
+    fn parse_and(&mut self) -> Result<Predicate, ParserError> {
+        let mut operands: Vec<Predicate> = Vec::new();
+        operands.push(self.parse_not()?);
+        while self.lexer.match_keyword("and") {
+            self.lexer.eat_keyword("and")?;
+            operands.push(self.parse_not()?);
+        }
+        if operands.len() == 1 {
+            return Ok(operands.remove(0));
+        }
+        Ok(Predicate::and(operands))
+    }
+
+    /// Parses NOT: (NOT)* primary
+    fn parse_not(&mut self) -> Result<Predicate, ParserError> {
+        if self.lexer.match_keyword("not") {
+            self.lexer.eat_keyword("not")?;
+            let inner = self.parse_not()?;
+            return Ok(Predicate::not(inner));
+        }
+        self.parse_primary_predicate()
+    }
+
+    /// Parses a parenthesized predicate or a single comparison term
+    fn parse_primary_predicate(&mut self) -> Result<Predicate, ParserError> {
+        if self.lexer.match_delim('(') {
+            self.lexer.eat_delim('(')?;
+            let pred = self.parse_predicate()?;
+            self.lexer.eat_delim(')')?;
+            return Ok(pred);
+        }
+        // Fallback to a single term
+        let t = self.term()?;
+        Ok(Predicate::new(vec![t]))
     }
 }
 
@@ -339,6 +389,35 @@ mod parser_tests {
                 comparison_op: ComparisonOp::Equal
             }) if val == "john"
         );
+    }
+
+    #[test]
+    fn parse_or_precedence() {
+        let sql = "select b from t where a = 2 or a = 3 and c = 4";
+        let mut parser = super::Parser::new(sql);
+        let qd = parser.query().unwrap();
+        // Expect Or at root
+        match &qd.predicate.root {
+            PredicateNode::Composite { op, operands } => {
+                assert!(matches!(op, BooleanConnective::Or));
+                assert_eq!(operands.len(), 2);
+            }
+            _ => panic!("expected composite"),
+        }
+    }
+
+    #[test]
+    fn parse_parentheses_and_not() {
+        let sql = "select a from t where not (a = 1 and (b = 2 or c = 3))";
+        let mut parser = super::Parser::new(sql);
+        let qd = parser.query().unwrap();
+        // Root should be NOT
+        if let PredicateNode::Composite { op, operands } = &qd.predicate.root {
+            assert!(matches!(op, BooleanConnective::Not));
+            assert_eq!(operands.len(), 1);
+        } else {
+            panic!("expected NOT composite");
+        }
     }
 
     #[test]
@@ -658,8 +737,8 @@ impl<'a> Lexer<'a> {
     /// Creates a new Lexer with the given SQL string
     fn new(string: &'a str) -> Self {
         let keywords = [
-            "select", "from", "where", "and", "insert", "into", "values", "delete", "update",
-            "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
+            "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
+            "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
         ];
         let mut lexer = Self {
             input: string.chars().peekable(),
