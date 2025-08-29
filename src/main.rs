@@ -35,27 +35,30 @@ type LSN = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 /// The database struct
-struct SimpleDB {
+pub struct SimpleDB {
     db_directory: PathBuf,
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     metadata_manager: Arc<MetadataManager>,
-    planner: Arc<Planner>,
+    pub planner: Arc<Planner>,
 }
 
 impl SimpleDB {
     const LOG_FILE: &str = "simpledb.log";
 
-    fn new<P: AsRef<Path>>(path: P, block_size: usize, num_buffers: usize, clean: bool) -> Self {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        block_size: usize,
+        num_buffers: usize,
+        clean: bool,
+    ) -> Self {
         let file_manager = Arc::new(Mutex::new(
             FileManager::new(&path, block_size, clean).unwrap(),
         ));
-        let joined_path = path.as_ref().join(Self::LOG_FILE);
-        let log_path = joined_path.to_str().unwrap();
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
-            log_path,
+            Self::LOG_FILE,
         )));
         let buffer_manager = Arc::new(Mutex::new(BufferManager::new(
             Arc::clone(&file_manager),
@@ -86,7 +89,7 @@ impl SimpleDB {
         }
     }
 
-    fn new_tx(&self) -> Transaction {
+    pub fn new_tx(&self) -> Transaction {
         Transaction::new(
             Arc::clone(&self.file_manager),
             Arc::clone(&self.log_manager),
@@ -3116,7 +3119,7 @@ impl TempTable {
     }
 }
 
-struct Planner {
+pub struct Planner {
     query_planner: Box<dyn QueryPlanner>,
     update_planner: Box<dyn UpdatePlanner>,
 }
@@ -3129,7 +3132,7 @@ impl Planner {
         }
     }
 
-    fn create_query_plan(
+    pub fn create_query_plan(
         &self,
         query: String,
         txn: Arc<Transaction>,
@@ -3140,7 +3143,7 @@ impl Planner {
         self.query_planner.create_plan(query_data, txn)
     }
 
-    fn execute_update(
+    pub fn execute_update(
         &self,
         command: String,
         txn: Arc<Transaction>,
@@ -4886,7 +4889,7 @@ impl Plan for TablePlan {
     }
 }
 
-trait Plan {
+pub trait Plan {
     fn open(&self) -> Box<dyn UpdateScan>;
     fn blocks_accessed(&self) -> usize;
     fn records_output(&self) -> usize;
@@ -8113,7 +8116,7 @@ impl UpdateScan for TableScan {
     }
 }
 
-trait UpdateScan: Scan + Any {
+pub trait UpdateScan: Scan + Any {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
@@ -8123,7 +8126,7 @@ trait UpdateScan: Scan + Any {
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>>;
 }
 
-trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
+pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>>;
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>>;
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
@@ -8195,7 +8198,7 @@ mod table_scan_tests {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum Constant {
+pub enum Constant {
     Int(i32),
     String(String),
 }
@@ -8217,7 +8220,7 @@ impl Constant {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-struct RID {
+pub struct RID {
     block_num: usize,
     slot: usize,
 }
@@ -8583,8 +8586,8 @@ struct FieldInfo {
 }
 
 #[derive(Clone, Debug)]
-struct Schema {
-    fields: Vec<String>,
+pub struct Schema {
+    pub fields: Vec<String>,
     info: HashMap<String, FieldInfo>,
 }
 
@@ -8679,7 +8682,7 @@ impl TxIdGenerator {
 static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
 #[derive(Debug)]
-struct Transaction {
+pub struct Transaction {
     file_manager: Arc<Mutex<FileManager>>,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
@@ -8719,7 +8722,7 @@ impl Transaction {
     /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
-    fn commit(&self) -> Result<(), Box<dyn Error>> {
+    pub fn commit(&self) -> Result<(), Box<dyn Error>> {
         //  Commit all data associated with this txn
         self.recovery_manager.commit();
         //  Release all locks associated with this txn

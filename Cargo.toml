@@ -3,4 +3,12 @@ name = "simpledb"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "simpledb-cli"
+path = "src/bin/simpledb-cli.rs"
+
+[lib]
+name = "simpledb"
+path = "src/main.rs"
+
 [dependencies]

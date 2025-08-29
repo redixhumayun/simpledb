@@ -46,6 +46,10 @@ impl<'a> Parser<'a> {
     /// Parses the SELECT clause field list
     /// Returns: Vec<String> containing selected field names
     fn select_list(&mut self) -> Result<Vec<String>, ParserError> {
+        if self.lexer.match_delim('*') {
+            self.lexer.eat_delim('*')?;
+            return Ok(vec!["*".to_string()]);
+        }
         self.field_list()
     }
 
@@ -733,6 +737,7 @@ impl<'a> Lexer<'a> {
     const ROUND_CLOSE: char = ')';
     const CURLY_OPEN: char = '{';
     const CURLY_CLOSE: char = '}';
+    const STAR: char = '*';
 
     /// Creates a new Lexer with the given SQL string
     fn new(string: &'a str) -> Self {
@@ -804,7 +809,8 @@ impl<'a> Lexer<'a> {
             | Self::ROUND_OPEN
             | Self::ROUND_CLOSE
             | Self::CURLY_OPEN
-            | Self::CURLY_CLOSE => {
+            | Self::CURLY_CLOSE
+            | Self::STAR => {
                 self.input.next();
                 Some(Token::Delimiter(c))
             } // delimiter
