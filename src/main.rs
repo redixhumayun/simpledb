@@ -67,7 +67,7 @@ impl SimpleDB {
             num_buffers,
         )));
         let lock_table = Arc::new(LockTable::new(100)); // 100ms timeout
-        let txn = Arc::new(Transaction::new_with_lock_table(
+        let txn = Arc::new(Transaction::new(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
             Arc::clone(&buffer_manager),
@@ -94,7 +94,7 @@ impl SimpleDB {
     }
 
     pub fn new_tx(&self) -> Transaction {
-        Transaction::new_with_lock_table(
+        Transaction::new(
             Arc::clone(&self.file_manager),
             Arc::clone(&self.log_manager),
             Arc::clone(&self.buffer_manager),
@@ -8693,7 +8693,8 @@ pub struct Transaction {
 impl Transaction {
     const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
     
-    fn new_with_lock_table(
+
+    fn new(
         file_manager: Arc<Mutex<FileManager>>,
         log_manager: Arc<Mutex<LogManager>>,
         buffer_manager: Arc<Mutex<BufferManager>>,
@@ -8716,18 +8717,6 @@ impl Transaction {
             concurrency_manager: ConcurrencyManager::new(tx_id, Self::TXN_SLEEP_TIMEOUT, lock_table),
             file_manager,
         }
-    }
-
-    fn new(
-        file_manager: Arc<Mutex<FileManager>>,
-        log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
-    ) -> Self {
-        // Use global lock table for backward compatibility
-        let lock_table = LOCK_TABLE_GENERATOR
-            .get_or_init(|| Arc::new(LockTable::new(Self::TXN_SLEEP_TIMEOUT)))
-            .clone();
-        Self::new_with_lock_table(file_manager, log_manager, buffer_manager, lock_table)
     }
 
     /// Commit this transaction
@@ -8932,16 +8921,18 @@ mod transaction_tests {
         let fm1 = Arc::clone(&test_db.file_manager);
         let lm1 = Arc::clone(&test_db.log_manager);
         let bm1 = Arc::clone(&test_db.buffer_manager);
+        let lt1 = Arc::clone(&test_db.lock_table);
         let bid1 = block_id.clone();
 
         let fm2 = Arc::clone(&test_db.file_manager);
         let lm2 = Arc::clone(&test_db.log_manager);
         let bm2 = Arc::clone(&test_db.buffer_manager);
+        let lt2 = Arc::clone(&test_db.lock_table);
         let bid2 = block_id.clone();
 
         //  Create a read only transasction
         let t1 = std::thread::spawn(move || {
-            let txn = Transaction::new(fm1, lm1, bm1);
+            let txn = Transaction::new(fm1, lm1, bm1, lt1);
             txn.pin(&bid1);
             txn.get_int(&bid1, 80).unwrap();
             txn.get_string(&bid1, 40).unwrap();
@@ -8950,7 +8941,7 @@ mod transaction_tests {
 
         //  Create a write only transaction
         let t2 = std::thread::spawn(move || {
-            let txn = Transaction::new(fm2, lm2, bm2);
+            let txn = Transaction::new(fm2, lm2, bm2, lt2);
             txn.pin(&bid2.clone());
             txn.set_int(&bid2, 80, 1, false).unwrap();
             txn.set_string(&bid2, 40, "Hello", false).unwrap();
@@ -8964,6 +8955,7 @@ mod transaction_tests {
             test_db.file_manager,
             test_db.log_manager,
             test_db.buffer_manager,
+            test_db.lock_table,
         );
         txn.pin(&block_id);
         assert_eq!(txn.get_int(&block_id, 80).unwrap(), 1);
@@ -8983,10 +8975,11 @@ mod transaction_tests {
             let fm = Arc::clone(&test_db.file_manager);
             let lm = Arc::clone(&test_db.log_manager);
             let bm = Arc::clone(&test_db.buffer_manager);
+            let lt = Arc::clone(&test_db.lock_table);
             let bid = block_id.clone();
 
             handles.push(std::thread::spawn(move || {
-                let txn = Transaction::new(fm, lm, bm);
+                let txn = Transaction::new(fm, lm, bm, lt);
                 txn.pin(&bid);
                 txn.get_int(&bid, 80).unwrap();
                 txn.get_string(&bid, 40).unwrap();
@@ -8998,6 +8991,7 @@ mod transaction_tests {
             test_db.file_manager.clone(),
             test_db.log_manager.clone(),
             test_db.buffer_manager.clone(),
+            test_db.lock_table.clone(),
         );
         txn.pin(&block_id);
         txn.set_int(&block_id, 80, 1, false).unwrap();
@@ -9020,6 +9014,7 @@ mod transaction_tests {
             Arc::clone(&test_db.file_manager),
             Arc::clone(&test_db.log_manager),
             Arc::clone(&test_db.buffer_manager),
+            Arc::clone(&test_db.lock_table),
         );
         t1.pin(&block_id);
         t1.set_int(&block_id, 80, 100, true).unwrap();
@@ -9031,6 +9026,7 @@ mod transaction_tests {
             Arc::clone(&test_db.file_manager),
             Arc::clone(&test_db.log_manager),
             Arc::clone(&test_db.buffer_manager),
+            Arc::clone(&test_db.lock_table),
         );
         t2.pin(&block_id);
         t2.set_int(&block_id, 80, 200, true).unwrap();
@@ -9043,6 +9039,7 @@ mod transaction_tests {
             Arc::clone(&test_db.file_manager),
             Arc::clone(&test_db.log_manager),
             Arc::clone(&test_db.buffer_manager),
+            Arc::clone(&test_db.lock_table),
         );
         t3.pin(&block_id);
         assert_eq!(t3.get_int(&block_id, 80).unwrap(), 100);
@@ -9065,6 +9062,7 @@ mod transaction_tests {
             Arc::clone(&test_db.file_manager),
             Arc::clone(&test_db.log_manager),
             Arc::clone(&test_db.buffer_manager),
+            Arc::clone(&test_db.lock_table),
         );
         t1.pin(&block_id);
         t1.set_int(&block_id, 80, 0, true).unwrap();
@@ -9079,12 +9077,13 @@ mod transaction_tests {
             let fm = Arc::clone(&test_db.file_manager);
             let lm = Arc::clone(&test_db.log_manager);
             let bm = Arc::clone(&test_db.buffer_manager);
+            let lt = Arc::clone(&test_db.lock_table);
             let bid = block_id.clone();
             let tx = tx.clone();
 
             handles.push(std::thread::spawn(move || {
                 let mut retry_count = 0;
-                let txn = Transaction::new(fm.clone(), lm.clone(), bm.clone());
+                let txn = Transaction::new(fm.clone(), lm.clone(), bm.clone(), lt.clone());
                 loop {
                     if retry_count > max_retry_count {
                         panic!("Too many retries");
@@ -9168,6 +9167,7 @@ mod transaction_tests {
             Arc::clone(&test_db.file_manager),
             Arc::clone(&test_db.log_manager),
             Arc::clone(&test_db.buffer_manager),
+            Arc::clone(&test_db.lock_table),
         );
         t_final.pin(&block_id);
         assert!(t_final.get_int(&block_id, 80).unwrap() == num_of_txns);
@@ -9185,6 +9185,7 @@ mod transaction_tests {
                 Arc::clone(&db.file_manager),
                 Arc::clone(&db.log_manager),
                 Arc::clone(&db.buffer_manager),
+                Arc::clone(&db.lock_table),
             );
             let block_id = BlockId::new(file.clone(), 1);
             t1.pin(&block_id);
@@ -9199,6 +9200,7 @@ mod transaction_tests {
                 Arc::clone(&db.file_manager),
                 Arc::clone(&db.log_manager),
                 Arc::clone(&db.buffer_manager),
+                Arc::clone(&db.lock_table),
             );
             t2.recover().unwrap();
 
