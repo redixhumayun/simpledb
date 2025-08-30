@@ -18,7 +18,7 @@ There are no dependencies apart from the Rust standard library and that is by de
 
 The code is designed to construct and answer typical SQL queries. The code will construct a query tree that will use the pull-based iterator pattern in a way that is probably typical in most SQL systems. However, the code leans towards readability rather than performance.
 
-There is a test suite which provides basic coverage to ensure the code still works. This can be run with `cargo test`
+There is a test suite which provides basic coverage to ensure the code still works. This can be run with `cargo test`. Never run tests in serial by specifying threads as 1 as this will hide isolation issues. Always make sure tests pass when you make any changes.
 
 ## Development Workflow
 
