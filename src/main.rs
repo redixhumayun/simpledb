@@ -42,6 +42,7 @@ pub struct SimpleDB {
     buffer_manager: Arc<Mutex<BufferManager>>,
     metadata_manager: Arc<MetadataManager>,
     pub planner: Arc<Planner>,
+    lock_table: Arc<LockTable>,
 }
 
 impl SimpleDB {
@@ -65,10 +66,12 @@ impl SimpleDB {
             Arc::clone(&log_manager),
             num_buffers,
         )));
-        let txn = Arc::new(Transaction::new(
+        let lock_table = Arc::new(LockTable::new(100)); // 100ms timeout
+        let txn = Arc::new(Transaction::new_with_lock_table(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
             Arc::clone(&buffer_manager),
+            Arc::clone(&lock_table),
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
         let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
@@ -86,14 +89,16 @@ impl SimpleDB {
             buffer_manager,
             metadata_manager,
             planner,
+            lock_table,
         }
     }
 
     pub fn new_tx(&self) -> Transaction {
-        Transaction::new(
+        Transaction::new_with_lock_table(
             Arc::clone(&self.file_manager),
             Arc::clone(&self.log_manager),
             Arc::clone(&self.buffer_manager),
+            Arc::clone(&self.lock_table),
         )
     }
 
@@ -361,14 +366,9 @@ where
 {
     fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
         debug!("Creating multi buffer product scan for {}.tbl", table_name);
-        let db_dir = {
-            let fm = txn.file_manager.lock().unwrap();
-            fm.db_directory.clone()
-        };
-        let path = db_dir.join(format!("{}.tbl", table_name));
-        let file_name = path.to_str().unwrap();
+        let file_name = format!("{}.tbl", table_name);
         let available_buffers = txn.available_buffs();
-        let rhs_file_size = txn.size(file_name);
+        let rhs_file_size = txn.size(&file_name);
         let chunk_size = best_factor(available_buffers, rhs_file_size);
         debug!(
             "The chunk size for the multi buffer product plan is {}",
@@ -739,12 +739,7 @@ impl ChunkScan {
             "Creating chunk scan for {}.tbl for blocks from {} to {}",
             table_name, first_block_num, last_block_num
         );
-        let db_dir = {
-            let fm = txn.file_manager.lock().unwrap();
-            fm.db_directory.clone()
-        };
-        let path = db_dir.join(format!("{}.tbl", table_name));
-        let file_name = path.to_str().unwrap();
+        let file_name = format!("{}.tbl", table_name);
         let mut buffer_list = Vec::new();
         for block_num in first_block_num..=last_block_num {
             let block_id = BlockId::new(file_name.to_string(), block_num);
@@ -4680,7 +4675,15 @@ struct ProjectPlan {
 impl ProjectPlan {
     fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
-        for field in fields_list {
+        
+        // Handle wildcard expansion
+        let expanded_fields: Vec<String> = if fields_list.contains(&"*") {
+            plan.schema().fields.clone()
+        } else {
+            fields_list.iter().map(|s| s.to_string()).collect()
+        };
+        
+        for field in &expanded_fields {
             schema.add_from_schema(field, &plan.schema())?;
         }
         Ok(Self { plan, schema })
@@ -7848,12 +7851,7 @@ impl Clone for TableScan {
 impl TableScan {
     fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
-        let db_dir = {
-            let fm = txn.file_manager.lock().unwrap();
-            fm.db_directory.clone()
-        };
-        let path = db_dir.join(format!("{}.tbl", table_name));
-        let file_name = path.to_str().unwrap();
+        let file_name = format!("{}.tbl", table_name);
         let mut scan = Self {
             txn,
             layout,
@@ -8694,10 +8692,12 @@ pub struct Transaction {
 
 impl Transaction {
     const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
-    fn new(
+    
+    fn new_with_lock_table(
         file_manager: Arc<Mutex<FileManager>>,
         log_manager: Arc<Mutex<LogManager>>,
         buffer_manager: Arc<Mutex<BufferManager>>,
+        lock_table: Arc<LockTable>,
     ) -> Self {
         let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
             next_id: AtomicU64::new(0),
@@ -8713,9 +8713,21 @@ impl Transaction {
             buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
             buffer_manager,
             log_manager,
-            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TXN_SLEEP_TIMEOUT),
+            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TXN_SLEEP_TIMEOUT, lock_table),
             file_manager,
         }
+    }
+
+    fn new(
+        file_manager: Arc<Mutex<FileManager>>,
+        log_manager: Arc<Mutex<LogManager>>,
+        buffer_manager: Arc<Mutex<BufferManager>>,
+    ) -> Self {
+        // Use global lock table for backward compatibility
+        let lock_table = LOCK_TABLE_GENERATOR
+            .get_or_init(|| Arc::new(LockTable::new(Self::TXN_SLEEP_TIMEOUT)))
+            .clone();
+        Self::new_with_lock_table(file_manager, log_manager, buffer_manager, lock_table)
     }
 
     /// Commit this transaction
@@ -8874,11 +8886,7 @@ mod transaction_tests {
         let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 3);
 
         //  Start a transaction t1 that will set an int and a string
-        let t1 = Transaction::new(
-            Arc::clone(&test_db.file_manager),
-            Arc::clone(&test_db.log_manager),
-            Arc::clone(&test_db.buffer_manager),
-        );
+        let t1 = test_db.new_tx();
         let block_id = BlockId::new(file.to_string(), 1);
         t1.pin(&block_id);
         t1.set_int(&block_id, 80, 1, false).unwrap();
@@ -8887,11 +8895,7 @@ mod transaction_tests {
 
         //  Start a transaction t2 that should see the results of the previously committed transaction t1
         //  Set new values in this transaction
-        let t2 = Transaction::new(
-            Arc::clone(&test_db.file_manager),
-            Arc::clone(&test_db.log_manager),
-            Arc::clone(&test_db.buffer_manager),
-        );
+        let t2 = test_db.new_tx();
         t2.pin(&block_id);
         assert_eq!(t2.get_int(&block_id, 80).unwrap(), 1);
         assert_eq!(t2.get_string(&block_id, 40).unwrap(), "one");
@@ -8901,11 +8905,7 @@ mod transaction_tests {
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
-        let t3 = Transaction::new(
-            Arc::clone(&test_db.file_manager),
-            Arc::clone(&test_db.log_manager),
-            Arc::clone(&test_db.buffer_manager),
-        );
+        let t3 = test_db.new_tx();
         t3.pin(&block_id);
         assert_eq!(t3.get_int(&block_id, 80).unwrap(), 2);
         assert_eq!(t3.get_string(&block_id, 40).unwrap(), "two");
@@ -8915,11 +8915,7 @@ mod transaction_tests {
 
         //  Start a transaction t4 which should see the result of t2 since t3 rolled back
         //  This will be a read only transaction that commits
-        let t4 = Transaction::new(
-            Arc::clone(&test_db.file_manager),
-            Arc::clone(&test_db.log_manager),
-            Arc::clone(&test_db.buffer_manager),
-        );
+        let t4 = test_db.new_tx();
         t4.pin(&block_id);
         assert_eq!(t4.get_int(&block_id, 80).unwrap(), 2);
         assert_eq!(t4.get_string(&block_id, 40).unwrap(), "two");
@@ -9516,11 +9512,9 @@ struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    fn new(tx_id: TransactionID, timeout: u64) -> Self {
+    fn new(tx_id: TransactionID, timeout: u64, lock_table: Arc<LockTable>) -> Self {
         Self {
-            lock_table: LOCK_TABLE_GENERATOR
-                .get_or_init(|| Arc::new(LockTable::new(timeout)))
-                .clone(),
+            lock_table,
             locks: RefCell::new(HashMap::new()),
             tx_id,
         }
@@ -10919,14 +10913,16 @@ impl FileManager {
 
     /// Get the file handle for the file with the given filename or create it if it doesn't exist
     fn get_file(&mut self, filename: &str) -> File {
+        let full_path = self.db_directory.join(filename);
+        let full_path_str = full_path.to_string_lossy().to_string();
         self.open_files
-            .entry(filename.to_string())
+            .entry(full_path_str)
             .or_insert_with(|| {
                 OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
-                    .open(self.db_directory.join(filename))
+                    .open(full_path)
                     .expect("Failed to open file")
             })
             .try_clone()
@@ -10958,7 +10954,9 @@ mod file_manager_tests {
         let filename = "test_file";
         file_manager.get_file(filename);
 
-        assert!(file_manager.open_files.contains_key(filename));
+        let full_path = file_manager.db_directory.join(filename);
+        let full_path_str = full_path.to_string_lossy().to_string();
+        assert!(file_manager.open_files.contains_key(&full_path_str));
     }
 
     #[test]

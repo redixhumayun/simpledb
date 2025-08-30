@@ -129,7 +129,7 @@ impl<'a> Parser<'a> {
     /// Returns: QueryData containing fields, tables, and predicates
     pub fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
-        let select_list = self.field_list()?;
+        let select_list = self.select_list()?;
         self.lexer.eat_keyword("from")?;
         let table_list = self.select_tables()?;
         let predicate = {
