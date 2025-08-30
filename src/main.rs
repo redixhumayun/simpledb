@@ -4675,14 +4675,14 @@ struct ProjectPlan {
 impl ProjectPlan {
     fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
-        
+
         // Handle wildcard expansion
         let expanded_fields: Vec<String> = if fields_list.contains(&"*") {
             plan.schema().fields.clone()
         } else {
             fields_list.iter().map(|s| s.to_string()).collect()
         };
-        
+
         for field in &expanded_fields {
             schema.add_from_schema(field, &plan.schema())?;
         }
@@ -7048,7 +7048,6 @@ impl MetadataManager {
     }
 
     fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
-        println!("Calling get_stat_info to acquire stat_manager lock");
         self.stat_manager
             .lock()
             .unwrap()
@@ -7480,19 +7479,19 @@ impl StatManager {
         layout: Layout,
         txn: Arc<Transaction>,
     ) -> StatInfo {
-        dbg!("getting stat info for {}", table_name);
+        debug!("getting stat info for {}", table_name);
         self.num_calls += 1;
         if self.num_calls > 100 {
             self.refresh_stats(Arc::clone(&txn));
         }
 
         if let Some(stats) = self.table_stats.get(table_name) {
-            dbg!("found table stats {:?}", stats);
+            debug!("found table stats {:?}", stats);
             stats.clone()
         } else {
-            dbg!("going to calculate table stats");
+            debug!("going to calculate table stats");
             let table_stats = self.calculate_table_stats(table_name, layout, txn);
-            dbg!("table stats {:?}", table_stats.clone());
+            debug!("table stats {:?}", table_stats.clone());
             self.table_stats
                 .insert(table_name.to_string(), table_stats.clone());
             table_stats
@@ -7525,7 +7524,7 @@ impl StatManager {
         layout: Layout,
         txn: Arc<Transaction>,
     ) -> StatInfo {
-        dbg!("calculating table stats for {}", table_name);
+        debug!("calculating table stats for {}", table_name);
         let mut table_scan = TableScan::new(txn, layout, table_name);
         let mut num_rec = 0;
         let mut num_blocks = 0;
@@ -8692,7 +8691,6 @@ pub struct Transaction {
 
 impl Transaction {
     const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
-    
 
     fn new(
         file_manager: Arc<Mutex<FileManager>>,
@@ -8714,7 +8712,11 @@ impl Transaction {
             buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
             buffer_manager,
             log_manager,
-            concurrency_manager: ConcurrencyManager::new(tx_id, Self::TXN_SLEEP_TIMEOUT, lock_table),
+            concurrency_manager: ConcurrencyManager::new(
+                tx_id,
+                Self::TXN_SLEEP_TIMEOUT,
+                lock_table,
+            ),
             file_manager,
         }
     }
