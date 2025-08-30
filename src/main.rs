@@ -4675,7 +4675,15 @@ struct ProjectPlan {
 impl ProjectPlan {
     fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
-        for field in fields_list {
+        
+        // Handle wildcard expansion
+        let expanded_fields: Vec<String> = if fields_list.contains(&"*") {
+            plan.schema().fields.clone()
+        } else {
+            fields_list.iter().map(|s| s.to_string()).collect()
+        };
+        
+        for field in &expanded_fields {
             schema.add_from_schema(field, &plan.schema())?;
         }
         Ok(Self { plan, schema })
