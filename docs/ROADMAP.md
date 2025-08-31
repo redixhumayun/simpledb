@@ -2,6 +2,7 @@
 
 ### Transactions
 1. [Implement deadlock detection strategy](https://github.com/redixhumayun/simpledb/issues/6) - Add wait-for or wait-die strategy
+2. [Add file synchronization for transaction durability](https://github.com/redixhumayun/simpledb/issues/13) - Fix critical durability flaw with fsync operations
 
 ### Storage
 1. [Store bitmap for presence checking](https://github.com/redixhumayun/simpledb/issues/7) - Improve record presence check performance
