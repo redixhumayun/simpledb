@@ -3,6 +3,20 @@ SimpleDB is a Rust port of the Java implementation by Edward Sciore. You can rea
 
 This port is mainly for pedagagical and experimentation reasons. I wanted to understand how query engines worked in more detail and I also wanted a playground to experiment with different ideas.
 
+## Usage
+
+Run the CLI:
+```bash
+cargo run --bin simpledb
+```
+
+Example commands:
+```sql
+CREATE TABLE USERS(id int, name varchar(50))
+INSERT INTO USERS(id, name) VALUES (1, 'Alice')
+SELECT * FROM USERS
+```
+
 ### Core Features
 
 The database supports ACID transactions, along with some other niceties like 
