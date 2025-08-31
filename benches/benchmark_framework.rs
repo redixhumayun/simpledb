@@ -34,7 +34,13 @@ where
     
     durations.sort();
     let mean = durations.iter().sum::<Duration>() / iterations as u32;
-    let median = durations[iterations / 2];
+    let median = if iterations % 2 == 1 {
+        durations[iterations / 2]
+    } else {
+        let mid1 = durations[iterations / 2 - 1].as_nanos();
+        let mid2 = durations[iterations / 2].as_nanos();
+        Duration::from_nanos(((mid1 + mid2) / 2) as u64)
+    };
     
     // Simple std deviation calculation
     let variance: f64 = durations.iter()
