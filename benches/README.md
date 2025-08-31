@@ -48,9 +48,3 @@ SELECT (table scan)  |     2.76ms |     2.75ms |    42.68µs |       50
 - **Dependencies**: None - uses only Rust stdlib
 - **Statistics**: Mean, median, and standard deviation calculated manually
 
-## Design Principles
-
-- **Zero dependencies**: Maintains SimpleDB's stdlib-only philosophy
-- **Educational value**: Simple, understandable benchmark implementation
-- **Accurate timing**: Uses `std::time::Instant` with statistical analysis
-- **Real workloads**: Tests actual SQL operations through the query planner
