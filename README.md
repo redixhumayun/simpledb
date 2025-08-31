@@ -17,6 +17,18 @@ INSERT INTO USERS(id, name) VALUES (1, 'Alice')
 SELECT * FROM USERS
 ```
 
+### Benchmarks
+
+Run performance benchmarks:
+```bash
+cargo run --bin simple_bench
+```
+
+Or with custom iterations:
+```bash
+cargo run --bin simple_bench 100
+```
+
 ### Core Features
 
 The database supports ACID transactions, along with some other niceties like 

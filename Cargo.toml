@@ -7,6 +7,10 @@ edition = "2021"
 name = "simpledb"
 path = "src/bin/simpledb-cli.rs"
 
+[[bin]]
+name = "simple_bench"
+path = "src/bin/simple_bench.rs"
+
 [lib]
 name = "simpledb"
 path = "src/main.rs"
