@@ -20,6 +20,7 @@
 
 ### Query Engine & CLI
 1. [Add EXPLAIN command for query plan visualization](https://github.com/redixhumayun/simpledb/issues/19) - Show query execution plans for educational insight
+2. [Implement cost-based query optimizer](https://github.com/redixhumayun/simpledb/issues/20) - Replace heuristic optimizer with statistics-driven cost-based optimization
 
 ### Performance & Benchmarking
 1. [Set up Criterion.rs benchmarking framework](https://github.com/redixhumayun/simpledb/issues/14) - Basic CRUD operation benchmarks
