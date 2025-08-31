@@ -4,11 +4,20 @@ This directory contains the stdlib-only benchmarking framework for SimpleDB.
 
 ## Usage
 
-Run benchmarks with:
+Run benchmarks with default iterations (10):
 
 ```bash
 cargo run --bin simple_bench
 ```
+
+Or specify custom iteration count:
+
+```bash
+cargo run --bin simple_bench 50    # 50 iterations per operation
+cargo run --bin simple_bench 100   # 100 iterations per operation
+```
+
+**Note**: Higher iteration counts provide more reliable statistics but take longer to run.
 
 ## What's Benchmarked
 
@@ -22,10 +31,14 @@ The benchmark suite measures performance of core database operations:
 ## Output Format
 
 ```
+SimpleDB Stdlib-Only Benchmark Suite
+====================================
+Running benchmarks with 50 iterations per operation
+
 Operation            |       Mean |     Median |     StdDev |    Iters
 ----------------------------------------------------------------------
-INSERT (empty table) |     7.68ms |     7.32ms |   996.90µs |       10
-SELECT (table scan)  |     2.75ms |     2.74ms |     8.35µs |       10
+INSERT (empty table) |     7.22ms |     7.16ms |   229.59µs |       50
+SELECT (table scan)  |     2.76ms |     2.75ms |    42.68µs |       50
 ```
 
 ## Implementation
