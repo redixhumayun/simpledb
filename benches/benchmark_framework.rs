@@ -43,9 +43,13 @@ where
     };
     
     // Simple std deviation calculation
-    let variance: f64 = durations.iter()
-        .map(|d| (d.as_nanos() as f64 - mean.as_nanos() as f64).powi(2))
-        .sum::<f64>() / iterations as f64;
+    let variance: f64 = if iterations > 1 {
+        durations.iter()
+            .map(|d| (d.as_nanos() as f64 - mean.as_nanos() as f64).powi(2))
+            .sum::<f64>() / (iterations as f64 - 1.0)
+    } else {
+        0.0
+    };
     let std_dev = Duration::from_nanos(variance.sqrt() as u64);
     
     BenchResult {
