@@ -23,6 +23,6 @@
 2. [Implement cost-based query optimizer](https://github.com/redixhumayun/simpledb/issues/20) - Replace heuristic optimizer with statistics-driven cost-based optimization
 
 ### Performance & Benchmarking
-1. [Set up Criterion.rs benchmarking framework](https://github.com/redixhumayun/simpledb/issues/14) - Basic CRUD operation benchmarks
+1. [Set up stdlib-only benchmarking framework](https://github.com/redixhumayun/simpledb/issues/14) - Basic CRUD operation benchmarks using only Rust stdlib
 2. [Implement buffer pool and I/O performance benchmarks](https://github.com/redixhumayun/simpledb/issues/15) - Storage layer performance measurement
 3. [Add basic CI benchmark execution](https://github.com/redixhumayun/simpledb/issues/16) - Automated benchmark runs with output
