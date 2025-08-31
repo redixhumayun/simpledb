@@ -88,12 +88,14 @@ fn run_select_benchmarks(db: &SimpleDB) {
             .planner
             .create_query_plan(select_sql.to_string(), Arc::clone(&txn))
             .unwrap();
-        let mut scan = plan.open();
-        let mut _count = 0;
-        while let Some(_) = scan.next() {
-            _count += 1;
-        }
-        scan.close();
+        {
+            let mut scan = plan.open();
+            let mut _count = 0;
+            while let Some(_) = scan.next() {
+                _count += 1;
+            }
+            scan.close();
+        } // scan is dropped here, before transaction commit
         txn.commit().unwrap();
     });
     println!("{}", result);
@@ -170,8 +172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     run_delete_benchmarks(&db);
 
     println!();
-    println!("Benchmark measurements completed successfully!");
-    println!("Note: Assertion failure during cleanup is a known issue and doesn't affect benchmark results.");
+    println!("All benchmarks completed successfully!");
 
     // Cleanup
     cleanup_bench_data();
