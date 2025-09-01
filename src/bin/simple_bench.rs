@@ -50,7 +50,7 @@ fn populate_table(db: &SimpleDB, num_records: usize) -> Result<(), Box<dyn Error
 
 fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark single INSERT operations
-    let result = benchmark("INSERT (empty table)", iterations, || {
+    let result = benchmark("INSERT (single record)", iterations, || {
         let txn = Arc::new(db.new_tx());
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (99999, 'test_user', 25)";
         db.planner
@@ -147,11 +147,14 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn parse_iterations() -> usize {
     let args: Vec<String> = env::args().collect();
-    
+
     match args.len() {
-        1 => 10,  // No args, use default
+        1 => 10, // No args, use default
         2 => args[1].parse().unwrap_or_else(|_| {
-            eprintln!("Warning: Invalid number '{}', using default 10 iterations", args[1]);
+            eprintln!(
+                "Warning: Invalid number '{}', using default 10 iterations",
+                args[1]
+            );
             10
         }),
         _ => {
@@ -164,10 +167,13 @@ fn parse_iterations() -> usize {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let iterations = parse_iterations();
-    
+
     println!("SimpleDB Stdlib-Only Benchmark Suite");
     println!("====================================");
-    println!("Running benchmarks with {} iterations per operation", iterations);
+    println!(
+        "Running benchmarks with {} iterations per operation",
+        iterations
+    );
     println!();
 
     // Clean up any existing benchmark data
