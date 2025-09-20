@@ -2,10 +2,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::only_used_in_recursion)]
-#![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::needless_lifetimes)]
-#![allow(clippy::iter_cloned_collect)]
-#![allow(clippy::while_let_on_iterator)]
 
 use std::{
     any::Any,
@@ -2635,9 +2631,7 @@ impl Iterator for SortScan {
                     None
                 }
             },
-            SortScanState::Done => {
-                None
-            }
+            SortScanState::Done => None,
         }
     }
 }
@@ -2985,11 +2979,13 @@ mod materialize_plan_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
 
         // Insert test data using SQL
-        let test_data = [(1, "first"),
+        let test_data = [
+            (1, "first"),
             (2, "second"),
             (3, "third"),
             (4, "fourth"),
-            (5, "fifth")];
+            (5, "fifth"),
+        ];
 
         for (a_val, b_val) in test_data.iter() {
             let sql = format!(
@@ -6469,32 +6465,30 @@ impl Predicate {
             //  terminal condition for recursion
             PredicateNode::Empty => Ok(true),
             PredicateNode::Term(term) => term.is_satisfied(scan),
-            PredicateNode::Composite { op, operands } => {
-                match op {
-                    BooleanConnective::And => {
-                        for operand in operands {
-                            if !self.evaluate_node(operand, scan)? {
-                                return Ok(false);
-                            }
+            PredicateNode::Composite { op, operands } => match op {
+                BooleanConnective::And => {
+                    for operand in operands {
+                        if !self.evaluate_node(operand, scan)? {
+                            return Ok(false);
                         }
-                        Ok(true)
                     }
-                    BooleanConnective::Or => {
-                        for operand in operands {
-                            if self.evaluate_node(operand, scan)? {
-                                return Ok(true);
-                            }
-                        }
-                        Ok(false)
-                    }
-                    BooleanConnective::Not => {
-                        if operands.len() != 1 {
-                            return Err("NOT operator must have exactly one operand".into());
-                        }
-                        return Ok(!self.evaluate_node(&operands[0], scan)?);
-                    }
+                    Ok(true)
                 }
-            }
+                BooleanConnective::Or => {
+                    for operand in operands {
+                        if self.evaluate_node(operand, scan)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                BooleanConnective::Not => {
+                    if operands.len() != 1 {
+                        return Err("NOT operator must have exactly one operand".into());
+                    }
+                    return Ok(!self.evaluate_node(&operands[0], scan)?);
+                }
+            },
         }
     }
 
@@ -6662,53 +6656,51 @@ impl Predicate {
                     PredicateNode::Empty
                 }
             }
-            PredicateNode::Composite { op, operands } => {
-                match op {
-                    BooleanConnective::And => {
+            PredicateNode::Composite { op, operands } => match op {
+                BooleanConnective::And => {
+                    let kept: Vec<PredicateNode> = operands
+                        .iter()
+                        .map(|node| self.filter_node(node, term_ok))
+                        .filter(|node| !matches!(node, PredicateNode::Empty))
+                        .collect();
+                    match kept.is_empty() {
+                        true => PredicateNode::Empty,
+                        false => PredicateNode::Composite {
+                            op: BooleanConnective::And,
+                            operands: kept,
+                        },
+                    }
+                }
+                BooleanConnective::Or => {
+                    if operands
+                        .iter()
+                        .all(|node| self.node_applies_to(node, term_ok))
+                    {
                         let kept: Vec<PredicateNode> = operands
                             .iter()
                             .map(|node| self.filter_node(node, term_ok))
-                            .filter(|node| !matches!(node, PredicateNode::Empty))
                             .collect();
-                        match kept.is_empty() {
-                            true => PredicateNode::Empty,
-                            false => PredicateNode::Composite {
-                                op: BooleanConnective::And,
-                                operands: kept,
-                            },
+                        PredicateNode::Composite {
+                            op: BooleanConnective::Or,
+                            operands: kept,
                         }
-                    }
-                    BooleanConnective::Or => {
-                        if operands
-                            .iter()
-                            .all(|node| self.node_applies_to(node, term_ok))
-                        {
-                            let kept: Vec<PredicateNode> = operands
-                                .iter()
-                                .map(|node| self.filter_node(node, term_ok))
-                                .collect();
-                            PredicateNode::Composite {
-                                op: BooleanConnective::Or,
-                                operands: kept,
-                            }
-                        } else {
-                            PredicateNode::Empty
-                        }
-                    }
-                    BooleanConnective::Not => {
-                        assert!(operands.len() == 1);
-                        let inner = &operands[0];
-                        if self.node_applies_to(inner, term_ok) {
-                            let kept = self.filter_node(inner, term_ok);
-                            return PredicateNode::Composite {
-                                op: BooleanConnective::Not,
-                                operands: vec![kept],
-                            };
-                        }
+                    } else {
                         PredicateNode::Empty
                     }
                 }
-            }
+                BooleanConnective::Not => {
+                    assert!(operands.len() == 1);
+                    let inner = &operands[0];
+                    if self.node_applies_to(inner, term_ok) {
+                        let kept = self.filter_node(inner, term_ok);
+                        return PredicateNode::Composite {
+                            op: BooleanConnective::Not,
+                            operands: vec![kept],
+                        };
+                    }
+                    PredicateNode::Empty
+                }
+            },
         }
     }
 
