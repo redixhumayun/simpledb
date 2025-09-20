@@ -492,7 +492,7 @@ mod btree_internal_tests {
         assert!(split_entry.block_num > 0); // Should be a new block number
 
         // Verify middle key was chosen for split
-        let mid_val = ((block_num + 1) / 2);
+        let mid_val = (block_num + 1) / 2;
         assert_eq!(split_entry.dataval, Constant::Int(mid_val));
     }
 

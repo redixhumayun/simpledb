@@ -277,10 +277,10 @@ mod multi_buffer_product_plan_tests {
         insert_dept(&db, Arc::clone(&txn), 30);
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let mut scan = mbp.open();
+        let scan = mbp.open();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -295,10 +295,10 @@ mod multi_buffer_product_plan_tests {
         // no inserts
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let mut scan = mbp.open();
+        let scan = mbp.open();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -323,7 +323,7 @@ mod multi_buffer_product_plan_tests {
         scan.before_first().unwrap();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -1661,12 +1661,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(result) = merge_join_scan.next() {
+        for result in merge_join_scan {
             assert!(result.is_ok());
             join_count += 1;
         }
@@ -1764,12 +1764,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             join_count += 1;
         }
 
@@ -1811,12 +1811,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             join_count += 1;
         }
 
@@ -1939,7 +1939,7 @@ mod merge_join_scan_tests {
 
         // First read all records
         let mut first_pass_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan.by_ref() {
             first_pass_count += 1;
         }
 
@@ -1950,7 +1950,7 @@ mod merge_join_scan_tests {
 
         // Second pass should get the same results
         let mut second_pass_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             second_pass_count += 1;
         }
 
@@ -2460,11 +2460,11 @@ mod sort_plan_tests {
         let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
 
         // Open the sort scan
-        let mut sort_scan = sort_plan.open();
+        let sort_scan = sort_plan.open();
 
         // Verify no records are returned
         let mut count = 0;
-        while let Some(result) = sort_scan.next() {
+        for result in sort_scan {
             assert!(result.is_ok());
             count += 1;
         }
@@ -2862,7 +2862,7 @@ mod sort_scan_tests {
         let mut sort_scan = SortScan::new(vec![temp_table1, temp_table2], record_comparator);
 
         let mut count = 0;
-        while let Some(result) = sort_scan.next() {
+        for result in sort_scan.by_ref() {
             assert!(result.is_ok());
             count += 1;
         }
@@ -3069,11 +3069,11 @@ mod materialize_plan_tests {
         let materialize_plan = MaterializePlan::new(source_plan, Arc::clone(&txn));
 
         // Open the materialized scan
-        let mut materialized_scan = materialize_plan.open();
+        let materialized_scan = materialize_plan.open();
 
         // Verify no records exist
         let mut count = 0;
-        while let Some(result) = materialized_scan.next() {
+        for result in materialized_scan {
             assert!(result.is_ok());
             count += 1;
         }
@@ -5694,9 +5694,9 @@ mod index_join_plan_tests {
             .expect("expected index on t2.c");
 
         let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
-        let mut scan = plan.open();
+        let scan = plan.open();
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             assert!(res.is_ok());
             count += 1;
         }
@@ -8235,7 +8235,7 @@ impl<'a> RecordPageIterator<'a> {
     }
 }
 
-impl<'a> Iterator for RecordPageIterator<'a> {
+impl Iterator for RecordPageIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
