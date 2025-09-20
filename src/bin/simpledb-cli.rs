@@ -1,4 +1,6 @@
-use simpledb::{SimpleDB, Transaction, Constant};
+#![allow(clippy::arc_with_non_send_sync)]
+
+use simpledb::{Constant, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -101,7 +103,7 @@ fn execute_query(
 
     // Get the schema to know what fields to display
     let schema = plan.schema();
-    let fields: Vec<String> = schema.fields.iter().cloned().collect();
+    let fields: Vec<String> = schema.fields.to_vec();
 
     // Print header
     if !fields.is_empty() {

@@ -45,8 +45,8 @@ impl BTreeIndex {
                 .unwrap()
                 .field_type;
             let min_val = match field_type {
-                FieldType::INT => Constant::Int(i32::MIN),
-                FieldType::STRING => Constant::String("".to_string()),
+                FieldType::Int => Constant::Int(i32::MIN),
+                FieldType::String => Constant::String("".to_string()),
             };
             internal_page.insert_internal(0, min_val, 0)?;
         }
@@ -92,16 +92,12 @@ impl Index for BTreeIndex {
     }
 
     fn next(&mut self) -> bool {
-        match self
-            .leaf
+        self.leaf
             .as_mut()
             .expect("Leaf not initialized, did you forget to call before_first?")
             .next()
             .expect("Next failed")
-        {
-            Some(_) => true,
-            None => false,
-        }
+            .is_some()
     }
 
     fn get_data_rid(&self) -> RID {
@@ -367,10 +363,8 @@ impl BTreeInternal {
         );
         let new_entry = child_internal_node.insert_entry(entry)?;
         match new_entry {
-            Some(entry) => {
-                return self.insert_internal_node_entry(entry);
-            }
-            None => return Ok(None),
+            Some(entry) => self.insert_internal_node_entry(entry),
+            None => Ok(None),
         }
     }
 
@@ -396,20 +390,17 @@ impl BTreeInternal {
         let split_point = self.contents.get_number_of_recs()? / 2;
         let split_record = self.contents.get_data_value(split_point)?;
         let new_block_id = self.contents.split(split_point, page_type)?;
-        return Ok(Some(InternalNodeEntry {
+        Ok(Some(InternalNodeEntry {
             dataval: split_record,
             block_num: new_block_id.block_num,
-        }));
+        }))
     }
 
     /// This method will find the child block for a given search key in a [BTreeInternal] node
     /// It will search for the rightmost slot before the search key
     /// If the search key is found in the slot, it will return the next slot
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let mut slot = match self.contents.find_slot_before(&search_key)? {
-            Some(slot) => slot,
-            None => 0,
-        };
+        let mut slot = (self.contents.find_slot_before(search_key)?).unwrap_or(0);
         if self.contents.get_data_value(slot + 1)? == *search_key {
             slot += 1;
         }
@@ -501,7 +492,7 @@ mod btree_internal_tests {
         assert!(split_entry.block_num > 0); // Should be a new block number
 
         // Verify middle key was chosen for split
-        let mid_val = ((block_num + 1) / 2) as i32;
+        let mid_val = (block_num + 1) / 2;
         assert_eq!(split_entry.dataval, Constant::Int(mid_val));
     }
 
@@ -677,11 +668,11 @@ impl BTreeLeaf {
             }
         };
         if self.current_slot.unwrap() >= self.contents.get_number_of_recs()? {
-            return self.try_overflow();
+            self.try_overflow()
         } else if self.contents.get_data_value(self.current_slot.unwrap())? == self.search_key {
-            return Ok(Some(()));
+            Ok(Some(()))
         } else {
-            return self.try_overflow();
+            self.try_overflow()
         }
     }
 
@@ -689,13 +680,13 @@ impl BTreeLeaf {
     /// Returns Ok(()) if the record was found and deleted, error otherwise
     /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        while let Some(_) = self.next()? {
+        while (self.next()?).is_some() {
             if self.contents.get_rid(self.current_slot.unwrap())? == rid {
                 self.contents.delete(self.current_slot.unwrap())?;
                 return Ok(());
             }
         }
-        return Err("RID not found in BTreeLeaf".into());
+        Err("RID not found in BTreeLeaf".into())
     }
 
     /// This method will attempt to insert an entry into a [BTreeLeaf] page
@@ -995,16 +986,16 @@ impl From<i32> for PageType {
         let is_internal = value & TYPE_MASK == 0;
         if is_internal {
             if value == 0 {
-                return PageType::Internal(None);
+                PageType::Internal(None)
             } else {
-                return PageType::Internal(Some((value & VALUE_MASK) as usize));
+                PageType::Internal(Some((value & VALUE_MASK) as usize))
             }
         } else {
             let val = value & VALUE_MASK;
             if val == 0 {
-                return PageType::Leaf(None);
+                PageType::Leaf(None)
             } else {
-                return PageType::Leaf(Some(val as usize));
+                PageType::Leaf(Some(val as usize))
             }
         }
     }
@@ -1057,9 +1048,9 @@ impl BTreePage {
             current_slot += 1;
         }
         if current_slot == 0 {
-            return Ok(None);
+            Ok(None)
         } else {
-            return Ok(Some(current_slot - 1));
+            Ok(Some(current_slot - 1))
         }
     }
 
@@ -1118,10 +1109,10 @@ impl BTreePage {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
-                    FieldType::INT => {
+                    FieldType::Int => {
                         self.txn.set_int(&self.block_id, i, 0, false)?;
                     }
-                    FieldType::STRING => {
+                    FieldType::String => {
                         self.txn.set_string(&self.block_id, i, "", false)?;
                     }
                 }
@@ -1273,11 +1264,11 @@ impl BTreePage {
             .ok_or_else(|| format!("Field {} not found in schema", field_name))?
             .field_type;
         match field_type {
-            FieldType::INT => {
+            FieldType::Int => {
                 let value = self.get_int(slot, field_name)?;
                 Ok(Constant::Int(value))
             }
-            FieldType::STRING => {
+            FieldType::String => {
                 let value = self.get_string(slot, field_name)?;
                 Ok(Constant::String(value))
             }
@@ -1301,8 +1292,8 @@ impl BTreePage {
 
         // Check if value type matches schema
         match (expected_type, &value) {
-            (FieldType::INT, Constant::Int(v)) => self.set_int(slot, field_name, *v),
-            (FieldType::STRING, Constant::String(v)) => {
+            (FieldType::Int, Constant::Int(v)) => self.set_int(slot, field_name, *v),
+            (FieldType::String, Constant::String(v)) => {
                 self.set_string(slot, field_name, v.clone())
             }
             _ => Err(Box::new(std::io::Error::new(

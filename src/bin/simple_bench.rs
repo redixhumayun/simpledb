@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use std::env;
 use std::error::Error;
 use std::path::Path;
@@ -91,10 +93,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         {
             let mut scan = plan.open();
-            let mut _count = 0;
-            while let Some(_) = scan.next() {
-                _count += 1;
-            }
+            let _count = scan.by_ref().count();
             scan.close();
         } // scan is dropped here, before transaction commit
         txn.commit().unwrap();
@@ -174,6 +173,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Running benchmarks with {} iterations per operation",
         iterations
     );
+    println!(
+        "Environment: {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!();
 
     // Clean up any existing benchmark data
@@ -201,6 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!();
     println!("All benchmarks completed successfully!");
+    println!("Note: These results are for educational purposes and system comparison");
 
     // Cleanup
     cleanup_bench_data();

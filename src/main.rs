@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::only_used_in_recursion)]
 
 use std::{
     any::Any,
@@ -18,7 +20,6 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
-    usize,
 };
 mod test_utils;
 use btree::BTreeIndex;
@@ -31,7 +32,7 @@ use test_utils::TestDir;
 mod btree;
 mod parser;
 
-type LSN = usize;
+type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 /// The database struct
@@ -190,9 +191,9 @@ impl Plan for MultiBufferProductPlan {
 
     fn distinct_values(&self, field_name: &str) -> usize {
         if self.lhs.schema().fields.contains(&field_name.to_string()) {
-            return self.lhs.distinct_values(field_name);
+            self.lhs.distinct_values(field_name)
         } else {
-            return self.rhs.distinct_values(field_name);
+            self.rhs.distinct_values(field_name)
         }
     }
 
@@ -276,10 +277,10 @@ mod multi_buffer_product_plan_tests {
         insert_dept(&db, Arc::clone(&txn), 30);
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let mut scan = mbp.open();
+        let scan = mbp.open();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -294,10 +295,10 @@ mod multi_buffer_product_plan_tests {
         // no inserts
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let mut scan = mbp.open();
+        let scan = mbp.open();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -322,7 +323,7 @@ mod multi_buffer_product_plan_tests {
         scan.before_first().unwrap();
 
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             res.unwrap();
             count += 1;
         }
@@ -418,7 +419,7 @@ where
             self.s2.as_ref().unwrap().clone(),
         ));
         self.next_start_block_num = new_last_block_num + 1;
-        return true;
+        true
     }
 }
 
@@ -443,8 +444,9 @@ where
                         }
                     }
                 }
+            } else {
+                return None;
             }
-            return None;
         }
     }
 }
@@ -711,11 +713,11 @@ impl Clone for ChunkScan {
             layout: self.layout.clone(),
             file_name: self.file_name.clone(),
             table_name: self.table_name.clone(),
-            first_block_num: self.first_block_num.clone(),
-            last_block_num: self.last_block_num.clone(),
-            current_block_num: self.current_block_num.clone(),
-            current_record_page: self.current_record_page.clone(),
-            current_slot: self.current_slot.clone(),
+            first_block_num: self.first_block_num,
+            last_block_num: self.last_block_num,
+            current_block_num: self.current_block_num,
+            current_record_page: self.current_record_page,
+            current_slot: self.current_slot,
             buffer_list: self.buffer_list.clone(),
         }
     }
@@ -760,7 +762,7 @@ impl ChunkScan {
             buffer_list,
         };
         scan.move_to_block(first_block_num);
-        return scan;
+        scan
     }
 
     fn move_to_block(&mut self, block_num: usize) {
@@ -785,16 +787,13 @@ impl Iterator for ChunkScan {
 
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on ChunkScan for {}", self.table_name);
-        assert!(self.buffer_list.len() != 0);
+        assert!(!self.buffer_list.is_empty());
         loop {
             if let Some(record_page_idx) = &self.current_record_page {
                 let record_page = &self.buffer_list[*record_page_idx];
                 let next_slot = match self.current_slot {
                     None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page
-                        .iter_used_slots()
-                        .skip_while(|s| *s <= slot)
-                        .next(),
+                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
                 };
 
                 //  There are still slots to iterate in the current record page
@@ -861,8 +860,8 @@ impl Scan for ChunkScan {
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
         }
     }
 
@@ -1487,9 +1486,7 @@ where
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
-        if self.scan_1.has_field(field_name)? {
-            return Ok(true);
-        } else if self.scan_2.has_field(field_name)? {
+        if self.scan_1.has_field(field_name)? || self.scan_2.has_field(field_name)? {
             return Ok(true);
         }
         Err(format!("Field {} not found", field_name).into())
@@ -1664,12 +1661,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(result) = merge_join_scan.next() {
+        for result in merge_join_scan {
             assert!(result.is_ok());
             join_count += 1;
         }
@@ -1767,12 +1764,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             join_count += 1;
         }
 
@@ -1814,12 +1811,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
+        let merge_join_scan =
             MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
 
         // Test the join - should find no matches
         let mut join_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             join_count += 1;
         }
 
@@ -1942,7 +1939,7 @@ mod merge_join_scan_tests {
 
         // First read all records
         let mut first_pass_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan.by_ref() {
             first_pass_count += 1;
         }
 
@@ -1953,7 +1950,7 @@ mod merge_join_scan_tests {
 
         // Second pass should get the same results
         let mut second_pass_count = 0;
-        while let Some(_) = merge_join_scan.next() {
+        for _ in merge_join_scan {
             second_pass_count += 1;
         }
 
@@ -1995,8 +1992,8 @@ impl SortPlan {
     {
         destination.insert()?;
         for field in &self.schema.fields {
-            let value = source.get_value(&field)?;
-            destination.set_value(&field, value)?;
+            let value = source.get_value(field)?;
+            destination.set_value(field, value)?;
         }
         Ok(())
     }
@@ -2213,7 +2210,7 @@ impl Plan for SortPlan {
         let source_scan = self.source_plan.open();
         let runs = self.split_into_runs(source_scan).unwrap();
         let merged_runs = self.do_merge_iters(runs).unwrap();
-        return Box::new(SortScan::new(merged_runs, self.record_comparator.clone()));
+        Box::new(SortScan::new(merged_runs, self.record_comparator.clone()))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -2463,11 +2460,11 @@ mod sort_plan_tests {
         let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
 
         // Open the sort scan
-        let mut sort_scan = sort_plan.open();
+        let sort_scan = sort_plan.open();
 
         // Verify no records are returned
         let mut count = 0;
-        while let Some(result) = sort_scan.next() {
+        for result in sort_scan {
             assert!(result.is_ok());
             count += 1;
         }
@@ -2543,8 +2540,8 @@ impl SortScan {
     }
 
     fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
-        let rid_1 =
-            self.saved_rids[0].ok_or_else(|| format!("Error getting saved RID from first scan"))?;
+        let rid_1 = self.saved_rids[0]
+            .ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
         self.s1.move_to_row_id(rid_1);
         match (self.s2.as_mut(), self.saved_rids[1]) {
             (None, None) => (),
@@ -2567,19 +2564,19 @@ impl Iterator for SortScan {
                 match (self.s1.next(), self.s2.as_mut().and_then(|s| s.next())) {
                     (None, None) => {
                         self.current_scan = SortScanState::Done;
-                        return None;
+                        None
                     }
                     (Some(Ok(_)), None) => {
                         self.current_scan = SortScanState::OnlyFirst;
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
                     (None, Some(Ok(_))) => {
                         self.current_scan = SortScanState::OnlySecond;
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
                     (Some(Err(e)), _) | (_, Some(Err(e))) => {
                         self.current_scan = SortScanState::Done;
-                        return Some(Err(e));
+                        Some(Err(e))
                     }
                     (Some(_), Some(_)) => match self.set_current_scan() {
                         Ok(_) => Some(Ok(())),
@@ -2594,19 +2591,19 @@ impl Iterator for SortScan {
                         Err(e) => Some(Err(e)),
                     };
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::OnlySecond;
                     self.s1.close();
-                    return Some(Ok(()));
+                    Some(Ok(()))
                 }
             },
             SortScanState::OnlyFirst => match self.s1.next() {
-                Some(Ok(_)) => return Some(Ok(())),
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(_)) => Some(Ok(())),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::Done;
-                    return None;
+                    None
                 }
             },
             SortScanState::OnSecond => match self.s2.as_mut().unwrap().next() {
@@ -2616,25 +2613,25 @@ impl Iterator for SortScan {
                         Err(e) => Some(Err(e)),
                     };
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
-                    self.s2.as_mut().and_then(|s| Some(s.close()));
+                    if let Some(s) = self.s2.as_mut() {
+                        s.close()
+                    };
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
-                    return Some(Ok(()));
+                    Some(Ok(()))
                 }
             },
             SortScanState::OnlySecond => match self.s2.as_mut().unwrap().next() {
-                Some(Ok(_)) => return Some(Ok(())),
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(_)) => Some(Ok(())),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::Done;
-                    return None;
+                    None
                 }
             },
-            SortScanState::Done => {
-                return None;
-            }
+            SortScanState::Done => None,
         }
     }
 }
@@ -2865,7 +2862,7 @@ mod sort_scan_tests {
         let mut sort_scan = SortScan::new(vec![temp_table1, temp_table2], record_comparator);
 
         let mut count = 0;
-        while let Some(result) = sort_scan.next() {
+        for result in sort_scan.by_ref() {
             assert!(result.is_ok());
             count += 1;
         }
@@ -2982,7 +2979,7 @@ mod materialize_plan_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
 
         // Insert test data using SQL
-        let test_data = vec![
+        let test_data = [
             (1, "first"),
             (2, "second"),
             (3, "third"),
@@ -3072,11 +3069,11 @@ mod materialize_plan_tests {
         let materialize_plan = MaterializePlan::new(source_plan, Arc::clone(&txn));
 
         // Open the materialized scan
-        let mut materialized_scan = materialize_plan.open();
+        let materialized_scan = materialize_plan.open();
 
         // Verify no records exist
         let mut count = 0;
-        while let Some(result) = materialized_scan.next() {
+        for result in materialized_scan {
             assert!(result.is_ok());
             count += 1;
         }
@@ -3145,22 +3142,22 @@ impl Planner {
     ) -> Result<usize, Box<dyn Error>> {
         let mut parser = Parser::new(&command);
         match parser.update_command()? {
-            parser::SQLStatement::CreateTableData(create_table_data) => self
+            parser::SQLStatement::CreateTable(create_table_data) => self
                 .update_planner
                 .execute_create_table(create_table_data, Arc::clone(&txn)),
-            parser::SQLStatement::CreateViewData(create_view_data) => self
+            parser::SQLStatement::CreateView(create_view_data) => self
                 .update_planner
                 .execute_create_view(create_view_data, Arc::clone(&txn)),
-            parser::SQLStatement::CreateIndexData(create_index_data) => self
+            parser::SQLStatement::CreateIndex(create_index_data) => self
                 .update_planner
                 .execute_create_index(create_index_data, Arc::clone(&txn)),
-            parser::SQLStatement::InsertData(insert_data) => self
+            parser::SQLStatement::Insert(insert_data) => self
                 .update_planner
                 .execute_insert(insert_data, Arc::clone(&txn)),
-            parser::SQLStatement::DeleteData(delete_data) => self
+            parser::SQLStatement::Delete(delete_data) => self
                 .update_planner
                 .execute_delete(delete_data, Arc::clone(&txn)),
-            parser::SQLStatement::ModifyData(modify_data) => self
+            parser::SQLStatement::Modify(modify_data) => self
                 .update_planner
                 .execute_modify(modify_data, Arc::clone(&txn)),
         }
@@ -3192,7 +3189,7 @@ mod planner_tests {
 
         //  Read the records back and make sure they exist
         dbg!("reading records back");
-        let sql = format!("select B from T1 where A>10");
+        let sql = "select B from T1 where A>10".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
         let mut scan = plan.open();
         let mut retrieved_count = 0;
@@ -3661,7 +3658,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let mut scan = plan.open();
         scan.insert()?;
         for (field, value) in data.fields.iter().zip(data.values) {
-            scan.set_value(&field, value)?;
+            scan.set_value(field, value)?;
         }
         Ok(1)
     }
@@ -3847,9 +3844,9 @@ impl TablePlanner {
             return Ok(None);
         }
         let plan = self
-            .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(&other_plan))?
+            .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(other_plan))?
             .map(Ok)
-            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(&other_plan)))?;
+            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(other_plan)))?;
         Ok(Some(plan))
     }
 
@@ -3876,7 +3873,7 @@ impl TablePlanner {
         let plan_schema = &self.schema;
         let other_plan_schema = &other_plan.schema();
         for field in self.indexes.keys() {
-            if let Some(lhs_field) = self.predicate.equates_with_field(&field) {
+            if let Some(lhs_field) = self.predicate.equates_with_field(field) {
                 if plan_schema.fields.contains(field)
                     && other_plan_schema.fields.contains(&lhs_field)
                 {
@@ -3907,7 +3904,7 @@ impl TablePlanner {
     /// TODO: Fix this to use the most selective index and to use more than one index
     fn make_index_select_plan(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         for field in self.indexes.keys() {
-            match self.predicate.equates_with_constant(&field) {
+            match self.predicate.equates_with_constant(field) {
                 Some(value) => {
                     return Arc::new(IndexSelectPlan::new(
                         plan,
@@ -4051,7 +4048,7 @@ impl HeuristicQueryPlanner {
         let (idx, plan) = candidates
             .into_iter()
             .min_by_key(|(_, p)| p.records_output())
-            .ok_or_else(|| "could not construct any join plans")?;
+            .ok_or("could not construct any join plans")?;
         self.table_planners.remove(idx);
         Ok(plan)
     }
@@ -4804,14 +4801,14 @@ impl Plan for SelectPlan {
 
     fn distinct_values(&self, field_name: &str) -> usize {
         if self.predicate.equates_with_constant(field_name).is_some() {
-            return 1;
+            1
         } else if let Some(field_name_2) = self.predicate.equates_with_field(field_name) {
-            return std::cmp::min(
+            std::cmp::min(
                 self.plan.distinct_values(field_name),
                 self.plan.distinct_values(&field_name_2),
-            );
+            )
         } else {
-            return self.plan.distinct_values(field_name);
+            self.plan.distinct_values(field_name)
         }
     }
 
@@ -5083,8 +5080,8 @@ where
         debug!("Calling next on ProductScan");
         match self.s2.next() {
             Some(result) => match result {
-                Ok(_) => return Some(Ok(())),
-                Err(e) => return Some(Err(e)),
+                Ok(_) => Some(Ok(())),
+                Err(e) => Some(Err(e)),
             },
             //  s2 cannot be advanced
             None => match self.s1.next() {
@@ -5093,11 +5090,11 @@ where
                     Ok(_) => {
                         self.s2.before_first().unwrap();
                         self.s2.next();
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => Some(Err(e)),
                 },
-                None => return None,
+                None => None,
             },
         }
     }
@@ -5240,10 +5237,10 @@ mod product_scan_tests {
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
             for i in 0..50 {
                 scan1.insert().unwrap();
-                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_int("A", i).unwrap();
                 scan1.set_string("B", format!("string{}", i)).unwrap();
                 scan2.insert().unwrap();
-                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_int("C", i).unwrap();
                 scan2.set_string("D", format!("string{}", i)).unwrap();
             }
         }
@@ -5697,9 +5694,9 @@ mod index_join_plan_tests {
             .expect("expected index on t2.c");
 
         let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
-        let mut scan = plan.open();
+        let scan = plan.open();
         let mut count = 0;
-        while let Some(res) = scan.next() {
+        for res in scan {
             assert!(res.is_ok());
             count += 1;
         }
@@ -5742,9 +5739,9 @@ where
     }
 
     fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
-        Ok(self
-            .index
-            .before_first(&self.lhs.get_value(&self.join_field)?))
+        self.index
+            .before_first(&self.lhs.get_value(&self.join_field)?);
+        Ok(())
     }
 }
 
@@ -5963,17 +5960,17 @@ mod index_join_scan_tests {
             for i in 0..50 {
                 // Insert into first table
                 scan1.insert().unwrap();
-                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_int("A", i).unwrap();
                 scan1.set_string("B", format!("string{}", i)).unwrap();
 
                 // Insert into second table with matching values
                 scan2.insert().unwrap();
-                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_int("C", i).unwrap();
                 scan2.set_string("D", format!("string{}", i)).unwrap();
 
                 // Create index entry
                 let mut index = index_info.open();
-                index.insert(&Constant::Int(i as i32), &scan2.get_rid().unwrap());
+                index.insert(&Constant::Int(i), &scan2.get_rid().unwrap());
 
                 inserted_count += 1;
             }
@@ -6457,7 +6454,7 @@ impl Predicate {
     where
         S: Scan,
     {
-        return self.evaluate_node(&self.root, scan);
+        self.evaluate_node(&self.root, scan)
     }
 
     fn evaluate_node<S>(&self, node: &PredicateNode, scan: &S) -> Result<bool, Box<dyn Error>>
@@ -6468,32 +6465,30 @@ impl Predicate {
             //  terminal condition for recursion
             PredicateNode::Empty => Ok(true),
             PredicateNode::Term(term) => term.is_satisfied(scan),
-            PredicateNode::Composite { op, operands } => {
-                match op {
-                    BooleanConnective::And => {
-                        for operand in operands {
-                            if !self.evaluate_node(operand, scan)? {
-                                return Ok(false);
-                            }
+            PredicateNode::Composite { op, operands } => match op {
+                BooleanConnective::And => {
+                    for operand in operands {
+                        if !self.evaluate_node(operand, scan)? {
+                            return Ok(false);
                         }
-                        return Ok(true);
                     }
-                    BooleanConnective::Or => {
-                        for operand in operands {
-                            if self.evaluate_node(operand, scan)? {
-                                return Ok(true);
-                            }
+                    Ok(true)
+                }
+                BooleanConnective::Or => {
+                    for operand in operands {
+                        if self.evaluate_node(operand, scan)? {
+                            return Ok(true);
                         }
-                        return Ok(false);
                     }
-                    BooleanConnective::Not => {
-                        if operands.len() != 1 {
-                            return Err("NOT operator must have exactly one operand".into());
-                        }
-                        return Ok(!self.evaluate_node(&operands[0], scan)?);
+                    Ok(false)
+                }
+                BooleanConnective::Not => {
+                    if operands.len() != 1 {
+                        return Err("NOT operator must have exactly one operand".into());
                     }
-                };
-            }
+                    return Ok(!self.evaluate_node(&operands[0], scan)?);
+                }
+            },
         }
     }
 
@@ -6537,7 +6532,7 @@ impl Predicate {
                         return Some(val);
                     }
                 }
-                return None;
+                None
             }
         }
     }
@@ -6593,7 +6588,7 @@ impl Predicate {
     ) -> Predicate {
         let term_ok = |term: &Term| {
             !term.applies_to(schema_1)
-                && !term.applies_to(&schema_2)
+                && !term.applies_to(schema_2)
                 && term.applies_to(unioned_schema)
         };
         Predicate {
@@ -6622,7 +6617,7 @@ impl Predicate {
             PredicateNode::Composite { op, operands } => match op {
                 BooleanConnective::Not => {
                     assert!(operands.len() == 1);
-                    self.node_applies_to(operands.get(0).unwrap(), term_ok)
+                    self.node_applies_to(operands.first().unwrap(), term_ok)
                 }
                 _ => operands
                     .iter()
@@ -6636,18 +6631,18 @@ impl Predicate {
     /// 2. If [BooleanConnective::And] is encountered, keep parts of conjunct that apply
     /// 3. If [BooleanConnective::Or] is encountered, all parts of disjunct must apply
     /// 4. If [BooleanConnective::Not] is encountered, the sole term must apply
-    /// Technically, it is not required for the [BooleanConnective::Or] disjuncts to apply. Take, for instance,
-    /// P = (R.a = 1 ∧ S.b = 2) ∨ (R.c = 3), pushing to R
-    /// (R.a = 1 ∧ S.b = 2) filters to R.a = 1
-    /// (R.c = 3) stays R.c = 3
-    /// OR as (R.a = 1) ∨ (R.c = 3)
-    /// This would lead to a partial application of the disjuncts but would not be incorrect
-    /// However, the same is not true for NOT because
-    /// P = NOT(R.a = 1 ∧ S.b = 2), pushing to R.
-    /// Inner on R partially applies: (R.a = 1 ∧ S.b = 2) ⇒ R.a = 1
-    /// Consider a row r with a=1 and some s with b≠2
-    /// Pushed-down filter NOT(a=1) removes r before join, losing valid results.
-    /// TODO: An alternative is to rewrite the rules using De Morgan's Laws
+    ///    Technically, it is not required for the [BooleanConnective::Or] disjuncts to apply. Take, for instance,
+    ///    P = (R.a = 1 ∧ S.b = 2) ∨ (R.c = 3), pushing to R
+    ///    (R.a = 1 ∧ S.b = 2) filters to R.a = 1
+    ///    (R.c = 3) stays R.c = 3
+    ///    OR as (R.a = 1) ∨ (R.c = 3)
+    ///    This would lead to a partial application of the disjuncts but would not be incorrect
+    ///    However, the same is not true for NOT because
+    ///    P = NOT(R.a = 1 ∧ S.b = 2), pushing to R.
+    ///    Inner on R partially applies: (R.a = 1 ∧ S.b = 2) ⇒ R.a = 1
+    ///    Consider a row r with a=1 and some s with b≠2
+    ///    Pushed-down filter NOT(a=1) removes r before join, losing valid results.
+    ///    TODO: An alternative is to rewrite the rules using De Morgan's Laws
     fn filter_node<F>(&self, node: &PredicateNode, term_ok: &F) -> PredicateNode
     where
         F: Fn(&Term) -> bool,
@@ -6661,53 +6656,51 @@ impl Predicate {
                     PredicateNode::Empty
                 }
             }
-            PredicateNode::Composite { op, operands } => {
-                return match op {
-                    BooleanConnective::And => {
+            PredicateNode::Composite { op, operands } => match op {
+                BooleanConnective::And => {
+                    let kept: Vec<PredicateNode> = operands
+                        .iter()
+                        .map(|node| self.filter_node(node, term_ok))
+                        .filter(|node| !matches!(node, PredicateNode::Empty))
+                        .collect();
+                    match kept.is_empty() {
+                        true => PredicateNode::Empty,
+                        false => PredicateNode::Composite {
+                            op: BooleanConnective::And,
+                            operands: kept,
+                        },
+                    }
+                }
+                BooleanConnective::Or => {
+                    if operands
+                        .iter()
+                        .all(|node| self.node_applies_to(node, term_ok))
+                    {
                         let kept: Vec<PredicateNode> = operands
                             .iter()
                             .map(|node| self.filter_node(node, term_ok))
-                            .filter(|node| !matches!(node, PredicateNode::Empty))
                             .collect();
-                        match kept.is_empty() {
-                            true => PredicateNode::Empty,
-                            false => PredicateNode::Composite {
-                                op: BooleanConnective::And,
-                                operands: kept,
-                            },
+                        PredicateNode::Composite {
+                            op: BooleanConnective::Or,
+                            operands: kept,
                         }
-                    }
-                    BooleanConnective::Or => {
-                        if operands
-                            .iter()
-                            .all(|node| self.node_applies_to(node, term_ok))
-                        {
-                            let kept: Vec<PredicateNode> = operands
-                                .iter()
-                                .map(|node| self.filter_node(node, term_ok))
-                                .collect();
-                            PredicateNode::Composite {
-                                op: BooleanConnective::Or,
-                                operands: kept,
-                            }
-                        } else {
-                            PredicateNode::Empty
-                        }
-                    }
-                    BooleanConnective::Not => {
-                        assert!(operands.len() == 1);
-                        let inner = &operands[0];
-                        if self.node_applies_to(inner, term_ok) {
-                            let kept = self.filter_node(inner, term_ok);
-                            return PredicateNode::Composite {
-                                op: BooleanConnective::Not,
-                                operands: vec![kept],
-                            };
-                        }
+                    } else {
                         PredicateNode::Empty
                     }
-                };
-            }
+                }
+                BooleanConnective::Not => {
+                    assert!(operands.len() == 1);
+                    let inner = &operands[0];
+                    if self.node_applies_to(inner, term_ok) {
+                        let kept = self.filter_node(inner, term_ok);
+                        return PredicateNode::Composite {
+                            op: BooleanConnective::Not,
+                            operands: vec![kept],
+                        };
+                    }
+                    PredicateNode::Empty
+                }
+            },
         }
     }
 
@@ -6793,19 +6786,19 @@ impl Term {
             let lhs_field = self.lhs.get_field_name().unwrap();
             let rhs_field = self.rhs.get_field_name().unwrap();
             return std::cmp::max(
-                plan.distinct_values(&lhs_field),
-                plan.distinct_values(&rhs_field),
+                plan.distinct_values(lhs_field),
+                plan.distinct_values(rhs_field),
             );
         }
 
         if self.lhs.is_field_name() {
             let lhs_field = self.lhs.get_field_name().unwrap();
-            return plan.distinct_values(&lhs_field);
+            return plan.distinct_values(lhs_field);
         }
 
         if self.rhs.is_field_name() {
             let rhs_field = self.rhs.get_field_name().unwrap();
-            return plan.distinct_values(&rhs_field);
+            return plan.distinct_values(rhs_field);
         }
 
         if self.lhs.get_constant_value().unwrap() == self.rhs.get_constant_value().unwrap() {
@@ -6829,7 +6822,7 @@ impl Term {
         {
             return self.lhs.get_constant_value().cloned();
         }
-        return None;
+        None
     }
 
     /// Checks if the term equates with a field name of the form "F=G"
@@ -6846,7 +6839,7 @@ impl Term {
         {
             return self.lhs.get_field_name().cloned();
         }
-        return None;
+        None
     }
 
     /// Check that both sides of this expression apply to the provided [Schema]
@@ -7088,16 +7081,16 @@ mod metadata_manager_tests {
         for field in &layout.schema.fields {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
-                FieldType::INT => "int".to_string(),
-                FieldType::STRING => format!("varchar({})", field_info.length),
+                FieldType::Int => "int".to_string(),
+                FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{}: {}", field, type_str);
 
             // Assert field properties
             match field.as_str() {
-                "A" => assert_eq!(field_info.field_type, FieldType::INT),
+                "A" => assert_eq!(field_info.field_type, FieldType::Int),
                 "B" => {
-                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
                 _ => panic!("Unexpected field: {}", field),
@@ -7288,10 +7281,10 @@ impl IndexInfo {
         schema.add_int_field(Self::BLOCK_NUM_FIELD);
         schema.add_int_field(Self::ID_FIELD);
         match table_schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => {
+            FieldType::Int => {
                 schema.add_int_field(Self::DATA_FIELD);
             }
-            FieldType::STRING => {
+            FieldType::String => {
                 let field_length = table_schema.info.get(field_name).unwrap().length;
                 schema.add_string_field(Self::DATA_FIELD, field_length);
             }
@@ -7391,7 +7384,7 @@ impl Index for HashIndex {
                 return true;
             }
         }
-        return false;
+        false
     }
 
     fn get_data_rid(&self) -> RID {
@@ -7430,7 +7423,9 @@ impl Index for HashIndex {
     }
 
     fn close(&mut self) {
-        self.table_scan.as_mut().and_then(|ts| Some(ts.close()));
+        if let Some(ts) = self.table_scan.as_mut() {
+            ts.close()
+        };
     }
 }
 
@@ -7575,8 +7570,7 @@ impl ViewManager {
             schema.add_string_field(Self::VIEW_DEF_COL, Self::VIEW_DEF_MAX_LENGTH);
             table_manager.create_table(Self::VIEW_MANAGER_TABLE_NAME, &schema, txn);
         }
-        let view_manager = ViewManager { table_manager };
-        view_manager
+        ViewManager { table_manager }
     }
 
     /// Creates a new view in the view catalog
@@ -7789,18 +7783,18 @@ mod table_manager_tests {
         for field in &layout.schema.fields {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
-                FieldType::INT => "int".to_string(),
-                FieldType::STRING => format!("varchar({})", field_info.length),
+                FieldType::Int => "int".to_string(),
+                FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{}: {}", field, type_str);
 
             // Assert field properties
             match field.as_str() {
                 "A" => {
-                    assert_eq!(field_info.field_type, FieldType::INT);
+                    assert_eq!(field_info.field_type, FieldType::Int);
                 }
                 "B" => {
-                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
                 _ => panic!("Unexpected field: {}", field),
@@ -7841,7 +7835,7 @@ impl Clone for TableScan {
             layout: self.layout.clone(),
             file_name: self.file_name.clone(),
             record_page: self.record_page.clone(),
-            current_slot: self.current_slot.clone(),
+            current_slot: self.current_slot,
             table_name: self.table_name.clone(),
         }
     }
@@ -7934,10 +7928,7 @@ impl Iterator for TableScan {
             if let Some(record_page) = &self.record_page {
                 let next_slot = match self.current_slot {
                     None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page
-                        .iter_used_slots()
-                        .skip_while(|s| *s <= slot)
-                        .next(),
+                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
                 };
 
                 if let Some(slot) = next_slot {
@@ -8001,8 +7992,8 @@ impl Scan for TableScan {
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
         }
     }
 
@@ -8044,8 +8035,8 @@ impl UpdateScan for TableScan {
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => self.set_int(field_name, value.as_int())?,
-            FieldType::STRING => self.set_string(field_name, value.as_str().to_string())?,
+            FieldType::Int => self.set_int(field_name, value.as_int())?,
+            FieldType::String => self.set_string(field_name, value.as_str().to_string())?,
         }
         Ok(())
     }
@@ -8244,7 +8235,7 @@ impl<'a> RecordPageIterator<'a> {
     }
 }
 
-impl<'a> Iterator for RecordPageIterator<'a> {
+impl Iterator for RecordPageIterator<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -8275,8 +8266,8 @@ impl<'a> Iterator for RecordPageIterator<'a> {
 
 #[derive(Clone, Copy)]
 enum SlotPresence {
-    EMPTY,
-    USED,
+    Empty,
+    Used,
 }
 
 #[derive(Clone)]
@@ -8332,7 +8323,7 @@ impl RecordPage {
 
     /// Marks a slot as used and returns its slot number.
     fn insert(&self, slot: usize) -> usize {
-        self.set_flag(slot, SlotPresence::USED);
+        self.set_flag(slot, SlotPresence::Used);
         slot
     }
 
@@ -8342,24 +8333,19 @@ impl RecordPage {
             None => self
                 .iter_empty_slots()
                 .next()
-                .ok_or_else(|| "no empty slots available in this record page")?,
+                .ok_or("no empty slots available in this record page")?,
             Some(current_slot) => self
                 .iter_empty_slots()
-                .skip_while(|s| *s <= current_slot)
-                .next()
-                .ok_or_else(|| "no empty slots available in this record page")?,
+                .find(|s| *s > current_slot)
+                .ok_or("no empty slots available in this record page")?,
         };
-        self.set_flag(new_slot, SlotPresence::USED);
+        self.set_flag(new_slot, SlotPresence::Used);
         Ok(new_slot)
     }
 
-    /// Returns the next [`SlotPresence::USED`] slot after the slot passed in
+    /// Returns the next [`SlotPresence::Used`] slot after the slot passed in
     fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        let next_slot = self
-            .iter_used_slots()
-            .skip_while(|s| *s <= slot)
-            .next()
-            .unwrap();
+        let next_slot = self.iter_used_slots().find(|s| *s > slot).unwrap();
         Ok(next_slot)
     }
 
@@ -8372,7 +8358,7 @@ impl RecordPage {
 
     /// Marks a slot as empty, effectively deleting its record.
     fn delete(&self, slot: usize) {
-        self.set_flag(slot, SlotPresence::EMPTY);
+        self.set_flag(slot, SlotPresence::Empty);
     }
 
     /// Calculates the byte offset for a given slot based on the layout's slot size.
@@ -8394,19 +8380,19 @@ impl RecordPage {
                 .set_int(
                     &self.block_id,
                     self.offset(current_slot),
-                    SlotPresence::EMPTY as i32,
+                    SlotPresence::Empty as i32,
                     false,
                 )
                 .unwrap();
             let schema = &self.layout.schema;
             for field in &schema.fields {
-                let field_pos = self.offset(current_slot) + self.layout.offset(&field).unwrap();
+                let field_pos = self.offset(current_slot) + self.layout.offset(field).unwrap();
                 match schema.info.get(field).unwrap().field_type {
-                    FieldType::INT => self
+                    FieldType::Int => self
                         .tx
                         .set_int(&self.block_id, field_pos, 0, false)
                         .unwrap(),
-                    FieldType::STRING => self
+                    FieldType::String => self
                         .tx
                         .set_string(&self.block_id, field_pos, "", false)
                         .unwrap(),
@@ -8417,20 +8403,20 @@ impl RecordPage {
     }
 
     /// Returns an iterator over empty slots in the record page.
-    fn iter_empty_slots(&self) -> RecordPageIterator {
+    fn iter_empty_slots(&self) -> RecordPageIterator<'_> {
         RecordPageIterator {
             record_page: self,
             current_slot: None,
-            presence: SlotPresence::EMPTY,
+            presence: SlotPresence::Empty,
         }
     }
 
     /// Returns an iterator over used slots in the record page.
-    fn iter_used_slots(&self) -> RecordPageIterator {
+    fn iter_used_slots(&self) -> RecordPageIterator<'_> {
         RecordPageIterator {
             record_page: self,
             current_slot: None,
-            presence: SlotPresence::USED,
+            presence: SlotPresence::Used,
         }
     }
 }
@@ -8452,7 +8438,7 @@ mod record_page_tests {
         schema.add_string_field("B", 10);
         let layout = Layout::new(schema);
         for field in &layout.schema.fields {
-            let offset = layout.offset(&field).unwrap();
+            let offset = layout.offset(field).unwrap();
             if field == "A" {
                 assert_eq!(offset, 4);
             }
@@ -8521,8 +8507,8 @@ impl Layout {
             offsets.insert(field.clone(), offset);
 
             match field_info.field_type {
-                FieldType::INT => offset += field_info.length,
-                FieldType::STRING => offset += Page::INT_BYTES + field_info.length,
+                FieldType::Int => offset += field_info.length,
+                FieldType::String => offset += Page::INT_BYTES + field_info.length,
             }
         }
         Self {
@@ -8549,7 +8535,7 @@ mod layout_tests {
         schema.add_string_field("B", 10);
         let layout = Layout::new(schema);
         for field in layout.schema.fields.iter() {
-            let offset = layout.offset(&field).unwrap();
+            let offset = layout.offset(field).unwrap();
             if field == "A" {
                 assert_eq!(offset, 4);
             }
@@ -8562,15 +8548,15 @@ mod layout_tests {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FieldType {
-    INT = 0,
-    STRING = 1,
+    Int = 0,
+    String = 1,
 }
 
 impl From<i32> for FieldType {
     fn from(value: i32) -> Self {
         match value {
-            0 => FieldType::INT,
-            1 => FieldType::STRING,
+            0 => FieldType::Int,
+            1 => FieldType::String,
             _ => panic!("Invalid field type"),
         }
     }
@@ -8605,18 +8591,18 @@ impl Schema {
     }
 
     fn add_int_field(&mut self, field_name: &str) {
-        self.add_field(field_name, FieldType::INT, Page::INT_BYTES);
+        self.add_field(field_name, FieldType::Int, Page::INT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
-        self.add_field(field_name, FieldType::STRING, length);
+        self.add_field(field_name, FieldType::String, length);
     }
 
     fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
         let (field_type, field_length) = schema
             .info
             .get(field_name)
-            .and_then(|info| Some((info.field_type, info.length)))
+            .map(|info| (info.field_type, info.length))
             .ok_or_else(|| {
                 format!(
                     "Field {} not found in schema while looking for type",
@@ -8645,19 +8631,19 @@ trait TransactionOperations {
 
 impl TransactionOperations for Transaction {
     fn pin(&self, block_id: &BlockId) {
-        Transaction::pin(&self, block_id);
+        Transaction::pin(self, block_id);
     }
 
     fn unpin(&self, block_id: &BlockId) {
-        Transaction::unpin(&self, block_id);
+        Transaction::unpin(self, block_id);
     }
 
     fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
-        Transaction::set_int(&self, block_id, offset, val, log).unwrap();
+        Transaction::set_int(self, block_id, offset, val, log).unwrap();
     }
 
     fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
-        Transaction::set_string(&self, block_id, offset, val, log).unwrap();
+        Transaction::set_string(self, block_id, offset, val, log).unwrap();
     }
 }
 
@@ -8786,13 +8772,13 @@ impl Transaction {
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let lsn = {
             if log {
-                //  The LSN returned from writing to the WAL
+                //  The Lsn returned from writing to the WAL
                 self.recovery_manager
                     .set_int(buffer.lock().unwrap().deref(), offset, value)
                     .unwrap()
             } else {
-                //  The default LSN when no WAL write occurs
-                LSN::MAX
+                //  The default Lsn when no WAL write occurs
+                Lsn::MAX
             }
         };
         let mut guard = buffer.lock().unwrap();
@@ -8825,7 +8811,7 @@ impl Transaction {
                     .set_string(buffer.lock().unwrap().deref(), offset, value)
                     .unwrap()
             } else {
-                LSN::MAX
+                Lsn::MAX
             }
         };
         let mut guard = buffer.lock().unwrap();
@@ -9304,12 +9290,7 @@ impl LockTable {
             });
 
         //  Do an early return if this txn already has an xlock on the buffer
-        if lock_table_guard
-            .get(block_id)
-            .unwrap()
-            .writer
-            .map_or(false, |id| id == tx_id)
-        {
+        if lock_table_guard.get(block_id).unwrap().writer == Some(tx_id) {
             return Ok(());
         }
 
@@ -9385,7 +9366,7 @@ impl LockTable {
             state.upgrade_requests.retain(|&id| id != tx_id);
         }
         self.cond_var.notify_all();
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -9493,9 +9474,9 @@ mod lock_table_tests {
         });
 
         //  Wait for T1 to start acquiring write lock and release T2's lock
-        assert!(rx.recv().unwrap() == "Acquiring write lock".to_string());
+        assert!(rx.recv().unwrap() == *"Acquiring write lock");
         lock_table.release_locks(2, &block_id).unwrap();
-        assert!(rx.recv().unwrap() == "Acquired write lock".to_string());
+        assert!(rx.recv().unwrap() == *"Acquired write lock");
     }
 }
 
@@ -9559,7 +9540,7 @@ impl ConcurrencyManager {
                 locks.insert(block_id.clone(), LockType::Exclusive);
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     /// Release all locks associated with a [`Transaction`]
@@ -9670,7 +9651,7 @@ impl RecoveryManager {
         buffer: &Buffer,
         offset: usize,
         _new_value: i32,
-    ) -> Result<LSN, Box<dyn Error>> {
+    ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_int(offset);
         let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetInt {
@@ -9688,7 +9669,7 @@ impl RecoveryManager {
         buffer: &Buffer,
         offset: usize,
         _new_value: &str,
-    ) -> Result<LSN, Box<dyn Error>> {
+    ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_string(offset);
         let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetString {
@@ -9795,7 +9776,7 @@ mod recovery_manager_tests {
             Arc::clone(&db.buffer_manager),
         );
 
-        let mut mock_tx = MockTransaction::new();
+        let mock_tx = MockTransaction::new();
         let test_block = BlockId::new("test.txt".to_string(), 1);
 
         // Write some log records that will need to be rolled back
@@ -9810,7 +9791,7 @@ mod recovery_manager_tests {
             .unwrap();
 
         // Perform rollback
-        recovery_manager.rollback(&mut mock_tx).unwrap();
+        recovery_manager.rollback(&mock_tx).unwrap();
 
         // Verify that the value was reset to the original value
         assert!(mock_tx.verify_int_was_reset(&test_block, 0, 100));
@@ -9830,7 +9811,7 @@ mod recovery_manager_tests {
             Arc::clone(&db.buffer_manager),
         );
 
-        let mut mock_tx = MockTransaction::new();
+        let mock_tx = MockTransaction::new();
         let test_block = BlockId::new("test.txt".to_string(), 1);
 
         //  Write some log records that will need to be rolled back
@@ -9845,7 +9826,7 @@ mod recovery_manager_tests {
             .unwrap();
 
         //   Perform rollback
-        recovery_manager.rollback(&mut mock_tx).unwrap();
+        recovery_manager.rollback(&mock_tx).unwrap();
 
         //  Verify that the value was reset to the original value
         assert!(mock_tx.verify_string_was_reset(&test_block, 0, "Hello World".to_string()));
@@ -9992,12 +9973,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 pos += 4;
                 let old_val = page.get_int(pos);
 
-                return Ok(LogRecord::SetInt {
+                Ok(LogRecord::SetInt {
                     txnum,
                     block_id: BlockId::new(filename, block_num),
                     offset,
                     old_val,
-                });
+                })
             }
             5 => {
                 let txnum = page.get_int(pos) as usize;
@@ -10010,12 +9991,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 pos += 4;
                 let old_val = page.get_string(pos);
 
-                return Ok(LogRecord::SetString {
+                Ok(LogRecord::SetString {
                     txnum,
                     block_id: BlockId::new(filename, block_num),
                     offset,
                     old_val,
-                });
+                })
             }
             _ => Err("Invalid log record type".into()),
         }
@@ -10118,7 +10099,7 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<LSN, Box<dyn Error>> {
+    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<Lsn, Box<dyn Error>> {
         let bytes: Vec<u8> = self.try_into()?;
         Ok(log_manager.lock().unwrap().append(bytes))
     }
@@ -10158,7 +10139,7 @@ impl BufferList {
         self.buffers
             .borrow()
             .get(block_id)
-            .and_then(|v| Some(Arc::clone(&v.buffer)))
+            .map(|v| Arc::clone(&v.buffer))
     }
 
     /// Pin the buffer associated with the provided [`BlockId`]
@@ -10243,7 +10224,7 @@ struct Buffer {
     block_id: Option<BlockId>,
     pins: usize,
     txn: Option<usize>,
-    lsn: Option<LSN>,
+    lsn: Option<Lsn>,
 }
 
 impl Buffer {
@@ -10285,7 +10266,7 @@ impl Buffer {
 
     /// Write the current buffer contents to disk if dirty
     fn flush(&mut self) {
-        if let Some(_) = &self.txn {
+        if self.txn.is_some() {
             self.log_manager
                 .lock()
                 .unwrap()
@@ -10406,7 +10387,7 @@ impl BufferManager {
                 None => return None,
             },
         };
-        return Some(buffer);
+        Some(buffer)
     }
 
     /// Decrement the pin count for the provided buffer
@@ -10427,7 +10408,7 @@ impl BufferManager {
             if buffer_guard.block_id.is_some()
                 && buffer_guard.block_id.as_ref().unwrap() == block_id
             {
-                return Some(Arc::clone(&buffer));
+                return Some(Arc::clone(buffer));
             }
         }
         None
@@ -10438,7 +10419,7 @@ impl BufferManager {
         for buffer in &self.buffer_pool {
             let buffer_guard = buffer.lock().unwrap();
             if !buffer_guard.is_pinned() {
-                return Some(Arc::clone(&buffer));
+                return Some(Arc::clone(buffer));
             }
         }
         None
@@ -10529,8 +10510,8 @@ impl LogManager {
         }
     }
 
-    /// Determine if this LSN has been flushed to disk, and flush it if it hasn't
-    fn flush_lsn(&mut self, lsn: LSN) {
+    /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
+    fn flush_lsn(&mut self, lsn: Lsn) {
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -10549,13 +10530,13 @@ impl LogManager {
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
-    fn append(&mut self, log_record: Vec<u8>) -> LSN {
+    fn append(&mut self, log_record: Vec<u8>) -> Lsn {
         let mut boundary = self.log_page.get_int(0) as usize;
         let bytes_needed = log_record.len() + Page::INT_BYTES;
         if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
             self.flush_to_disk();
             self.current_block = LogManager::append_new_block(
-                &mut self.file_manager,
+                &self.file_manager,
                 &self.log_file,
                 &mut self.log_page,
             );
@@ -10675,7 +10656,7 @@ mod log_manager_tests {
         record
             .write_all(&(string_bytes.len() as i32).to_be_bytes())
             .unwrap();
-        record.write_all(&string_bytes).unwrap();
+        record.write_all(string_bytes).unwrap();
         record.write_all(&n.to_be_bytes()).unwrap();
         record
     }
@@ -10687,7 +10668,7 @@ mod log_manager_tests {
             let lsn = log_manager.lock().unwrap().append(record);
             print!("{lsn} ");
         }
-        println!("");
+        println!();
     }
 
     /// Print the log records in the log file
@@ -10783,7 +10764,7 @@ impl Page {
             .try_into()
             .unwrap();
         let length = u32::from_be_bytes(bytes) as usize;
-        offset = offset + Self::INT_BYTES;
+        offset += Self::INT_BYTES;
         self.contents[offset..offset + length].to_vec()
     }
 
@@ -10792,8 +10773,8 @@ impl Page {
         let length = bytes.len() as u32;
         let length_bytes = length.to_be_bytes();
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
-        offset = offset + Self::INT_BYTES;
-        self.contents[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        offset += Self::INT_BYTES;
+        self.contents[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
     /// Get a string from the page at the given offset
@@ -10898,7 +10879,7 @@ impl FileManager {
             (block_id.block_num * self.blocksize) as u64,
         ))
         .unwrap();
-        file.write(&page.contents).unwrap();
+        file.write_all(&page.contents).unwrap();
     }
 
     /// Append a new, empty block to the file and return
@@ -10911,7 +10892,7 @@ impl FileManager {
             (block_id.block_num * self.blocksize).try_into().unwrap(),
         ))
         .unwrap();
-        file.write(&buffer.contents).unwrap();
+        file.write_all(&buffer.contents).unwrap();
         block_id
     }
 
@@ -10926,6 +10907,7 @@ impl FileManager {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(full_path)
                     .expect("Failed to open file")
             })
