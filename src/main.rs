@@ -2,7 +2,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::len_zero)]
 #![allow(clippy::skip_while_next)]
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::useless_format)]
@@ -802,7 +801,7 @@ impl Iterator for ChunkScan {
 
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on ChunkScan for {}", self.table_name);
-        assert!(self.buffer_list.len() != 0);
+        assert!(!self.buffer_list.is_empty());
         loop {
             if let Some(record_page_idx) = &self.current_record_page {
                 let record_page = &self.buffer_list[*record_page_idx];
