@@ -149,9 +149,9 @@ impl<'a> Parser<'a> {
         if self.lexer.match_keyword("insert") {
             Ok(SQLStatement::Insert(self.insert()?))
         } else if self.lexer.match_keyword("delete") {
-            return Ok(SQLStatement::Delete(self.delete()?));
+            Ok(SQLStatement::Delete(self.delete()?))
         } else if self.lexer.match_keyword("update") {
-            return Ok(SQLStatement::Modify(self.modify()?));
+            Ok(SQLStatement::Modify(self.modify()?))
         } else {
             self.create()
         }
@@ -165,12 +165,12 @@ impl<'a> Parser<'a> {
             Ok(SQLStatement::CreateTable(self.create_table()?))
         } else if self.lexer.match_keyword("view") {
             self.lexer.match_keyword("view");
-            return Ok(SQLStatement::CreateView(self.create_view()?));
+            Ok(SQLStatement::CreateView(self.create_view()?))
         } else if self.lexer.match_keyword("index") {
             self.lexer.match_keyword("index");
-            return Ok(SQLStatement::CreateIndex(self.create_index()?));
+            Ok(SQLStatement::CreateIndex(self.create_index()?))
         } else {
-            return Err(ParserError::BadSyntax);
+            Err(ParserError::BadSyntax)
         }
     }
 

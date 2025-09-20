@@ -4803,12 +4803,12 @@ impl Plan for SelectPlan {
         if self.predicate.equates_with_constant(field_name).is_some() {
             1
         } else if let Some(field_name_2) = self.predicate.equates_with_field(field_name) {
-            return std::cmp::min(
+            std::cmp::min(
                 self.plan.distinct_values(field_name),
                 self.plan.distinct_values(&field_name_2),
-            );
+            )
         } else {
-            return self.plan.distinct_values(field_name);
+            self.plan.distinct_values(field_name)
         }
     }
 
@@ -8403,7 +8403,7 @@ impl RecordPage {
     }
 
     /// Returns an iterator over empty slots in the record page.
-    fn iter_empty_slots(&self) -> RecordPageIterator {
+    fn iter_empty_slots(&self) -> RecordPageIterator<'_> {
         RecordPageIterator {
             record_page: self,
             current_slot: None,
@@ -8412,7 +8412,7 @@ impl RecordPage {
     }
 
     /// Returns an iterator over used slots in the record page.
-    fn iter_used_slots(&self) -> RecordPageIterator {
+    fn iter_used_slots(&self) -> RecordPageIterator<'_> {
         RecordPageIterator {
             record_page: self,
             current_slot: None,

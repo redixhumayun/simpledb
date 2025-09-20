@@ -670,9 +670,9 @@ impl BTreeLeaf {
         if self.current_slot.unwrap() >= self.contents.get_number_of_recs()? {
             self.try_overflow()
         } else if self.contents.get_data_value(self.current_slot.unwrap())? == self.search_key {
-            return Ok(Some(()));
+            Ok(Some(()))
         } else {
-            return self.try_overflow();
+            self.try_overflow()
         }
     }
 
