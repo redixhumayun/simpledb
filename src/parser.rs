@@ -1,5 +1,6 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(clippy::needless_if)]
+#![allow(clippy::needless_return)]
 
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
@@ -74,7 +75,7 @@ impl<'a> Parser<'a> {
         if self.lexer.match_string_constant() {
             return Ok(Constant::String(self.lexer.eat_string_constant()?));
         }
-        return Ok(Constant::Int(self.lexer.eat_int_constant()?));
+        Ok(Constant::Int(self.lexer.eat_int_constant()?))
     }
 
     /// Parses a comma-separated list of constants
@@ -95,7 +96,7 @@ impl<'a> Parser<'a> {
         if self.lexer.match_identifier() {
             return Ok(Expression::FieldName(self.lexer.eat_identifier()?));
         }
-        return Ok(Expression::Constant(self.constant()?));
+        Ok(Expression::Constant(self.constant()?))
     }
 
     /// Parses a term (comparison between expressions)
@@ -156,7 +157,7 @@ impl<'a> Parser<'a> {
         } else if self.lexer.match_keyword("update") {
             return Ok(SQLStatement::ModifyData(self.modify()?));
         } else {
-            return self.create();
+            self.create()
         }
     }
 
