@@ -51,8 +51,8 @@ impl BTreeIndex {
                 .unwrap()
                 .field_type;
             let min_val = match field_type {
-                FieldType::INT => Constant::Int(i32::MIN),
-                FieldType::STRING => Constant::String("".to_string()),
+                FieldType::Int => Constant::Int(i32::MIN),
+                FieldType::String => Constant::String("".to_string()),
             };
             internal_page.insert_internal(0, min_val, 0)?;
         }
@@ -1124,10 +1124,10 @@ impl BTreePage {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
-                    FieldType::INT => {
+                    FieldType::Int => {
                         self.txn.set_int(&self.block_id, i, 0, false)?;
                     }
-                    FieldType::STRING => {
+                    FieldType::String => {
                         self.txn.set_string(&self.block_id, i, "", false)?;
                     }
                 }
@@ -1279,11 +1279,11 @@ impl BTreePage {
             .ok_or_else(|| format!("Field {} not found in schema", field_name))?
             .field_type;
         match field_type {
-            FieldType::INT => {
+            FieldType::Int => {
                 let value = self.get_int(slot, field_name)?;
                 Ok(Constant::Int(value))
             }
-            FieldType::STRING => {
+            FieldType::String => {
                 let value = self.get_string(slot, field_name)?;
                 Ok(Constant::String(value))
             }
@@ -1307,8 +1307,8 @@ impl BTreePage {
 
         // Check if value type matches schema
         match (expected_type, &value) {
-            (FieldType::INT, Constant::Int(v)) => self.set_int(slot, field_name, *v),
-            (FieldType::STRING, Constant::String(v)) => {
+            (FieldType::Int, Constant::Int(v)) => self.set_int(slot, field_name, *v),
+            (FieldType::String, Constant::String(v)) => {
                 self.set_string(slot, field_name, v.clone())
             }
             _ => Err(Box::new(std::io::Error::new(

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
-#![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::assign_op_pattern)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::never_loop)]
@@ -51,7 +50,7 @@ use test_utils::TestDir;
 mod btree;
 mod parser;
 
-type LSN = usize;
+type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 /// The database struct
@@ -881,8 +880,8 @@ impl Scan for ChunkScan {
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
         }
     }
 
@@ -7108,16 +7107,16 @@ mod metadata_manager_tests {
         for field in &layout.schema.fields {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
-                FieldType::INT => "int".to_string(),
-                FieldType::STRING => format!("varchar({})", field_info.length),
+                FieldType::Int => "int".to_string(),
+                FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{}: {}", field, type_str);
 
             // Assert field properties
             match field.as_str() {
-                "A" => assert_eq!(field_info.field_type, FieldType::INT),
+                "A" => assert_eq!(field_info.field_type, FieldType::Int),
                 "B" => {
-                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
                 _ => panic!("Unexpected field: {}", field),
@@ -7308,10 +7307,10 @@ impl IndexInfo {
         schema.add_int_field(Self::BLOCK_NUM_FIELD);
         schema.add_int_field(Self::ID_FIELD);
         match table_schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => {
+            FieldType::Int => {
                 schema.add_int_field(Self::DATA_FIELD);
             }
-            FieldType::STRING => {
+            FieldType::String => {
                 let field_length = table_schema.info.get(field_name).unwrap().length;
                 schema.add_string_field(Self::DATA_FIELD, field_length);
             }
@@ -7809,18 +7808,18 @@ mod table_manager_tests {
         for field in &layout.schema.fields {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
-                FieldType::INT => "int".to_string(),
-                FieldType::STRING => format!("varchar({})", field_info.length),
+                FieldType::Int => "int".to_string(),
+                FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{}: {}", field, type_str);
 
             // Assert field properties
             match field.as_str() {
                 "A" => {
-                    assert_eq!(field_info.field_type, FieldType::INT);
+                    assert_eq!(field_info.field_type, FieldType::Int);
                 }
                 "B" => {
-                    assert_eq!(field_info.field_type, FieldType::STRING);
+                    assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
                 _ => panic!("Unexpected field: {}", field),
@@ -8021,8 +8020,8 @@ impl Scan for TableScan {
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::STRING => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
+            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
         }
     }
 
@@ -8064,8 +8063,8 @@ impl UpdateScan for TableScan {
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::INT => self.set_int(field_name, value.as_int())?,
-            FieldType::STRING => self.set_string(field_name, value.as_str().to_string())?,
+            FieldType::Int => self.set_int(field_name, value.as_int())?,
+            FieldType::String => self.set_string(field_name, value.as_str().to_string())?,
         }
         Ok(())
     }
@@ -8295,8 +8294,8 @@ impl<'a> Iterator for RecordPageIterator<'a> {
 
 #[derive(Clone, Copy)]
 enum SlotPresence {
-    EMPTY,
-    USED,
+    Empty,
+    Used,
 }
 
 #[derive(Clone)]
@@ -8352,7 +8351,7 @@ impl RecordPage {
 
     /// Marks a slot as used and returns its slot number.
     fn insert(&self, slot: usize) -> usize {
-        self.set_flag(slot, SlotPresence::USED);
+        self.set_flag(slot, SlotPresence::Used);
         slot
     }
 
@@ -8369,11 +8368,11 @@ impl RecordPage {
                 .next()
                 .ok_or_else(|| "no empty slots available in this record page")?,
         };
-        self.set_flag(new_slot, SlotPresence::USED);
+        self.set_flag(new_slot, SlotPresence::Used);
         Ok(new_slot)
     }
 
-    /// Returns the next [`SlotPresence::USED`] slot after the slot passed in
+    /// Returns the next [`SlotPresence::Used`] slot after the slot passed in
     fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
         let next_slot = self
             .iter_used_slots()
@@ -8392,7 +8391,7 @@ impl RecordPage {
 
     /// Marks a slot as empty, effectively deleting its record.
     fn delete(&self, slot: usize) {
-        self.set_flag(slot, SlotPresence::EMPTY);
+        self.set_flag(slot, SlotPresence::Empty);
     }
 
     /// Calculates the byte offset for a given slot based on the layout's slot size.
@@ -8414,7 +8413,7 @@ impl RecordPage {
                 .set_int(
                     &self.block_id,
                     self.offset(current_slot),
-                    SlotPresence::EMPTY as i32,
+                    SlotPresence::Empty as i32,
                     false,
                 )
                 .unwrap();
@@ -8422,11 +8421,11 @@ impl RecordPage {
             for field in &schema.fields {
                 let field_pos = self.offset(current_slot) + self.layout.offset(field).unwrap();
                 match schema.info.get(field).unwrap().field_type {
-                    FieldType::INT => self
+                    FieldType::Int => self
                         .tx
                         .set_int(&self.block_id, field_pos, 0, false)
                         .unwrap(),
-                    FieldType::STRING => self
+                    FieldType::String => self
                         .tx
                         .set_string(&self.block_id, field_pos, "", false)
                         .unwrap(),
@@ -8441,7 +8440,7 @@ impl RecordPage {
         RecordPageIterator {
             record_page: self,
             current_slot: None,
-            presence: SlotPresence::EMPTY,
+            presence: SlotPresence::Empty,
         }
     }
 
@@ -8450,7 +8449,7 @@ impl RecordPage {
         RecordPageIterator {
             record_page: self,
             current_slot: None,
-            presence: SlotPresence::USED,
+            presence: SlotPresence::Used,
         }
     }
 }
@@ -8541,8 +8540,8 @@ impl Layout {
             offsets.insert(field.clone(), offset);
 
             match field_info.field_type {
-                FieldType::INT => offset += field_info.length,
-                FieldType::STRING => offset += Page::INT_BYTES + field_info.length,
+                FieldType::Int => offset += field_info.length,
+                FieldType::String => offset += Page::INT_BYTES + field_info.length,
             }
         }
         Self {
@@ -8582,15 +8581,15 @@ mod layout_tests {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FieldType {
-    INT = 0,
-    STRING = 1,
+    Int = 0,
+    String = 1,
 }
 
 impl From<i32> for FieldType {
     fn from(value: i32) -> Self {
         match value {
-            0 => FieldType::INT,
-            1 => FieldType::STRING,
+            0 => FieldType::Int,
+            1 => FieldType::String,
             _ => panic!("Invalid field type"),
         }
     }
@@ -8625,11 +8624,11 @@ impl Schema {
     }
 
     fn add_int_field(&mut self, field_name: &str) {
-        self.add_field(field_name, FieldType::INT, Page::INT_BYTES);
+        self.add_field(field_name, FieldType::Int, Page::INT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
-        self.add_field(field_name, FieldType::STRING, length);
+        self.add_field(field_name, FieldType::String, length);
     }
 
     fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
@@ -8806,13 +8805,13 @@ impl Transaction {
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
         let lsn = {
             if log {
-                //  The LSN returned from writing to the WAL
+                //  The Lsn returned from writing to the WAL
                 self.recovery_manager
                     .set_int(buffer.lock().unwrap().deref(), offset, value)
                     .unwrap()
             } else {
-                //  The default LSN when no WAL write occurs
-                LSN::MAX
+                //  The default Lsn when no WAL write occurs
+                Lsn::MAX
             }
         };
         let mut guard = buffer.lock().unwrap();
@@ -8845,7 +8844,7 @@ impl Transaction {
                     .set_string(buffer.lock().unwrap().deref(), offset, value)
                     .unwrap()
             } else {
-                LSN::MAX
+                Lsn::MAX
             }
         };
         let mut guard = buffer.lock().unwrap();
@@ -9690,7 +9689,7 @@ impl RecoveryManager {
         buffer: &Buffer,
         offset: usize,
         _new_value: i32,
-    ) -> Result<LSN, Box<dyn Error>> {
+    ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_int(offset);
         let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetInt {
@@ -9708,7 +9707,7 @@ impl RecoveryManager {
         buffer: &Buffer,
         offset: usize,
         _new_value: &str,
-    ) -> Result<LSN, Box<dyn Error>> {
+    ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_string(offset);
         let block_id = buffer.block_id.clone().unwrap();
         let record = LogRecord::SetString {
@@ -10138,7 +10137,7 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<LSN, Box<dyn Error>> {
+    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<Lsn, Box<dyn Error>> {
         let bytes: Vec<u8> = self.try_into()?;
         Ok(log_manager.lock().unwrap().append(bytes))
     }
@@ -10263,7 +10262,7 @@ struct Buffer {
     block_id: Option<BlockId>,
     pins: usize,
     txn: Option<usize>,
-    lsn: Option<LSN>,
+    lsn: Option<Lsn>,
 }
 
 impl Buffer {
@@ -10549,8 +10548,8 @@ impl LogManager {
         }
     }
 
-    /// Determine if this LSN has been flushed to disk, and flush it if it hasn't
-    fn flush_lsn(&mut self, lsn: LSN) {
+    /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
+    fn flush_lsn(&mut self, lsn: Lsn) {
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -10569,7 +10568,7 @@ impl LogManager {
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
-    fn append(&mut self, log_record: Vec<u8>) -> LSN {
+    fn append(&mut self, log_record: Vec<u8>) -> Lsn {
         let mut boundary = self.log_page.get_int(0) as usize;
         let bytes_needed = log_record.len() + Page::INT_BYTES;
         if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
