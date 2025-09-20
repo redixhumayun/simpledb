@@ -4,7 +4,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::skip_while_next)]
 #![allow(clippy::if_same_then_else)]
-#![allow(clippy::useless_format)]
 #![allow(clippy::bind_instead_of_map)]
 #![allow(clippy::unit_arg)]
 #![allow(clippy::unnecessary_lazy_evaluations)]
@@ -2559,7 +2558,7 @@ impl SortScan {
 
     fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
         let rid_1 =
-            self.saved_rids[0].ok_or_else(|| format!("Error getting saved RID from first scan"))?;
+            self.saved_rids[0].ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
         self.s1.move_to_row_id(rid_1);
         match (self.s2.as_mut(), self.saved_rids[1]) {
             (None, None) => (),
