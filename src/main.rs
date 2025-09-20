@@ -195,9 +195,9 @@ impl Plan for MultiBufferProductPlan {
 
     fn distinct_values(&self, field_name: &str) -> usize {
         if self.lhs.schema().fields.contains(&field_name.to_string()) {
-            return self.lhs.distinct_values(field_name);
+            self.lhs.distinct_values(field_name)
         } else {
-            return self.rhs.distinct_values(field_name);
+            self.rhs.distinct_values(field_name)
         }
     }
 
@@ -423,7 +423,7 @@ where
             self.s2.as_ref().unwrap().clone(),
         ));
         self.next_start_block_num = new_last_block_num + 1;
-        return true;
+        true
     }
 }
 
@@ -766,7 +766,7 @@ impl ChunkScan {
             buffer_list,
         };
         scan.move_to_block(first_block_num);
-        return scan;
+        scan
     }
 
     fn move_to_block(&mut self, block_num: usize) {
@@ -2214,7 +2214,7 @@ impl Plan for SortPlan {
         let source_scan = self.source_plan.open();
         let runs = self.split_into_runs(source_scan).unwrap();
         let merged_runs = self.do_merge_iters(runs).unwrap();
-        return Box::new(SortScan::new(merged_runs, self.record_comparator.clone()));
+        Box::new(SortScan::new(merged_runs, self.record_comparator.clone()))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -2568,19 +2568,19 @@ impl Iterator for SortScan {
                 match (self.s1.next(), self.s2.as_mut().and_then(|s| s.next())) {
                     (None, None) => {
                         self.current_scan = SortScanState::Done;
-                        return None;
+                        None
                     }
                     (Some(Ok(_)), None) => {
                         self.current_scan = SortScanState::OnlyFirst;
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
                     (None, Some(Ok(_))) => {
                         self.current_scan = SortScanState::OnlySecond;
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
                     (Some(Err(e)), _) | (_, Some(Err(e))) => {
                         self.current_scan = SortScanState::Done;
-                        return Some(Err(e));
+                        Some(Err(e))
                     }
                     (Some(_), Some(_)) => match self.set_current_scan() {
                         Ok(_) => Some(Ok(())),
@@ -2595,19 +2595,19 @@ impl Iterator for SortScan {
                         Err(e) => Some(Err(e)),
                     };
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::OnlySecond;
                     self.s1.close();
-                    return Some(Ok(()));
+                    Some(Ok(()))
                 }
             },
             SortScanState::OnlyFirst => match self.s1.next() {
-                Some(Ok(_)) => return Some(Ok(())),
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(_)) => Some(Ok(())),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::Done;
-                    return None;
+                    None
                 }
             },
             SortScanState::OnSecond => match self.s2.as_mut().unwrap().next() {
@@ -2617,26 +2617,26 @@ impl Iterator for SortScan {
                         Err(e) => Some(Err(e)),
                     };
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     if let Some(s) = self.s2.as_mut() {
                         s.close()
                     };
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
-                    return Some(Ok(()));
+                    Some(Ok(()))
                 }
             },
             SortScanState::OnlySecond => match self.s2.as_mut().unwrap().next() {
-                Some(Ok(_)) => return Some(Ok(())),
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(_)) => Some(Ok(())),
+                Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::Done;
-                    return None;
+                    None
                 }
             },
             SortScanState::Done => {
-                return None;
+                None
             }
         }
     }
@@ -2985,13 +2985,11 @@ mod materialize_plan_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
 
         // Insert test data using SQL
-        let test_data = vec![
-            (1, "first"),
+        let test_data = [(1, "first"),
             (2, "second"),
             (3, "third"),
             (4, "fourth"),
-            (5, "fifth"),
-        ];
+            (5, "fifth")];
 
         for (a_val, b_val) in test_data.iter() {
             let sql = format!(
@@ -3195,7 +3193,7 @@ mod planner_tests {
 
         //  Read the records back and make sure they exist
         dbg!("reading records back");
-        let sql = format!("select B from T1 where A>10");
+        let sql = "select B from T1 where A>10".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
         let mut scan = plan.open();
         let mut retrieved_count = 0;
@@ -4807,7 +4805,7 @@ impl Plan for SelectPlan {
 
     fn distinct_values(&self, field_name: &str) -> usize {
         if self.predicate.equates_with_constant(field_name).is_some() {
-            return 1;
+            1
         } else if let Some(field_name_2) = self.predicate.equates_with_field(field_name) {
             return std::cmp::min(
                 self.plan.distinct_values(field_name),
@@ -5086,8 +5084,8 @@ where
         debug!("Calling next on ProductScan");
         match self.s2.next() {
             Some(result) => match result {
-                Ok(_) => return Some(Ok(())),
-                Err(e) => return Some(Err(e)),
+                Ok(_) => Some(Ok(())),
+                Err(e) => Some(Err(e)),
             },
             //  s2 cannot be advanced
             None => match self.s1.next() {
@@ -5096,11 +5094,11 @@ where
                     Ok(_) => {
                         self.s2.before_first().unwrap();
                         self.s2.next();
-                        return Some(Ok(()));
+                        Some(Ok(()))
                     }
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => Some(Err(e)),
                 },
-                None => return None,
+                None => None,
             },
         }
     }
@@ -5243,10 +5241,10 @@ mod product_scan_tests {
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
             for i in 0..50 {
                 scan1.insert().unwrap();
-                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_int("A", i).unwrap();
                 scan1.set_string("B", format!("string{}", i)).unwrap();
                 scan2.insert().unwrap();
-                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_int("C", i).unwrap();
                 scan2.set_string("D", format!("string{}", i)).unwrap();
             }
         }
@@ -5966,17 +5964,17 @@ mod index_join_scan_tests {
             for i in 0..50 {
                 // Insert into first table
                 scan1.insert().unwrap();
-                scan1.set_int("A", i as i32).unwrap();
+                scan1.set_int("A", i).unwrap();
                 scan1.set_string("B", format!("string{}", i)).unwrap();
 
                 // Insert into second table with matching values
                 scan2.insert().unwrap();
-                scan2.set_int("C", i as i32).unwrap();
+                scan2.set_int("C", i).unwrap();
                 scan2.set_string("D", format!("string{}", i)).unwrap();
 
                 // Create index entry
                 let mut index = index_info.open();
-                index.insert(&Constant::Int(i as i32), &scan2.get_rid().unwrap());
+                index.insert(&Constant::Int(i), &scan2.get_rid().unwrap());
 
                 inserted_count += 1;
             }
@@ -6460,7 +6458,7 @@ impl Predicate {
     where
         S: Scan,
     {
-        return self.evaluate_node(&self.root, scan);
+        self.evaluate_node(&self.root, scan)
     }
 
     fn evaluate_node<S>(&self, node: &PredicateNode, scan: &S) -> Result<bool, Box<dyn Error>>
@@ -6479,7 +6477,7 @@ impl Predicate {
                                 return Ok(false);
                             }
                         }
-                        return Ok(true);
+                        Ok(true)
                     }
                     BooleanConnective::Or => {
                         for operand in operands {
@@ -6487,7 +6485,7 @@ impl Predicate {
                                 return Ok(true);
                             }
                         }
-                        return Ok(false);
+                        Ok(false)
                     }
                     BooleanConnective::Not => {
                         if operands.len() != 1 {
@@ -6495,7 +6493,7 @@ impl Predicate {
                         }
                         return Ok(!self.evaluate_node(&operands[0], scan)?);
                     }
-                };
+                }
             }
         }
     }
@@ -6540,7 +6538,7 @@ impl Predicate {
                         return Some(val);
                     }
                 }
-                return None;
+                None
             }
         }
     }
@@ -6665,7 +6663,7 @@ impl Predicate {
                 }
             }
             PredicateNode::Composite { op, operands } => {
-                return match op {
+                match op {
                     BooleanConnective::And => {
                         let kept: Vec<PredicateNode> = operands
                             .iter()
@@ -6709,7 +6707,7 @@ impl Predicate {
                         }
                         PredicateNode::Empty
                     }
-                };
+                }
             }
         }
     }
@@ -6832,7 +6830,7 @@ impl Term {
         {
             return self.lhs.get_constant_value().cloned();
         }
-        return None;
+        None
     }
 
     /// Checks if the term equates with a field name of the form "F=G"
@@ -6849,7 +6847,7 @@ impl Term {
         {
             return self.lhs.get_field_name().cloned();
         }
-        return None;
+        None
     }
 
     /// Check that both sides of this expression apply to the provided [Schema]
@@ -7394,7 +7392,7 @@ impl Index for HashIndex {
                 return true;
             }
         }
-        return false;
+        false
     }
 
     fn get_data_rid(&self) -> RID {
@@ -8448,7 +8446,7 @@ mod record_page_tests {
         schema.add_string_field("B", 10);
         let layout = Layout::new(schema);
         for field in &layout.schema.fields {
-            let offset = layout.offset(&field).unwrap();
+            let offset = layout.offset(field).unwrap();
             if field == "A" {
                 assert_eq!(offset, 4);
             }
@@ -8545,7 +8543,7 @@ mod layout_tests {
         schema.add_string_field("B", 10);
         let layout = Layout::new(schema);
         for field in layout.schema.fields.iter() {
-            let offset = layout.offset(&field).unwrap();
+            let offset = layout.offset(field).unwrap();
             if field == "A" {
                 assert_eq!(offset, 4);
             }
@@ -9376,7 +9374,7 @@ impl LockTable {
             state.upgrade_requests.retain(|&id| id != tx_id);
         }
         self.cond_var.notify_all();
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -9484,9 +9482,9 @@ mod lock_table_tests {
         });
 
         //  Wait for T1 to start acquiring write lock and release T2's lock
-        assert!(rx.recv().unwrap() == "Acquiring write lock".to_string());
+        assert!(rx.recv().unwrap() == *"Acquiring write lock");
         lock_table.release_locks(2, &block_id).unwrap();
-        assert!(rx.recv().unwrap() == "Acquired write lock".to_string());
+        assert!(rx.recv().unwrap() == *"Acquired write lock");
     }
 }
 
@@ -9550,7 +9548,7 @@ impl ConcurrencyManager {
                 locks.insert(block_id.clone(), LockType::Exclusive);
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     /// Release all locks associated with a [`Transaction`]
@@ -9983,12 +9981,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 pos += 4;
                 let old_val = page.get_int(pos);
 
-                return Ok(LogRecord::SetInt {
+                Ok(LogRecord::SetInt {
                     txnum,
                     block_id: BlockId::new(filename, block_num),
                     offset,
                     old_val,
-                });
+                })
             }
             5 => {
                 let txnum = page.get_int(pos) as usize;
@@ -10001,12 +9999,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 pos += 4;
                 let old_val = page.get_string(pos);
 
-                return Ok(LogRecord::SetString {
+                Ok(LogRecord::SetString {
                     txnum,
                     block_id: BlockId::new(filename, block_num),
                     offset,
                     old_val,
-                });
+                })
             }
             _ => Err("Invalid log record type".into()),
         }
@@ -10397,7 +10395,7 @@ impl BufferManager {
                 None => return None,
             },
         };
-        return Some(buffer);
+        Some(buffer)
     }
 
     /// Decrement the pin count for the provided buffer
@@ -10666,7 +10664,7 @@ mod log_manager_tests {
         record
             .write_all(&(string_bytes.len() as i32).to_be_bytes())
             .unwrap();
-        record.write_all(&string_bytes).unwrap();
+        record.write_all(string_bytes).unwrap();
         record.write_all(&n.to_be_bytes()).unwrap();
         record
     }
@@ -10678,7 +10676,7 @@ mod log_manager_tests {
             let lsn = log_manager.lock().unwrap().append(record);
             print!("{lsn} ");
         }
-        println!("");
+        println!();
     }
 
     /// Print the log records in the log file

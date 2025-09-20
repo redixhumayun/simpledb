@@ -148,7 +148,7 @@ impl<'a> Parser<'a> {
     /// Returns: SQLStatement enum variant
     pub fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
         if self.lexer.match_keyword("insert") {
-            return Ok(SQLStatement::Insert(self.insert()?));
+            Ok(SQLStatement::Insert(self.insert()?))
         } else if self.lexer.match_keyword("delete") {
             return Ok(SQLStatement::Delete(self.delete()?));
         } else if self.lexer.match_keyword("update") {
@@ -163,7 +163,7 @@ impl<'a> Parser<'a> {
     fn create(&mut self) -> Result<SQLStatement, ParserError> {
         self.lexer.eat_keyword("create")?;
         if self.lexer.match_keyword("table") {
-            return Ok(SQLStatement::CreateTable(self.create_table()?));
+            Ok(SQLStatement::CreateTable(self.create_table()?))
         } else if self.lexer.match_keyword("view") {
             self.lexer.match_keyword("view");
             return Ok(SQLStatement::CreateView(self.create_view()?));

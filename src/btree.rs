@@ -400,7 +400,7 @@ impl BTreeInternal {
     /// It will search for the rightmost slot before the search key
     /// If the search key is found in the slot, it will return the next slot
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let mut slot = (self.contents.find_slot_before(&search_key)?).unwrap_or(0);
+        let mut slot = (self.contents.find_slot_before(search_key)?).unwrap_or(0);
         if self.contents.get_data_value(slot + 1)? == *search_key {
             slot += 1;
         }
@@ -492,7 +492,7 @@ mod btree_internal_tests {
         assert!(split_entry.block_num > 0); // Should be a new block number
 
         // Verify middle key was chosen for split
-        let mid_val = ((block_num + 1) / 2) as i32;
+        let mid_val = ((block_num + 1) / 2);
         assert_eq!(split_entry.dataval, Constant::Int(mid_val));
     }
 
@@ -668,7 +668,7 @@ impl BTreeLeaf {
             }
         };
         if self.current_slot.unwrap() >= self.contents.get_number_of_recs()? {
-            return self.try_overflow();
+            self.try_overflow()
         } else if self.contents.get_data_value(self.current_slot.unwrap())? == self.search_key {
             return Ok(Some(()));
         } else {
@@ -686,7 +686,7 @@ impl BTreeLeaf {
                 return Ok(());
             }
         }
-        return Err("RID not found in BTreeLeaf".into());
+        Err("RID not found in BTreeLeaf".into())
     }
 
     /// This method will attempt to insert an entry into a [BTreeLeaf] page
@@ -986,16 +986,16 @@ impl From<i32> for PageType {
         let is_internal = value & TYPE_MASK == 0;
         if is_internal {
             if value == 0 {
-                return PageType::Internal(None);
+                PageType::Internal(None)
             } else {
-                return PageType::Internal(Some((value & VALUE_MASK) as usize));
+                PageType::Internal(Some((value & VALUE_MASK) as usize))
             }
         } else {
             let val = value & VALUE_MASK;
             if val == 0 {
-                return PageType::Leaf(None);
+                PageType::Leaf(None)
             } else {
-                return PageType::Leaf(Some(val as usize));
+                PageType::Leaf(Some(val as usize))
             }
         }
     }
@@ -1048,9 +1048,9 @@ impl BTreePage {
             current_slot += 1;
         }
         if current_slot == 0 {
-            return Ok(None);
+            Ok(None)
         } else {
-            return Ok(Some(current_slot - 1));
+            Ok(Some(current_slot - 1))
         }
     }
 
