@@ -3151,22 +3151,22 @@ impl Planner {
     ) -> Result<usize, Box<dyn Error>> {
         let mut parser = Parser::new(&command);
         match parser.update_command()? {
-            parser::SQLStatement::CreateTableData(create_table_data) => self
+            parser::SQLStatement::CreateTable(create_table_data) => self
                 .update_planner
                 .execute_create_table(create_table_data, Arc::clone(&txn)),
-            parser::SQLStatement::CreateViewData(create_view_data) => self
+            parser::SQLStatement::CreateView(create_view_data) => self
                 .update_planner
                 .execute_create_view(create_view_data, Arc::clone(&txn)),
-            parser::SQLStatement::CreateIndexData(create_index_data) => self
+            parser::SQLStatement::CreateIndex(create_index_data) => self
                 .update_planner
                 .execute_create_index(create_index_data, Arc::clone(&txn)),
-            parser::SQLStatement::InsertData(insert_data) => self
+            parser::SQLStatement::Insert(insert_data) => self
                 .update_planner
                 .execute_insert(insert_data, Arc::clone(&txn)),
-            parser::SQLStatement::DeleteData(delete_data) => self
+            parser::SQLStatement::Delete(delete_data) => self
                 .update_planner
                 .execute_delete(delete_data, Arc::clone(&txn)),
-            parser::SQLStatement::ModifyData(modify_data) => self
+            parser::SQLStatement::Modify(modify_data) => self
                 .update_planner
                 .execute_modify(modify_data, Arc::clone(&txn)),
         }

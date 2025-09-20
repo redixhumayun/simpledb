@@ -1,4 +1,3 @@
-#![allow(clippy::enum_variant_names)]
 #![allow(clippy::needless_if)]
 #![allow(clippy::needless_return)]
 
@@ -151,11 +150,11 @@ impl<'a> Parser<'a> {
     /// Returns: SQLStatement enum variant
     pub fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
         if self.lexer.match_keyword("insert") {
-            return Ok(SQLStatement::InsertData(self.insert()?));
+            return Ok(SQLStatement::Insert(self.insert()?));
         } else if self.lexer.match_keyword("delete") {
-            return Ok(SQLStatement::DeleteData(self.delete()?));
+            return Ok(SQLStatement::Delete(self.delete()?));
         } else if self.lexer.match_keyword("update") {
-            return Ok(SQLStatement::ModifyData(self.modify()?));
+            return Ok(SQLStatement::Modify(self.modify()?));
         } else {
             self.create()
         }
@@ -166,13 +165,13 @@ impl<'a> Parser<'a> {
     fn create(&mut self) -> Result<SQLStatement, ParserError> {
         self.lexer.eat_keyword("create")?;
         if self.lexer.match_keyword("table") {
-            return Ok(SQLStatement::CreateTableData(self.create_table()?));
+            return Ok(SQLStatement::CreateTable(self.create_table()?));
         } else if self.lexer.match_keyword("view") {
             self.lexer.match_keyword("view");
-            return Ok(SQLStatement::CreateViewData(self.create_view()?));
+            return Ok(SQLStatement::CreateView(self.create_view()?));
         } else if self.lexer.match_keyword("index") {
             self.lexer.match_keyword("index");
-            return Ok(SQLStatement::CreateIndexData(self.create_index()?));
+            return Ok(SQLStatement::CreateIndex(self.create_index()?));
         } else {
             return Err(ParserError::BadSyntax);
         }
@@ -434,7 +433,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::CreateTableData(create_table) = stmt {
+        if let SQLStatement::CreateTable(create_table) = stmt {
             assert_eq!(create_table.table_name, "students");
             assert!(create_table.schema.fields.contains(&"id".to_string()));
             assert!(create_table.schema.fields.contains(&"name".to_string()));
@@ -450,7 +449,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::InsertData(insert) = stmt {
+        if let SQLStatement::Insert(insert) = stmt {
             assert_eq!(insert.table_name, "users");
             assert_eq!(insert.fields, vec!["name", "age"]);
             assert_eq!(
@@ -468,7 +467,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::DeleteData(delete) = stmt {
+        if let SQLStatement::Delete(delete) = stmt {
             assert_eq!(delete.table_name, "users");
             if let PredicateNode::Term(term) = &delete.predicate.root {
                 assert!(matches!(term.lhs, Expression::FieldName(ref name) if name == "age"));
@@ -488,7 +487,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::ModifyData(modify) = stmt {
+        if let SQLStatement::Modify(modify) = stmt {
             assert_eq!(modify.table_name, "employees");
             assert_eq!(modify.field_name, "salary");
             assert_eq!(modify.new_value, Expression::Constant(Constant::Int(50000)));
@@ -515,7 +514,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::CreateIndexData(create_index) = stmt {
+        if let SQLStatement::CreateIndex(create_index) = stmt {
             assert_eq!(create_index.index_name, "idx_name");
             assert_eq!(create_index.table_name, "users");
             assert_eq!(create_index.field_name, "name");
@@ -531,7 +530,7 @@ mod parser_tests {
         let mut parser = Parser::new(sql);
         let stmt = parser.update_command().unwrap();
 
-        if let SQLStatement::CreateViewData(create_view) = stmt {
+        if let SQLStatement::CreateView(create_view) = stmt {
             assert_eq!(create_view.view_name, "high_salary");
             assert_eq!(create_view.query_data.fields, vec!["name", "salary"]);
             assert_eq!(create_view.query_data.tables, vec!["employees"]);
@@ -591,12 +590,12 @@ mod parser_tests {
 
 #[derive(Debug)]
 pub enum SQLStatement {
-    CreateTableData(CreateTableData),
-    CreateViewData(CreateViewData),
-    CreateIndexData(CreateIndexData),
-    InsertData(InsertData),
-    DeleteData(DeleteData),
-    ModifyData(ModifyData),
+    CreateTable(CreateTableData),
+    CreateView(CreateViewData),
+    CreateIndex(CreateIndexData),
+    Insert(InsertData),
+    Delete(DeleteData),
+    Modify(ModifyData),
 }
 
 #[derive(Debug)]
