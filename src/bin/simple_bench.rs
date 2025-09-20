@@ -174,6 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Running benchmarks with {} iterations per operation",
         iterations
     );
+    println!("Environment: {} ({})", std::env::consts::OS, std::env::consts::ARCH);
     println!();
 
     // Clean up any existing benchmark data
@@ -201,6 +202,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!();
     println!("All benchmarks completed successfully!");
+    println!("Note: These results are for educational purposes and system comparison");
 
     // Cleanup
     cleanup_bench_data();
