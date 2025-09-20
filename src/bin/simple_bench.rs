@@ -1,5 +1,4 @@
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::while_let_on_iterator)]
 
 use std::env;
 use std::error::Error;
@@ -94,10 +93,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         {
             let mut scan = plan.open();
-            let mut _count = 0;
-            while let Some(_) = scan.next() {
-                _count += 1;
-            }
+            let _count = scan.by_ref().count();
             scan.close();
         } // scan is dropped here, before transaction commit
         txn.commit().unwrap();
