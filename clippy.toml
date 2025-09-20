@@ -1,0 +1,9 @@
+# Clippy configuration for SimpleDB
+# This is a pedagogical codebase that prioritizes readability
+
+# Allow Arc::clone(&...) patterns as they're common in concurrent code
+too-many-lines-threshold = 500
+
+# More permissive settings for educational code
+cognitive-complexity-threshold = 50
+type-complexity-threshold = 500

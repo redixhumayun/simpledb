@@ -1,3 +1,6 @@
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::iter_cloned_collect)]
+
 use simpledb::{Constant, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};

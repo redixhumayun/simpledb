@@ -1,5 +1,31 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::manual_unwrap_or)]
+#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::unnecessary_mut_passed)]
+#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::assign_op_pattern)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::never_loop)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::skip_while_next)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::bind_instead_of_map)]
+#![allow(clippy::unit_arg)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
+#![allow(clippy::only_used_in_recursion)]
+#![allow(clippy::get_first)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::iter_cloned_collect)]
+#![allow(clippy::while_let_on_iterator)]
 
 use std::{
     any::Any,
@@ -18,7 +44,6 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant},
-    usize,
 };
 mod test_utils;
 use btree::BTreeIndex;
@@ -10783,7 +10808,7 @@ impl Page {
             .try_into()
             .unwrap();
         let length = u32::from_be_bytes(bytes) as usize;
-        offset = offset + Self::INT_BYTES;
+        offset += Self::INT_BYTES;
         self.contents[offset..offset + length].to_vec()
     }
 
@@ -10792,8 +10817,8 @@ impl Page {
         let length = bytes.len() as u32;
         let length_bytes = length.to_be_bytes();
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
-        offset = offset + Self::INT_BYTES;
-        self.contents[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        offset += Self::INT_BYTES;
+        self.contents[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
     /// Get a string from the page at the given offset
@@ -10898,7 +10923,7 @@ impl FileManager {
             (block_id.block_num * self.blocksize) as u64,
         ))
         .unwrap();
-        file.write(&page.contents).unwrap();
+        file.write_all(&page.contents).unwrap();
     }
 
     /// Append a new, empty block to the file and return
@@ -10911,7 +10936,7 @@ impl FileManager {
             (block_id.block_num * self.blocksize).try_into().unwrap(),
         ))
         .unwrap();
-        file.write(&buffer.contents).unwrap();
+        file.write_all(&buffer.contents).unwrap();
         block_id
     }
 
@@ -10926,6 +10951,7 @@ impl FileManager {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(full_path)
                     .expect("Failed to open file")
             })

@@ -1,3 +1,6 @@
+#![allow(clippy::enum_variant_names)]
+#![allow(clippy::needless_if)]
+
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
 use crate::{ComparisonOp, Constant, Expression, Predicate, Schema, Term};

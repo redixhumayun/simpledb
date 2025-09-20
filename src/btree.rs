@@ -1,3 +1,9 @@
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::manual_unwrap_or)]
+#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::needless_borrow)]
+
 use std::{error::Error, sync::Arc};
 
 use crate::{

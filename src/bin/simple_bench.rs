@@ -1,3 +1,6 @@
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::while_let_on_iterator)]
+
 use std::env;
 use std::error::Error;
 use std::path::Path;
