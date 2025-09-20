@@ -9,7 +9,6 @@
 #![allow(clippy::unit_arg)]
 #![allow(clippy::unnecessary_lazy_evaluations)]
 #![allow(clippy::only_used_in_recursion)]
-#![allow(clippy::get_first)]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::let_and_return)]
 #![allow(clippy::needless_lifetimes)]
@@ -6638,7 +6637,7 @@ impl Predicate {
             PredicateNode::Composite { op, operands } => match op {
                 BooleanConnective::Not => {
                     assert!(operands.len() == 1);
-                    self.node_applies_to(operands.get(0).unwrap(), term_ok)
+                    self.node_applies_to(operands.first().unwrap(), term_ok)
                 }
                 _ => operands
                     .iter()
