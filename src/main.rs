@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
-#![allow(clippy::manual_unwrap_or)]
-#![allow(clippy::manual_unwrap_or_default)]
-#![allow(clippy::unnecessary_mut_passed)]
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::assign_op_pattern)]
 #![allow(clippy::arc_with_non_send_sync)]
@@ -10578,7 +10575,7 @@ impl LogManager {
         if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
             self.flush_to_disk();
             self.current_block = LogManager::append_new_block(
-                &mut self.file_manager,
+                &self.file_manager,
                 &self.log_file,
                 &mut self.log_page,
             );
