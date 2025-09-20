@@ -2,7 +2,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::clone_on_copy)]
 #![allow(clippy::len_zero)]
 #![allow(clippy::skip_while_next)]
 #![allow(clippy::if_same_then_else)]
@@ -729,11 +728,11 @@ impl Clone for ChunkScan {
             layout: self.layout.clone(),
             file_name: self.file_name.clone(),
             table_name: self.table_name.clone(),
-            first_block_num: self.first_block_num.clone(),
-            last_block_num: self.last_block_num.clone(),
-            current_block_num: self.current_block_num.clone(),
-            current_record_page: self.current_record_page.clone(),
-            current_slot: self.current_slot.clone(),
+            first_block_num: self.first_block_num,
+            last_block_num: self.last_block_num,
+            current_block_num: self.current_block_num,
+            current_record_page: self.current_record_page,
+            current_slot: self.current_slot,
             buffer_list: self.buffer_list.clone(),
         }
     }
@@ -7859,7 +7858,7 @@ impl Clone for TableScan {
             layout: self.layout.clone(),
             file_name: self.file_name.clone(),
             record_page: self.record_page.clone(),
-            current_slot: self.current_slot.clone(),
+            current_slot: self.current_slot,
             table_name: self.table_name.clone(),
         }
     }
