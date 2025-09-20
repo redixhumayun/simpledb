@@ -5,7 +5,6 @@
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::needless_lifetimes)]
-#![allow(clippy::unnecessary_map_or)]
 #![allow(clippy::iter_cloned_collect)]
 #![allow(clippy::while_let_on_iterator)]
 
@@ -9308,7 +9307,7 @@ impl LockTable {
             .get(block_id)
             .unwrap()
             .writer
-            .map_or(false, |id| id == tx_id)
+            == Some(tx_id)
         {
             return Ok(());
         }
