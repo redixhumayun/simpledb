@@ -174,7 +174,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "Running benchmarks with {} iterations per operation",
         iterations
     );
-    println!("Environment: {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "Environment: {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!();
 
     // Clean up any existing benchmark data

@@ -1,4 +1,4 @@
-use simpledb::{SimpleDB, Transaction, Constant};
+use simpledb::{Constant, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
