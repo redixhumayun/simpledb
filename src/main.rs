@@ -3,7 +3,6 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::if_same_then_else)]
-#![allow(clippy::unit_arg)]
 #![allow(clippy::unnecessary_lazy_evaluations)]
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
@@ -5753,9 +5752,9 @@ where
     }
 
     fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
-        Ok(self
-            .index
-            .before_first(&self.lhs.get_value(&self.join_field)?))
+        self.index
+            .before_first(&self.lhs.get_value(&self.join_field)?);
+        Ok(())
     }
 }
 
