@@ -1,8 +1,3 @@
-#![allow(clippy::redundant_pattern_matching)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::manual_unwrap_or)]
-#![allow(clippy::manual_unwrap_or_default)]
-#![allow(clippy::needless_borrow)]
 
 use std::{error::Error, sync::Arc};
 
@@ -98,16 +93,13 @@ impl Index for BTreeIndex {
     }
 
     fn next(&mut self) -> bool {
-        match self
+        self
             .leaf
             .as_mut()
             .expect("Leaf not initialized, did you forget to call before_first?")
             .next()
             .expect("Next failed")
-        {
-            Some(_) => true,
-            None => false,
-        }
+            .is_some()
     }
 
     fn get_data_rid(&self) -> RID {
@@ -412,10 +404,7 @@ impl BTreeInternal {
     /// It will search for the rightmost slot before the search key
     /// If the search key is found in the slot, it will return the next slot
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let mut slot = match self.contents.find_slot_before(&search_key)? {
-            Some(slot) => slot,
-            None => 0,
-        };
+        let mut slot = (self.contents.find_slot_before(&search_key)?).unwrap_or(0);
         if self.contents.get_data_value(slot + 1)? == *search_key {
             slot += 1;
         }
@@ -695,7 +684,7 @@ impl BTreeLeaf {
     /// Returns Ok(()) if the record was found and deleted, error otherwise
     /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        while let Some(_) = self.next()? {
+        while (self.next()?).is_some() {
             if self.contents.get_rid(self.current_slot.unwrap())? == rid {
                 self.contents.delete(self.current_slot.unwrap())?;
                 return Ok(());
