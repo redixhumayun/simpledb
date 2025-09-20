@@ -6631,18 +6631,18 @@ impl Predicate {
     /// 2. If [BooleanConnective::And] is encountered, keep parts of conjunct that apply
     /// 3. If [BooleanConnective::Or] is encountered, all parts of disjunct must apply
     /// 4. If [BooleanConnective::Not] is encountered, the sole term must apply
-    /// Technically, it is not required for the [BooleanConnective::Or] disjuncts to apply. Take, for instance,
-    /// P = (R.a = 1 ∧ S.b = 2) ∨ (R.c = 3), pushing to R
-    /// (R.a = 1 ∧ S.b = 2) filters to R.a = 1
-    /// (R.c = 3) stays R.c = 3
-    /// OR as (R.a = 1) ∨ (R.c = 3)
-    /// This would lead to a partial application of the disjuncts but would not be incorrect
-    /// However, the same is not true for NOT because
-    /// P = NOT(R.a = 1 ∧ S.b = 2), pushing to R.
-    /// Inner on R partially applies: (R.a = 1 ∧ S.b = 2) ⇒ R.a = 1
-    /// Consider a row r with a=1 and some s with b≠2
-    /// Pushed-down filter NOT(a=1) removes r before join, losing valid results.
-    /// TODO: An alternative is to rewrite the rules using De Morgan's Laws
+    ///    Technically, it is not required for the [BooleanConnective::Or] disjuncts to apply. Take, for instance,
+    ///    P = (R.a = 1 ∧ S.b = 2) ∨ (R.c = 3), pushing to R
+    ///    (R.a = 1 ∧ S.b = 2) filters to R.a = 1
+    ///    (R.c = 3) stays R.c = 3
+    ///    OR as (R.a = 1) ∨ (R.c = 3)
+    ///    This would lead to a partial application of the disjuncts but would not be incorrect
+    ///    However, the same is not true for NOT because
+    ///    P = NOT(R.a = 1 ∧ S.b = 2), pushing to R.
+    ///    Inner on R partially applies: (R.a = 1 ∧ S.b = 2) ⇒ R.a = 1
+    ///    Consider a row r with a=1 and some s with b≠2
+    ///    Pushed-down filter NOT(a=1) removes r before join, losing valid results.
+    ///    TODO: An alternative is to rewrite the rules using De Morgan's Laws
     fn filter_node<F>(&self, node: &PredicateNode, term_ok: &F) -> PredicateNode
     where
         F: Fn(&Term) -> bool,
