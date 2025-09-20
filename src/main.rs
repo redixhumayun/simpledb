@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-#![allow(clippy::redundant_pattern_matching)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::manual_unwrap_or)]
 #![allow(clippy::manual_unwrap_or_default)]
@@ -10309,7 +10308,7 @@ impl Buffer {
 
     /// Write the current buffer contents to disk if dirty
     fn flush(&mut self) {
-        if let Some(_) = &self.txn {
+        if self.txn.is_some() {
             self.log_manager
                 .lock()
                 .unwrap()
