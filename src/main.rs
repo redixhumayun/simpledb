@@ -2,7 +2,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::if_same_then_else)]
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::let_and_return)]
@@ -1496,9 +1495,7 @@ where
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
-        if self.scan_1.has_field(field_name)? {
-            return Ok(true);
-        } else if self.scan_2.has_field(field_name)? {
+        if self.scan_1.has_field(field_name)? || self.scan_2.has_field(field_name)? {
             return Ok(true);
         }
         Err(format!("Field {} not found", field_name).into())
@@ -2627,7 +2624,7 @@ impl Iterator for SortScan {
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => {
-                    self.s2.as_mut().map(|s| s.close());
+                    if let Some(s) = self.s2.as_mut() { s.close() };
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
                     return Some(Ok(()));
@@ -7439,7 +7436,7 @@ impl Index for HashIndex {
     }
 
     fn close(&mut self) {
-        self.table_scan.as_mut().map(|ts| ts.close());
+        if let Some(ts) = self.table_scan.as_mut() { ts.close() };
     }
 }
 
