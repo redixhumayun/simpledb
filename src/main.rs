@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-#![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
@@ -798,9 +797,7 @@ impl Iterator for ChunkScan {
                 let record_page = &self.buffer_list[*record_page_idx];
                 let next_slot = match self.current_slot {
                     None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page
-                        .iter_used_slots()
-                        .find(|s| *s > slot),
+                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
                 };
 
                 //  There are still slots to iterate in the current record page
@@ -2547,8 +2544,8 @@ impl SortScan {
     }
 
     fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
-        let rid_1 =
-            self.saved_rids[0].ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
+        let rid_1 = self.saved_rids[0]
+            .ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
         self.s1.move_to_row_id(rid_1);
         match (self.s2.as_mut(), self.saved_rids[1]) {
             (None, None) => (),
@@ -2622,7 +2619,9 @@ impl Iterator for SortScan {
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => {
-                    if let Some(s) = self.s2.as_mut() { s.close() };
+                    if let Some(s) = self.s2.as_mut() {
+                        s.close()
+                    };
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
                     return Some(Ok(()));
@@ -7434,7 +7433,9 @@ impl Index for HashIndex {
     }
 
     fn close(&mut self) {
-        if let Some(ts) = self.table_scan.as_mut() { ts.close() };
+        if let Some(ts) = self.table_scan.as_mut() {
+            ts.close()
+        };
     }
 }
 
@@ -7937,9 +7938,7 @@ impl Iterator for TableScan {
             if let Some(record_page) = &self.record_page {
                 let next_slot = match self.current_slot {
                     None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page
-                        .iter_used_slots()
-                        .find(|s| *s > slot),
+                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
                 };
 
                 if let Some(slot) = next_slot {
@@ -8356,10 +8355,7 @@ impl RecordPage {
 
     /// Returns the next [`SlotPresence::Used`] slot after the slot passed in
     fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        let next_slot = self
-            .iter_used_slots()
-            .find(|s| *s > slot)
-            .unwrap();
+        let next_slot = self.iter_used_slots().find(|s| *s > slot).unwrap();
         Ok(next_slot)
     }
 
@@ -8615,7 +8611,8 @@ impl Schema {
     fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
         let (field_type, field_length) = schema
             .info
-            .get(field_name).map(|info| (info.field_type, info.length))
+            .get(field_name)
+            .map(|info| (info.field_type, info.length))
             .ok_or_else(|| {
                 format!(
                     "Field {} not found in schema while looking for type",
@@ -9303,12 +9300,7 @@ impl LockTable {
             });
 
         //  Do an early return if this txn already has an xlock on the buffer
-        if lock_table_guard
-            .get(block_id)
-            .unwrap()
-            .writer
-            == Some(tx_id)
-        {
+        if lock_table_guard.get(block_id).unwrap().writer == Some(tx_id) {
             return Ok(());
         }
 
@@ -10156,7 +10148,8 @@ impl BufferList {
     fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
         self.buffers
             .borrow()
-            .get(block_id).map(|v| Arc::clone(&v.buffer))
+            .get(block_id)
+            .map(|v| Arc::clone(&v.buffer))
     }
 
     /// Pin the buffer associated with the provided [`BlockId`]

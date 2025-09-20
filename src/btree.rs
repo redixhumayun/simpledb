@@ -1,4 +1,3 @@
-
 use std::{error::Error, sync::Arc};
 
 use crate::{
@@ -93,8 +92,7 @@ impl Index for BTreeIndex {
     }
 
     fn next(&mut self) -> bool {
-        self
-            .leaf
+        self.leaf
             .as_mut()
             .expect("Leaf not initialized, did you forget to call before_first?")
             .next()
@@ -365,10 +363,8 @@ impl BTreeInternal {
         );
         let new_entry = child_internal_node.insert_entry(entry)?;
         match new_entry {
-            Some(entry) => {
-                return self.insert_internal_node_entry(entry);
-            }
-            None => return Ok(None),
+            Some(entry) => self.insert_internal_node_entry(entry),
+            None => Ok(None),
         }
     }
 
@@ -394,10 +390,10 @@ impl BTreeInternal {
         let split_point = self.contents.get_number_of_recs()? / 2;
         let split_record = self.contents.get_data_value(split_point)?;
         let new_block_id = self.contents.split(split_point, page_type)?;
-        return Ok(Some(InternalNodeEntry {
+        Ok(Some(InternalNodeEntry {
             dataval: split_record,
             block_num: new_block_id.block_num,
-        }));
+        }))
     }
 
     /// This method will find the child block for a given search key in a [BTreeInternal] node
