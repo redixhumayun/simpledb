@@ -3,7 +3,6 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::if_same_then_else)]
-#![allow(clippy::unnecessary_lazy_evaluations)]
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::let_and_return)]
@@ -4061,7 +4060,7 @@ impl HeuristicQueryPlanner {
         let (idx, plan) = candidates
             .into_iter()
             .min_by_key(|(_, p)| p.records_output())
-            .ok_or_else(|| "could not construct any join plans")?;
+            .ok_or("could not construct any join plans")?;
         self.table_planners.remove(idx);
         Ok(plan)
     }
@@ -8351,11 +8350,11 @@ impl RecordPage {
             None => self
                 .iter_empty_slots()
                 .next()
-                .ok_or_else(|| "no empty slots available in this record page")?,
+                .ok_or("no empty slots available in this record page")?,
             Some(current_slot) => self
                 .iter_empty_slots()
                 .find(|s| *s > current_slot)
-                .ok_or_else(|| "no empty slots available in this record page")?,
+                .ok_or("no empty slots available in this record page")?,
         };
         self.set_flag(new_slot, SlotPresence::Used);
         Ok(new_slot)
