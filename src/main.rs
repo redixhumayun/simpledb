@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
-#![allow(clippy::needless_borrow)]
 #![allow(clippy::redundant_pattern_matching)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::manual_unwrap_or)]
@@ -2020,8 +2019,8 @@ impl SortPlan {
     {
         destination.insert()?;
         for field in &self.schema.fields {
-            let value = source.get_value(&field)?;
-            destination.set_value(&field, value)?;
+            let value = source.get_value(field)?;
+            destination.set_value(field, value)?;
         }
         Ok(())
     }
@@ -3686,7 +3685,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let mut scan = plan.open();
         scan.insert()?;
         for (field, value) in data.fields.iter().zip(data.values) {
-            scan.set_value(&field, value)?;
+            scan.set_value(field, value)?;
         }
         Ok(1)
     }
@@ -3872,9 +3871,9 @@ impl TablePlanner {
             return Ok(None);
         }
         let plan = self
-            .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(&other_plan))?
+            .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(other_plan))?
             .map(Ok)
-            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(&other_plan)))?;
+            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(other_plan)))?;
         Ok(Some(plan))
     }
 
@@ -3901,7 +3900,7 @@ impl TablePlanner {
         let plan_schema = &self.schema;
         let other_plan_schema = &other_plan.schema();
         for field in self.indexes.keys() {
-            if let Some(lhs_field) = self.predicate.equates_with_field(&field) {
+            if let Some(lhs_field) = self.predicate.equates_with_field(field) {
                 if plan_schema.fields.contains(field)
                     && other_plan_schema.fields.contains(&lhs_field)
                 {
@@ -3932,7 +3931,7 @@ impl TablePlanner {
     /// TODO: Fix this to use the most selective index and to use more than one index
     fn make_index_select_plan(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         for field in self.indexes.keys() {
-            match self.predicate.equates_with_constant(&field) {
+            match self.predicate.equates_with_constant(field) {
                 Some(value) => {
                     return Arc::new(IndexSelectPlan::new(
                         plan,
@@ -6618,7 +6617,7 @@ impl Predicate {
     ) -> Predicate {
         let term_ok = |term: &Term| {
             !term.applies_to(schema_1)
-                && !term.applies_to(&schema_2)
+                && !term.applies_to(schema_2)
                 && term.applies_to(unioned_schema)
         };
         Predicate {
@@ -6818,19 +6817,19 @@ impl Term {
             let lhs_field = self.lhs.get_field_name().unwrap();
             let rhs_field = self.rhs.get_field_name().unwrap();
             return std::cmp::max(
-                plan.distinct_values(&lhs_field),
-                plan.distinct_values(&rhs_field),
+                plan.distinct_values(lhs_field),
+                plan.distinct_values(rhs_field),
             );
         }
 
         if self.lhs.is_field_name() {
             let lhs_field = self.lhs.get_field_name().unwrap();
-            return plan.distinct_values(&lhs_field);
+            return plan.distinct_values(lhs_field);
         }
 
         if self.rhs.is_field_name() {
             let rhs_field = self.rhs.get_field_name().unwrap();
-            return plan.distinct_values(&rhs_field);
+            return plan.distinct_values(rhs_field);
         }
 
         if self.lhs.get_constant_value().unwrap() == self.rhs.get_constant_value().unwrap() {
@@ -8425,7 +8424,7 @@ impl RecordPage {
                 .unwrap();
             let schema = &self.layout.schema;
             for field in &schema.fields {
-                let field_pos = self.offset(current_slot) + self.layout.offset(&field).unwrap();
+                let field_pos = self.offset(current_slot) + self.layout.offset(field).unwrap();
                 match schema.info.get(field).unwrap().field_type {
                     FieldType::INT => self
                         .tx
@@ -8670,19 +8669,19 @@ trait TransactionOperations {
 
 impl TransactionOperations for Transaction {
     fn pin(&self, block_id: &BlockId) {
-        Transaction::pin(&self, block_id);
+        Transaction::pin(self, block_id);
     }
 
     fn unpin(&self, block_id: &BlockId) {
-        Transaction::unpin(&self, block_id);
+        Transaction::unpin(self, block_id);
     }
 
     fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
-        Transaction::set_int(&self, block_id, offset, val, log).unwrap();
+        Transaction::set_int(self, block_id, offset, val, log).unwrap();
     }
 
     fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
-        Transaction::set_string(&self, block_id, offset, val, log).unwrap();
+        Transaction::set_string(self, block_id, offset, val, log).unwrap();
     }
 }
 
@@ -10452,7 +10451,7 @@ impl BufferManager {
             if buffer_guard.block_id.is_some()
                 && buffer_guard.block_id.as_ref().unwrap() == block_id
             {
-                return Some(Arc::clone(&buffer));
+                return Some(Arc::clone(buffer));
             }
         }
         None
@@ -10463,7 +10462,7 @@ impl BufferManager {
         for buffer in &self.buffer_pool {
             let buffer_guard = buffer.lock().unwrap();
             if !buffer_guard.is_pinned() {
-                return Some(Arc::clone(&buffer));
+                return Some(Arc::clone(buffer));
             }
         }
         None
