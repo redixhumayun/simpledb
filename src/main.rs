@@ -3,7 +3,6 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::if_same_then_else)]
-#![allow(clippy::bind_instead_of_map)]
 #![allow(clippy::unit_arg)]
 #![allow(clippy::unnecessary_lazy_evaluations)]
 #![allow(clippy::only_used_in_recursion)]
@@ -2630,7 +2629,7 @@ impl Iterator for SortScan {
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => {
-                    self.s2.as_mut().and_then(|s| Some(s.close()));
+                    self.s2.as_mut().map(|s| s.close());
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
                     return Some(Ok(()));
@@ -7442,7 +7441,7 @@ impl Index for HashIndex {
     }
 
     fn close(&mut self) {
-        self.table_scan.as_mut().and_then(|ts| Some(ts.close()));
+        self.table_scan.as_mut().map(|ts| ts.close());
     }
 }
 
@@ -8624,8 +8623,7 @@ impl Schema {
     fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
         let (field_type, field_length) = schema
             .info
-            .get(field_name)
-            .and_then(|info| Some((info.field_type, info.length)))
+            .get(field_name).map(|info| (info.field_type, info.length))
             .ok_or_else(|| {
                 format!(
                     "Field {} not found in schema while looking for type",
@@ -10166,8 +10164,7 @@ impl BufferList {
     fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
         self.buffers
             .borrow()
-            .get(block_id)
-            .and_then(|v| Some(Arc::clone(&v.buffer)))
+            .get(block_id).map(|v| Arc::clone(&v.buffer))
     }
 
     /// Pin the buffer associated with the provided [`BlockId`]
