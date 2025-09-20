@@ -1,4 +1,3 @@
-#![allow(clippy::needless_if)]
 #![allow(clippy::needless_return)]
 
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
@@ -720,7 +719,6 @@ impl QueryData {
         sql.push_str("FROM ");
         sql.push_str(&self.tables.join(", "));
 
-        if !self.predicate.is_empty() {}
         todo!()
     }
 }
