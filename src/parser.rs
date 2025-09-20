@@ -1,4 +1,3 @@
-#![allow(clippy::needless_return)]
 
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
