@@ -1,4 +1,3 @@
-
 use std::{error::Error, fmt::Display, iter::Peekable, str::Chars};
 
 use crate::{ComparisonOp, Constant, Expression, Predicate, Schema, Term};
