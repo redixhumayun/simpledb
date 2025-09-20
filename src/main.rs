@@ -2,7 +2,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::skip_while_next)]
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::bind_instead_of_map)]
 #![allow(clippy::unit_arg)]
@@ -807,8 +806,7 @@ impl Iterator for ChunkScan {
                     None => record_page.iter_used_slots().next(),
                     Some(slot) => record_page
                         .iter_used_slots()
-                        .skip_while(|s| *s <= slot)
-                        .next(),
+                        .find(|s| *s > slot),
                 };
 
                 //  There are still slots to iterate in the current record page
@@ -7950,8 +7948,7 @@ impl Iterator for TableScan {
                     None => record_page.iter_used_slots().next(),
                     Some(slot) => record_page
                         .iter_used_slots()
-                        .skip_while(|s| *s <= slot)
-                        .next(),
+                        .find(|s| *s > slot),
                 };
 
                 if let Some(slot) = next_slot {
@@ -8359,8 +8356,7 @@ impl RecordPage {
                 .ok_or_else(|| "no empty slots available in this record page")?,
             Some(current_slot) => self
                 .iter_empty_slots()
-                .skip_while(|s| *s <= current_slot)
-                .next()
+                .find(|s| *s > current_slot)
                 .ok_or_else(|| "no empty slots available in this record page")?,
         };
         self.set_flag(new_slot, SlotPresence::Used);
@@ -8371,8 +8367,7 @@ impl RecordPage {
     fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
         let next_slot = self
             .iter_used_slots()
-            .skip_while(|s| *s <= slot)
-            .next()
+            .find(|s| *s > slot)
             .unwrap();
         Ok(next_slot)
     }
