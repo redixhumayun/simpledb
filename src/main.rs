@@ -4,7 +4,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::only_used_in_recursion)]
 #![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::let_and_return)]
 #![allow(clippy::needless_lifetimes)]
 #![allow(clippy::unnecessary_map_or)]
 #![allow(clippy::iter_cloned_collect)]
@@ -7581,8 +7580,7 @@ impl ViewManager {
             schema.add_string_field(Self::VIEW_DEF_COL, Self::VIEW_DEF_MAX_LENGTH);
             table_manager.create_table(Self::VIEW_MANAGER_TABLE_NAME, &schema, txn);
         }
-        let view_manager = ViewManager { table_manager };
-        view_manager
+        ViewManager { table_manager }
     }
 
     /// Creates a new view in the view catalog
