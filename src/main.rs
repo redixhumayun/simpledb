@@ -9776,7 +9776,7 @@ mod recovery_manager_tests {
             Arc::clone(&db.buffer_manager),
         );
 
-        let mut mock_tx = MockTransaction::new();
+        let mock_tx = MockTransaction::new();
         let test_block = BlockId::new("test.txt".to_string(), 1);
 
         // Write some log records that will need to be rolled back
@@ -9791,7 +9791,7 @@ mod recovery_manager_tests {
             .unwrap();
 
         // Perform rollback
-        recovery_manager.rollback(&mut mock_tx).unwrap();
+        recovery_manager.rollback(&mock_tx).unwrap();
 
         // Verify that the value was reset to the original value
         assert!(mock_tx.verify_int_was_reset(&test_block, 0, 100));
@@ -9811,7 +9811,7 @@ mod recovery_manager_tests {
             Arc::clone(&db.buffer_manager),
         );
 
-        let mut mock_tx = MockTransaction::new();
+        let mock_tx = MockTransaction::new();
         let test_block = BlockId::new("test.txt".to_string(), 1);
 
         //  Write some log records that will need to be rolled back
@@ -9826,7 +9826,7 @@ mod recovery_manager_tests {
             .unwrap();
 
         //   Perform rollback
-        recovery_manager.rollback(&mut mock_tx).unwrap();
+        recovery_manager.rollback(&mock_tx).unwrap();
 
         //  Verify that the value was reset to the original value
         assert!(mock_tx.verify_string_was_reset(&test_block, 0, "Hello World".to_string()));
