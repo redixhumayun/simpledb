@@ -1,9 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(clippy::needless_return)]
-#![allow(clippy::assign_op_pattern)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::never_loop)]
 #![allow(clippy::clone_on_copy)]
 #![allow(clippy::len_zero)]
 #![allow(clippy::skip_while_next)]
@@ -462,8 +460,9 @@ where
                         }
                     }
                 }
+            } else {
+                return None;
             }
-            return None;
         }
     }
 }
