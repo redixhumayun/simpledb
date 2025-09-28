@@ -1298,9 +1298,7 @@ impl BTreePage {
             }
             _ => Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Type mismatch: expected {expected_type:?} but got {value:?}"
-                ),
+                format!("Type mismatch: expected {expected_type:?} but got {value:?}"),
             ))),
         }
     }

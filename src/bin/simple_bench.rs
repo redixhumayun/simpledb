@@ -169,9 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("SimpleDB Stdlib-Only Benchmark Suite");
     println!("====================================");
-    println!(
-        "Running benchmarks with {iterations} iterations per operation"
-    );
+    println!("Running benchmarks with {iterations} iterations per operation");
     println!(
         "Environment: {} ({})",
         std::env::consts::OS,
