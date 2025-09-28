@@ -21,7 +21,7 @@ impl BTreeIndex {
         leaf_layout: Layout,
     ) -> Result<Self, Box<dyn Error>> {
         //  Create the leaf file with the schema provided if it does not exist
-        let leaf_table_name = format!("{}leaf", index_name);
+        let leaf_table_name = format!("{index_name}leaf");
         if txn.size(&leaf_table_name) == 0 {
             let block_id = txn.append(&leaf_table_name);
             let btree_page = BTreePage::new(Arc::clone(&txn), block_id, leaf_layout.clone());
@@ -29,7 +29,7 @@ impl BTreeIndex {
         }
 
         //  Create the internal file with the schema required if it does not exist
-        let internal_table_name = format!("{}internal", index_name);
+        let internal_table_name = format!("{index_name}internal");
         let mut internal_schema = Schema::new();
         internal_schema.add_from_schema(IndexInfo::BLOCK_NUM_FIELD, &leaf_layout.schema)?;
         internal_schema.add_from_schema(IndexInfo::DATA_FIELD, &leaf_layout.schema)?;
@@ -1261,7 +1261,7 @@ impl BTreePage {
             .schema
             .info
             .get(field_name)
-            .ok_or_else(|| format!("Field {} not found in schema", field_name))?
+            .ok_or_else(|| format!("Field {field_name} not found in schema"))?
             .field_type;
         match field_type {
             FieldType::Int => {
@@ -1287,7 +1287,7 @@ impl BTreePage {
             .schema
             .info
             .get(field_name)
-            .ok_or_else(|| format!("Field {} not found in schema", field_name))?
+            .ok_or_else(|| format!("Field {field_name} not found in schema"))?
             .field_type;
 
         // Check if value type matches schema
@@ -1298,10 +1298,7 @@ impl BTreePage {
             }
             _ => Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Type mismatch: expected {:?} but got {:?}",
-                    expected_type, value
-                ),
+                format!("Type mismatch: expected {expected_type:?} but got {value:?}"),
             ))),
         }
     }
@@ -1333,13 +1330,13 @@ impl std::fmt::Display for BTreePage {
         writeln!(f, "\n=== BTreePage Debug ===")?;
         writeln!(f, "Block: {:?}", self.block_id)?;
         match self.get_flag() {
-            Ok(flag) => writeln!(f, "Page Type: {:?}", flag)?,
-            Err(e) => writeln!(f, "Error getting flag: {}", e)?,
+            Ok(flag) => writeln!(f, "Page Type: {flag:?}")?,
+            Err(e) => writeln!(f, "Error getting flag: {e}")?,
         }
 
         match self.get_number_of_recs() {
             Ok(count) => {
-                writeln!(f, "Record Count: {}", count)?;
+                writeln!(f, "Record Count: {count}")?;
                 writeln!(f, "Entries:")?;
                 match self.get_flag() {
                     Ok(PageType::Internal(_)) => {
@@ -1347,7 +1344,7 @@ impl std::fmt::Display for BTreePage {
                             if let (Ok(key), Ok(child)) =
                                 (self.get_data_value(slot), self.get_child_block_num(slot))
                             {
-                                writeln!(f, "Slot {}: Key={:?}, Child Block={}", slot, key, child)?;
+                                writeln!(f, "Slot {slot}: Key={key:?}, Child Block={child}")?;
                             }
                         }
                     }
@@ -1364,10 +1361,10 @@ impl std::fmt::Display for BTreePage {
                             }
                         }
                     }
-                    Err(e) => writeln!(f, "Error getting page type: {}", e)?,
+                    Err(e) => writeln!(f, "Error getting page type: {e}")?,
                 }
             }
-            Err(e) => writeln!(f, "Error getting record count: {}", e)?,
+            Err(e) => writeln!(f, "Error getting record count: {e}")?,
         }
         writeln!(f, "====================")
     }

@@ -68,7 +68,7 @@ fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         txn.commit().unwrap();
     });
-    println!("{}", result);
+    println!("{result}");
 }
 
 fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
@@ -82,7 +82,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         txn.commit().unwrap();
     });
-    println!("{}", result);
+    println!("{result}");
 
     let result = benchmark("SELECT COUNT(*)", iterations, || {
         let txn = Arc::new(db.new_tx());
@@ -98,7 +98,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
         } // scan is dropped here, before transaction commit
         txn.commit().unwrap();
     });
-    println!("{}", result);
+    println!("{result}");
 }
 
 fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
@@ -119,7 +119,7 @@ fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         txn.commit().unwrap();
     });
-    println!("{}", result);
+    println!("{result}");
 }
 
 fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
@@ -141,7 +141,7 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
             .unwrap();
         txn.commit().unwrap();
     });
-    println!("{}", result);
+    println!("{result}");
 }
 
 fn parse_iterations() -> usize {
@@ -169,10 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("SimpleDB Stdlib-Only Benchmark Suite");
     println!("====================================");
-    println!(
-        "Running benchmarks with {} iterations per operation",
-        iterations
-    );
+    println!("Running benchmarks with {iterations} iterations per operation");
     println!(
         "Environment: {} ({})",
         std::env::consts::OS,

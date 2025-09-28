@@ -40,8 +40,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Execute SQL command
         match execute_sql(&db, input) {
-            Ok(result) => println!("{}", result),
-            Err(e) => println!("Error: {}", e),
+            Ok(result) => println!("{result}"),
+            Err(e) => println!("Error: {e}"),
         }
     }
 
@@ -139,7 +139,7 @@ fn execute_query(
     if row_count == 0 {
         result.push_str("No results found.\n");
     } else {
-        result.push_str(&format!("\n{} row(s) returned.\n", row_count));
+        result.push_str(&format!("\n{row_count} row(s) returned.\n"));
     }
 
     Ok(result)
@@ -151,7 +151,7 @@ fn execute_update(
     txn: Arc<Transaction>,
 ) -> Result<String, Box<dyn Error>> {
     let affected_rows = db.planner.execute_update(sql.to_string(), txn)?;
-    Ok(format!("{} row(s) affected.", affected_rows))
+    Ok(format!("{affected_rows} row(s) affected."))
 }
 
 fn format_value(value: &Constant) -> String {
