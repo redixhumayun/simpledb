@@ -35,10 +35,13 @@ mod parser;
 type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
+//  Shared filesystem trait object used across the database components
+type SharedFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+
 /// The database struct
 pub struct SimpleDB {
     db_directory: PathBuf,
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     metadata_manager: Arc<MetadataManager>,
@@ -55,9 +58,9 @@ impl SimpleDB {
         num_buffers: usize,
         clean: bool,
     ) -> Self {
-        let file_manager = Arc::new(Mutex::new(
+        let file_manager: SharedFS = Arc::new(Mutex::new(Box::new(
             FileManager::new(&path, block_size, clean).unwrap(),
-        ));
+        )));
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             Self::LOG_FILE,
@@ -7358,7 +7361,7 @@ impl HashIndex {
     }
 
     fn search_cost(num_blocks: usize) -> usize {
-        num_blocks / HashIndex::NUM_BUCKETS
+        num_blocks / Self::NUM_BUCKETS
     }
 }
 
@@ -8666,7 +8669,7 @@ static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Transaction {
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     recovery_manager: RecoveryManager,
@@ -8679,7 +8682,7 @@ impl Transaction {
     const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
 
     fn new(
-        file_manager: Arc<Mutex<FileManager>>,
+        file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
         buffer_manager: Arc<Mutex<BufferManager>>,
         lock_table: Arc<LockTable>,
@@ -8725,11 +8728,8 @@ impl Transaction {
     /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
     /// It will also handle meta operations like unpinning buffers
     fn rollback(&self) -> Result<(), Box<dyn Error>> {
-        //  Rollback all data associated with this txn
         self.recovery_manager.rollback(self).unwrap();
-        //  Release all locks associated with this txn
         self.concurrency_manager.release()?;
-        //  unpin all buffers and release metadata
         self.buffer_list.unpin_all();
         Ok(())
     }
@@ -8843,7 +8843,7 @@ impl Transaction {
 
     /// Get the block size
     fn block_size(&self) -> usize {
-        self.file_manager.lock().unwrap().blocksize
+        self.file_manager.lock().unwrap().block_size()
     }
 }
 
@@ -10192,7 +10192,9 @@ mod buffer_list_tests {
     #[test]
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
-        let file_manager = Arc::new(Mutex::new(FileManager::new(&dir, 400, true).unwrap()));
+        let file_manager: super::SharedFS = Arc::new(Mutex::new(Box::new(
+            FileManager::new(&dir, 400, true).unwrap(),
+        )));
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -10219,7 +10221,7 @@ mod buffer_list_tests {
 
 #[derive(Debug)]
 struct Buffer {
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
     block_id: Option<BlockId>,
@@ -10229,8 +10231,8 @@ struct Buffer {
 }
 
 impl Buffer {
-    fn new(file_manager: Arc<Mutex<FileManager>>, log_manager: Arc<Mutex<LogManager>>) -> Self {
-        let size = file_manager.lock().unwrap().blocksize;
+    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
+        let size = file_manager.lock().unwrap().block_size();
         Self {
             file_manager,
             log_manager,
@@ -10298,7 +10300,7 @@ impl Buffer {
 
 #[derive(Debug)]
 struct BufferManager {
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_pool: Vec<Arc<Mutex<Buffer>>>,
     num_available: Mutex<usize>,
@@ -10308,7 +10310,7 @@ struct BufferManager {
 impl BufferManager {
     const MAX_TIME: u64 = 10; //  10 seconds
     fn new(
-        file_manager: Arc<Mutex<FileManager>>,
+        file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
         num_buffers: usize,
     ) -> Self {
@@ -10429,13 +10431,13 @@ impl BufferManager {
 
 #[cfg(test)]
 mod buffer_manager_tests {
-    use crate::{BlockId, FileSystemInterface, Page, SimpleDB};
+    use crate::{BlockId, Page, SimpleDB};
 
     /// This test will assert that when the buffer pool swaps out a page from the buffer pool, it properly flushes those contents to disk
     /// and can then correctly read them back later
     #[test]
     fn test_buffer_replacement() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3); // use 3 buffer slots
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
         let buffer_manager = db.buffer_manager;
 
         //  Initialize the file with enough data
@@ -10478,7 +10480,7 @@ mod buffer_manager_tests {
 
 #[derive(Debug)]
 struct LogManager {
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     log_file: String,
     log_page: Page,
     current_block: BlockId,
@@ -10487,8 +10489,8 @@ struct LogManager {
 }
 
 impl LogManager {
-    fn new(file_manager: Arc<Mutex<FileManager>>, log_file: &str) -> Self {
-        let bytes = vec![0; file_manager.lock().unwrap().blocksize];
+    fn new(file_manager: SharedFS, log_file: &str) -> Self {
+        let bytes = vec![0; file_manager.lock().unwrap().block_size()];
         let mut log_page = Page::from_bytes(bytes);
         let log_size = file_manager.lock().unwrap().length(log_file.to_string());
         let current_block = if log_size == 0 {
@@ -10557,15 +10559,16 @@ impl LogManager {
 
     /// Append a new block to the file maintained by the log manager
     /// This involves initializing a new block, writing a boundary pointer to it and writing the block to disk
-    fn append_new_block(
-        file_manager: &Arc<Mutex<FileManager>>,
-        log_file: &str,
-        log_page: &mut Page,
-    ) -> BlockId {
+    fn append_new_block(file_manager: &SharedFS, log_file: &str, log_page: &mut Page) -> BlockId {
         let block_id = file_manager.lock().unwrap().append(log_file.to_string());
         log_page.set_int(
             0,
-            file_manager.lock().unwrap().blocksize.try_into().unwrap(),
+            file_manager
+                .lock()
+                .unwrap()
+                .block_size()
+                .try_into()
+                .unwrap(),
         );
         file_manager.lock().unwrap().write(&block_id, log_page);
         block_id
@@ -10581,7 +10584,7 @@ impl LogManager {
 }
 
 struct LogIterator {
-    file_manager: Arc<Mutex<FileManager>>,
+    file_manager: SharedFS,
     current_block: BlockId,
     page: Page,
     current_pos: usize,
@@ -10589,8 +10592,8 @@ struct LogIterator {
 }
 
 impl LogIterator {
-    fn new(file_manager: Arc<Mutex<FileManager>>, current_block: BlockId) -> Self {
-        let block_size = file_manager.lock().unwrap().blocksize;
+    fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
+        let block_size = file_manager.lock().unwrap().block_size();
         let mut page = Page::new(block_size);
         file_manager.lock().unwrap().read(&current_block, &mut page);
         let boundary = page.get_int(0) as usize;
@@ -10618,7 +10621,7 @@ impl Iterator for LogIterator {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos >= self.file_manager.lock().unwrap().blocksize {
+        if self.current_pos >= self.file_manager.lock().unwrap().block_size() {
             if self.current_block.block_num == 0 {
                 return None; //  no more blocks
             }
@@ -10715,13 +10718,13 @@ mod log_manager_tests {
 
 /// The block id container that contains a specific block number for a specific file
 #[derive(Debug, Eq, PartialEq, Clone, Hash)]
-struct BlockId {
+pub struct BlockId {
     filename: String,
     block_num: usize,
 }
 
 impl BlockId {
-    fn new(filename: String, block_num: usize) -> Self {
+    pub fn new(filename: String, block_num: usize) -> Self {
         Self {
             filename,
             block_num,
@@ -10822,7 +10825,8 @@ mod page_tests {
 }
 
 /// Trait defining the file system interface for database operations
-trait FileSystemInterface {
+pub trait FileSystemInterface: std::fmt::Debug {
+    fn block_size(&self) -> usize;
     fn length(&mut self, filename: String) -> usize;
     fn read(&mut self, block_id: &BlockId, page: &mut Page);
     fn write(&mut self, block_id: &BlockId, page: &mut Page);
@@ -10888,6 +10892,10 @@ impl FileManager {
 }
 
 impl FileSystemInterface for FileManager {
+    fn block_size(&self) -> usize {
+        self.blocksize
+    }
+
     fn length(&mut self, filename: String) -> usize {
         let file = self.get_file(&filename);
         let metadata = file.metadata().unwrap();
@@ -10918,6 +10926,7 @@ impl FileSystemInterface for FileManager {
         file.write_all(&page.contents).unwrap();
     }
 
+    /// Append a new empty block to the file
     fn append(&mut self, filename: String) -> BlockId {
         let new_blk_num = self.length(filename.clone());
         let block_id = BlockId::new(filename.clone(), new_blk_num);
@@ -10929,11 +10938,13 @@ impl FileSystemInterface for FileManager {
         block_id
     }
 
+    /// Sync the file with the disk to ensure durability
     fn sync(&mut self, filename: &str) {
         let file = self.get_file(filename);
         file.sync_all().unwrap();
     }
 
+    /// Sync the directory with the disk to ensure durability
     fn sync_directory(&mut self) {
         self.directory_fd.sync_all().unwrap();
     }
@@ -11025,6 +11036,10 @@ mod mock_file_manager {
     }
 
     impl FileSystemInterface for MockFileManager {
+        fn block_size(&self) -> usize {
+            self.blocksize
+        }
+
         fn length(&mut self, filename: String) -> usize {
             self.files
                 .get(&filename)
