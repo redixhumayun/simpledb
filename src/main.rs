@@ -8678,11 +8678,8 @@ impl Transaction {
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     pub fn commit(&self) -> Result<(), Box<dyn Error>> {
-        //  Commit all data associated with this txn
         self.recovery_manager.commit();
-        //  Release all locks associated with this txn
         self.concurrency_manager.release()?;
-        //  unpin all buffers and release metadata
         self.buffer_list.unpin_all();
         Ok(())
     }
