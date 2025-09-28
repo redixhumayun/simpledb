@@ -115,7 +115,7 @@ impl SimpleDB {
             .unwrap()
             .as_millis();
         let thread_id = std::thread::current().id();
-        let test_dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
+        let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
     }
@@ -236,7 +236,7 @@ mod multi_buffer_product_plan_tests {
         for i in 0..n {
             db.planner
                 .execute_update(
-                    format!("insert into emp(emp_id, name) values ({}, 'emp{}')", i, i),
+                    format!("insert into emp(emp_id, name) values ({i}, 'emp{i}')"),
                     Arc::clone(&txn),
                 )
                 .unwrap();
@@ -248,8 +248,7 @@ mod multi_buffer_product_plan_tests {
             db.planner
                 .execute_update(
                     format!(
-                        "insert into dept(dept_id, dept_name) values ({}, 'dept{}')",
-                        i, i
+                        "insert into dept(dept_id, dept_name) values ({i}, 'dept{i}')"
                     ),
                     Arc::clone(&txn),
                 )
@@ -370,7 +369,7 @@ where
 {
     fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
         debug!("Creating multi buffer product scan for {}.tbl", table_name);
-        let file_name = format!("{}.tbl", table_name);
+        let file_name = format!("{table_name}.tbl");
         let available_buffers = txn.available_buffs();
         let rhs_file_size = txn.size(&file_name);
         let chunk_size = best_factor(available_buffers, rhs_file_size);
@@ -552,14 +551,14 @@ mod multi_buffer_product_scan_tests {
         for i in 0..emp_size {
             emp_scan.insert()?;
             emp_scan.set_int("emp_id", i as i32)?;
-            emp_scan.set_string("name", format!("emp{}", i))?;
+            emp_scan.set_string("name", format!("emp{i}"))?;
         }
 
         // Insert department records
         for i in 0..dept_size {
             dept_scan.insert()?;
             dept_scan.set_int("dept_id", i as i32)?;
-            dept_scan.set_string("dept_name", format!("dept{}", i))?;
+            dept_scan.set_string("dept_name", format!("dept{i}"))?;
         }
 
         Ok(())
@@ -736,15 +735,13 @@ impl ChunkScan {
     ) -> Self {
         assert!(
             first_block_num <= last_block_num,
-            "{} is not less than or equal to {}",
-            first_block_num,
-            last_block_num
+            "{first_block_num} is not less than or equal to {last_block_num}"
         );
         debug!(
             "Creating chunk scan for {}.tbl for blocks from {} to {}",
             table_name, first_block_num, last_block_num
         );
-        let file_name = format!("{}.tbl", table_name);
+        let file_name = format!("{table_name}.tbl");
         let mut buffer_list = Vec::new();
         for block_num in first_block_num..=last_block_num {
             let block_id = BlockId::new(file_name.to_string(), block_num);
@@ -929,7 +926,7 @@ mod chunk_scan_tests {
         for i in 0..count {
             table_scan.insert()?;
             table_scan.set_int("id", i as i32)?;
-            table_scan.set_string("name", format!("name{}", i))?;
+            table_scan.set_string("name", format!("name{i}"))?;
         }
         Ok(())
     }
@@ -963,7 +960,7 @@ mod chunk_scan_tests {
             let name = chunk_scan.get_string("name")?;
 
             assert!(id > last_id, "Records should be read in order");
-            assert_eq!(name, format!("name{}", id));
+            assert_eq!(name, format!("name{id}"));
 
             last_id = id;
             count += 1;
@@ -1002,7 +999,7 @@ mod chunk_scan_tests {
             let name = chunk_scan.get_string("name")?;
 
             assert!(id > last_id, "Records should be read in order");
-            assert_eq!(name, format!("name{}", id));
+            assert_eq!(name, format!("name{id}"));
 
             last_id = id;
             count += 1;
@@ -1223,12 +1220,12 @@ impl Plan for MergeJoinPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let indent_str = " ".repeat(indent);
-        println!("{}MergeJoinPlan", indent_str);
+        println!("{indent_str}MergeJoinPlan");
         println!("{}  Field 1: {}", indent_str, self.field_name_1);
         println!("{}  Field 2: {}", indent_str, self.field_name_2);
-        println!("{}  Plan 1:", indent_str);
+        println!("{indent_str}  Plan 1:");
         self.plan_1.print_plan_internal(indent + 2);
-        println!("{}  Plan 2:", indent_str);
+        println!("{indent_str}  Plan 2:");
         self.plan_2.print_plan_internal(indent + 2);
     }
 }
@@ -1258,16 +1255,14 @@ mod merge_join_plan_tests {
 
         for (id, name) in &employees {
             let sql = format!(
-                "insert into employees(id, name) values ({}, '{}')",
-                id, name
+                "insert into employees(id, name) values ({id}, '{name}')"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
         for (id, dept) in &departments {
             let sql = format!(
-                "insert into departments(depid, deptname) values ({}, '{}')",
-                id, dept
+                "insert into departments(depid, deptname) values ({id}, '{dept}')"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -1382,8 +1377,7 @@ where
                     (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
                     (Some(Err(e1)), Some(Err(e2))) => {
                         return Some(Err(format!(
-                            "Error in both scans - First error: {}, Second error: {}",
-                            e1, e2
+                            "Error in both scans - First error: {e1}, Second error: {e2}"
                         )
                         .into()))
                     }
@@ -1467,7 +1461,7 @@ where
         } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_int(field_name);
         }
-        Err(format!("Field {} not found", field_name).into())
+        Err(format!("Field {field_name} not found").into())
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
@@ -1476,7 +1470,7 @@ where
         } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_string(field_name);
         }
-        Err(format!("Field {} not found", field_name).into())
+        Err(format!("Field {field_name} not found").into())
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -1485,14 +1479,14 @@ where
         } else if self.scan_2.has_field(field_name)? {
             return self.scan_2.get_value(field_name);
         }
-        Err(format!("Field {} not found", field_name).into())
+        Err(format!("Field {field_name} not found").into())
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         if self.scan_1.has_field(field_name)? || self.scan_2.has_field(field_name)? {
             return Ok(true);
         }
-        Err(format!("Field {} not found", field_name).into())
+        Err(format!("Field {field_name} not found").into())
     }
 
     fn close(&mut self) {
@@ -1571,7 +1565,7 @@ mod merge_join_scan_tests {
             for i in [1, 2, 3, 5, 7] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -1581,7 +1575,7 @@ mod merge_join_scan_tests {
             for i in [2, 3, 5, 7, 9] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{}", i)).unwrap();
+                scan.set_string("dept", format!("dept{i}")).unwrap();
             }
         }
 
@@ -1606,8 +1600,8 @@ mod merge_join_scan_tests {
             let name = merge_join_scan.get_string("name").unwrap();
             let dept = merge_join_scan.get_string("dept").unwrap();
 
-            assert_eq!(format!("name{}", id1), name);
-            assert_eq!(format!("dept{}", id1), dept);
+            assert_eq!(format!("name{id1}"), name);
+            assert_eq!(format!("dept{id1}"), dept);
 
             matched_ids.push(id1);
             join_count += 1;
@@ -1644,7 +1638,7 @@ mod merge_join_scan_tests {
             for i in [1, 3, 5, 7, 9] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -1653,7 +1647,7 @@ mod merge_join_scan_tests {
             for i in [2, 4, 6, 8, 10] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{}", i)).unwrap();
+                scan.set_string("dept", format!("dept{i}")).unwrap();
             }
         }
 
@@ -1705,7 +1699,7 @@ mod merge_join_scan_tests {
             for i in [1, 3, 5, 5, 7] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -1715,7 +1709,7 @@ mod merge_join_scan_tests {
             for i in [2, 5, 5, 5, 8] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{}", i)).unwrap();
+                scan.set_string("dept", format!("dept{i}")).unwrap();
             }
         }
 
@@ -1853,7 +1847,7 @@ mod merge_join_scan_tests {
             for i in [1, 3, 5, 7] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -1862,7 +1856,7 @@ mod merge_join_scan_tests {
             for i in [5, 8, 10] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{}", i)).unwrap();
+                scan.set_string("dept", format!("dept{i}")).unwrap();
             }
         }
 
@@ -2239,7 +2233,7 @@ impl Plan for SortPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ SortPlan", prefix);
+        println!("{prefix}╭─ SortPlan");
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!(
@@ -2247,9 +2241,9 @@ impl Plan for SortPlan {
             prefix,
             self.source_plan.schema().fields
         );
-        println!("{}├─ Source Plan:", prefix);
+        println!("{prefix}├─ Source Plan:");
         self.source_plan.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -2272,7 +2266,7 @@ mod sort_plan_tests {
         let test_data = vec![(5, 50), (3, 30), (1, 10), (4, 40), (2, 20)];
 
         for (id, value) in &test_data {
-            let sql = format!("insert into numbers(id, value) values ({}, {})", id, value);
+            let sql = format!("insert into numbers(id, value) values ({id}, {value})");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -2329,8 +2323,7 @@ mod sort_plan_tests {
 
         for (grade, name) in &test_data {
             let sql = format!(
-                "insert into students_sort(grade, name) values ({}, '{}')",
-                grade, name
+                "insert into students_sort(grade, name) values ({grade}, '{name}')"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -2398,8 +2391,7 @@ mod sort_plan_tests {
 
         for (dept, salary, name) in &test_data {
             let sql = format!(
-                "insert into employees(dept, salary, name) values ({}, {}, '{}')",
-                dept, salary, name
+                "insert into employees(dept, salary, name) values ({dept}, {salary}, '{name}')"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -2529,7 +2521,7 @@ impl SortScan {
             },
             Err(e) => {
                 self.current_scan = SortScanState::Done;
-                Err(format!("Error in SortScan while comparing records: {}", e).into())
+                Err(format!("Error in SortScan while comparing records: {e}").into())
             }
         }
     }
@@ -2757,7 +2749,7 @@ mod sort_scan_tests {
             for i in [1, 3, 5] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -2767,7 +2759,7 @@ mod sort_scan_tests {
             for i in [2, 4, 6] {
                 scan.insert().unwrap();
                 scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{}", i)).unwrap();
+                scan.set_string("name", format!("name{i}")).unwrap();
             }
         }
 
@@ -2788,9 +2780,7 @@ mod sort_scan_tests {
             if let Some(prev) = prev_id {
                 assert!(
                     curr_id > prev,
-                    "Records should be in ascending order which is not upheld for {} and {}",
-                    curr_id,
-                    prev
+                    "Records should be in ascending order which is not upheld for {curr_id} and {prev}"
                 );
             }
 
@@ -2952,7 +2942,7 @@ impl Plan for MaterializePlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ MaterializePlan", prefix);
+        println!("{prefix}╭─ MaterializePlan");
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!(
@@ -2960,9 +2950,9 @@ impl Plan for MaterializePlan {
             prefix,
             self.source_plan.schema().fields
         );
-        println!("{}├─ Source Plan:", prefix);
+        println!("{prefix}├─ Source Plan:");
         self.source_plan.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -2992,8 +2982,7 @@ mod materialize_plan_tests {
 
         for (a_val, b_val) in test_data.iter() {
             let sql = format!(
-                "insert into source_table(A, B) values ({}, '{}')",
-                a_val, b_val
+                "insert into source_table(A, B) values ({a_val}, '{b_val}')"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -3100,7 +3089,7 @@ struct TempTable {
 impl TempTable {
     fn new(txn: Arc<Transaction>, schema: Schema) -> Self {
         let table_id = TEMP_TABLE_ID_GENERATOR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let table_name = format!("TempTable{}", table_id);
+        let table_name = format!("TempTable{table_id}");
         let layout = Layout::new(schema);
         Self {
             txn,
@@ -3185,8 +3174,8 @@ mod planner_tests {
         let count = 200;
         dbg!("inserting records", count);
         for i in 0..count {
-            let sql = format!("insert into T1(A, B) values ({}, 'string{}')", i, i);
-            println!("the sql {:?}", sql);
+            let sql = format!("insert into T1(A, B) values ({i}, 'string{i}')");
+            println!("the sql {sql:?}");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3216,7 +3205,7 @@ mod planner_tests {
         let count = 200;
         dbg!("Inserting records in T1", count);
         for i in 0..count {
-            let sql = format!("insert into T1(A, B) values ({}, 'string{}')", i, i);
+            let sql = format!("insert into T1(A, B) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3227,7 +3216,7 @@ mod planner_tests {
         //  Insert records into T2
         dbg!("Inserting records in T2", count);
         for i in (0..count).rev() {
-            let sql = format!("insert into T2(C, D) values ({}, 'string{}')", i, i);
+            let sql = format!("insert into T2(C, D) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3262,7 +3251,7 @@ mod planner_tests {
         let count = 200;
         dbg!("Inserting {} records into t1", count);
         for i in 0..count {
-            let sql = format!("insert into t1(A, B) values ({}, 'string{}')", i, i);
+            let sql = format!("insert into t1(A, B) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3310,7 +3299,7 @@ mod planner_tests {
         let count = 200;
         dbg!("Inserting {} records into t1", count);
         for i in 0..count {
-            let sql = format!("insert into t1(A, B) values ({}, 'string{}')", i, i);
+            let sql = format!("insert into t1(A, B) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
 
@@ -3356,8 +3345,7 @@ mod planner_tests {
 
         for (sid, sname, majorid, gradyear) in students {
             let sql = format!(
-                "insert into student(sid, sname, majorid, gradyear) values ({}, '{}', {}, {})",
-                sid, sname, majorid, gradyear
+                "insert into student(sid, sname, majorid, gradyear) values ({sid}, '{sname}', {majorid}, {gradyear})"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -3436,8 +3424,7 @@ mod planner_tests {
 
         for (sid, sname, majorid, gradyear) in students {
             let sql = format!(
-                "insert into student_alt(sid, sname, majorid, gradyear) values ({}, '{}', {}, {})",
-                sid, sname, majorid, gradyear
+                "insert into student_alt(sid, sname, majorid, gradyear) values ({sid}, '{sname}', {majorid}, {gradyear})"
             );
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -4578,12 +4565,10 @@ mod heuristic_efficiency_tests {
         h_plan.print_plan(0);
 
         assert_eq!(b_rows, h_rows);
-        println!("h_blocks: {}, b_blocks: {}", h_blocks, b_blocks);
+        println!("h_blocks: {h_blocks}, b_blocks: {b_blocks}");
         assert!(
             h_blocks <= b_blocks,
-            "heuristic blocks {} > basic blocks {}",
-            h_blocks,
-            b_blocks
+            "heuristic blocks {h_blocks} > basic blocks {b_blocks}"
         );
     }
 }
@@ -4655,15 +4640,15 @@ impl Plan for ProductPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ ProductPlan", prefix);
+        println!("{prefix}╭─ ProductPlan");
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{}├─ Schema: {:?}", prefix, self.schema.fields);
-        println!("{}├─ Left Plan:", prefix);
+        println!("{prefix}├─ Left Plan:");
         self.plan_1.print_plan(indent + 1);
-        println!("{}├─ Right Plan:", prefix);
+        println!("{prefix}├─ Right Plan:");
         self.plan_2.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -4714,13 +4699,13 @@ impl Plan for ProjectPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ ProjectPlan", prefix);
+        println!("{prefix}╭─ ProjectPlan");
         println!("{}├─ Fields: {:?}", prefix, self.schema.fields);
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
-        println!("{}├─ Child Plan:", prefix);
+        println!("{prefix}├─ Child Plan:");
         self.plan.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -4767,14 +4752,14 @@ impl Plan for IndexSelectPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ IndexSelectPlan", prefix);
+        println!("{prefix}╭─ IndexSelectPlan");
         println!("{}├─ Index: {}", prefix, self.ii.index_name);
         println!("{}├─ Search Value: {:?}", prefix, self.value);
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
-        println!("{}├─ Child Plan:", prefix);
+        println!("{prefix}├─ Child Plan:");
         self.plan.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -4821,13 +4806,13 @@ impl Plan for SelectPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ SelectPlan", prefix);
+        println!("{prefix}╭─ SelectPlan");
         println!("{}├─ Predicate: {}", prefix, self.predicate.to_sql());
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
-        println!("{}├─ Child Plan:", prefix);
+        println!("{prefix}├─ Child Plan:");
         self.plan.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -4883,12 +4868,12 @@ impl Plan for TablePlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ TablePlan", prefix);
+        println!("{prefix}╭─ TablePlan");
         println!("{}├─ Table: {}", prefix, self.table_name);
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{}├─ Schema: {:?}", prefix, self.schema().fields);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -5121,7 +5106,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.get_int(field_name);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
@@ -5131,7 +5116,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.get_string(field_name);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -5141,7 +5126,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.get_value(field_name);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
@@ -5171,7 +5156,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.set_int(field_name, value);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
@@ -5181,7 +5166,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.set_string(field_name, value);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
@@ -5191,7 +5176,7 @@ where
         if self.s2.has_field(field_name)? {
             return self.s2.set_value(field_name, value);
         }
-        Err(format!("Field {} not found in ProductScan", field_name).into())
+        Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
     fn insert(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5241,10 +5226,10 @@ mod product_scan_tests {
             for i in 0..50 {
                 scan1.insert().unwrap();
                 scan1.set_int("A", i).unwrap();
-                scan1.set_string("B", format!("string{}", i)).unwrap();
+                scan1.set_string("B", format!("string{i}")).unwrap();
                 scan2.insert().unwrap();
                 scan2.set_int("C", i).unwrap();
-                scan2.set_string("D", format!("string{}", i)).unwrap();
+                scan2.set_string("D", format!("string{i}")).unwrap();
             }
         }
 
@@ -5307,21 +5292,21 @@ where
 {
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
         if !self.has_field(field_name)? {
-            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+            return Err(format!("Field {field_name} not found in ProjectScan").into());
         }
         self.scan.get_int(field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
         if !self.has_field(field_name)? {
-            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+            return Err(format!("Field {field_name} not found in ProjectScan").into());
         }
         self.scan.get_string(field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         if !self.has_field(field_name)? {
-            return Err(format!("Field {} not found in ProjectScan", field_name).into());
+            return Err(format!("Field {field_name} not found in ProjectScan").into());
         }
         self.scan.get_value(field_name)
     }
@@ -5421,7 +5406,7 @@ mod project_scan_tests {
                 dbg!("Inserting number {}", number);
                 scan.insert().unwrap();
                 scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{}", number)).unwrap();
+                scan.set_string("B", format!("string{number}")).unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -5519,7 +5504,7 @@ impl Plan for IndexJoinPlan {
         {
             return self.plan_2.distinct_values(field_name);
         }
-        panic!("Field {} not found in IndexJoinPlan", field_name);
+        panic!("Field {field_name} not found in IndexJoinPlan");
     }
 
     fn schema(&self) -> Schema {
@@ -5528,16 +5513,16 @@ impl Plan for IndexJoinPlan {
 
     fn print_plan_internal(&self, indent: usize) {
         let prefix = "  ".repeat(indent);
-        println!("{}╭─ IndexJoinPlan", prefix);
+        println!("{prefix}╭─ IndexJoinPlan");
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{}├─ Index: {}", prefix, self.index_info);
         println!("{}├─ JoinField: {}", prefix, self.join_field);
-        println!("{}├─ Left Plan:", prefix);
+        println!("{prefix}├─ Left Plan:");
         self.plan_1.print_plan(indent + 1);
-        println!("{}├─ Right Plan:", prefix);
+        println!("{prefix}├─ Right Plan:");
         self.plan_2.print_plan(indent + 1);
-        println!("{}╰─", prefix);
+        println!("{prefix}╰─");
     }
 }
 
@@ -5580,8 +5565,7 @@ mod index_join_plan_tests {
             db.planner
                 .execute_update(
                     format!(
-                        "insert into employees(id, name) values ({}, '{}')",
-                        id, name
+                        "insert into employees(id, name) values ({id}, '{name}')"
                     ),
                     Arc::clone(&txn),
                 )
@@ -5591,8 +5575,7 @@ mod index_join_plan_tests {
             db.planner
                 .execute_update(
                     format!(
-                        "insert into departments(depid, deptname) values ({}, '{}')",
-                        id, dept
+                        "insert into departments(depid, deptname) values ({id}, '{dept}')"
                     ),
                     Arc::clone(&txn),
                 )
@@ -5666,7 +5649,7 @@ mod index_join_plan_tests {
         for i in 0..5 {
             db.planner
                 .execute_update(
-                    format!("insert into t1(a, b) values ({}, 'x{}')", i, i),
+                    format!("insert into t1(a, b) values ({i}, 'x{i}')"),
                     Arc::clone(&txn),
                 )
                 .unwrap();
@@ -5674,7 +5657,7 @@ mod index_join_plan_tests {
         for i in 100..105 {
             db.planner
                 .execute_update(
-                    format!("insert into t2(c, d) values ({}, 'y{}')", i, i),
+                    format!("insert into t2(c, d) values ({i}, 'y{i}')"),
                     Arc::clone(&txn),
                 )
                 .unwrap();
@@ -5827,7 +5810,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.get_int(field_name);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
@@ -5837,7 +5820,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.get_string(field_name);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -5847,7 +5830,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.get_value(field_name);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
@@ -5877,7 +5860,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.set_int(field_name, value);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
@@ -5887,7 +5870,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.set_string(field_name, value);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
@@ -5897,7 +5880,7 @@ where
         if self.rhs.has_field(field_name)? {
             return self.rhs.set_value(field_name, value);
         }
-        Err(format!("Field {} not found in IndexJoinScan", field_name).into())
+        Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
     fn insert(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5964,12 +5947,12 @@ mod index_join_scan_tests {
                 // Insert into first table
                 scan1.insert().unwrap();
                 scan1.set_int("A", i).unwrap();
-                scan1.set_string("B", format!("string{}", i)).unwrap();
+                scan1.set_string("B", format!("string{i}")).unwrap();
 
                 // Insert into second table with matching values
                 scan2.insert().unwrap();
                 scan2.set_int("C", i).unwrap();
-                scan2.set_string("D", format!("string{}", i)).unwrap();
+                scan2.set_string("D", format!("string{i}")).unwrap();
 
                 // Create index entry
                 let mut index = index_info.open();
@@ -6161,7 +6144,7 @@ mod index_select_scan_tests {
                 dbg!("Inserting number {} into table", number);
                 scan.insert().unwrap();
                 scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{}", number)).unwrap();
+                scan.set_string("B", format!("string{number}")).unwrap();
                 dbg!("Inserting the index entry");
                 let mut index = index_info.open();
                 index.insert(
@@ -6332,7 +6315,7 @@ mod select_scan_tests {
                 dbg!("Inserting number {}", number);
                 scan.insert().unwrap();
                 scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{}", number)).unwrap();
+                scan.set_string("B", format!("string{number}")).unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -6861,7 +6844,7 @@ impl Term {
             ComparisonOp::GreaterThanOrEqual => ">=",
             ComparisonOp::NotEqual => "<>",
         };
-        format!("{} {} {}", lhs_sql, op_str, rhs_sql)
+        format!("{lhs_sql} {op_str} {rhs_sql}")
     }
 }
 
@@ -7087,7 +7070,7 @@ mod metadata_manager_tests {
                 FieldType::Int => "int".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
-            println!("{}: {}", field, type_str);
+            println!("{field}: {type_str}");
 
             // Assert field properties
             match field.as_str() {
@@ -7096,7 +7079,7 @@ mod metadata_manager_tests {
                     assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
-                _ => panic!("Unexpected field: {}", field),
+                _ => panic!("Unexpected field: {field}"),
             }
         }
 
@@ -7107,7 +7090,7 @@ mod metadata_manager_tests {
                 table_scan.insert().unwrap();
                 let n = (generate_random_number() % 50) + 1;
                 table_scan.set_int("A", n as i32).unwrap();
-                table_scan.set_string("B", format!("rec{}", n)).unwrap();
+                table_scan.set_string("B", format!("rec{n}")).unwrap();
             }
 
             let stat_info = mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&tx));
@@ -7127,7 +7110,7 @@ mod metadata_manager_tests {
         let view_def = "select B from MyTable where A = 1";
         mdm.create_view("viewA", view_def, Arc::clone(&tx));
         let retrieved_view = mdm.get_view_def("viewA", Arc::clone(&tx));
-        println!("View def = {:?}", retrieved_view);
+        println!("View def = {retrieved_view:?}");
         assert_eq!(retrieved_view, Some(view_def.to_string()));
 
         // Part 4: Index Metadata
@@ -7789,7 +7772,7 @@ mod table_manager_tests {
                 FieldType::Int => "int".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
-            println!("{}: {}", field, type_str);
+            println!("{field}: {type_str}");
 
             // Assert field properties
             match field.as_str() {
@@ -7800,7 +7783,7 @@ mod table_manager_tests {
                     assert_eq!(field_info.field_type, FieldType::String);
                     assert_eq!(field_info.length, 9);
                 }
-                _ => panic!("Unexpected field: {}", field),
+                _ => panic!("Unexpected field: {field}"),
             }
         }
 
@@ -7847,7 +7830,7 @@ impl Clone for TableScan {
 impl TableScan {
     fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
-        let file_name = format!("{}.tbl", table_name);
+        let file_name = format!("{table_name}.tbl");
         let mut scan = Self {
             txn,
             layout,
@@ -8051,8 +8034,7 @@ impl UpdateScan for TableScan {
             iterations += 1;
             assert!(
                 iterations <= 10000,
-                "Table scan insert failed for {} iterations",
-                iterations
+                "Table scan insert failed for {iterations} iterations"
             );
             match self
                 .record_page
@@ -8151,7 +8133,7 @@ mod table_scan_tests {
             let number = (generate_random_number() % 100) + 1;
             table_scan.set_int("A", number as i32).unwrap();
             table_scan
-                .set_string("B", format!("rec{}", number))
+                .set_string("B", format!("rec{number}"))
                 .unwrap();
             dbg!(format!("Inserting number {}", number));
             inserted_count += 1;
@@ -8478,7 +8460,7 @@ mod record_page_tests {
                 record_page.delete(slot);
             }
         }
-        println!("{} values were deleted", deleted_count);
+        println!("{deleted_count} values were deleted");
 
         //  Check that the correct number of records are left
         let record_iter = record_page.iter_used_slots();
@@ -8608,8 +8590,7 @@ impl Schema {
             .map(|info| (info.field_type, info.length))
             .ok_or_else(|| {
                 format!(
-                    "Field {} not found in schema while looking for type",
-                    field_name
+                    "Field {field_name} not found in schema while looking for type"
                 )
             })?;
 
@@ -9112,7 +9093,7 @@ mod transaction_tests {
                                 continue;
                             }
                             // Other errors should fail the test
-                            panic!("Transaction failed: {}", e);
+                            panic!("Transaction failed: {e}");
                         }
                     }
                 }
@@ -9137,10 +9118,9 @@ mod transaction_tests {
                 }
                 Err(_) => {
                     // Print operations for debugging
-                    println!("Operations so far: {:?}", operations);
+                    println!("Operations so far: {operations:?}");
                     panic!(
-                        "Test timed out with {} successful increments",
-                        successful_increments
+                        "Test timed out with {successful_increments} successful increments"
                     );
                 }
             }
@@ -9300,7 +9280,7 @@ impl LockTable {
             .get(block_id)
             .unwrap()
             .readers
-            .contains(&tx_id), "Transaction {} failed to have an slock before attempting to acquire xlock on block id {:?}", tx_id, block_id);
+            .contains(&tx_id), "Transaction {tx_id} failed to have an slock before attempting to acquire xlock on block id {block_id:?}");
 
         lock_table_guard
             .get_mut(block_id)
@@ -9863,9 +9843,9 @@ enum LogRecord {
 impl Display for LogRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LogRecord::Start(txnum) => write!(f, "Start({})", txnum),
-            LogRecord::Commit(txnum) => write!(f, "Commit({})", txnum),
-            LogRecord::Rollback(txnum) => write!(f, "Rollback({})", txnum),
+            LogRecord::Start(txnum) => write!(f, "Start({txnum})"),
+            LogRecord::Commit(txnum) => write!(f, "Commit({txnum})"),
+            LogRecord::Rollback(txnum) => write!(f, "Rollback({txnum})"),
             LogRecord::Checkpoint => write!(f, "Checkpoint"),
             LogRecord::SetInt {
                 txnum,
@@ -9874,8 +9854,7 @@ impl Display for LogRecord {
                 old_val,
             } => write!(
                 f,
-                "SetInt(txnum: {}, block_id: {:?}, offset: {}, old_val: {})",
-                txnum, block_id, offset, old_val
+                "SetInt(txnum: {txnum}, block_id: {block_id:?}, offset: {offset}, old_val: {old_val})"
             ),
             LogRecord::SetString {
                 txnum,
@@ -9884,8 +9863,7 @@ impl Display for LogRecord {
                 old_val,
             } => write!(
                 f,
-                "SetString(txnum: {}, block_id: {:?}, offset: {}, old_val: {})",
-                txnum, block_id, offset, old_val
+                "SetString(txnum: {txnum}, block_id: {block_id:?}, offset: {offset}, old_val: {old_val})"
             ),
         }
     }
@@ -10913,7 +10891,7 @@ impl FileSystemInterface for FileManager {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 page.contents = vec![0; self.blocksize];
             }
-            Err(e) => panic!("Failed to read from file {}", e),
+            Err(e) => panic!("Failed to read from file {e}"),
         }
     }
 
@@ -11132,7 +11110,7 @@ mod file_manager_tests {
             .unwrap()
             .as_millis();
         let thread_id = std::thread::current().id();
-        let dir = TestDir::new(format!("/tmp/test_db_{}_{:?}", timestamp, thread_id));
+        let dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
         let file_manger = FileManager::new(&dir, 400, true).unwrap();
         (dir, file_manger)
     }

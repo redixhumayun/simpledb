@@ -45,7 +45,7 @@ pub fn generate_filename() -> String {
         .unwrap()
         .as_nanos();
     let thread_id = std::thread::current().id();
-    format!("test_file_{}_{:?}", timestamp, thread_id)
+    format!("test_file_{timestamp}_{thread_id:?}")
 }
 
 /// Generate a random number using /dev/urandom.

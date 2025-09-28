@@ -14,7 +14,7 @@ impl Display for ParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParserError::BadSyntax => write!(f, "Bad syntax"),
-            ParserError::Other(err) => write!(f, "{}", err),
+            ParserError::Other(err) => write!(f, "{err}"),
         }
     }
 }
