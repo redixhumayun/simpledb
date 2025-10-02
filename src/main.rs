@@ -10294,8 +10294,8 @@ impl BufferManager {
     }
 
     /// Flushes the dirty buffers modified by this specific transaction
-    fn flush_all(&mut self, txn_num: usize) {
-        for buffer in &mut self.buffer_pool {
+    fn flush_all(&self, txn_num: usize) {
+        for buffer in &self.buffer_pool {
             let mut buffer = buffer.lock().unwrap();
             if buffer.txn.is_some() && *buffer.txn.as_ref().unwrap() == txn_num {
                 buffer.flush();
