@@ -11,7 +11,8 @@
 ### Buffer Management
 1. [Convert manual pin/unpin to RAII Buffer Guard](https://github.com/redixhumayun/simpledb/issues/9) - Eliminate memory leaks and double-unpin errors
 2. [Remove redundant Mutex wrapper from BufferManager](https://github.com/redixhumayun/simpledb/issues/26) - BufferManager has interior mutability, outer Mutex is unnecessary
-3. [Implement LRU replacement policy for buffer pool](https://github.com/redixhumayun/simpledb/issues/17) - Replace naive first-available selection with cache-aware algorithm
+3. [Replace Mutex<Buffer> with RwLock<Buffer> for concurrent reads](https://github.com/redixhumayun/simpledb/issues/27) - Enable true concurrent reads when multiple transactions hold shared locks (requires profiling first)
+4. [Implement LRU replacement policy for buffer pool](https://github.com/redixhumayun/simpledb/issues/17) - Replace naive first-available selection with cache-aware algorithm
 
 ### Iterator Design
 1. [Value-Based vs Zero-Copy Scans](https://github.com/redixhumayun/simpledb/issues/10) - Overhaul Scan trait to separate concerns and improve API
