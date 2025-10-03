@@ -692,6 +692,113 @@ impl ScanReader {
 
 ---
 
+## Invariants and Assertions
+
+### Core Invariants
+
+These invariants must hold at all times for correctness:
+
+1. **Pin Count Equality**: `live_handles(block) = buffer_list.count(block) = buffer_manager.pins(block)`
+2. **No Pins After Commit**: After `commit()`, all pins released and BufferList empty
+3. **Unpin is No-Op After Commit**: `unpin()` after commit doesn't modify state or panic
+4. **Clone Increments**: `handle.clone()` increments pin count by exactly 1
+5. **Drop Decrements**: `drop(handle)` decrements pin count by 1 (unless committed)
+6. **Buffer Availability**: `num_available + count(pinned_buffers) = pool_size`
+
+### Debug Assertions
+
+Add these assertions for development (compiled out in release):
+
+```rust
+impl BufferList {
+    #[cfg(debug_assertions)]
+    fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
+        let buffer_list_count = self.buffers.borrow()
+            .get(block_id)
+            .map(|v| v.count)
+            .unwrap_or(0);
+
+        let buffer = self.get_buffer(block_id).unwrap();
+        let buffer_manager_count = buffer.lock().unwrap().pins;
+
+        assert_eq!(buffer_list_count, buffer_manager_count,
+            "Pin count mismatch: BufferList={}, BufferManager={}",
+            buffer_list_count, buffer_manager_count);
+
+        assert_eq!(expected_handles, buffer_list_count,
+            "Handle count mismatch: expected={}, actual={}",
+            expected_handles, buffer_list_count);
+    }
+}
+
+impl BufferManager {
+    #[cfg(debug_assertions)]
+    pub fn assert_buffer_count_invariant(&self) {
+        let available = *self.num_available.lock().unwrap();
+
+        // Count buffers with at least one pin (not sum of pins)
+        let num_pinned_buffers: usize = self.buffer_pool.iter()
+            .filter(|buf| buf.lock().unwrap().pins > 0)
+            .count();
+
+        assert_eq!(available + num_pinned_buffers, self.buffer_pool.len(),
+            "Buffer count: available={}, pinned_buffers={}, total={}",
+            available, num_pinned_buffers, self.buffer_pool.len());
+    }
+}
+```
+
+### Runtime Assertions
+
+These should always run (even in release builds):
+
+```rust
+impl BufferList {
+    fn unpin(&self, block_id: &BlockId) {
+        if self.committed.get() {
+            return;
+        }
+
+        // ALWAYS check
+        if !self.buffers.borrow().contains_key(block_id) {
+            panic!(
+                "INVARIANT VIOLATION: Unpinning {:?} that was never pinned",
+                block_id
+            );
+        }
+
+        // ... unpin logic ...
+    }
+}
+```
+
+### Property-Based Testing
+
+Example property test using handle tracker:
+
+```rust
+#[test]
+fn test_property_pin_count_equals_handle_count() {
+    let txn = Arc::new(Transaction::new(/*...*/));
+    let block_id = BlockId::new("test".to_string(), 0);
+
+    let h1 = txn.pin(&block_id);
+    txn.buffer_list.assert_pin_invariant(&block_id, 1);
+
+    let h2 = h1.clone();
+    txn.buffer_list.assert_pin_invariant(&block_id, 2);
+
+    drop(h1);
+    txn.buffer_list.assert_pin_invariant(&block_id, 1);
+
+    drop(h2);
+    // All dropped - buffer should be unpinned
+    assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+}
+```
+
+---
+
 ## Summary
 
 ### Core Implementation
