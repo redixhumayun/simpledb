@@ -153,8 +153,6 @@ impl MultiBufferProductPlan {
                 table_scan.set_value(&field, source_scan.get_value(&field)?)?;
             }
         }
-        source_scan.close();
-        table_scan.close();
         Ok(temp_table)
     }
 }
@@ -476,10 +474,6 @@ where
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         self.product_scan.as_ref().unwrap().has_field(field_name)
     }
-
-    fn close(&mut self) {
-        self.product_scan.as_mut().unwrap().close();
-    }
 }
 
 impl<S1> UpdateScan for MultiBufferProductScan<S1>
@@ -572,8 +566,8 @@ mod multi_buffer_product_scan_tests {
         let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
         let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
-        emp_scan.close();
-        dept_scan.close();
+        drop(emp_scan);
+        drop(dept_scan);
 
         // Create MultiBufferProductScan
         let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
@@ -623,8 +617,8 @@ mod multi_buffer_product_scan_tests {
         let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
         let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
-        emp_scan.close();
-        dept_scan.close();
+        drop(emp_scan);
+        drop(dept_scan);
 
         // Create MultiBufferProductScan
         let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
@@ -658,8 +652,8 @@ mod multi_buffer_product_scan_tests {
         let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
         let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
-        emp_scan.close();
-        dept_scan.close();
+        drop(emp_scan);
+        drop(dept_scan);
 
         // Create MultiBufferProductScan
         let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
@@ -805,10 +799,6 @@ impl Scan for ChunkScan {
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         Ok(self.layout.schema.fields.contains(&field_name.to_string()))
     }
-
-    fn close(&mut self) {
-        self.current_record_page = None;
-    }
 }
 
 impl Iterator for ChunkScan {
@@ -908,7 +898,7 @@ mod chunk_scan_tests {
         // Insert some test records using TableScan
         let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
         insert_test_records(&mut table_scan, 10)?;
-        table_scan.close();
+        drop(table_scan);
 
         // Test ChunkScan over all blocks
         let mut chunk_scan = ChunkScan::new(
@@ -947,7 +937,7 @@ mod chunk_scan_tests {
         // Insert some test records using TableScan
         let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
         insert_test_records(&mut table_scan, 100)?;
-        table_scan.close();
+        drop(table_scan);
 
         // Test ChunkScan over all blocks
         let mut chunk_scan = ChunkScan::new(
@@ -984,9 +974,10 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
-        insert_test_records(&mut table_scan, 100)?;
-        table_scan.close();
+        {
+            let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+            insert_test_records(&mut table_scan, 100)?;
+        }
 
         // Test ChunkScan over middle blocks only
         let mut chunk_scan = ChunkScan::new(
@@ -1022,8 +1013,9 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Create empty table
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
-        table_scan.close();
+        {
+            let table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        }
 
         // Test ChunkScan over empty blocks
         let chunk_scan = ChunkScan::new(Arc::clone(&txn), layout.clone(), "test_table", 0, 1);
@@ -1047,7 +1039,7 @@ mod chunk_scan_tests {
         // Insert test records
         let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
         insert_test_records(&mut table_scan, 5)?;
-        table_scan.close();
+        drop(table_scan);
 
         // Test before_first functionality
         let mut chunk_scan = ChunkScan::new(Arc::clone(&txn), layout.clone(), "test_table", 0, 1);
@@ -1451,11 +1443,6 @@ where
             return Ok(true);
         }
         Err(format!("Field {field_name} not found").into())
-    }
-
-    fn close(&mut self) {
-        self.scan_1.close();
-        self.scan_2.close();
     }
 }
 
@@ -1974,7 +1961,6 @@ impl SortPlan {
             Some(Ok(_)) => self.copy(&source_scan, &mut current_scan)?,
             Some(Err(e)) => return Err(e),
             None => {
-                current_scan.close();
                 return Ok(temp_tables);
             }
         };
@@ -2551,7 +2537,6 @@ impl Iterator for SortScan {
                 Some(Err(e)) => Some(Err(e)),
                 None => {
                     self.current_scan = SortScanState::OnlySecond;
-                    self.s1.close();
                     Some(Ok(()))
                 }
             },
@@ -2572,9 +2557,6 @@ impl Iterator for SortScan {
                 }
                 Some(Err(e)) => Some(Err(e)),
                 None => {
-                    if let Some(s) = self.s2.as_mut() {
-                        s.close()
-                    };
                     self.s2 = None;
                     self.current_scan = SortScanState::OnlyFirst;
                     Some(Ok(()))
@@ -2640,13 +2622,6 @@ impl Scan for SortScan {
                 self.s2.as_ref().unwrap().has_field(field_name)
             }
             _ => Err("No current record".into()),
-        }
-    }
-
-    fn close(&mut self) {
-        self.s1.close();
-        if let Some(s2) = &mut self.s2 {
-            s2.close();
         }
     }
 }
@@ -2752,7 +2727,6 @@ mod sort_scan_tests {
 
         assert_eq!(count, 6, "Should have retrieved all records");
 
-        sort_scan.close();
         txn.commit().unwrap();
     }
 
@@ -2796,7 +2770,7 @@ mod sort_scan_tests {
 
         assert_eq!(count, 5);
 
-        sort_scan.close();
+        drop(sort_scan);
         txn.commit().unwrap();
     }
 
@@ -2824,7 +2798,7 @@ mod sort_scan_tests {
 
         assert_eq!(count, 0, "No records should be returned for empty tables");
 
-        sort_scan.close();
+        drop(sort_scan);
         txn.commit().unwrap();
     }
 }
@@ -4934,10 +4908,6 @@ impl Scan for Box<dyn Scan> {
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         (**self).has_field(field_name)
     }
-
-    fn close(&mut self) {
-        (**self).close()
-    }
 }
 
 impl Scan for Box<dyn UpdateScan> {
@@ -4959,10 +4929,6 @@ impl Scan for Box<dyn UpdateScan> {
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         (**self).has_field(field_name)
-    }
-
-    fn close(&mut self) {
-        (**self).close()
     }
 }
 
@@ -5097,10 +5063,6 @@ where
             return Ok(true);
         }
         Ok(false)
-    }
-
-    fn close(&mut self) {
-        //  no-op because no resources to clean up
     }
 }
 
@@ -5273,10 +5235,6 @@ where
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         self.scan.has_field(field_name)
-    }
-
-    fn close(&mut self) {
-        //  no-op because no resources to clean up
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5798,10 +5756,6 @@ where
         }
         Ok(false)
     }
-
-    fn close(&mut self) {
-        //  no-op because no resources to clean up
-    }
 }
 
 impl<S, I> UpdateScan for IndexJoinScan<S, I>
@@ -6010,11 +5964,6 @@ where
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         self.scan.has_field(field_name)
     }
-
-    fn close(&mut self) {
-        //  no-op because no resources to clean up
-        //  the index will be cleaned up automatically once its dropped
-    }
 }
 
 impl<I> UpdateScan for IndexSelectScan<I>
@@ -6187,10 +6136,6 @@ where
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         self.scan.has_field(field_name)
-    }
-
-    fn close(&mut self) {
-        //  no-op because no resources to clean up
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
@@ -7792,7 +7737,6 @@ impl TableScan {
 
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
     fn move_to_block(&mut self, block_num: usize) {
-        self.close();
         let block_id = BlockId::new(self.file_name.clone(), block_num);
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
@@ -7801,7 +7745,6 @@ impl TableScan {
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
     fn move_to_new_block(&mut self) {
-        self.close();
         let block = self.txn.append(&self.file_name);
         let record_page = RecordPage::new(Arc::clone(&self.txn), block, self.layout.clone());
         record_page.format();
@@ -7826,7 +7769,6 @@ impl TableScan {
     }
 
     fn move_to_row_id(&mut self, row_id: RID) {
-        self.close();
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
@@ -7834,14 +7776,6 @@ impl TableScan {
             self.layout.clone(),
         ));
         self.current_slot = Some(row_id.slot);
-    }
-}
-
-impl Drop for TableScan {
-    fn drop(&mut self) {
-        eprintln!("DROP: TableScan dropping for table {}", self.table_name);
-        self.close();
-        eprintln!("DROP: TableScan dropped for table {}", self.table_name);
     }
 }
 
@@ -7935,10 +7869,6 @@ impl Scan for TableScan {
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         Ok(self.layout.schema.fields.contains(&field_name.to_string()))
-    }
-
-    fn close(&mut self) {
-        self.record_page = None;
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
@@ -8035,7 +7965,6 @@ impl UpdateScan for TableScan {
     }
 
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
-        self.close();
         let block_id = BlockId::new(self.file_name.clone(), rid.block_num);
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
@@ -8063,7 +7992,6 @@ pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
-    fn close(&mut self);
 }
 
 #[cfg(test)]
