@@ -8515,7 +8515,6 @@ impl BufferHandle {
 
 impl Clone for BufferHandle {
     fn clone(&self) -> Self {
-        eprintln!("CLONE: BufferHandle cloning for block {:?}", self.block_id);
         self.txn.pin_internal(&self.block_id);
         Self {
             block_id: self.block_id.clone(),
@@ -8526,9 +8525,7 @@ impl Clone for BufferHandle {
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
-        eprintln!("DROP: BufferHandle dropping for block {:?}", self.block_id);
         self.txn.unpin_internal(&self.block_id);
-        eprintln!("DROP: BufferHandle dropped for block {:?}", self.block_id);
     }
 }
 
@@ -8622,11 +8619,9 @@ impl Transaction {
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     pub fn commit(&self) -> Result<(), Box<dyn Error>> {
-        eprintln!("COMMIT: Transaction committing");
         self.recovery_manager.commit();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
-        eprintln!("COMMIT: Transaction committed, buffers unpinned");
         Ok(())
     }
 
@@ -10070,17 +10065,9 @@ impl BufferList {
         // If transaction has committed/rolled back, BufferHandles may outlive the transaction
         // In that case, unpin is a no-op since unpin_all() already handled it
         if self.committed.get() {
-            eprintln!(
-                "UNPIN_SKIP: Transaction committed, skipping unpin for {:?}",
-                block_id
-            );
             return;
         }
 
-        eprintln!(
-            "UNPIN_PROCEED: Transaction not committed, unpinning {:?}",
-            block_id
-        );
         assert!(self.buffers.borrow().contains_key(block_id));
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
         self.buffer_manager.lock().unwrap().unpin(buffer);
@@ -10217,13 +10204,8 @@ impl Buffer {
 
     /// Decrement the pin count for this buffer
     fn unpin(&mut self) {
-        eprintln!(
-            "BUFFER_UNPIN: Before decrement, pins = {}, block = {:?}",
-            self.pins, self.block_id
-        );
         assert!(self.pins > 0); //  sanity check to know that it will not become negative
         self.pins -= 1;
-        eprintln!("BUFFER_UNPIN: After decrement, pins = {}", self.pins);
     }
 
     /// Reset the pin count for this buffer
@@ -10331,19 +10313,10 @@ impl BufferManager {
     /// If all of the pins have been removed, managed metadata & notify waiting threads
     fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
-        let block_id = buffer_guard.block_id.clone();
         buffer_guard.unpin();
         let is_pinned = buffer_guard.is_pinned();
-        eprintln!(
-            "UNPIN: BufferManager unpinning {:?}, pins now: {}, is_pinned: {}",
-            block_id, buffer_guard.pins, is_pinned
-        );
         if !is_pinned {
             *self.num_available.lock().unwrap() += 1;
-            eprintln!(
-                "UNPIN: Buffer released, num_available now: {}",
-                *self.num_available.lock().unwrap()
-            );
             self.cond.notify_all();
         }
     }
@@ -10381,14 +10354,8 @@ mod buffer_manager_tests {
     /// and can then correctly read them back later
     #[test]
     fn test_buffer_replacement() {
-        eprintln!("TEST: Starting test_buffer_replacement");
         let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
-        eprintln!("TEST: SimpleDB created successfully");
         let buffer_manager = db.buffer_manager;
-        eprintln!(
-            "TEST: Available buffers: {}",
-            buffer_manager.lock().unwrap().available()
-        );
 
         //  Initialize the file with enough data
         let block_id = BlockId::new("testfile".to_string(), 1);
@@ -10399,11 +10366,9 @@ mod buffer_manager_tests {
         let buffer_manager_guard = buffer_manager.lock().unwrap();
 
         //  Create a buffer for block 1 and modify it
-        eprintln!("TEST: Pinning block 1");
         let buffer_1 = buffer_manager_guard
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
-        eprintln!("TEST: Block 1 pinned");
         buffer_1.lock().unwrap().contents.set_int(80, 100);
         buffer_1.lock().unwrap().set_modified(1, 0);
         buffer_manager_guard.unpin(buffer_1);
