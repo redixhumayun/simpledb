@@ -8761,7 +8761,7 @@ mod transaction_tests {
 
     use crate::{
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, SimpleDB, Transaction,
+        BlockId, BufferHandle, SimpleDB, Transaction,
     };
 
     #[test]
@@ -9104,6 +9104,143 @@ mod transaction_tests {
             t2.pin_internal(&block_id);
             assert_eq!(t2.get_int(&block_id, 80).unwrap(), 100);
         }
+    }
+
+    #[test]
+    fn test_buffer_handle_raii_basic_pin_unpin() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(db.new_tx());
+        let block_id = BlockId::new("test".to_string(), 0);
+
+        {
+            let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+
+            // Verify pin count = 1
+            let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+            assert_eq!(buffer.lock().unwrap().pins, 1);
+
+            #[cfg(debug_assertions)]
+            txn.buffer_list.assert_pin_invariant(&block_id, 1);
+        }
+
+        // After handle is dropped, buffer should be unpinned
+        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+
+        #[cfg(debug_assertions)]
+        db.buffer_manager
+            .lock()
+            .unwrap()
+            .assert_buffer_count_invariant();
+    }
+
+    #[test]
+    fn test_buffer_handle_clone_increments_pins() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(db.new_tx());
+        let block_id = BlockId::new("test".to_string(), 0);
+
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+
+        #[cfg(debug_assertions)]
+        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+
+        let handle2 = handle1.clone();
+
+        // Both handles should keep block pinned - pin count should be 2
+        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        assert_eq!(buffer.lock().unwrap().pins, 2);
+
+        #[cfg(debug_assertions)]
+        txn.buffer_list.assert_pin_invariant(&block_id, 2);
+
+        drop(handle1);
+
+        // After dropping one handle, pin count should be 1
+        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        assert_eq!(buffer.lock().unwrap().pins, 1);
+
+        #[cfg(debug_assertions)]
+        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+
+        drop(handle2);
+
+        // After dropping both handles, buffer should be unpinned
+        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+
+        #[cfg(debug_assertions)]
+        db.buffer_manager
+            .lock()
+            .unwrap()
+            .assert_buffer_count_invariant();
+    }
+
+    #[test]
+    fn test_no_buffer_leaks_after_commit() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(db.new_tx());
+        let block_id = BlockId::new("test".to_string(), 0);
+
+        let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+
+        txn.commit().unwrap();
+
+        // All buffers should be unpinned after commit
+        // Even though handle still exists
+        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+
+        #[cfg(debug_assertions)]
+        db.buffer_manager
+            .lock()
+            .unwrap()
+            .assert_buffer_count_invariant();
+    }
+
+    #[test]
+    fn test_handle_drop_after_commit_is_safe() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let txn = Arc::new(db.new_tx());
+        let block_id = BlockId::new("test".to_string(), 0);
+        let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+
+        // Commit unpins everything and sets committed flag
+        txn.commit().unwrap();
+
+        // Handle still exists - this should NOT panic
+        drop(handle); // Should be no-op (committed flag prevents double-unpin)
+
+        // Verify no crash and all buffers available
+        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+    }
+
+    #[test]
+    fn test_multiple_handles_after_commit() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+
+        // Check initial available buffers
+        let initial_available = db.buffer_manager.lock().unwrap().available();
+
+        let txn = Arc::new(db.new_tx());
+        let block_id = BlockId::new("test".to_string(), 0);
+
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle2 = handle1.clone();
+        let handle3 = handle2.clone();
+
+        txn.commit().unwrap();
+
+        // All three handles should drop safely (no-op after commit)
+        drop(handle1);
+        drop(handle2);
+        drop(handle3);
+
+        // Drop the transaction Arc as well
+        drop(txn);
+
+        // Verify all buffers available (should match initial available)
+        assert_eq!(
+            db.buffer_manager.lock().unwrap().available(),
+            initial_available
+        );
     }
 }
 
@@ -10071,7 +10208,13 @@ impl BufferList {
             return;
         }
 
-        assert!(self.buffers.borrow().contains_key(block_id));
+        // Runtime assertion: ensure we're unpinning a block that was actually pinned
+        if !self.buffers.borrow().contains_key(block_id) {
+            panic!(
+                "INVARIANT VIOLATION: Unpinning {:?} that was never pinned or already fully unpinned",
+                block_id
+            );
+        }
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
         self.buffer_manager.lock().unwrap().unpin(buffer);
         let should_remove = {
@@ -10089,16 +10232,52 @@ impl BufferList {
     fn unpin_all(&self) {
         let mut buffer_guard = self.buffers.borrow_mut();
         let buffers = buffer_guard.values();
-        for buffer in buffers {
-            self.buffer_manager
-                .lock()
-                .unwrap()
-                .unpin(Arc::clone(&buffer.buffer));
+        for value in buffers {
+            for _ in 0..value.count {
+                self.buffer_manager
+                    .lock()
+                    .unwrap()
+                    .unpin(Arc::clone(&value.buffer));
+            }
         }
         buffer_guard.clear();
 
         // Mark as committed so subsequent BufferHandle drops become no-ops
         self.txn_committed.set(true);
+    }
+
+    /// Debug assertion to verify pin count invariants hold for this transaction
+    ///
+    /// Verifies:
+    /// 1. BufferList count matches expected number of live handles for this transaction
+    /// 2. BufferManager pin count >= BufferList count (other transactions may have pins too)
+    #[cfg(debug_assertions)]
+    fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
+        let buffer_list_count = self
+            .buffers
+            .borrow()
+            .get(block_id)
+            .map(|v| v.count)
+            .unwrap_or(0);
+
+        // Invariant 1: This transaction's BufferList count should match expected handles
+        assert_eq!(
+            expected_handles, buffer_list_count,
+            "Handle count mismatch for {:?}: expected={}, actual={}",
+            block_id, expected_handles, buffer_list_count
+        );
+
+        // Invariant 2: BufferManager total pins >= this transaction's pins
+        // (Other transactions may have pinned the same buffer)
+        if let Some(buffer) = self.get_buffer(block_id) {
+            let buffer_manager_count = buffer.lock().unwrap().pins;
+
+            assert!(
+                buffer_manager_count >= buffer_list_count,
+                "Pin count invariant violated for {:?}: BufferManager pins ({}) < BufferList count ({}) for this transaction",
+                block_id, buffer_manager_count, buffer_list_count
+            );
+        }
     }
 }
 
@@ -10346,6 +10525,29 @@ impl BufferManager {
             }
         }
         None
+    }
+
+    /// Debug assertion to verify buffer count invariants
+    /// Checks that available + pinned buffers = pool size
+    #[cfg(debug_assertions)]
+    pub fn assert_buffer_count_invariant(&self) {
+        let available = *self.num_available.lock().unwrap();
+
+        // Count buffers with at least one pin
+        let num_pinned_buffers: usize = self
+            .buffer_pool
+            .iter()
+            .filter(|buf| buf.lock().unwrap().pins > 0)
+            .count();
+
+        assert_eq!(
+            available + num_pinned_buffers,
+            self.buffer_pool.len(),
+            "Buffer count invariant violated: available={}, pinned_buffers={}, total={}",
+            available,
+            num_pinned_buffers,
+            self.buffer_pool.len()
+        );
     }
 }
 
