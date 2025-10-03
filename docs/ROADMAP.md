@@ -9,7 +9,7 @@
 2. [Implement direct I/O](https://github.com/redixhumayun/simpledb/issues/12) - Eliminate double-buffering with OS page cache
 
 ### Buffer Management
-1. [Convert manual pin/unpin to RAII Buffer Guard](https://github.com/redixhumayun/simpledb/issues/9) - Eliminate memory leaks and double-unpin errors
+1. [Implement ReadHandle and WriteHandle for type-safe buffer access](https://github.com/redixhumayun/simpledb/issues/29) - Compile-time enforcement of read/write access and integrated lock management
 2. [Remove redundant Mutex wrapper from BufferManager](https://github.com/redixhumayun/simpledb/issues/26) - BufferManager has interior mutability, outer Mutex is unnecessary
 3. [Replace Mutex<Buffer> with RwLock<Buffer> for concurrent reads](https://github.com/redixhumayun/simpledb/issues/27) - Enable true concurrent reads when multiple transactions hold shared locks (requires profiling first)
 4. [Implement LRU replacement policy for buffer pool](https://github.com/redixhumayun/simpledb/issues/17) - Replace naive first-available selection with cache-aware algorithm
