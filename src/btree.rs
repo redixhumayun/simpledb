@@ -1,7 +1,8 @@
 use std::{error::Error, sync::Arc};
 
 use crate::{
-    debug, BlockId, Constant, FieldType, Index, IndexInfo, Layout, Schema, Transaction, RID,
+    debug, BlockId, BufferHandle, Constant, FieldType, Index, IndexInfo, Layout, Schema,
+    Transaction, RID,
 };
 
 pub struct BTreeIndex {
@@ -70,7 +71,6 @@ impl BTreeIndex {
 
 impl Index for BTreeIndex {
     fn before_first(&mut self, search_key: &Constant) {
-        self.close();
         let mut root = BTreeInternal::new(
             Arc::clone(&self.txn),
             self.root_block.clone(),
@@ -136,12 +136,6 @@ impl Index for BTreeIndex {
         self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
         //  TODO: Should the leaf be set to None here?
         self.leaf = None;
-    }
-
-    fn close(&mut self) {
-        if self.leaf.is_some() {
-            self.leaf = None;
-        }
     }
 }
 
@@ -1015,7 +1009,7 @@ impl From<PageType> for i32 {
 
 struct BTreePage {
     txn: Arc<Transaction>,
-    block_id: BlockId,
+    handle: BufferHandle,
     layout: Layout,
 }
 
@@ -1029,10 +1023,10 @@ impl BTreePage {
 
     /// Creates a new [BTreePage] by pinning the specified block and initializing it with the given layout
     fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
-        txn.pin(&block_id);
+        let handle = txn.pin(&block_id);
         Self {
             txn,
-            block_id,
+            handle,
             layout,
         }
     }
@@ -1074,9 +1068,10 @@ impl BTreePage {
         //  construct a new block, a new btree page and then pin the buffer
         debug!(
             "Splitting the btree page for block num {} at slot {}",
-            self.block_id.block_num, slot
+            self.handle.block_id().block_num,
+            slot
         );
-        let block_id = self.txn.append(&self.block_id.filename);
+        let block_id = self.txn.append(&self.handle.block_id().filename);
         let new_btree_page =
             BTreePage::new(Arc::clone(&self.txn), block_id.clone(), self.layout.clone());
         new_btree_page.format(page_type)?;
@@ -1102,18 +1097,19 @@ impl BTreePage {
     /// Sets all record slots to their zero values based on field types
     fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
         self.txn
-            .set_int(&self.block_id, 0, page_type.into(), true)?;
-        self.txn.set_int(&self.block_id, Self::INT_BYTES, 0, true)?;
+            .set_int(self.handle.block_id(), 0, page_type.into(), true)?;
+        self.txn
+            .set_int(self.handle.block_id(), Self::INT_BYTES, 0, true)?;
         let record_size = self.layout.slot_size;
         for i in ((2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size) {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
                     FieldType::Int => {
-                        self.txn.set_int(&self.block_id, i, 0, false)?;
+                        self.txn.set_int(self.handle.block_id(), i, 0, false)?;
                     }
                     FieldType::String => {
-                        self.txn.set_string(&self.block_id, i, "", false)?;
+                        self.txn.set_string(self.handle.block_id(), i, "", false)?;
                     }
                 }
             }
@@ -1123,12 +1119,15 @@ impl BTreePage {
 
     /// Retrieves the page type flag from the header
     fn get_flag(&self) -> Result<PageType, Box<dyn Error>> {
-        self.txn.get_int(&self.block_id, 0).map(PageType::from)
+        self.txn
+            .get_int(self.handle.block_id(), 0)
+            .map(PageType::from)
     }
 
     /// Updates the page type flag in the header
     fn set_flag(&self, value: PageType) -> Result<(), Box<dyn Error>> {
-        self.txn.set_int(&self.block_id, 0, value.into(), true)
+        self.txn
+            .set_int(self.handle.block_id(), 0, value.into(), true)
     }
 
     /// Gets the data value at the specified slot
@@ -1208,26 +1207,26 @@ impl BTreePage {
     /// Gets the number of records currently stored in the page
     fn get_number_of_recs(&self) -> Result<usize, Box<dyn Error>> {
         self.txn
-            .get_int(&self.block_id, Self::INT_BYTES)
+            .get_int(self.handle.block_id(), Self::INT_BYTES)
             .map(|v| v as usize)
     }
 
     /// Updates the number of records stored in the page
     fn set_number_of_recs(&self, num: usize) -> Result<(), Box<dyn Error>> {
         self.txn
-            .set_int(&self.block_id, Self::INT_BYTES, num as i32, true)
+            .set_int(self.handle.block_id(), Self::INT_BYTES, num as i32, true)
     }
 
     fn get_int(&self, slot: usize, field_name: &str) -> Result<i32, Box<dyn Error>> {
         self.txn.get_int(
-            &self.block_id,
+            self.handle.block_id(),
             self.slot_pos(slot) + self.layout.offset(field_name).unwrap(),
         )
     }
 
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
         self.txn.set_int(
-            &self.block_id,
+            self.handle.block_id(),
             self.field_position(slot, field_name),
             value,
             true,
@@ -1236,7 +1235,7 @@ impl BTreePage {
 
     fn get_string(&self, slot: usize, field_name: &str) -> Result<String, Box<dyn Error>> {
         self.txn.get_string(
-            &self.block_id,
+            self.handle.block_id(),
             self.slot_pos(slot) + self.layout.offset(field_name).unwrap(),
         )
     }
@@ -1248,7 +1247,7 @@ impl BTreePage {
         value: String,
     ) -> Result<(), Box<dyn Error>> {
         self.txn.set_string(
-            &self.block_id,
+            self.handle.block_id(),
             self.field_position(slot, field_name),
             &value,
             true,
@@ -1312,23 +1311,12 @@ impl BTreePage {
     fn slot_pos(&self, slot: usize) -> usize {
         Self::INT_BYTES + Self::INT_BYTES + slot * self.layout.slot_size
     }
-
-    /// Unpins the page's block from the buffer manager
-    fn close(&self) {
-        self.txn.unpin(&self.block_id);
-    }
-}
-
-impl Drop for BTreePage {
-    fn drop(&mut self) {
-        self.close();
-    }
 }
 
 impl std::fmt::Display for BTreePage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "\n=== BTreePage Debug ===")?;
-        writeln!(f, "Block: {:?}", self.block_id)?;
+        writeln!(f, "Block: {:?}", self.handle.block_id())?;
         match self.get_flag() {
             Ok(flag) => writeln!(f, "Page Type: {flag:?}")?,
             Err(e) => writeln!(f, "Error getting flag: {e}")?,

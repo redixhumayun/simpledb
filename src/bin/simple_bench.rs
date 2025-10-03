@@ -94,7 +94,6 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
         {
             let mut scan = plan.open();
             let _count = scan.by_ref().count();
-            scan.close();
         } // scan is dropped here, before transaction commit
         txn.commit().unwrap();
     });

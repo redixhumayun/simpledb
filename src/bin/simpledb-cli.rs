@@ -134,8 +134,6 @@ fn execute_query(
         row_count += 1;
     }
 
-    scan.close();
-
     if row_count == 0 {
         result.push_str("No results found.\n");
     } else {
