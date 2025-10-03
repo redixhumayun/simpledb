@@ -1023,7 +1023,6 @@ impl BTreePage {
 
     /// Creates a new [BTreePage] by pinning the specified block and initializing it with the given layout
     fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
-        // txn.pin_internal(&block_id);
         let handle = txn.pin(&block_id);
         Self {
             txn,
