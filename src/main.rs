@@ -8645,7 +8645,7 @@ impl Transaction {
 
     /// The public pin method which will return a [`BufferHandle`] for RAII semantics
     pub fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
-        BufferHandle::new(block_id.clone(), Arc::clone(&self))
+        BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -10211,8 +10211,7 @@ impl BufferList {
         // Runtime assertion: ensure we're unpinning a block that was actually pinned
         if !self.buffers.borrow().contains_key(block_id) {
             panic!(
-                "INVARIANT VIOLATION: Unpinning {:?} that was never pinned or already fully unpinned",
-                block_id
+                "INVARIANT VIOLATION: Unpinning {block_id:?} that was never pinned or already fully unpinned"
             );
         }
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
@@ -10263,8 +10262,7 @@ impl BufferList {
         // Invariant 1: This transaction's BufferList count should match expected handles
         assert_eq!(
             expected_handles, buffer_list_count,
-            "Handle count mismatch for {:?}: expected={}, actual={}",
-            block_id, expected_handles, buffer_list_count
+            "Handle count mismatch for {block_id:?}: expected={expected_handles}, actual={buffer_list_count}"
         );
 
         // Invariant 2: BufferManager total pins >= this transaction's pins
@@ -10274,8 +10272,7 @@ impl BufferList {
 
             assert!(
                 buffer_manager_count >= buffer_list_count,
-                "Pin count invariant violated for {:?}: BufferManager pins ({}) < BufferList count ({}) for this transaction",
-                block_id, buffer_manager_count, buffer_list_count
+                "Pin count invariant violated for {block_id:?}: BufferManager pins ({buffer_manager_count}) < BufferList count ({buffer_list_count}) for this transaction"
             );
         }
     }

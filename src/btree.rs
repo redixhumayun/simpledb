@@ -1098,19 +1098,19 @@ impl BTreePage {
     /// Sets all record slots to their zero values based on field types
     fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
         self.txn
-            .set_int(&self.handle.block_id(), 0, page_type.into(), true)?;
+            .set_int(self.handle.block_id(), 0, page_type.into(), true)?;
         self.txn
-            .set_int(&self.handle.block_id(), Self::INT_BYTES, 0, true)?;
+            .set_int(self.handle.block_id(), Self::INT_BYTES, 0, true)?;
         let record_size = self.layout.slot_size;
         for i in ((2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size) {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
                     FieldType::Int => {
-                        self.txn.set_int(&self.handle.block_id(), i, 0, false)?;
+                        self.txn.set_int(self.handle.block_id(), i, 0, false)?;
                     }
                     FieldType::String => {
-                        self.txn.set_string(&self.handle.block_id(), i, "", false)?;
+                        self.txn.set_string(self.handle.block_id(), i, "", false)?;
                     }
                 }
             }
@@ -1121,14 +1121,14 @@ impl BTreePage {
     /// Retrieves the page type flag from the header
     fn get_flag(&self) -> Result<PageType, Box<dyn Error>> {
         self.txn
-            .get_int(&self.handle.block_id(), 0)
+            .get_int(self.handle.block_id(), 0)
             .map(PageType::from)
     }
 
     /// Updates the page type flag in the header
     fn set_flag(&self, value: PageType) -> Result<(), Box<dyn Error>> {
         self.txn
-            .set_int(&self.handle.block_id(), 0, value.into(), true)
+            .set_int(self.handle.block_id(), 0, value.into(), true)
     }
 
     /// Gets the data value at the specified slot
@@ -1208,26 +1208,26 @@ impl BTreePage {
     /// Gets the number of records currently stored in the page
     fn get_number_of_recs(&self) -> Result<usize, Box<dyn Error>> {
         self.txn
-            .get_int(&self.handle.block_id(), Self::INT_BYTES)
+            .get_int(self.handle.block_id(), Self::INT_BYTES)
             .map(|v| v as usize)
     }
 
     /// Updates the number of records stored in the page
     fn set_number_of_recs(&self, num: usize) -> Result<(), Box<dyn Error>> {
         self.txn
-            .set_int(&self.handle.block_id(), Self::INT_BYTES, num as i32, true)
+            .set_int(self.handle.block_id(), Self::INT_BYTES, num as i32, true)
     }
 
     fn get_int(&self, slot: usize, field_name: &str) -> Result<i32, Box<dyn Error>> {
         self.txn.get_int(
-            &self.handle.block_id(),
+            self.handle.block_id(),
             self.slot_pos(slot) + self.layout.offset(field_name).unwrap(),
         )
     }
 
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
         self.txn.set_int(
-            &self.handle.block_id(),
+            self.handle.block_id(),
             self.field_position(slot, field_name),
             value,
             true,
@@ -1236,7 +1236,7 @@ impl BTreePage {
 
     fn get_string(&self, slot: usize, field_name: &str) -> Result<String, Box<dyn Error>> {
         self.txn.get_string(
-            &self.handle.block_id(),
+            self.handle.block_id(),
             self.slot_pos(slot) + self.layout.offset(field_name).unwrap(),
         )
     }
@@ -1248,7 +1248,7 @@ impl BTreePage {
         value: String,
     ) -> Result<(), Box<dyn Error>> {
         self.txn.set_string(
-            &self.handle.block_id(),
+            self.handle.block_id(),
             self.field_position(slot, field_name),
             &value,
             true,
