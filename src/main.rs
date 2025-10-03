@@ -10028,9 +10028,12 @@ struct HashMapValue {
 /// It uses the [`BufferManager`] internally to maintain metadata
 #[derive(Debug)]
 struct BufferList {
+    /// Maps block ID's to buffers and their pin contents
     buffers: RefCell<HashMap<BlockId, HashMapValue>>,
+    /// Shared buffer manager for pinning/unpinning operations
     buffer_manager: Arc<Mutex<BufferManager>>,
-    committed: Cell<bool>,
+    /// Tracks whether the transaction has been committed
+    txn_committed: Cell<bool>,
 }
 
 impl BufferList {
@@ -10038,7 +10041,7 @@ impl BufferList {
         Self {
             buffers: RefCell::new(HashMap::new()),
             buffer_manager,
-            committed: Cell::new(false),
+            txn_committed: Cell::new(false),
         }
     }
 
@@ -10064,7 +10067,7 @@ impl BufferList {
     fn unpin(&self, block_id: &BlockId) {
         // If transaction has committed/rolled back, BufferHandles may outlive the transaction
         // In that case, unpin is a no-op since unpin_all() already handled it
-        if self.committed.get() {
+        if self.txn_committed.get() {
             return;
         }
 
@@ -10095,7 +10098,7 @@ impl BufferList {
         buffer_guard.clear();
 
         // Mark as committed so subsequent BufferHandle drops become no-ops
-        self.committed.set(true);
+        self.txn_committed.set(true);
     }
 }
 
