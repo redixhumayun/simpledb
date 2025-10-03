@@ -7306,7 +7306,6 @@ impl HashIndex {
 
 impl Index for HashIndex {
     fn before_first(&mut self, search_key: &Constant) {
-        self.close();
         self.search_key = Some(search_key.clone());
         let mut hasher = DefaultHasher::new();
         search_key.hash(&mut hasher);
@@ -7363,12 +7362,6 @@ impl Index for HashIndex {
             }
         }
     }
-
-    fn close(&mut self) {
-        if let Some(ts) = self.table_scan.as_mut() {
-            ts.close()
-        };
-    }
 }
 
 /// Interface for traversing and modifying an index
@@ -7388,9 +7381,6 @@ trait Index {
 
     /// Delete the index record with the specified value and RID
     fn delete(&mut self, data_val: &Constant, data_rid: &RID);
-
-    /// Close the index and release any resources
-    fn close(&mut self);
 }
 
 struct StatManager {

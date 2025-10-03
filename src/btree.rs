@@ -71,7 +71,6 @@ impl BTreeIndex {
 
 impl Index for BTreeIndex {
     fn before_first(&mut self, search_key: &Constant) {
-        self.close();
         let mut root = BTreeInternal::new(
             Arc::clone(&self.txn),
             self.root_block.clone(),
@@ -137,12 +136,6 @@ impl Index for BTreeIndex {
         self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
         //  TODO: Should the leaf be set to None here?
         self.leaf = None;
-    }
-
-    fn close(&mut self) {
-        if self.leaf.is_some() {
-            self.leaf = None;
-        }
     }
 }
 
