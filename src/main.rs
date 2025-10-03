@@ -7948,9 +7948,7 @@ impl Scan for TableScan {
     }
 
     fn close(&mut self) {
-        if let Some(record_page) = &self.record_page {
-            self.record_page = None;
-        }
+        self.record_page = None;
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
