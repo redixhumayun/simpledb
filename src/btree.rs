@@ -1319,17 +1319,6 @@ impl BTreePage {
     fn slot_pos(&self, slot: usize) -> usize {
         Self::INT_BYTES + Self::INT_BYTES + slot * self.layout.slot_size
     }
-
-    /// Unpins the page's block from the buffer manager
-    fn close(&self) {
-        self.txn.unpin_internal(&self.handle.block_id());
-    }
-}
-
-impl Drop for BTreePage {
-    fn drop(&mut self) {
-        self.close();
-    }
 }
 
 impl std::fmt::Display for BTreePage {

@@ -5,7 +5,7 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
@@ -688,6 +688,7 @@ mod multi_buffer_product_scan_tests {
     }
 }
 
+#[derive(Clone)]
 struct ChunkScan {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -699,28 +700,6 @@ struct ChunkScan {
     current_record_page: Option<usize>,
     current_slot: Option<usize>,
     buffer_list: Vec<RecordPage>,
-}
-
-impl Clone for ChunkScan {
-    fn clone(&self) -> Self {
-        for block_num in self.first_block_num..=self.last_block_num {
-            let block_id = BlockId::new(self.file_name.clone(), block_num);
-            self.txn.pin_internal(&block_id);
-        }
-
-        Self {
-            txn: Arc::clone(&self.txn),
-            layout: self.layout.clone(),
-            file_name: self.file_name.clone(),
-            table_name: self.table_name.clone(),
-            first_block_num: self.first_block_num,
-            last_block_num: self.last_block_num,
-            current_block_num: self.current_block_num,
-            current_record_page: self.current_record_page,
-            current_slot: self.current_slot,
-            buffer_list: self.buffer_list.clone(),
-        }
-    }
 }
 
 impl ChunkScan {
@@ -771,46 +750,6 @@ impl ChunkScan {
         );
         self.current_record_page = Some(offset);
         self.current_slot = None;
-    }
-}
-
-impl Drop for ChunkScan {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-impl Iterator for ChunkScan {
-    type Item = SimpleDBResult<()>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        debug!("Calling next on ChunkScan for {}", self.table_name);
-        assert!(!self.buffer_list.is_empty());
-        loop {
-            if let Some(record_page_idx) = &self.current_record_page {
-                let record_page = &self.buffer_list[*record_page_idx];
-                let next_slot = match self.current_slot {
-                    None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
-                };
-
-                //  There are still slots to iterate in the current record page
-                if let Some(slot) = next_slot {
-                    self.current_slot = Some(slot);
-                    return Some(Ok(()));
-                }
-
-                //  There are no more slots in the current record page. Check if there are more record pages
-                if *record_page_idx < self.buffer_list.len() - 1 {
-                    self.current_record_page = Some(*record_page_idx + 1);
-                    self.current_slot = None;
-                    continue;
-                }
-            }
-
-            //  There are no more record pages left
-            return None;
-        }
     }
 }
 
@@ -868,10 +807,41 @@ impl Scan for ChunkScan {
     }
 
     fn close(&mut self) {
-        for record_page in &self.buffer_list {
-            self.txn.unpin_internal(record_page.handle.block_id());
-        }
         self.current_record_page = None;
+    }
+}
+
+impl Iterator for ChunkScan {
+    type Item = SimpleDBResult<()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        debug!("Calling next on ChunkScan for {}", self.table_name);
+        assert!(!self.buffer_list.is_empty());
+        loop {
+            if let Some(record_page_idx) = &self.current_record_page {
+                let record_page = &self.buffer_list[*record_page_idx];
+                let next_slot = match self.current_slot {
+                    None => record_page.iter_used_slots().next(),
+                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
+                };
+
+                //  There are still slots to iterate in the current record page
+                if let Some(slot) = next_slot {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
+                }
+
+                //  There are no more slots in the current record page. Check if there are more record pages
+                if *record_page_idx < self.buffer_list.len() - 1 {
+                    self.current_record_page = Some(*record_page_idx + 1);
+                    self.current_slot = None;
+                    continue;
+                }
+            }
+
+            //  There are no more record pages left
+            return None;
+        }
     }
 }
 
@@ -7791,6 +7761,7 @@ mod table_manager_tests {
     }
 }
 
+#[derive(Clone)]
 struct TableScan {
     txn: Arc<Transaction>,
     layout: Layout,
@@ -7798,26 +7769,6 @@ struct TableScan {
     record_page: Option<RecordPage>,
     current_slot: Option<usize>,
     table_name: String,
-}
-
-impl Clone for TableScan {
-    fn clone(&self) -> Self {
-        if let Some(block_id) = self
-            .record_page
-            .as_ref()
-            .map(|record_page| record_page.handle.block_id())
-        {
-            self.txn.pin_internal(block_id);
-        }
-        Self {
-            txn: Arc::clone(&self.txn),
-            layout: self.layout.clone(),
-            file_name: self.file_name.clone(),
-            record_page: self.record_page.clone(),
-            current_slot: self.current_slot,
-            table_name: self.table_name.clone(),
-        }
-    }
 }
 
 impl TableScan {
@@ -7898,7 +7849,9 @@ impl TableScan {
 
 impl Drop for TableScan {
     fn drop(&mut self) {
+        eprintln!("DROP: TableScan dropping for table {}", self.table_name);
         self.close();
+        eprintln!("DROP: TableScan dropped for table {}", self.table_name);
     }
 }
 
@@ -7996,7 +7949,6 @@ impl Scan for TableScan {
 
     fn close(&mut self) {
         if let Some(record_page) = &self.record_page {
-            self.txn.unpin_internal(&record_page.handle.block_id());
             self.record_page = None;
         }
     }
@@ -8647,6 +8599,7 @@ impl BufferHandle {
 
 impl Clone for BufferHandle {
     fn clone(&self) -> Self {
+        eprintln!("CLONE: BufferHandle cloning for block {:?}", self.block_id);
         self.txn.pin_internal(&self.block_id);
         Self {
             block_id: self.block_id.clone(),
@@ -8657,7 +8610,9 @@ impl Clone for BufferHandle {
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
+        eprintln!("DROP: BufferHandle dropping for block {:?}", self.block_id);
         self.txn.unpin_internal(&self.block_id);
+        eprintln!("DROP: BufferHandle dropped for block {:?}", self.block_id);
     }
 }
 
@@ -8751,9 +8706,11 @@ impl Transaction {
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     pub fn commit(&self) -> Result<(), Box<dyn Error>> {
+        eprintln!("COMMIT: Transaction committing");
         self.recovery_manager.commit();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
+        eprintln!("COMMIT: Transaction committed, buffers unpinned");
         Ok(())
     }
 
@@ -8777,7 +8734,6 @@ impl Transaction {
 
     /// The public pin method which will return a [`BufferHandle`] for RAII semantics
     pub fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
-        self.buffer_list.pin(block_id);
         BufferHandle::new(block_id.clone(), Arc::clone(&self))
     }
 
@@ -10163,6 +10119,7 @@ struct HashMapValue {
 struct BufferList {
     buffers: RefCell<HashMap<BlockId, HashMapValue>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
+    committed: Cell<bool>,
 }
 
 impl BufferList {
@@ -10170,6 +10127,7 @@ impl BufferList {
         Self {
             buffers: RefCell::new(HashMap::new()),
             buffer_manager,
+            committed: Cell::new(false),
         }
     }
 
@@ -10193,6 +10151,20 @@ impl BufferList {
 
     /// Unpin the buffer associated with the provided [`BlockId`]
     fn unpin(&self, block_id: &BlockId) {
+        // If transaction has committed/rolled back, BufferHandles may outlive the transaction
+        // In that case, unpin is a no-op since unpin_all() already handled it
+        if self.committed.get() {
+            eprintln!(
+                "UNPIN_SKIP: Transaction committed, skipping unpin for {:?}",
+                block_id
+            );
+            return;
+        }
+
+        eprintln!(
+            "UNPIN_PROCEED: Transaction not committed, unpinning {:?}",
+            block_id
+        );
         assert!(self.buffers.borrow().contains_key(block_id));
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
         self.buffer_manager.lock().unwrap().unpin(buffer);
@@ -10218,6 +10190,9 @@ impl BufferList {
                 .unpin(Arc::clone(&buffer.buffer));
         }
         buffer_guard.clear();
+
+        // Mark as committed so subsequent BufferHandle drops become no-ops
+        self.committed.set(true);
     }
 }
 
@@ -10326,8 +10301,13 @@ impl Buffer {
 
     /// Decrement the pin count for this buffer
     fn unpin(&mut self) {
+        eprintln!(
+            "BUFFER_UNPIN: Before decrement, pins = {}, block = {:?}",
+            self.pins, self.block_id
+        );
         assert!(self.pins > 0); //  sanity check to know that it will not become negative
         self.pins -= 1;
+        eprintln!("BUFFER_UNPIN: After decrement, pins = {}", self.pins);
     }
 
     /// Reset the pin count for this buffer
@@ -10435,9 +10415,19 @@ impl BufferManager {
     /// If all of the pins have been removed, managed metadata & notify waiting threads
     fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
+        let block_id = buffer_guard.block_id.clone();
         buffer_guard.unpin();
-        if !buffer_guard.is_pinned() {
+        let is_pinned = buffer_guard.is_pinned();
+        eprintln!(
+            "UNPIN: BufferManager unpinning {:?}, pins now: {}, is_pinned: {}",
+            block_id, buffer_guard.pins, is_pinned
+        );
+        if !is_pinned {
             *self.num_available.lock().unwrap() += 1;
+            eprintln!(
+                "UNPIN: Buffer released, num_available now: {}",
+                *self.num_available.lock().unwrap()
+            );
             self.cond.notify_all();
         }
     }
@@ -10475,8 +10465,14 @@ mod buffer_manager_tests {
     /// and can then correctly read them back later
     #[test]
     fn test_buffer_replacement() {
+        eprintln!("TEST: Starting test_buffer_replacement");
         let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        eprintln!("TEST: SimpleDB created successfully");
         let buffer_manager = db.buffer_manager;
+        eprintln!(
+            "TEST: Available buffers: {}",
+            buffer_manager.lock().unwrap().available()
+        );
 
         //  Initialize the file with enough data
         let block_id = BlockId::new("testfile".to_string(), 1);
@@ -10487,9 +10483,11 @@ mod buffer_manager_tests {
         let buffer_manager_guard = buffer_manager.lock().unwrap();
 
         //  Create a buffer for block 1 and modify it
+        eprintln!("TEST: Pinning block 1");
         let buffer_1 = buffer_manager_guard
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
+        eprintln!("TEST: Block 1 pinned");
         buffer_1.lock().unwrap().contents.set_int(80, 100);
         buffer_1.lock().unwrap().set_modified(1, 0);
         buffer_manager_guard.unpin(buffer_1);
