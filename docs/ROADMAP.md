@@ -22,6 +22,8 @@
 ### Query Engine & CLI
 1. [Add EXPLAIN command for query plan visualization](https://github.com/redixhumayun/simpledb/issues/19) - Show query execution plans for educational insight
 2. [Implement cost-based query optimizer](https://github.com/redixhumayun/simpledb/issues/20) - Replace heuristic optimizer with statistics-driven cost-based optimization
+3. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
 
 ### Performance & Benchmarking
 1. [Implement buffer pool and I/O performance benchmarks](https://github.com/redixhumayun/simpledb/issues/15) - Storage layer performance measurement
+2. [Simplify Arc/Mutex usage and clarify multi-threading boundaries](https://github.com/redixhumayun/simpledb/issues/31) - Remove unnecessary synchronization overhead and improve code clarity
