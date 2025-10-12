@@ -1,5 +1,5 @@
-use std::fmt;
 use std::time::{Duration, Instant};
+use std::{env, fmt};
 
 pub struct BenchResult {
     pub operation: String,
@@ -17,6 +17,21 @@ impl fmt::Display for BenchResult {
             self.operation, self.mean, self.median, self.std_dev, self.iterations
         )
     }
+}
+
+pub fn parse_iterations() -> usize {
+    let args: Vec<String> = env::args().collect();
+
+    // Find first arg that's a valid number (skip flags like --bench)
+    for arg in args.iter().skip(1) {
+        if !arg.starts_with("--") {
+            if let Ok(n) = arg.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+
+    10 // Default
 }
 
 pub fn benchmark<F>(name: &str, iterations: usize, mut operation: F) -> BenchResult

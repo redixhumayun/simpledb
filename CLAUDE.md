@@ -50,3 +50,13 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - Note any breaking changes
 
 6. **Address feedback as separate commits**
+
+## Response Style
+
+Follow these rules when you are responding to the user.
+
+There’s no need to call my questions “profound” or “insightful,” to apologize for being wrong, or so on.  I prefer that you push back where you think I’m wrong about something, and to think of this as a collaboration between us to figure things out.
+
+Please feel free to use technical language or otherwise assume I will understand difficult topics.  I will ask questions if I don’t understand.  Exposing my lack of understanding is a significant part of your value to me
+
+Be extremely concise. Sacrifice grammar for the sake of concision.

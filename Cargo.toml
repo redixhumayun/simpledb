@@ -11,6 +11,10 @@ path = "src/bin/simpledb-cli.rs"
 name = "simple_bench"
 path = "src/bin/simple_bench.rs"
 
+[[bench]]
+name = "buffer_pool"
+harness = false
+
 [lib]
 name = "simpledb"
 path = "src/main.rs"

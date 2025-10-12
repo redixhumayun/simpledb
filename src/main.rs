@@ -27,8 +27,9 @@ use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
     QueryData,
 };
-#[cfg(test)]
-use test_utils::TestDir;
+
+pub use test_utils::TestDir;
+pub mod benchmark_framework;
 mod btree;
 mod parser;
 
@@ -41,7 +42,7 @@ type SharedFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
 /// The database struct
 pub struct SimpleDB {
     db_directory: PathBuf,
-    file_manager: SharedFS,
+    pub file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<Mutex<BufferManager>>,
     metadata_manager: Arc<MetadataManager>,
@@ -106,8 +107,7 @@ impl SimpleDB {
         )
     }
 
-    #[cfg(test)]
-    fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
+    pub fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -118,6 +118,10 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+
+    pub fn buffer_manager(&self) -> Arc<Mutex<BufferManager>> {
+        Arc::clone(&self.buffer_manager)
     }
 }
 
@@ -10315,7 +10319,7 @@ mod buffer_list_tests {
 }
 
 #[derive(Debug)]
-struct Buffer {
+pub struct Buffer {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
@@ -10394,7 +10398,7 @@ impl Buffer {
 }
 
 #[derive(Debug)]
-struct BufferManager {
+pub struct BufferManager {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_pool: Vec<Arc<Mutex<Buffer>>>,
@@ -10444,7 +10448,7 @@ impl BufferManager {
     /// Pin the buffer associated with the provided block_id
     /// It depends on [`BufferManager::try_to_pin`] to get a buffer back
     /// Once the buffer has been retrieved, it will handle metadata operations
-    fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
+    pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
         let mut num_available = self.num_available.lock().unwrap();
         loop {
@@ -10490,7 +10494,7 @@ impl BufferManager {
 
     /// Decrement the pin count for the provided buffer
     /// If all of the pins have been removed, managed metadata & notify waiting threads
-    fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
+    pub fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
         buffer_guard.unpin();
         let is_pinned = buffer_guard.is_pinned();
@@ -10880,7 +10884,7 @@ impl Page {
     }
 
     /// Set an integer at the given offset
-    fn set_int(&mut self, offset: usize, n: i32) {
+    pub fn set_int(&mut self, offset: usize, n: i32) {
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
     }
 

@@ -1,16 +1,13 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
+use simpledb::benchmark_framework::parse_iterations;
 use simpledb::SimpleDB;
 
-// Include our benchmark framework
-mod benchmark_framework {
-    include!("../../benches/benchmark_framework.rs");
-}
+use simpledb::benchmark_framework;
 
 use benchmark_framework::{benchmark, print_header};
 
@@ -141,26 +138,6 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
         txn.commit().unwrap();
     });
     println!("{result}");
-}
-
-fn parse_iterations() -> usize {
-    let args: Vec<String> = env::args().collect();
-
-    match args.len() {
-        1 => 10, // No args, use default
-        2 => args[1].parse().unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: Invalid number '{}', using default 10 iterations",
-                args[1]
-            );
-            10
-        }),
-        _ => {
-            eprintln!("Usage: {} [iterations]", args[0]);
-            eprintln!("Using default 10 iterations");
-            10
-        }
-    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

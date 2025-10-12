@@ -13,7 +13,6 @@ pub struct TestDir {
     pub path: PathBuf,
 }
 
-#[cfg(test)]
 impl TestDir {
     pub fn new<P>(path: P) -> Self
     where
