@@ -10397,6 +10397,44 @@ impl Buffer {
     }
 }
 
+/// Statistics for buffer pool performance tracking
+#[derive(Debug)]
+pub struct BufferStats {
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+}
+
+impl BufferStats {
+    fn new() -> Self {
+        Self {
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn get(&self) -> (usize, usize) {
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset(&self) {
+        self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        let (hits, misses) = self.get();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            (hits as f64 / total as f64) * 100.0
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BufferManager {
     file_manager: SharedFS,
@@ -10404,6 +10442,7 @@ pub struct BufferManager {
     buffer_pool: Vec<Arc<Mutex<Buffer>>>,
     num_available: Mutex<usize>,
     cond: Condvar,
+    stats: Option<Arc<BufferStats>>,
 }
 
 impl BufferManager {
@@ -10427,6 +10466,29 @@ impl BufferManager {
             buffer_pool,
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
+            stats: None,
+        }
+    }
+
+    /// Enable statistics collection for benchmarking
+    pub fn enable_stats(&mut self) {
+        self.stats = Some(Arc::new(BufferStats::new()));
+    }
+
+    /// Get current statistics if enabled
+    pub fn get_stats(&self) -> Option<(usize, usize)> {
+        self.stats.as_ref().map(|s| s.get())
+    }
+
+    /// Get statistics struct reference if enabled
+    pub fn stats(&self) -> Option<&Arc<BufferStats>> {
+        self.stats.as_ref()
+    }
+
+    /// Reset statistics
+    pub fn reset_stats(&self) {
+        if let Some(stats) = &self.stats {
+            stats.reset();
         }
     }
 
@@ -10480,14 +10542,26 @@ impl BufferManager {
     /// Update matadata for the assigned buffer before returning
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
         let buffer = match self.find_existing_buffer(block_id) {
-            Some(buffer) => buffer,
-            None => match self.choose_unpinned_buffer() {
-                Some(buffer) => {
-                    buffer.lock().unwrap().assign_to_block(block_id);
-                    buffer
+            Some(buffer) => {
+                // Track cache hit
+                if let Some(stats) = &self.stats {
+                    stats.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => return None,
-            },
+                buffer
+            }
+            None => {
+                // Track cache miss
+                if let Some(stats) = &self.stats {
+                    stats.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                match self.choose_unpinned_buffer() {
+                    Some(buffer) => {
+                        buffer.lock().unwrap().assign_to_block(block_id);
+                        buffer
+                    }
+                    None => return None,
+                }
+            }
         };
         Some(buffer)
     }

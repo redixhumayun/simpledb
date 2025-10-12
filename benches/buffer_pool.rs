@@ -10,6 +10,15 @@ fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDi
     SimpleDB::new_for_test(block_size, num_buffers)
 }
 
+fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
+    let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers);
+    db.buffer_manager()
+        .lock()
+        .unwrap()
+        .enable_stats();
+    (db, test_dir)
+}
+
 fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
     let test_file = "testfile".to_string();
     let buffer_manager = db.buffer_manager();
@@ -327,6 +336,64 @@ fn memory_pressure_test(block_size: usize, iterations: usize) {
     }
 }
 
+// Phase 4: Hit Rate Measurement
+
+fn run_pattern_with_stats(
+    name: &str,
+    db: &SimpleDB,
+    block_size: usize,
+    num_buffers: usize,
+    iterations: usize,
+    pattern_fn: impl Fn(&SimpleDB, usize, usize, usize),
+) {
+    // Reset stats before run
+    db.buffer_manager().lock().unwrap().reset_stats();
+
+    // Run the pattern
+    pattern_fn(db, block_size, num_buffers, iterations);
+
+    // Get stats
+    if let Some(stats) = db.buffer_manager().lock().unwrap().stats() {
+        let hit_rate = stats.hit_rate();
+        let (hits, misses) = stats.get();
+        println!("{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
+                 name, hit_rate, hits, misses);
+    }
+}
+
+fn run_random_pattern_with_stats(
+    name: &str,
+    db: &SimpleDB,
+    block_size: usize,
+    working_set: usize,
+    iterations: usize,
+) {
+    db.buffer_manager().lock().unwrap().reset_stats();
+    random_access(db, block_size, working_set, iterations);
+
+    if let Some(stats) = db.buffer_manager().lock().unwrap().stats() {
+        let hit_rate = stats.hit_rate();
+        let (hits, misses) = stats.get();
+        println!("{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
+                 name, hit_rate, hits, misses);
+    }
+}
+
+fn hit_rate_benchmarks(block_size: usize, num_buffers: usize, iterations: usize) {
+    let (db, _test_dir) = setup_buffer_pool_with_stats(block_size, num_buffers);
+
+    println!("Phase 4: Hit Rate Measurement");
+    println!("Operation            | Hit Rate & Statistics");
+    println!("{}", "-".repeat(70));
+
+    run_pattern_with_stats("Sequential Scan", &db, block_size, num_buffers, iterations, sequential_scan);
+    run_pattern_with_stats("Repeated Access", &db, block_size, num_buffers, iterations, repeated_access);
+    run_random_pattern_with_stats("Random (K=10)", &db, block_size, 10, iterations);
+    run_random_pattern_with_stats("Random (K=50)", &db, block_size, 50, iterations);
+    run_random_pattern_with_stats("Random (K=100)", &db, block_size, 100, iterations);
+    run_pattern_with_stats("Zipfian (80/20)", &db, block_size, num_buffers, iterations, zipfian_access);
+}
+
 fn main() {
     let iterations = parse_iterations();
     let block_size = 4096;
@@ -368,6 +435,10 @@ fn main() {
     // Phase 3
     pool_size_scaling(block_size, iterations);
     memory_pressure_test(block_size, iterations);
+    println!();
+
+    // Phase 4
+    hit_rate_benchmarks(block_size, num_buffers, iterations);
 
     println!();
     println!("All benchmarks completed!");
