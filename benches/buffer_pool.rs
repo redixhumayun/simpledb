@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use simpledb::{
-    benchmark_framework::{benchmark, parse_iterations, print_header},
+    benchmark_framework::{benchmark, parse_bench_args, print_header},
     test_utils::generate_random_number,
     BlockId, Page, SimpleDB, TestDir,
 };
@@ -12,10 +12,7 @@ fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDi
 
 fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
     let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers);
-    db.buffer_manager()
-        .lock()
-        .unwrap()
-        .enable_stats();
+    db.buffer_manager().lock().unwrap().enable_stats();
     (db, test_dir)
 }
 
@@ -135,8 +132,10 @@ fn sequential_scan(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
     let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
 
-    println!("{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-             "Sequential Scan", mean_throughput, median_throughput);
+    println!(
+        "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+        "Sequential Scan", mean_throughput, median_throughput
+    );
 }
 
 fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterations: usize) {
@@ -167,8 +166,10 @@ fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
     let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
 
-    println!("{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-             "Repeated Access", mean_throughput, median_throughput);
+    println!(
+        "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+        "Repeated Access", mean_throughput, median_throughput
+    );
 }
 
 fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iterations: usize) {
@@ -190,20 +191,28 @@ fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iter
         .collect();
 
     // Benchmark: random access pattern as one workload
-    let result = benchmark(&format!("Random (K={})", working_set_size), iterations, || {
-        for &block_idx in &random_indices {
-            let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer_manager_guard = buffer_manager.lock().unwrap();
-            let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-            buffer_manager_guard.unpin(buffer);
-        }
-    });
+    let result = benchmark(
+        &format!("Random (K={})", working_set_size),
+        iterations,
+        || {
+            for &block_idx in &random_indices {
+                let block_id = BlockId::new(test_file.clone(), block_idx);
+                let buffer_manager_guard = buffer_manager.lock().unwrap();
+                let buffer = buffer_manager_guard.pin(&block_id).unwrap();
+                buffer_manager_guard.unpin(buffer);
+            }
+        },
+    );
 
     let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
     let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
 
-    println!("{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-             format!("Random (K={:3})", working_set_size), mean_throughput, median_throughput);
+    println!(
+        "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+        format!("Random (K={:3})", working_set_size),
+        mean_throughput,
+        median_throughput
+    );
 }
 
 fn zipfian_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterations: usize) {
@@ -248,8 +257,10 @@ fn zipfian_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iteratio
     let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
     let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
 
-    println!("{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-             "Zipfian (80/20)", mean_throughput, median_throughput);
+    println!(
+        "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+        "Zipfian (80/20)", mean_throughput, median_throughput
+    );
 }
 
 // Phase 3: Pool Size Sensitivity
@@ -296,18 +307,17 @@ fn pool_size_scaling(block_size: usize, iterations: usize) {
     let working_set_size = 100; // Fixed workload: 100 blocks
 
     println!("Phase 3: Pool Size Sensitivity");
-    println!("Fixed workload: Random access to {} blocks", working_set_size);
+    println!(
+        "Fixed workload: Random access to {} blocks",
+        working_set_size
+    );
     println!();
     println!("Pool Size (buffers) | Throughput (blocks/sec)");
     println!("{}", "-".repeat(50));
 
     for pool_size in pool_sizes {
-        let throughput = run_fixed_workload_with_pool_size(
-            block_size,
-            pool_size,
-            working_set_size,
-            iterations,
-        );
+        let throughput =
+            run_fixed_workload_with_pool_size(block_size, pool_size, working_set_size, iterations);
         println!("{:19} | {:>10.0}", pool_size, throughput);
     }
 }
@@ -323,12 +333,8 @@ fn memory_pressure_test(block_size: usize, iterations: usize) {
 
     for offset in pressure_offsets {
         let working_set = base_pool_size + offset;
-        let throughput = run_fixed_workload_with_pool_size(
-            block_size,
-            base_pool_size,
-            working_set,
-            iterations,
-        );
+        let throughput =
+            run_fixed_workload_with_pool_size(block_size, base_pool_size, working_set, iterations);
         println!(
             "{:9} | {:11} | {:>10.0}",
             base_pool_size, working_set, throughput
@@ -356,26 +362,10 @@ fn run_pattern_with_stats(
     if let Some(stats) = db.buffer_manager().lock().unwrap().stats() {
         let hit_rate = stats.hit_rate();
         let (hits, misses) = stats.get();
-        println!("{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
-                 name, hit_rate, hits, misses);
-    }
-}
-
-fn run_random_pattern_with_stats(
-    name: &str,
-    db: &SimpleDB,
-    block_size: usize,
-    working_set: usize,
-    iterations: usize,
-) {
-    db.buffer_manager().lock().unwrap().reset_stats();
-    random_access(db, block_size, working_set, iterations);
-
-    if let Some(stats) = db.buffer_manager().lock().unwrap().stats() {
-        let hit_rate = stats.hit_rate();
-        let (hits, misses) = stats.get();
-        println!("{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
-                 name, hit_rate, hits, misses);
+        println!(
+            "{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
+            name, hit_rate, hits, misses
+        );
     }
 }
 
@@ -386,18 +376,59 @@ fn hit_rate_benchmarks(block_size: usize, num_buffers: usize, iterations: usize)
     println!("Operation            | Hit Rate & Statistics");
     println!("{}", "-".repeat(70));
 
-    run_pattern_with_stats("Sequential Scan", &db, block_size, num_buffers, iterations, sequential_scan);
-    run_pattern_with_stats("Repeated Access", &db, block_size, num_buffers, iterations, repeated_access);
-    run_random_pattern_with_stats("Random (K=10)", &db, block_size, 10, iterations);
-    run_random_pattern_with_stats("Random (K=50)", &db, block_size, 50, iterations);
-    run_random_pattern_with_stats("Random (K=100)", &db, block_size, 100, iterations);
-    run_pattern_with_stats("Zipfian (80/20)", &db, block_size, num_buffers, iterations, zipfian_access);
+    run_pattern_with_stats(
+        "Sequential Scan",
+        &db,
+        block_size,
+        num_buffers,
+        iterations,
+        sequential_scan,
+    );
+    run_pattern_with_stats(
+        "Repeated Access",
+        &db,
+        block_size,
+        num_buffers,
+        iterations,
+        repeated_access,
+    );
+    run_pattern_with_stats(
+        "Zipfian (80/20)",
+        &db,
+        block_size,
+        num_buffers,
+        iterations,
+        zipfian_access,
+    );
+    run_pattern_with_stats(
+        "Random (K=10)",
+        &db,
+        block_size,
+        10,
+        iterations,
+        random_access,
+    );
+    run_pattern_with_stats(
+        "Random (K=50)",
+        &db,
+        block_size,
+        50,
+        iterations,
+        random_access,
+    );
+    run_pattern_with_stats(
+        "Random (K=100)",
+        &db,
+        block_size,
+        100,
+        iterations,
+        random_access,
+    );
 }
 
 fn main() {
-    let iterations = parse_iterations();
+    let (iterations, num_buffers) = parse_bench_args();
     let block_size = 4096;
-    let num_buffers = 12;
 
     println!("SimpleDB Buffer Pool Benchmark Suite");
     println!("====================================");

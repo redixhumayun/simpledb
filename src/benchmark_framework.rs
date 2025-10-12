@@ -19,19 +19,23 @@ impl fmt::Display for BenchResult {
     }
 }
 
-pub fn parse_iterations() -> usize {
+pub fn parse_bench_args() -> (usize, usize) {
     let args: Vec<String> = env::args().collect();
+    let mut numeric_args = Vec::new();
 
-    // Find first arg that's a valid number (skip flags like --bench)
+    // Collect all numeric args (skip flags like --bench)
     for arg in args.iter().skip(1) {
         if !arg.starts_with("--") {
             if let Ok(n) = arg.parse::<usize>() {
-                return n;
+                numeric_args.push(n);
             }
         }
     }
 
-    10 // Default
+    let iterations = numeric_args.get(0).copied().unwrap_or(10);
+    let num_buffers = numeric_args.get(1).copied().unwrap_or(12);
+
+    (iterations, num_buffers)
 }
 
 pub fn benchmark<F>(name: &str, iterations: usize, mut operation: F) -> BenchResult

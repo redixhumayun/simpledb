@@ -4,12 +4,11 @@ use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
-use simpledb::benchmark_framework::parse_iterations;
 use simpledb::SimpleDB;
 
 use simpledb::benchmark_framework;
 
-use benchmark_framework::{benchmark, print_header};
+use benchmark_framework::{benchmark, parse_bench_args, print_header};
 
 fn cleanup_bench_data() {
     let bench_path = Path::new("./bench-data");
@@ -141,7 +140,7 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let iterations = parse_iterations();
+    let (iterations, _num_buffers) = parse_bench_args();
 
     println!("SimpleDB Stdlib-Only Benchmark Suite");
     println!("====================================");
