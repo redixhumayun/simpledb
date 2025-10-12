@@ -21,7 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-mod test_utils;
+pub mod test_utils;
 use btree::BTreeIndex;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
