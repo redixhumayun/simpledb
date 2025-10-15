@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
 
 use simpledb::{
     benchmark_framework::{benchmark, parse_bench_args, print_header},
@@ -12,7 +14,7 @@ fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDi
 
 fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
     let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers);
-    db.buffer_manager().lock().unwrap().enable_stats();
+    db.buffer_manager().enable_stats();
     (db, test_dir)
 }
 
@@ -26,9 +28,8 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
     db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
     let result = benchmark("Pin/Unpin (hit)", iterations, || {
-        let buffer_manager_guard = buffer_manager.lock().unwrap();
-        let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-        buffer_manager_guard.unpin(buffer);
+        let buffer = buffer_manager.pin(&block_id).unwrap();
+        buffer_manager.unpin(buffer);
     });
     println!("{result}");
 }
@@ -48,9 +49,8 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize, _num_buffers: u
     let mut block_idx = 0;
     let result = benchmark("Cold Pin (miss)", iterations, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
-        let buffer_manager_guard = buffer_manager.lock().unwrap();
-        let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-        buffer_manager_guard.unpin(buffer);
+        let buffer = buffer_manager.pin(&block_id).unwrap();
+        buffer_manager.unpin(buffer);
         block_idx += 1;
     });
     println!("{result}");
@@ -122,9 +122,8 @@ fn sequential_scan(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     let result = benchmark("Sequential Scan", iterations, || {
         for i in 0..total_blocks {
             let block_id = BlockId::new(test_file.clone(), i);
-            let buffer_manager_guard = buffer_manager.lock().unwrap();
-            let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-            buffer_manager_guard.unpin(buffer);
+            let buffer = buffer_manager.pin(&block_id).unwrap();
+            buffer_manager.unpin(buffer);
         }
     });
 
@@ -157,9 +156,8 @@ fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
         for i in 0..total_accesses {
             let block_idx = i % working_set;
             let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer_manager_guard = buffer_manager.lock().unwrap();
-            let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-            buffer_manager_guard.unpin(buffer);
+            let buffer = buffer_manager.pin(&block_id).unwrap();
+            buffer_manager.unpin(buffer);
         }
     });
 
@@ -197,9 +195,8 @@ fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iter
         || {
             for &block_idx in &random_indices {
                 let block_id = BlockId::new(test_file.clone(), block_idx);
-                let buffer_manager_guard = buffer_manager.lock().unwrap();
-                let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-                buffer_manager_guard.unpin(buffer);
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
             }
         },
     );
@@ -248,9 +245,8 @@ fn zipfian_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iteratio
     let result = benchmark("Zipfian (80/20)", iterations, || {
         for &block_idx in &zipfian_indices {
             let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer_manager_guard = buffer_manager.lock().unwrap();
-            let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-            buffer_manager_guard.unpin(buffer);
+            let buffer = buffer_manager.pin(&block_id).unwrap();
+            buffer_manager.unpin(buffer);
         }
     });
 
@@ -293,9 +289,8 @@ fn run_fixed_workload_with_pool_size(
     let result = benchmark("Pool Size Test", iterations, || {
         for &block_idx in &random_indices {
             let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer_manager_guard = buffer_manager.lock().unwrap();
-            let buffer = buffer_manager_guard.pin(&block_id).unwrap();
-            buffer_manager_guard.unpin(buffer);
+            let buffer = buffer_manager.pin(&block_id).unwrap();
+            buffer_manager.unpin(buffer);
         }
     });
 
@@ -353,13 +348,13 @@ fn run_pattern_with_stats(
     pattern_fn: impl Fn(&SimpleDB, usize, usize, usize),
 ) {
     // Reset stats before run
-    db.buffer_manager().lock().unwrap().reset_stats();
+    db.buffer_manager().reset_stats();
 
     // Run the pattern
     pattern_fn(db, block_size, num_buffers, iterations);
 
     // Get stats
-    if let Some(stats) = db.buffer_manager().lock().unwrap().stats() {
+    if let Some(stats) = db.buffer_manager().stats() {
         let hit_rate = stats.hit_rate();
         let (hits, misses) = stats.get();
         println!(
@@ -426,6 +421,134 @@ fn hit_rate_benchmarks(block_size: usize, num_buffers: usize, iterations: usize)
     );
 }
 
+// Phase 5: Concurrent Access
+
+fn multithreaded_pin(db: &SimpleDB, block_size: usize, num_threads: usize, ops_per_thread: usize) {
+    let test_file = "concurrent_test".to_string();
+
+    // Pre-create blocks (each thread gets its own range)
+    for i in 0..(num_threads * 10) {
+        let block_id = BlockId::new(test_file.clone(), i);
+        let mut page = Page::new(block_size);
+        page.set_int(0, i as i32);
+        db.file_manager.lock().unwrap().write(&block_id, &mut page);
+    }
+
+    let start = Instant::now();
+
+    // Spawn threads
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let test_file = test_file.clone();
+            let buffer_manager = db.buffer_manager();
+
+            thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    // Each thread accesses blocks in its own range to reduce contention
+                    let block_num = (thread_id * 10) + (i % 10);
+                    let block_id = BlockId::new(test_file.clone(), block_num);
+
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+            })
+        })
+        .collect();
+
+    // Wait for all threads
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let total_ops = num_threads * ops_per_thread;
+    let throughput = total_ops as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "{} threads, {} ops/thread | {:>10.0} ops/sec | {:>10.2?} total",
+        num_threads, ops_per_thread, throughput, elapsed
+    );
+}
+
+fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+    let test_file = "starvation_test".to_string();
+
+    // Pre-create blocks
+    for i in 0..(num_buffers + 10) {
+        let block_id = BlockId::new(test_file.clone(), i);
+        let mut page = Page::new(block_size);
+        page.set_int(0, i as i32);
+        db.file_manager.lock().unwrap().write(&block_id, &mut page);
+    }
+
+    // Pin entire buffer pool
+    let buffer_manager = db.buffer_manager();
+    let mut pinned_buffers = Vec::new();
+
+    for i in 0..num_buffers {
+        let block_id = BlockId::new(test_file.clone(), i);
+        let buffer = buffer_manager.pin(&block_id).unwrap();
+        pinned_buffers.push(buffer);
+    }
+
+    // Now spawn threads that will need to wait
+    let num_waiting_threads = 4;
+    let start = Instant::now();
+
+    let handles: Vec<_> = (0..num_waiting_threads)
+        .map(|thread_id| {
+            let test_file = test_file.clone();
+            let buffer_manager = buffer_manager.clone();
+
+            thread::spawn(move || {
+                let block_id = BlockId::new(test_file.clone(), num_buffers + thread_id);
+
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
+            })
+        })
+        .collect();
+
+    // Sleep to let threads start waiting
+    thread::sleep(std::time::Duration::from_millis(50));
+
+    // Unpin one buffer at a time with small delay to observe gradual recovery
+    for buffer in pinned_buffers {
+        buffer_manager.unpin(buffer);
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let elapsed = start.elapsed();
+
+    println!(
+        "Starved {} threads | Pool recovery time: {:>10.2?}",
+        num_waiting_threads, elapsed
+    );
+}
+
+fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
+    let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+
+    println!("Phase 5: Concurrent Access");
+    println!();
+
+    println!("5.1 Multi-threaded Pin/Unpin (lock contention):");
+    println!("{}", "-".repeat(70));
+    multithreaded_pin(&db, block_size, 2, 1000);
+    multithreaded_pin(&db, block_size, 4, 1000);
+    multithreaded_pin(&db, block_size, 8, 1000);
+
+    println!();
+    println!("5.2 Buffer Starvation (cond.wait() latency):");
+    println!("{}", "-".repeat(70));
+    buffer_starvation(&db, block_size, num_buffers);
+}
+
 fn main() {
     let (iterations, num_buffers) = parse_bench_args();
     let block_size = 4096;
@@ -470,6 +593,10 @@ fn main() {
 
     // Phase 4
     hit_rate_benchmarks(block_size, num_buffers, iterations);
+    println!();
+
+    // Phase 5
+    concurrent_benchmarks(block_size, num_buffers);
 
     println!();
     println!("All benchmarks completed!");

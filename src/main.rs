@@ -44,7 +44,7 @@ pub struct SimpleDB {
     db_directory: PathBuf,
     pub file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     metadata_manager: Arc<MetadataManager>,
     pub planner: Arc<Planner>,
     lock_table: Arc<LockTable>,
@@ -66,11 +66,11 @@ impl SimpleDB {
             Arc::clone(&file_manager),
             Self::LOG_FILE,
         )));
-        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(
+        let buffer_manager = Arc::new(BufferManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
             num_buffers,
-        )));
+        ));
         let lock_table = Arc::new(LockTable::new(100)); // 100ms timeout
         let txn = Arc::new(Transaction::new(
             Arc::clone(&file_manager),
@@ -120,7 +120,7 @@ impl SimpleDB {
         (db, test_dir)
     }
 
-    pub fn buffer_manager(&self) -> Arc<Mutex<BufferManager>> {
+    pub fn buffer_manager(&self) -> Arc<BufferManager> {
         Arc::clone(&self.buffer_manager)
     }
 }
@@ -750,7 +750,6 @@ impl ChunkScan {
         self.current_slot = None;
     }
 }
-
 impl Scan for ChunkScan {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
         self.move_to_block(self.first_block_num);
@@ -1335,15 +1334,10 @@ where
                 MergeJoinScanState::BeforeFirst => match (self.scan_1.next(), self.scan_2.next()) {
                     (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
                     (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
-                    (Some(Err(e1)), Some(Err(e2))) => {
-                        return Some(Err(format!(
-                            "Error in both scans - First error: {e1}, Second error: {e2}"
-                        )
-                        .into()))
-                    }
                     (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
                         return Some(Err(e))
                     }
+                    (Some(Err(e1)), Some(Err(_e2))) => return Some(Err(e1)),
                     (Some(Ok(_)), Some(Ok(_))) => {
                         self.scan_state = MergeJoinScanState::SeekMatch;
                         continue;
@@ -1482,7 +1476,6 @@ where
         unimplemented!()
     }
 }
-
 #[cfg(test)]
 mod merge_join_scan_tests {
 
@@ -8579,7 +8572,7 @@ static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     recovery_manager: RecoveryManager,
     concurrency_manager: ConcurrencyManager,
     buffer_list: BufferList,
@@ -8592,7 +8585,7 @@ impl Transaction {
     fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
+        buffer_manager: Arc<BufferManager>,
         lock_table: Arc<LockTable>,
     ) -> Self {
         let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
@@ -8734,7 +8727,7 @@ impl Transaction {
 
     /// Get the available buffers for this transaction
     fn available_buffs(&self) -> usize {
-        self.buffer_manager.lock().unwrap().available()
+        self.buffer_manager.available()
     }
 
     /// Get the size of this file in blocks
@@ -8758,7 +8751,6 @@ impl Transaction {
         self.file_manager.lock().unwrap().block_size()
     }
 }
-
 #[cfg(test)]
 mod transaction_tests {
     use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
@@ -9131,10 +9123,7 @@ mod transaction_tests {
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9172,10 +9161,7 @@ mod transaction_tests {
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9190,13 +9176,10 @@ mod transaction_tests {
 
         // All buffers should be unpinned after commit
         // Even though handle still exists
-        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+        assert_eq!(db.buffer_manager.available(), 3);
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9213,7 +9196,7 @@ mod transaction_tests {
         drop(handle); // Should be no-op (committed flag prevents double-unpin)
 
         // Verify no crash and all buffers available
-        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+        assert_eq!(db.buffer_manager.available(), 3);
     }
 
     #[test]
@@ -9221,7 +9204,7 @@ mod transaction_tests {
         let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
 
         // Check initial available buffers
-        let initial_available = db.buffer_manager.lock().unwrap().available();
+        let initial_available = db.buffer_manager.available();
 
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
@@ -9241,10 +9224,7 @@ mod transaction_tests {
         drop(txn);
 
         // Verify all buffers available (should match initial available)
-        assert_eq!(
-            db.buffer_manager.lock().unwrap().available(),
-            initial_available
-        );
+        assert_eq!(db.buffer_manager.available(), initial_available);
     }
 }
 
@@ -9544,7 +9524,6 @@ struct ConcurrencyManager {
     locks: RefCell<HashMap<BlockId, LockType>>,
     tx_id: TransactionID,
 }
-
 impl ConcurrencyManager {
     fn new(tx_id: TransactionID, timeout: u64, lock_table: Arc<LockTable>) -> Self {
         Self {
@@ -9609,14 +9588,14 @@ impl ConcurrencyManager {
 struct RecoveryManager {
     tx_num: usize,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
 }
 
 impl RecoveryManager {
     fn new(
         tx_num: usize,
         log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
+        buffer_manager: Arc<BufferManager>,
     ) -> Self {
         Self {
             tx_num,
@@ -9630,7 +9609,7 @@ impl RecoveryManager {
     /// It creates and writes a new [`LogRecord::Commit`] record to the WAL
     /// It then forces a flush on the WAL to ensure logs are committed
     fn commit(&self) {
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
         let lsn = record
             .write_log_record(Arc::clone(&self.log_manager))
@@ -9656,7 +9635,7 @@ impl RecoveryManager {
             record.undo(tx);
         }
         //  Flush all data associated with this transaction
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
         let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
@@ -9686,7 +9665,7 @@ impl RecoveryManager {
             }
         }
         //  Flush all data associated with this transaction
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
         let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
@@ -10172,13 +10151,13 @@ struct BufferList {
     /// Maps block ID's to buffers and their pin contents
     buffers: RefCell<HashMap<BlockId, HashMapValue>>,
     /// Shared buffer manager for pinning/unpinning operations
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     /// Tracks whether the transaction has been committed
     txn_committed: Cell<bool>,
 }
 
 impl BufferList {
-    fn new(buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
+    fn new(buffer_manager: Arc<BufferManager>) -> Self {
         Self {
             buffers: RefCell::new(HashMap::new()),
             buffer_manager,
@@ -10196,7 +10175,7 @@ impl BufferList {
 
     /// Pin the buffer associated with the provided [`BlockId`]
     fn pin(&self, block_id: &BlockId) {
-        let buffer = self.buffer_manager.lock().unwrap().pin(block_id).unwrap();
+        let buffer = self.buffer_manager.pin(block_id).unwrap();
         self.buffers
             .borrow_mut()
             .entry(block_id.clone())
@@ -10219,7 +10198,7 @@ impl BufferList {
             );
         }
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
-        self.buffer_manager.lock().unwrap().unpin(buffer);
+        self.buffer_manager.unpin(buffer);
         let should_remove = {
             let mut buffers = self.buffers.borrow_mut();
             let v = buffers.get_mut(block_id).unwrap();
@@ -10237,10 +10216,7 @@ impl BufferList {
         let buffers = buffer_guard.values();
         for value in buffers {
             for _ in 0..value.count {
-                self.buffer_manager
-                    .lock()
-                    .unwrap()
-                    .unpin(Arc::clone(&value.buffer));
+                self.buffer_manager.unpin(Arc::clone(&value.buffer));
             }
         }
         buffer_guard.clear();
@@ -10298,7 +10274,7 @@ mod buffer_list_tests {
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
         )));
-        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(file_manager, log_manager, 4)));
+        let buffer_manager = Arc::new(BufferManager::new(file_manager, log_manager, 4));
         let buffer_list = BufferList::new(buffer_manager);
 
         //  check that there are no buffers in the buffer list initially
@@ -10328,7 +10304,6 @@ pub struct Buffer {
     txn: Option<usize>,
     lsn: Option<Lsn>,
 }
-
 impl Buffer {
     fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
         let size = file_manager.lock().unwrap().block_size();
@@ -10442,7 +10417,7 @@ pub struct BufferManager {
     buffer_pool: Vec<Arc<Mutex<Buffer>>>,
     num_available: Mutex<usize>,
     cond: Condvar,
-    stats: Option<Arc<BufferStats>>,
+    stats: OnceLock<Arc<BufferStats>>,
 }
 
 impl BufferManager {
@@ -10466,28 +10441,28 @@ impl BufferManager {
             buffer_pool,
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
-            stats: None,
+            stats: OnceLock::new(),
         }
     }
 
-    /// Enable statistics collection for benchmarking
-    pub fn enable_stats(&mut self) {
-        self.stats = Some(Arc::new(BufferStats::new()));
+    /// Enable statistics collection for benchmarking (idempotent)
+    pub fn enable_stats(&self) {
+        let _ = self.stats.set(Arc::new(BufferStats::new()));
     }
 
     /// Get current statistics if enabled
     pub fn get_stats(&self) -> Option<(usize, usize)> {
-        self.stats.as_ref().map(|s| s.get())
+        self.stats.get().map(|s| s.get())
     }
 
     /// Get statistics struct reference if enabled
     pub fn stats(&self) -> Option<&Arc<BufferStats>> {
-        self.stats.as_ref()
+        self.stats.get()
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        if let Some(stats) = &self.stats {
+        if let Some(stats) = self.stats.get() {
             stats.reset();
         }
     }
@@ -10507,73 +10482,84 @@ impl BufferManager {
         }
     }
 
-    /// Pin the buffer associated with the provided block_id
-    /// It depends on [`BufferManager::try_to_pin`] to get a buffer back
-    /// Once the buffer has been retrieved, it will handle metadata operations
+    /// Depends on the [`BufferManager::try_to_pin`] method to get a [`Buffer`] back
+    /// This method will not perform any metadata operations on the buffer
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
-        let mut num_available = self.num_available.lock().unwrap();
         loop {
-            match self.try_to_pin(block_id) {
-                Some(buffer) => {
-                    {
-                        let mut buffer_guard = buffer.lock().unwrap();
-                        if !buffer_guard.is_pinned() {
-                            *num_available -= 1;
-                        }
-                        buffer_guard.pin();
-                    }
-                    return Ok(buffer);
-                }
-                None => {
-                    num_available = self.cond.wait(num_available).unwrap();
-                    if start.elapsed() > Duration::from_secs(Self::MAX_TIME) {
-                        return Err("Timed out waiting for buffer".into());
-                    }
-                }
+            if let Some(buffer) = self.try_to_pin(block_id) {
+                return Ok(buffer);
+            }
+
+            let avail = self.num_available.lock().unwrap();
+            let (avail, wait_res) = self
+                .cond
+                .wait_timeout(avail, Duration::from_secs(Self::MAX_TIME))
+                .unwrap();
+            if wait_res.timed_out() || start.elapsed() > Duration::from_secs(Self::MAX_TIME) {
+                return Err("Timed out waiting for buffer".into());
             }
         }
     }
 
     /// Find a buffer to pin this block to
     /// First check to see if there is an existing buffer for this block
-    /// If not, try to find an unpinned buffer
+    /// If there is an existing buffer, increment the pin count and return it
+    /// If not, try to find an unpinned buffer, pin it and then return it
     /// If both cases above fail, return None
-    /// Update matadata for the assigned buffer before returning
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
-        let buffer = match self.find_existing_buffer(block_id) {
-            Some(buffer) => {
-                // Track cache hit
-                if let Some(stats) = &self.stats {
-                    stats.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(buffer) = self.find_existing_buffer(block_id) {
+            let was_unpinned = {
+                let mut guard = buffer.lock().unwrap();
+                if guard.block_id.as_ref() != Some(block_id) {
+                    return None;
                 }
-                buffer
+                let was_unpinned = !guard.is_pinned();
+                guard.pin();
+                was_unpinned
+            };
+            if was_unpinned {
+                *self.num_available.lock().unwrap() -= 1;
             }
-            None => {
-                // Track cache miss
-                if let Some(stats) = &self.stats {
-                    stats.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                match self.choose_unpinned_buffer() {
-                    Some(buffer) => {
-                        buffer.lock().unwrap().assign_to_block(block_id);
-                        buffer
-                    }
-                    None => return None,
-                }
+            if let Some(stats) = self.stats.get() {
+                stats
+                    .hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        };
-        Some(buffer)
+            return Some(buffer);
+        }
+
+        if let Some(stats) = self.stats.get() {
+            stats
+                .misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some(buffer) = self.choose_unpinned_buffer() {
+            {
+                let mut guard = buffer.lock().unwrap();
+                if guard.is_pinned() {
+                    return None;
+                }
+                guard.assign_to_block(block_id);
+                guard.pin();
+            }
+            *self.num_available.lock().unwrap() -= 1;
+            return Some(buffer);
+        }
+        None
     }
 
     /// Decrement the pin count for the provided buffer
     /// If all of the pins have been removed, managed metadata & notify waiting threads
     pub fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
+        assert!(buffer_guard.pins > 0);
+        let was_one = buffer_guard.pins == 1;
         buffer_guard.unpin();
-        let is_pinned = buffer_guard.is_pinned();
-        if !is_pinned {
-            *self.num_available.lock().unwrap() += 1;
+        if was_one {
+            let mut avail = self.num_available.lock().unwrap();
+            *avail += 1;
             self.cond.notify_all();
         }
     }
@@ -10643,7 +10629,7 @@ mod buffer_manager_tests {
         page.set_int(80, 1);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
-        let buffer_manager_guard = buffer_manager.lock().unwrap();
+        let buffer_manager_guard = &buffer_manager;
 
         //  Create a buffer for block 1 and modify it
         let buffer_1 = buffer_manager_guard
@@ -11087,7 +11073,6 @@ impl FileManager {
             .unwrap()
     }
 }
-
 impl FileSystemInterface for FileManager {
     fn block_size(&self) -> usize {
         self.blocksize
