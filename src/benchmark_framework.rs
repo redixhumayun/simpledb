@@ -1,5 +1,5 @@
-use std::fmt;
 use std::time::{Duration, Instant};
+use std::{env, fmt};
 
 pub struct BenchResult {
     pub operation: String,
@@ -19,14 +19,35 @@ impl fmt::Display for BenchResult {
     }
 }
 
-pub fn benchmark<F>(name: &str, iterations: usize, mut operation: F) -> BenchResult
+pub fn parse_bench_args() -> (usize, usize) {
+    let args: Vec<String> = env::args().collect();
+    let mut numeric_args = Vec::new();
+
+    // Collect all numeric args (skip flags like --bench)
+    for arg in args.iter().skip(1) {
+        if !arg.starts_with("--") {
+            if let Ok(n) = arg.parse::<usize>() {
+                numeric_args.push(n);
+            }
+        }
+    }
+
+    let iterations = numeric_args.first().copied().unwrap_or(10);
+    let num_buffers = numeric_args.get(1).copied().unwrap_or(12);
+
+    (iterations, num_buffers)
+}
+
+pub fn benchmark<F>(name: &str, iterations: usize, warmup: usize, mut operation: F) -> BenchResult
 where
     F: FnMut(),
 {
     let mut durations = Vec::with_capacity(iterations);
 
-    // Warm up - run operation once to initialize any caches
-    operation();
+    // Warm up - run operation multiple times to stabilize caches
+    for _ in 0..warmup {
+        operation();
+    }
 
     // Collect timing data
     for _ in 0..iterations {

@@ -1,4 +1,5 @@
 /target
 /simpledb-data
+/bench-data
 /random
 node_modules

@@ -21,14 +21,15 @@ use std::{
     },
     time::{Duration, Instant},
 };
-mod test_utils;
+pub mod test_utils;
 use btree::BTreeIndex;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
     QueryData,
 };
-#[cfg(test)]
-use test_utils::TestDir;
+
+pub use test_utils::TestDir;
+pub mod benchmark_framework;
 mod btree;
 mod parser;
 
@@ -41,9 +42,9 @@ type SharedFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
 /// The database struct
 pub struct SimpleDB {
     db_directory: PathBuf,
-    file_manager: SharedFS,
+    pub file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     metadata_manager: Arc<MetadataManager>,
     pub planner: Arc<Planner>,
     lock_table: Arc<LockTable>,
@@ -65,11 +66,11 @@ impl SimpleDB {
             Arc::clone(&file_manager),
             Self::LOG_FILE,
         )));
-        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(
+        let buffer_manager = Arc::new(BufferManager::new(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
             num_buffers,
-        )));
+        ));
         let lock_table = Arc::new(LockTable::new(100)); // 100ms timeout
         let txn = Arc::new(Transaction::new(
             Arc::clone(&file_manager),
@@ -106,8 +107,7 @@ impl SimpleDB {
         )
     }
 
-    #[cfg(test)]
-    fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
+    pub fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -118,6 +118,10 @@ impl SimpleDB {
         let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
         let db = Self::new(&test_dir, block_size, num_buffers, true);
         (db, test_dir)
+    }
+
+    pub fn buffer_manager(&self) -> Arc<BufferManager> {
+        Arc::clone(&self.buffer_manager)
     }
 }
 
@@ -746,7 +750,6 @@ impl ChunkScan {
         self.current_slot = None;
     }
 }
-
 impl Scan for ChunkScan {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
         self.move_to_block(self.first_block_num);
@@ -1331,15 +1334,10 @@ where
                 MergeJoinScanState::BeforeFirst => match (self.scan_1.next(), self.scan_2.next()) {
                     (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
                     (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
-                    (Some(Err(e1)), Some(Err(e2))) => {
-                        return Some(Err(format!(
-                            "Error in both scans - First error: {e1}, Second error: {e2}"
-                        )
-                        .into()))
-                    }
                     (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
                         return Some(Err(e))
                     }
+                    (Some(Err(e1)), Some(Err(_e2))) => return Some(Err(e1)),
                     (Some(Ok(_)), Some(Ok(_))) => {
                         self.scan_state = MergeJoinScanState::SeekMatch;
                         continue;
@@ -1478,7 +1476,6 @@ where
         unimplemented!()
     }
 }
-
 #[cfg(test)]
 mod merge_join_scan_tests {
 
@@ -8575,7 +8572,7 @@ static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     recovery_manager: RecoveryManager,
     concurrency_manager: ConcurrencyManager,
     buffer_list: BufferList,
@@ -8588,7 +8585,7 @@ impl Transaction {
     fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
+        buffer_manager: Arc<BufferManager>,
         lock_table: Arc<LockTable>,
     ) -> Self {
         let generator = TX_ID_GENERATOR.get_or_init(|| TxIdGenerator {
@@ -8669,7 +8666,7 @@ impl Transaction {
     }
 
     /// Set an integer value in a [`Buffer`] associated with this transaction
-    fn set_int(
+    pub fn set_int(
         &self,
         block_id: &BlockId,
         offset: usize,
@@ -8730,7 +8727,7 @@ impl Transaction {
 
     /// Get the available buffers for this transaction
     fn available_buffs(&self) -> usize {
-        self.buffer_manager.lock().unwrap().available()
+        self.buffer_manager.available()
     }
 
     /// Get the size of this file in blocks
@@ -8754,7 +8751,6 @@ impl Transaction {
         self.file_manager.lock().unwrap().block_size()
     }
 }
-
 #[cfg(test)]
 mod transaction_tests {
     use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
@@ -9127,10 +9123,7 @@ mod transaction_tests {
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9168,10 +9161,7 @@ mod transaction_tests {
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9186,13 +9176,10 @@ mod transaction_tests {
 
         // All buffers should be unpinned after commit
         // Even though handle still exists
-        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+        assert_eq!(db.buffer_manager.available(), 3);
 
         #[cfg(debug_assertions)]
-        db.buffer_manager
-            .lock()
-            .unwrap()
-            .assert_buffer_count_invariant();
+        db.buffer_manager.assert_buffer_count_invariant();
     }
 
     #[test]
@@ -9209,7 +9196,7 @@ mod transaction_tests {
         drop(handle); // Should be no-op (committed flag prevents double-unpin)
 
         // Verify no crash and all buffers available
-        assert_eq!(db.buffer_manager.lock().unwrap().available(), 3);
+        assert_eq!(db.buffer_manager.available(), 3);
     }
 
     #[test]
@@ -9217,7 +9204,7 @@ mod transaction_tests {
         let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
 
         // Check initial available buffers
-        let initial_available = db.buffer_manager.lock().unwrap().available();
+        let initial_available = db.buffer_manager.available();
 
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
@@ -9237,10 +9224,7 @@ mod transaction_tests {
         drop(txn);
 
         // Verify all buffers available (should match initial available)
-        assert_eq!(
-            db.buffer_manager.lock().unwrap().available(),
-            initial_available
-        );
+        assert_eq!(db.buffer_manager.available(), initial_available);
     }
 }
 
@@ -9540,7 +9524,6 @@ struct ConcurrencyManager {
     locks: RefCell<HashMap<BlockId, LockType>>,
     tx_id: TransactionID,
 }
-
 impl ConcurrencyManager {
     fn new(tx_id: TransactionID, timeout: u64, lock_table: Arc<LockTable>) -> Self {
         Self {
@@ -9605,14 +9588,14 @@ impl ConcurrencyManager {
 struct RecoveryManager {
     tx_num: usize,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
 }
 
 impl RecoveryManager {
     fn new(
         tx_num: usize,
         log_manager: Arc<Mutex<LogManager>>,
-        buffer_manager: Arc<Mutex<BufferManager>>,
+        buffer_manager: Arc<BufferManager>,
     ) -> Self {
         Self {
             tx_num,
@@ -9626,7 +9609,7 @@ impl RecoveryManager {
     /// It creates and writes a new [`LogRecord::Commit`] record to the WAL
     /// It then forces a flush on the WAL to ensure logs are committed
     fn commit(&self) {
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
         let lsn = record
             .write_log_record(Arc::clone(&self.log_manager))
@@ -9652,7 +9635,7 @@ impl RecoveryManager {
             record.undo(tx);
         }
         //  Flush all data associated with this transaction
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
         let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
@@ -9682,7 +9665,7 @@ impl RecoveryManager {
             }
         }
         //  Flush all data associated with this transaction
-        self.buffer_manager.lock().unwrap().flush_all(self.tx_num);
+        self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
         let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
@@ -10168,13 +10151,13 @@ struct BufferList {
     /// Maps block ID's to buffers and their pin contents
     buffers: RefCell<HashMap<BlockId, HashMapValue>>,
     /// Shared buffer manager for pinning/unpinning operations
-    buffer_manager: Arc<Mutex<BufferManager>>,
+    buffer_manager: Arc<BufferManager>,
     /// Tracks whether the transaction has been committed
     txn_committed: Cell<bool>,
 }
 
 impl BufferList {
-    fn new(buffer_manager: Arc<Mutex<BufferManager>>) -> Self {
+    fn new(buffer_manager: Arc<BufferManager>) -> Self {
         Self {
             buffers: RefCell::new(HashMap::new()),
             buffer_manager,
@@ -10192,7 +10175,7 @@ impl BufferList {
 
     /// Pin the buffer associated with the provided [`BlockId`]
     fn pin(&self, block_id: &BlockId) {
-        let buffer = self.buffer_manager.lock().unwrap().pin(block_id).unwrap();
+        let buffer = self.buffer_manager.pin(block_id).unwrap();
         self.buffers
             .borrow_mut()
             .entry(block_id.clone())
@@ -10215,7 +10198,7 @@ impl BufferList {
             );
         }
         let buffer = Arc::clone(&self.buffers.borrow().get(block_id).unwrap().buffer);
-        self.buffer_manager.lock().unwrap().unpin(buffer);
+        self.buffer_manager.unpin(buffer);
         let should_remove = {
             let mut buffers = self.buffers.borrow_mut();
             let v = buffers.get_mut(block_id).unwrap();
@@ -10233,10 +10216,7 @@ impl BufferList {
         let buffers = buffer_guard.values();
         for value in buffers {
             for _ in 0..value.count {
-                self.buffer_manager
-                    .lock()
-                    .unwrap()
-                    .unpin(Arc::clone(&value.buffer));
+                self.buffer_manager.unpin(Arc::clone(&value.buffer));
             }
         }
         buffer_guard.clear();
@@ -10294,7 +10274,7 @@ mod buffer_list_tests {
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
         )));
-        let buffer_manager = Arc::new(Mutex::new(BufferManager::new(file_manager, log_manager, 4)));
+        let buffer_manager = Arc::new(BufferManager::new(file_manager, log_manager, 4));
         let buffer_list = BufferList::new(buffer_manager);
 
         //  check that there are no buffers in the buffer list initially
@@ -10315,7 +10295,7 @@ mod buffer_list_tests {
 }
 
 #[derive(Debug)]
-struct Buffer {
+pub struct Buffer {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
@@ -10324,7 +10304,6 @@ struct Buffer {
     txn: Option<usize>,
     lsn: Option<Lsn>,
 }
-
 impl Buffer {
     fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
         let size = file_manager.lock().unwrap().block_size();
@@ -10393,13 +10372,53 @@ impl Buffer {
     }
 }
 
+/// Statistics for buffer pool performance tracking
 #[derive(Debug)]
-struct BufferManager {
+pub struct BufferStats {
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+}
+
+impl BufferStats {
+    fn new() -> Self {
+        Self {
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn get(&self) -> (usize, usize) {
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset(&self) {
+        self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        let (hits, misses) = self.get();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            (hits as f64 / total as f64) * 100.0
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferManager {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_pool: Vec<Arc<Mutex<Buffer>>>,
     num_available: Mutex<usize>,
     cond: Condvar,
+    stats: OnceLock<Arc<BufferStats>>,
+    global_lock: Mutex<()>,
 }
 
 impl BufferManager {
@@ -10423,6 +10442,40 @@ impl BufferManager {
             buffer_pool,
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
+            stats: OnceLock::new(),
+            global_lock: Mutex::new(()),
+        }
+    }
+
+    /// Enable statistics collection for benchmarking purposes.
+    ///
+    /// Idempotent - calling multiple times has no effect after first call.
+    /// Zero-cost when not enabled. Thread-safe.
+    pub fn enable_stats(&self) {
+        let _ = self.stats.set(Arc::new(BufferStats::new()));
+    }
+
+    /// Get current buffer pool statistics as (hits, misses) tuple.
+    ///
+    /// Returns `None` if stats not enabled via `enable_stats()`.
+    /// Use this for simple stat queries; use `stats()` for access to full `BufferStats` API.
+    pub fn get_stats(&self) -> Option<(usize, usize)> {
+        self.stats.get().map(|s| s.get())
+    }
+
+    /// Get reference to `BufferStats` struct for advanced queries (e.g., `hit_rate()`).
+    ///
+    /// Returns `None` if stats not enabled. Prefer `get_stats()` for simple (hits, misses) access.
+    pub fn stats(&self) -> Option<&Arc<BufferStats>> {
+        self.stats.get()
+    }
+
+    /// Reset hit/miss counters to zero.
+    ///
+    /// No-op if stats not enabled. Useful for isolating measurements between benchmark phases.
+    pub fn reset_stats(&self) {
+        if let Some(stats) = self.stats.get() {
+            stats.reset();
         }
     }
 
@@ -10441,61 +10494,113 @@ impl BufferManager {
         }
     }
 
-    /// Pin the buffer associated with the provided block_id
-    /// It depends on [`BufferManager::try_to_pin`] to get a buffer back
-    /// Once the buffer has been retrieved, it will handle metadata operations
-    fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
+    /// Depends on the [`BufferManager::try_to_pin`] method to get a [`Buffer`] back
+    /// This method will not perform any metadata operations on the buffer
+    pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
-        let mut num_available = self.num_available.lock().unwrap();
         loop {
-            match self.try_to_pin(block_id) {
-                Some(buffer) => {
-                    {
-                        let mut buffer_guard = buffer.lock().unwrap();
-                        if !buffer_guard.is_pinned() {
-                            *num_available -= 1;
-                        }
-                        buffer_guard.pin();
-                    }
+            {
+                let _guard = self.global_lock.lock().unwrap();
+                if let Some(buffer) = self.try_to_pin(block_id) {
                     return Ok(buffer);
                 }
-                None => {
-                    num_available = self.cond.wait(num_available).unwrap();
-                    if start.elapsed() > Duration::from_secs(Self::MAX_TIME) {
-                        return Err("Timed out waiting for buffer".into());
-                    }
+            }
+
+            let mut avail = self.num_available.lock().unwrap();
+            while *avail == 0 {
+                let elapsed = start.elapsed();
+                if elapsed >= Duration::from_secs(Self::MAX_TIME) {
+                    return Err("Timed out waiting for buffer".into());
+                }
+                let timeout = Duration::from_secs(Self::MAX_TIME) - elapsed;
+                let (guard, wait_res) = self.cond.wait_timeout(avail, timeout).unwrap();
+                avail = guard;
+                if wait_res.timed_out() {
+                    return Err("Timed out waiting for buffer".into());
                 }
             }
+            drop(avail);
         }
     }
 
     /// Find a buffer to pin this block to
     /// First check to see if there is an existing buffer for this block
-    /// If not, try to find an unpinned buffer
+    /// If there is an existing buffer, increment the pin count and return it
+    /// If not, try to find an unpinned buffer, pin it and then return it
     /// If both cases above fail, return None
-    /// Update matadata for the assigned buffer before returning
+    ///
+    /// # ABA Race at Buffer Pool Layer
+    ///
+    /// There is a TOCTOU race between `find_existing_buffer()` releasing the lock and
+    /// re-acquiring it here. A buffer can be evicted and reloaded with the SAME BlockId
+    /// but DIFFERENT content (e.g., another transaction committed changes to disk, then
+    /// the block was reloaded). The check below detects BlockId changes but not content
+    /// changes for the same BlockId.
+    ///
+    /// **Why this is safe**: Transaction-level locks (via LockTable) prevent isolation
+    /// violations. Transactions acquire slock/xlock on BlockId before calling pin(), and
+    /// hold locks until commit/rollback (Strict 2PL). Even if a buffer is evicted and
+    /// uncommitted data flushed to disk, other transactions cannot read it until locks
+    /// are released. The buffer pool provides physical consistency; LockTable provides
+    /// logical isolation.
+    ///
+    /// **Non-transactional access** (catalog reads, WAL, recovery) bypasses LockTable
+    /// and could observe stale data from this race, but these operations are designed
+    /// to handle such cases.
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
-        let buffer = match self.find_existing_buffer(block_id) {
-            Some(buffer) => buffer,
-            None => match self.choose_unpinned_buffer() {
-                Some(buffer) => {
-                    buffer.lock().unwrap().assign_to_block(block_id);
-                    buffer
+        if let Some(buffer) = self.find_existing_buffer(block_id) {
+            let was_unpinned = {
+                let mut guard = buffer.lock().unwrap();
+                // Defensive check: block may have been evicted between find and lock
+                if guard.block_id.as_ref() != Some(block_id) {
+                    return None;
                 }
-                None => return None,
-            },
-        };
-        Some(buffer)
+                let was_unpinned = !guard.is_pinned();
+                guard.pin();
+                was_unpinned
+            };
+            if was_unpinned {
+                *self.num_available.lock().unwrap() -= 1;
+            }
+            if let Some(stats) = self.stats.get() {
+                stats
+                    .hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Some(buffer);
+        }
+
+        if let Some(stats) = self.stats.get() {
+            stats
+                .misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some(buffer) = self.choose_unpinned_buffer() {
+            {
+                let mut guard = buffer.lock().unwrap();
+                if guard.is_pinned() {
+                    return None;
+                }
+                guard.assign_to_block(block_id);
+                guard.pin();
+            }
+            *self.num_available.lock().unwrap() -= 1;
+            return Some(buffer);
+        }
+        None
     }
 
     /// Decrement the pin count for the provided buffer
     /// If all of the pins have been removed, managed metadata & notify waiting threads
-    fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
+    pub fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
+        assert!(buffer_guard.pins > 0);
+        let was_one = buffer_guard.pins == 1;
         buffer_guard.unpin();
-        let is_pinned = buffer_guard.is_pinned();
-        if !is_pinned {
-            *self.num_available.lock().unwrap() += 1;
+        if was_one {
+            let mut avail = self.num_available.lock().unwrap();
+            *avail += 1;
             self.cond.notify_all();
         }
     }
@@ -10565,7 +10670,7 @@ mod buffer_manager_tests {
         page.set_int(80, 1);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
-        let buffer_manager_guard = buffer_manager.lock().unwrap();
+        let buffer_manager_guard = &buffer_manager;
 
         //  Create a buffer for block 1 and modify it
         let buffer_1 = buffer_manager_guard
@@ -10594,6 +10699,104 @@ mod buffer_manager_tests {
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
         assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
+    }
+
+    /// Concurrent stress test: multiple threads hammering same small working set
+    /// Tests for:
+    /// 1. Concurrent eviction races (multiple threads evicting/pinning same buffer slots)
+    /// 2. Pin count correctness (concurrent pin/unpin on same BlockId)
+    /// 3. Stats counter accuracy (AtomicUsize under concurrent updates)
+    /// 4. No panics/deadlocks under high contention
+    #[test]
+    fn test_concurrent_buffer_pool_stress() {
+        use std::thread;
+
+        // Small buffer pool (4 buffers) with small working set (6 blocks)
+        // Forces evictions and contention
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 4);
+        db.buffer_manager.enable_stats();
+
+        let block_size = 400;
+        let num_blocks = 6;
+        let num_threads = 8;
+        let ops_per_thread = 100;
+
+        // Pre-create blocks on disk
+        for i in 0..num_blocks {
+            let block_id = BlockId::new("stressfile".to_string(), i);
+            let mut page = Page::new(block_size);
+            page.set_int(0, i as i32);
+            db.file_manager.lock().unwrap().write(&block_id, &mut page);
+        }
+
+        // Spawn threads that all hammer the same small working set
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                let buffer_manager = db.buffer_manager.clone();
+                thread::spawn(move || {
+                    for op in 0..ops_per_thread {
+                        // Each thread accesses all blocks in round-robin
+                        // This creates maximum contention on buffer slots
+                        let block_num = (thread_id + op) % num_blocks;
+                        let block_id = BlockId::new("stressfile".to_string(), block_num);
+
+                        // Pin block
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+
+                        // Verify we got the right block
+                        {
+                            let guard = buffer.lock().unwrap();
+                            assert_eq!(guard.block_id.as_ref().unwrap(), &block_id);
+                            let value = guard.contents.get_int(0);
+                            assert_eq!(value, block_num as i32);
+                        }
+
+                        // Unpin immediately to maximize churn
+                        buffer_manager.unpin(buffer);
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked during stress test");
+        }
+
+        // Verify stats counters are consistent with deterministic lower bounds
+        // Note: Total may exceed num_threads * ops_per_thread because pin() can call
+        // try_to_pin() multiple times (retries when waiting for buffers)
+        if let Some(stats) = db.buffer_manager.stats() {
+            let (hits, misses) = stats.get();
+            let total = hits + misses;
+            let min_expected = num_threads * ops_per_thread;
+
+            assert!(
+                total >= min_expected,
+                "Stats counter sanity check failed: got {total} total accesses (hits={hits}, misses={misses}), expected at least {min_expected}"
+            );
+
+            // Misses: Must miss on first access to each unique block (6 blocks)
+            assert!(
+                misses >= num_blocks,
+                "Expected at least {num_blocks} misses (cold start for {num_blocks} blocks), got {misses}"
+            );
+
+            // Hits: With 4 buffers for 6 blocks, even with thrashing, expect some hits
+            // Conservative lower bound: ~12% hit rate under worst-case thrashing
+            let min_hits = 100;
+            assert!(
+                hits >= min_hits,
+                "Expected at least {min_hits} hits under contention (got {hits}), possible correctness issue"
+            );
+
+            // Verify buffer pool is consistent (all buffers unpinned)
+            let available = db.buffer_manager.available();
+            assert_eq!(
+                available, 4,
+                "Buffer pool inconsistent: expected 4 available buffers, got {available}"
+            );
+        }
     }
 }
 
@@ -10880,7 +11083,7 @@ impl Page {
     }
 
     /// Set an integer at the given offset
-    fn set_int(&mut self, offset: usize, n: i32) {
+    pub fn set_int(&mut self, offset: usize, n: i32) {
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
     }
 
@@ -11009,7 +11212,6 @@ impl FileManager {
             .unwrap()
     }
 }
-
 impl FileSystemInterface for FileManager {
     fn block_size(&self) -> usize {
         self.blocksize

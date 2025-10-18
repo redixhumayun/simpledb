@@ -1,18 +1,14 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
 use simpledb::SimpleDB;
 
-// Include our benchmark framework
-mod benchmark_framework {
-    include!("../../benches/benchmark_framework.rs");
-}
+use simpledb::benchmark_framework;
 
-use benchmark_framework::{benchmark, print_header};
+use benchmark_framework::{benchmark, parse_bench_args, print_header};
 
 fn cleanup_bench_data() {
     let bench_path = Path::new("./bench-data");
@@ -52,7 +48,7 @@ fn populate_table(db: &SimpleDB, num_records: usize) -> Result<(), Box<dyn Error
 
 fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark single INSERT operations
-    let result = benchmark("INSERT (single record)", iterations, || {
+    let result = benchmark("INSERT (single record)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (99999, 'test_user', 25)";
         db.planner
@@ -73,7 +69,7 @@ fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark SELECT operations
-    let result = benchmark("SELECT (table scan)", iterations, || {
+    let result = benchmark("SELECT (table scan)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let select_sql = "SELECT id, name FROM bench_table WHERE age > 30";
         let _plan = db
@@ -84,7 +80,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
     });
     println!("{result}");
 
-    let result = benchmark("SELECT COUNT(*)", iterations, || {
+    let result = benchmark("SELECT COUNT(*)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let select_sql = "SELECT * FROM bench_table";
         let plan = db
@@ -102,7 +98,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark UPDATE operations
-    let result = benchmark("UPDATE (single record)", iterations, || {
+    let result = benchmark("UPDATE (single record)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let update_sql = "UPDATE bench_table SET age = 99 WHERE id = 0";
         db.planner
@@ -123,7 +119,7 @@ fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark DELETE operations
-    let result = benchmark("DELETE (single record)", iterations, || {
+    let result = benchmark("DELETE (single record)", iterations, 2, || {
         // Insert a record to delete
         let txn = Arc::new(db.new_tx());
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (88888, 'delete_me', 25)";
@@ -143,28 +139,8 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
     println!("{result}");
 }
 
-fn parse_iterations() -> usize {
-    let args: Vec<String> = env::args().collect();
-
-    match args.len() {
-        1 => 10, // No args, use default
-        2 => args[1].parse().unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: Invalid number '{}', using default 10 iterations",
-                args[1]
-            );
-            10
-        }),
-        _ => {
-            eprintln!("Usage: {} [iterations]", args[0]);
-            eprintln!("Using default 10 iterations");
-            10
-        }
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
-    let iterations = parse_iterations();
+    let (iterations, _num_buffers) = parse_bench_args();
 
     println!("SimpleDB Stdlib-Only Benchmark Suite");
     println!("====================================");

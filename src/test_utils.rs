@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::{
     fs::File,
     io::Read,
@@ -13,7 +12,6 @@ pub struct TestDir {
     pub path: PathBuf,
 }
 
-#[cfg(test)]
 impl TestDir {
     pub fn new<P>(path: P) -> Self
     where
@@ -38,7 +36,6 @@ impl AsRef<Path> for TestDir {
 }
 
 /// Create a temporary file in the given directory.
-#[cfg(test)]
 pub fn generate_filename() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -49,7 +46,6 @@ pub fn generate_filename() -> String {
 }
 
 /// Generate a random number using /dev/urandom.
-#[cfg(test)]
 pub fn generate_random_number() -> usize {
     let mut f = File::open("/dev/urandom").unwrap();
     let mut buf = [0u8; 8];
