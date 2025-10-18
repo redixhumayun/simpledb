@@ -49,7 +49,8 @@ jobs:
         tool: 'customSmallerIsBetter'
         output-file-path: simple_bench_results.json
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: true
+        # Only push to gh-pages on master branch, not on PRs (permission issue)
+        auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         alert-threshold: '105%'
         comment-on-alert: true
         fail-on-alert: false
@@ -104,7 +105,8 @@ jobs:
         tool: 'customSmallerIsBetter'
         output-file-path: buffer_pool_results.json
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: true
+        # Only push to gh-pages on master branch, not on PRs (permission issue)
+        auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         alert-threshold: '105%'
         comment-on-alert: true
         fail-on-alert: false
