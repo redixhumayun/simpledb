@@ -10418,6 +10418,7 @@ pub struct BufferManager {
     num_available: Mutex<usize>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
+    global_lock: Mutex<()>,
 }
 
 impl BufferManager {
@@ -10442,6 +10443,7 @@ impl BufferManager {
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
             stats: OnceLock::new(),
+            global_lock: Mutex::new(()),
         }
     }
 
@@ -10497,8 +10499,11 @@ impl BufferManager {
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
-            if let Some(buffer) = self.try_to_pin(block_id) {
-                return Ok(buffer);
+            {
+                let _guard = self.global_lock.lock().unwrap();
+                if let Some(buffer) = self.try_to_pin(block_id) {
+                    return Ok(buffer);
+                }
             }
 
             let mut avail = self.num_available.lock().unwrap();
