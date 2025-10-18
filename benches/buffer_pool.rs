@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -171,7 +173,7 @@ fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
 }
 
 fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iterations: usize) {
-    let test_file = format!("randomfile_{}", working_set_size);
+    let test_file = format!("randomfile_{working_set_size}");
     let buffer_manager = db.buffer_manager();
     let total_accesses = 500;
 
@@ -190,7 +192,7 @@ fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iter
 
     // Benchmark: random access pattern as one workload
     let result = benchmark(
-        &format!("Random (K={})", working_set_size),
+        &format!("Random (K={working_set_size})"),
         iterations,
         || {
             for &block_idx in &random_indices {
@@ -302,10 +304,7 @@ fn pool_size_scaling(block_size: usize, iterations: usize) {
     let working_set_size = 100; // Fixed workload: 100 blocks
 
     println!("Phase 3: Pool Size Sensitivity");
-    println!(
-        "Fixed workload: Random access to {} blocks",
-        working_set_size
-    );
+    println!("Fixed workload: Random access to {working_set_size} blocks");
     println!();
     println!("Pool Size (buffers) | Throughput (blocks/sec)");
     println!("{}", "-".repeat(50));
@@ -313,7 +312,7 @@ fn pool_size_scaling(block_size: usize, iterations: usize) {
     for pool_size in pool_sizes {
         let throughput =
             run_fixed_workload_with_pool_size(block_size, pool_size, working_set_size, iterations);
-        println!("{:19} | {:>10.0}", pool_size, throughput);
+        println!("{pool_size:19} | {throughput:>10.0}");
     }
 }
 
@@ -330,10 +329,7 @@ fn memory_pressure_test(block_size: usize, iterations: usize) {
         let working_set = base_pool_size + offset;
         let throughput =
             run_fixed_workload_with_pool_size(block_size, base_pool_size, working_set, iterations);
-        println!(
-            "{:9} | {:11} | {:>10.0}",
-            base_pool_size, working_set, throughput
-        );
+        println!("{base_pool_size:9} | {working_set:11} | {throughput:>10.0}");
     }
 }
 
@@ -357,10 +353,7 @@ fn run_pattern_with_stats(
     if let Some(stats) = db.buffer_manager().stats() {
         let hit_rate = stats.hit_rate();
         let (hits, misses) = stats.get();
-        println!(
-            "{:20} | Hit rate: {:>5.1}% (hits: {}, misses: {})",
-            name, hit_rate, hits, misses
-        );
+        println!("{name:20} | Hit rate: {hit_rate:>5.1}% (hits: {hits}, misses: {misses})");
     }
 }
 
@@ -465,8 +458,7 @@ fn multithreaded_pin(db: &SimpleDB, block_size: usize, num_threads: usize, ops_p
     let throughput = total_ops as f64 / elapsed.as_secs_f64();
 
     println!(
-        "{} threads, {} ops/thread | {:>10.0} ops/sec | {:>10.2?} total",
-        num_threads, ops_per_thread, throughput, elapsed
+        "{num_threads} threads, {ops_per_thread} ops/thread | {throughput:>10.0} ops/sec | {elapsed:>10.2?} total"
     );
 }
 
@@ -531,10 +523,7 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
 
     let elapsed = start.elapsed();
 
-    println!(
-        "Starved {} threads | Pool recovery time: {:>10.2?}",
-        num_waiting_threads, elapsed
-    );
+    println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
 fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {

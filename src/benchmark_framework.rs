@@ -32,7 +32,7 @@ pub fn parse_bench_args() -> (usize, usize) {
         }
     }
 
-    let iterations = numeric_args.get(0).copied().unwrap_or(10);
+    let iterations = numeric_args.first().copied().unwrap_or(10);
     let num_buffers = numeric_args.get(1).copied().unwrap_or(12);
 
     (iterations, num_buffers)

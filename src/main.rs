@@ -10773,15 +10773,13 @@ mod buffer_manager_tests {
 
             assert!(
                 total >= min_expected,
-                "Stats counter sanity check failed: got {} total accesses (hits={}, misses={}), expected at least {}",
-                total, hits, misses, min_expected
+                "Stats counter sanity check failed: got {total} total accesses (hits={hits}, misses={misses}), expected at least {min_expected}"
             );
 
             // Misses: Must miss on first access to each unique block (6 blocks)
             assert!(
                 misses >= num_blocks,
-                "Expected at least {} misses (cold start for {} blocks), got {}",
-                num_blocks, num_blocks, misses
+                "Expected at least {num_blocks} misses (cold start for {num_blocks} blocks), got {misses}"
             );
 
             // Hits: With 4 buffers for 6 blocks, even with thrashing, expect some hits
@@ -10789,16 +10787,14 @@ mod buffer_manager_tests {
             let min_hits = 100;
             assert!(
                 hits >= min_hits,
-                "Expected at least {} hits under contention (got {}), possible correctness issue",
-                min_hits, hits
+                "Expected at least {min_hits} hits under contention (got {hits}), possible correctness issue"
             );
 
             // Verify buffer pool is consistent (all buffers unpinned)
             let available = db.buffer_manager.available();
             assert_eq!(
                 available, 4,
-                "Buffer pool inconsistent: expected 4 available buffers, got {}",
-                available
+                "Buffer pool inconsistent: expected 4 available buffers, got {available}"
             );
         }
     }
