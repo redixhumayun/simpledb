@@ -10445,22 +10445,32 @@ impl BufferManager {
         }
     }
 
-    /// Enable statistics collection for benchmarking (idempotent)
+    /// Enable statistics collection for benchmarking purposes.
+    ///
+    /// Idempotent - calling multiple times has no effect after first call.
+    /// Zero-cost when not enabled. Thread-safe.
     pub fn enable_stats(&self) {
         let _ = self.stats.set(Arc::new(BufferStats::new()));
     }
 
-    /// Get current statistics if enabled
+    /// Get current buffer pool statistics as (hits, misses) tuple.
+    ///
+    /// Returns `None` if stats not enabled via `enable_stats()`.
+    /// Use this for simple stat queries; use `stats()` for access to full `BufferStats` API.
     pub fn get_stats(&self) -> Option<(usize, usize)> {
         self.stats.get().map(|s| s.get())
     }
 
-    /// Get statistics struct reference if enabled
+    /// Get reference to `BufferStats` struct for advanced queries (e.g., `hit_rate()`).
+    ///
+    /// Returns `None` if stats not enabled. Prefer `get_stats()` for simple (hits, misses) access.
     pub fn stats(&self) -> Option<&Arc<BufferStats>> {
         self.stats.get()
     }
 
-    /// Reset statistics
+    /// Reset hit/miss counters to zero.
+    ///
+    /// No-op if stats not enabled. Useful for isolating measurements between benchmark phases.
     pub fn reset_stats(&self) {
         if let Some(stats) = self.stats.get() {
             stats.reset();

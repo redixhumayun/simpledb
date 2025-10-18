@@ -509,7 +509,13 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
         })
         .collect();
 
-    // Sleep to let threads start waiting
+    // NOTE: Timing assumption - we sleep 50ms hoping all threads reach pin() and block.
+    // On loaded systems, threads might not be scheduled in time, causing them to start
+    // their pin() calls after we begin unpinning, which would measure thread startup
+    // overhead rather than starvation recovery. If you observe high variance in results
+    // (e.g., 50ms one run, 200ms another), this race condition is likely occurring.
+    // Consider instrumenting BufferManager with a waiting_threads counter for deterministic
+    // measurement (see docs/buffer_pool_thrashing_analysis.md for implementation).
     thread::sleep(std::time::Duration::from_millis(50));
 
     // Unpin one buffer at a time with small delay to observe gradual recovery
@@ -564,26 +570,51 @@ fn main() {
     );
     println!();
 
-    let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-
     // Phase 1
     println!("Phase 1: Core Latency Benchmarks");
     print_header();
-    pin_unpin_overhead(&db, block_size, iterations);
-    cold_pin(&db, block_size, iterations, num_buffers);
-    dirty_eviction(&db, block_size, iterations, num_buffers);
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        pin_unpin_overhead(&db, block_size, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        cold_pin(&db, block_size, iterations, num_buffers);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        dirty_eviction(&db, block_size, iterations, num_buffers);
+    }
     println!();
 
     // Phase 2
     println!("Phase 2: Access Pattern Benchmarks");
     println!("Operation            | Throughput (mean)          | Throughput (median)");
     println!("{}", "-".repeat(75));
-    sequential_scan(&db, block_size, num_buffers, iterations);
-    repeated_access(&db, block_size, num_buffers, iterations);
-    random_access(&db, block_size, 10, iterations);
-    random_access(&db, block_size, 50, iterations);
-    random_access(&db, block_size, 100, iterations);
-    zipfian_access(&db, block_size, num_buffers, iterations);
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        sequential_scan(&db, block_size, num_buffers, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        repeated_access(&db, block_size, num_buffers, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        random_access(&db, block_size, 10, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        random_access(&db, block_size, 50, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        random_access(&db, block_size, 100, iterations);
+    }
+    {
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        zipfian_access(&db, block_size, num_buffers, iterations);
+    }
     println!();
 
     // Phase 3
