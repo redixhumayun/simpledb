@@ -27,5 +27,6 @@
 3. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
 
 ### Performance & Benchmarking
-1. [Implement buffer pool and I/O performance benchmarks](https://github.com/redixhumayun/simpledb/issues/15) - Storage layer performance measurement
-2. [Simplify Arc/Mutex usage and clarify multi-threading boundaries](https://github.com/redixhumayun/simpledb/issues/31) - Remove unnecessary synchronization overhead and improve code clarity
+1. [Implement buffer pool performance benchmarks](https://github.com/redixhumayun/simpledb/issues/15) - Buffer pool effectiveness measurement (completed in PR #36)
+2. [Implement I/O performance benchmarks](https://github.com/redixhumayun/simpledb/issues/37) - Raw disk performance measurement at FileManager layer
+3. [Simplify Arc/Mutex usage and clarify multi-threading boundaries](https://github.com/redixhumayun/simpledb/issues/31) - Remove unnecessary synchronization overhead and improve code clarity
