@@ -29,7 +29,7 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
     page.set_int(80, 1);
     db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
-    let result = benchmark("Pin/Unpin (hit)", iterations, || {
+    let result = benchmark("Pin/Unpin (hit)", iterations, 5, || {
         let buffer = buffer_manager.pin(&block_id).unwrap();
         buffer_manager.unpin(buffer);
     });
@@ -49,7 +49,7 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) {
     }
 
     let mut block_idx = 0;
-    let result = benchmark("Cold Pin (miss)", iterations, || {
+    let result = benchmark("Cold Pin (miss)", iterations, 0, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
         let buffer = buffer_manager.pin(&block_id).unwrap();
         buffer_manager.unpin(buffer);
@@ -82,7 +82,7 @@ fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffe
 
     // Now benchmark: pinning new blocks forces dirty buffer eviction + flush
     let mut block_idx = num_buffers;
-    let result = benchmark("Dirty Eviction", iterations, || {
+    let result = benchmark("Dirty Eviction", iterations, 2, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
         let buffer = buffer_manager.pin(&block_id).unwrap(); // Forces eviction + flush
         buffer_manager.unpin(buffer);
@@ -110,7 +110,7 @@ fn sequential_scan(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     }
 
     // Benchmark: complete scan as one workload
-    let result = benchmark("Sequential Scan", iterations, || {
+    let result = benchmark("Sequential Scan", iterations, 2, || {
         for i in 0..total_blocks {
             let block_id = BlockId::new(test_file.clone(), i);
             let buffer = buffer_manager.pin(&block_id).unwrap();
@@ -143,7 +143,7 @@ fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     }
 
     // Benchmark: repeated access pattern as one workload
-    let result = benchmark("Repeated Access", iterations, || {
+    let result = benchmark("Repeated Access", iterations, 2, || {
         for i in 0..total_accesses {
             let block_idx = i % working_set;
             let block_id = BlockId::new(test_file.clone(), block_idx);
@@ -183,6 +183,7 @@ fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iter
     let result = benchmark(
         &format!("Random (K={working_set_size})"),
         iterations,
+        2,
         || {
             for &block_idx in &random_indices {
                 let block_id = BlockId::new(test_file.clone(), block_idx);
@@ -233,7 +234,7 @@ fn zipfian_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iteratio
         .collect();
 
     // Benchmark: zipfian access pattern as one workload
-    let result = benchmark("Zipfian (80/20)", iterations, || {
+    let result = benchmark("Zipfian (80/20)", iterations, 2, || {
         for &block_idx in &zipfian_indices {
             let block_id = BlockId::new(test_file.clone(), block_idx);
             let buffer = buffer_manager.pin(&block_id).unwrap();
@@ -277,7 +278,7 @@ fn run_fixed_workload_with_pool_size(
         .collect();
 
     // Run workload
-    let result = benchmark("Pool Size Test", iterations, || {
+    let result = benchmark("Pool Size Test", iterations, 2, || {
         for &block_idx in &random_indices {
             let block_id = BlockId::new(test_file.clone(), block_idx);
             let buffer = buffer_manager.pin(&block_id).unwrap();

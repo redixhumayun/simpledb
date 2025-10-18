@@ -38,14 +38,16 @@ pub fn parse_bench_args() -> (usize, usize) {
     (iterations, num_buffers)
 }
 
-pub fn benchmark<F>(name: &str, iterations: usize, mut operation: F) -> BenchResult
+pub fn benchmark<F>(name: &str, iterations: usize, warmup: usize, mut operation: F) -> BenchResult
 where
     F: FnMut(),
 {
     let mut durations = Vec::with_capacity(iterations);
 
-    // Warm up - run operation once to initialize any caches
-    operation();
+    // Warm up - run operation multiple times to stabilize caches
+    for _ in 0..warmup {
+        operation();
+    }
 
     // Collect timing data
     for _ in 0..iterations {

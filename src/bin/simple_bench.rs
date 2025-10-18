@@ -48,7 +48,7 @@ fn populate_table(db: &SimpleDB, num_records: usize) -> Result<(), Box<dyn Error
 
 fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark single INSERT operations
-    let result = benchmark("INSERT (single record)", iterations, || {
+    let result = benchmark("INSERT (single record)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (99999, 'test_user', 25)";
         db.planner
@@ -69,7 +69,7 @@ fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark SELECT operations
-    let result = benchmark("SELECT (table scan)", iterations, || {
+    let result = benchmark("SELECT (table scan)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let select_sql = "SELECT id, name FROM bench_table WHERE age > 30";
         let _plan = db
@@ -80,7 +80,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
     });
     println!("{result}");
 
-    let result = benchmark("SELECT COUNT(*)", iterations, || {
+    let result = benchmark("SELECT COUNT(*)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let select_sql = "SELECT * FROM bench_table";
         let plan = db
@@ -98,7 +98,7 @@ fn run_select_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark UPDATE operations
-    let result = benchmark("UPDATE (single record)", iterations, || {
+    let result = benchmark("UPDATE (single record)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
         let update_sql = "UPDATE bench_table SET age = 99 WHERE id = 0";
         db.planner
@@ -119,7 +119,7 @@ fn run_update_benchmarks(db: &SimpleDB, iterations: usize) {
 
 fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) {
     // Benchmark DELETE operations
-    let result = benchmark("DELETE (single record)", iterations, || {
+    let result = benchmark("DELETE (single record)", iterations, 2, || {
         // Insert a record to delete
         let txn = Arc::new(db.new_tx());
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (88888, 'delete_me', 25)";
