@@ -36,7 +36,7 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
     println!("{result}");
 }
 
-fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize, _num_buffers: usize) {
+fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) {
     let test_file = "coldfile".to_string();
     let buffer_manager = db.buffer_manager();
 
@@ -58,50 +58,39 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize, _num_buffers: u
     println!("{result}");
 }
 
-fn dirty_eviction(db: &SimpleDB, _block_size: usize, iterations: usize, num_buffers: usize) {
-    // Create a table to generate dirty buffers
-    let txn = Arc::new(db.new_tx());
-    db.planner
-        .execute_update(
-            "CREATE TABLE dirty_test(id int, value int)".to_string(),
-            Arc::clone(&txn),
-        )
-        .unwrap();
-    txn.commit().unwrap();
+fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffers: usize) {
+    let test_file = "dirtyfile".to_string();
+    let buffer_manager = db.buffer_manager();
 
-    // Fill buffer pool with dirty buffers by inserting records
-    let txn = Arc::new(db.new_tx());
-    for i in 0..num_buffers * 2 {
-        db.planner
-            .execute_update(
-                format!(
-                    "INSERT INTO dirty_test(id, value) VALUES ({}, {})",
-                    i,
-                    i * 10
-                ),
-                Arc::clone(&txn),
-            )
-            .unwrap();
+    // Pre-create blocks on disk (twice the buffer pool size)
+    for i in 0..(num_buffers * 2) {
+        let block_id = BlockId::new(test_file.clone(), i);
+        let mut page = Page::new(block_size);
+        page.set_int(0, i as i32);
+        db.file_manager.lock().unwrap().write(&block_id, &mut page);
     }
-    // Don't commit yet - keeps buffers dirty
 
-    // Now benchmark: pinning new blocks will evict dirty buffers
-    let mut counter = num_buffers * 2;
+    // Fill buffer pool with dirty buffers using transactions
+    let txn = Arc::new(db.new_tx());
+    for i in 0..num_buffers {
+        let block_id = BlockId::new(test_file.clone(), i);
+        // Pin the block first, then modify it
+        let _handle = txn.pin(&block_id);
+        txn.set_int(&block_id, 0, 999, false).unwrap();
+    }
+    // Don't commit - keeps buffers dirty and pinned by this transaction
+
+    // Now benchmark: pinning new blocks forces dirty buffer eviction + flush
+    let mut block_idx = num_buffers;
     let result = benchmark("Dirty Eviction", iterations, || {
-        db.planner
-            .execute_update(
-                format!(
-                    "INSERT INTO dirty_test(id, value) VALUES ({}, {})",
-                    counter,
-                    counter * 10
-                ),
-                Arc::clone(&txn),
-            )
-            .unwrap();
-        counter += 1;
+        let block_id = BlockId::new(test_file.clone(), block_idx);
+        let buffer = buffer_manager.pin(&block_id).unwrap(); // Forces eviction + flush
+        buffer_manager.unpin(buffer);
+        block_idx += 1;
     });
     println!("{result}");
 
+    // Clean up: commit transaction to release locks
     txn.commit().unwrap();
 }
 
@@ -568,7 +557,7 @@ fn main() {
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        cold_pin(&db, block_size, iterations, num_buffers);
+        cold_pin(&db, block_size, iterations);
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);

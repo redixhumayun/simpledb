@@ -8666,7 +8666,7 @@ impl Transaction {
     }
 
     /// Set an integer value in a [`Buffer`] associated with this transaction
-    fn set_int(
+    pub fn set_int(
         &self,
         block_id: &BlockId,
         offset: usize,

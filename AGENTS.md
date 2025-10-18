@@ -22,8 +22,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
 
 ## Development Workflow
 
-### Git Workflow
-[1. ](### Git Workflow (REQUIRED)
+### Git Workflow (REQUIRED)
 1. **Always start by syncing with master**:
    ```bash
    git checkout master
