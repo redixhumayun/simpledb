@@ -19,13 +19,28 @@ impl fmt::Display for BenchResult {
     }
 }
 
-pub fn parse_bench_args() -> (usize, usize) {
+impl BenchResult {
+    /// Convert benchmark result to JSON format compatible with github-action-benchmark
+    /// Returns JSON object with name, unit, and value (mean time in nanoseconds)
+    pub fn to_json(&self) -> String {
+        format!(
+            r#"{{"name":"{}","unit":"ns","value":{}}}"#,
+            self.operation,
+            self.mean.as_nanos()
+        )
+    }
+}
+
+pub fn parse_bench_args() -> (usize, usize, bool) {
     let args: Vec<String> = env::args().collect();
     let mut numeric_args = Vec::new();
+    let mut json_output = false;
 
-    // Collect all numeric args (skip flags like --bench)
+    // Collect all numeric args and check for flags
     for arg in args.iter().skip(1) {
-        if !arg.starts_with("--") {
+        if arg == "--json" {
+            json_output = true;
+        } else if !arg.starts_with("--") {
             if let Ok(n) = arg.parse::<usize>() {
                 numeric_args.push(n);
             }
@@ -35,7 +50,7 @@ pub fn parse_bench_args() -> (usize, usize) {
     let iterations = numeric_args.first().copied().unwrap_or(10);
     let num_buffers = numeric_args.get(1).copied().unwrap_or(12);
 
-    (iterations, num_buffers)
+    (iterations, num_buffers, json_output)
 }
 
 pub fn benchmark<F>(name: &str, iterations: usize, warmup: usize, mut operation: F) -> BenchResult

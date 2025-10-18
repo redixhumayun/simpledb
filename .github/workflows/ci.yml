@@ -39,11 +39,73 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
     
-    - name: Run benchmarks
-      run: cargo run --bin simple_bench 5
-      
+    - name: Run simple_bench (50 iterations)
+      run: cargo run --bin simple_bench 50 --json > simple_bench_results.json
+
+    - name: Store simple_bench results
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: SimpleDB CRUD Benchmarks
+        tool: 'customSmallerIsBetter'
+        output-file-path: simple_bench_results.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: true
+        alert-threshold: '105%'
+        comment-on-alert: true
+        fail-on-alert: false
+        alert-comment-cc-users: '@${{ github.actor }}'
+
     - name: Check formatting
       run: cargo fmt -- --check
-      
+
     - name: Run clippy
       run: cargo clippy -- -D warnings
+
+  buffer_pool_benchmarks:
+    runs-on: ubuntu-latest
+    # Run buffer_pool benchmarks conditionally:
+    # 1. Always on master branch
+    # 2. On PRs with 'performance' label
+    # 3. On PRs that modify buffer-related files
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/master' ||
+      contains(github.event.pull_request.labels.*.name, 'performance') ||
+      contains(github.event.pull_request.files.*.filename, 'buffer')
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Run buffer_pool benchmark (50 iterations)
+      run: cargo bench --bench buffer_pool -- 50 12 --json > buffer_pool_results.json
+
+    - name: Store buffer_pool results
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: SimpleDB Buffer Pool Benchmarks
+        tool: 'customSmallerIsBetter'
+        output-file-path: buffer_pool_results.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        auto-push: true
+        alert-threshold: '105%'
+        comment-on-alert: true
+        fail-on-alert: false
+        alert-comment-cc-users: '@${{ github.actor }}'

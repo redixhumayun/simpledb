@@ -1,0 +1,187 @@
+name: Benchmark Comparison
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+jobs:
+  compare:
+    # Only run when PR is labeled with 'performance' or manually triggered
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'performance'))
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for comparison
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-compare-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-compare-
+
+    - name: Build project
+      run: cargo build --release
+
+    # Run benchmarks on base branch (master)
+    - name: Checkout base branch
+      run: git checkout ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+
+    - name: Build base branch
+      run: cargo build --release
+
+    - name: Run base benchmarks (simple_bench)
+      run: cargo run --release --bin simple_bench 50 --json > base_simple_bench.json
+
+    - name: Run base benchmarks (buffer_pool)
+      run: cargo bench --bench buffer_pool -- 50 12 --json > base_buffer_pool.json
+
+    # Run benchmarks on PR branch
+    - name: Checkout PR branch
+      run: git checkout ${{ github.event.pull_request.head.sha }}
+
+    - name: Build PR branch
+      run: cargo build --release
+
+    - name: Run PR benchmarks (simple_bench)
+      run: cargo run --release --bin simple_bench 50 --json > pr_simple_bench.json
+
+    - name: Run PR benchmarks (buffer_pool)
+      run: cargo bench --bench buffer_pool -- 50 12 --json > pr_buffer_pool.json
+
+    # Generate comparison report
+    - name: Generate comparison report
+      run: |
+        cat > compare.py << 'EOF'
+        import json
+        import sys
+
+        def load_json(filename):
+            with open(filename, 'r') as f:
+                return json.load(f)
+
+        def format_ns(ns):
+            """Convert nanoseconds to human-readable format"""
+            if ns < 1000:
+                return f"{ns:.0f}ns"
+            elif ns < 1_000_000:
+                return f"{ns/1000:.2f}µs"
+            elif ns < 1_000_000_000:
+                return f"{ns/1_000_000:.2f}ms"
+            else:
+                return f"{ns/1_000_000_000:.2f}s"
+
+        def calculate_change(base, pr):
+            if base == 0:
+                return 0
+            return ((pr - base) / base) * 100
+
+        def compare_benchmarks(base_file, pr_file, benchmark_name):
+            base_data = load_json(base_file)
+            pr_data = load_json(pr_file)
+
+            # Create lookup dict for PR results
+            pr_lookup = {item['name']: item['value'] for item in pr_data}
+
+            lines = []
+            lines.append(f"\n### {benchmark_name}\n")
+            lines.append("| Benchmark | Base | PR | Change | Status |")
+            lines.append("|-----------|------|----|---------:|--------|")
+
+            for base_item in base_data:
+                name = base_item['name']
+                base_val = base_item['value']
+                pr_val = pr_lookup.get(name, base_val)
+
+                change = calculate_change(base_val, pr_val)
+
+                # Determine status emoji
+                if abs(change) < 5:
+                    status = "✅"
+                elif change > 5:
+                    status = "⚠️ slower"
+                else:
+                    status = "🚀 faster"
+
+                lines.append(
+                    f"| {name} | {format_ns(base_val)} | {format_ns(pr_val)} | "
+                    f"{change:+.2f}% | {status} |"
+                )
+
+            return "\n".join(lines)
+
+        # Generate full report
+        report = ["## 📊 Benchmark Comparison Report\n"]
+        report.append(compare_benchmarks('base_simple_bench.json', 'pr_simple_bench.json', 'CRUD Operations'))
+        report.append(compare_benchmarks('base_buffer_pool.json', 'pr_buffer_pool.json', 'Buffer Pool (Phase 1)'))
+        report.append("\n---")
+        report.append("\n**Note:** Changes < 5% are considered within normal variance.")
+        report.append("\n⚠️ = Performance regression detected")
+        report.append("\n🚀 = Performance improvement detected")
+
+        print("\n".join(report))
+
+        # Write to file for PR comment
+        with open('comparison_report.md', 'w') as f:
+            f.write("\n".join(report))
+        EOF
+
+        python3 compare.py
+
+    - name: Comment PR with results
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('comparison_report.md', 'utf8');
+
+          // Find existing comment
+          const comments = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const botComment = comments.data.find(comment =>
+            comment.user.login === 'github-actions[bot]' &&
+            comment.body.includes('Benchmark Comparison Report')
+          );
+
+          const commentBody = report;
+
+          if (botComment) {
+            // Update existing comment
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: commentBody
+            });
+          } else {
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+          }

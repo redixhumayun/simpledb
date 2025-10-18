@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Instant;
 
 use simpledb::{
-    benchmark_framework::{benchmark, parse_bench_args, print_header},
+    benchmark_framework::{benchmark, parse_bench_args, print_header, BenchResult},
     test_utils::generate_random_number,
     BlockId, Page, SimpleDB, TestDir,
 };
@@ -20,7 +20,7 @@ fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (Simpl
     (db, test_dir)
 }
 
-fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
+fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult {
     let test_file = "testfile".to_string();
     let buffer_manager = db.buffer_manager();
 
@@ -29,14 +29,13 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) {
     page.set_int(80, 1);
     db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
-    let result = benchmark("Pin/Unpin (hit)", iterations, 5, || {
+    benchmark("Pin/Unpin (hit)", iterations, 5, || {
         let buffer = buffer_manager.pin(&block_id).unwrap();
         buffer_manager.unpin(buffer);
-    });
-    println!("{result}");
+    })
 }
 
-fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) {
+fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult {
     let test_file = "coldfile".to_string();
     let buffer_manager = db.buffer_manager();
 
@@ -49,16 +48,15 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) {
     }
 
     let mut block_idx = 0;
-    let result = benchmark("Cold Pin (miss)", iterations, 0, || {
+    benchmark("Cold Pin (miss)", iterations, 0, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
         let buffer = buffer_manager.pin(&block_id).unwrap();
         buffer_manager.unpin(buffer);
         block_idx += 1;
-    });
-    println!("{result}");
+    })
 }
 
-fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffers: usize) {
+fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffers: usize) -> BenchResult {
     let test_file = "dirtyfile".to_string();
     let buffer_manager = db.buffer_manager();
 
@@ -88,10 +86,11 @@ fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffe
         buffer_manager.unpin(buffer);
         block_idx += 1;
     });
-    println!("{result}");
 
     // Clean up: commit transaction to release locks
     txn.commit().unwrap();
+
+    result
 }
 
 // Phase 2: Access Pattern Benchmarks
@@ -535,9 +534,32 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
 }
 
 fn main() {
-    let (iterations, num_buffers) = parse_bench_args();
+    let (iterations, num_buffers, json_output) = parse_bench_args();
     let block_size = 4096;
 
+    if json_output {
+        // In JSON mode, only run Phase 1 benchmarks and output JSON
+        let mut results = Vec::new();
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(pin_unpin_overhead(&db, block_size, iterations));
+        }
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(cold_pin(&db, block_size, iterations));
+        }
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(dirty_eviction(&db, block_size, iterations, num_buffers));
+        }
+
+        // Output as JSON array
+        let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
+        println!("[{}]", json_results.join(","));
+        return;
+    }
+
+    // Normal mode: run all phases with human-readable output
     println!("SimpleDB Buffer Pool Benchmark Suite");
     println!("====================================");
     println!("Running benchmarks with {iterations} iterations per operation");
@@ -554,15 +576,15 @@ fn main() {
     print_header();
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        pin_unpin_overhead(&db, block_size, iterations);
+        println!("{}", pin_unpin_overhead(&db, block_size, iterations));
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        cold_pin(&db, block_size, iterations);
+        println!("{}", cold_pin(&db, block_size, iterations));
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        dirty_eviction(&db, block_size, iterations, num_buffers);
+        println!("{}", dirty_eviction(&db, block_size, iterations, num_buffers));
     }
     println!();
 
