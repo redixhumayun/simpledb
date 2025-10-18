@@ -29,6 +29,42 @@ Or with custom iterations:
 cargo run --bin simple_bench 100
 ```
 
+Run buffer pool benchmarks:
+```bash
+cargo bench --bench buffer_pool -- 50 12
+```
+
+#### CI Benchmark Tracking
+
+All PRs automatically track CRUD operation performance (INSERT, SELECT, UPDATE, DELETE). Results are:
+- Stored historically in the `gh-pages` branch
+- Compared against previous runs with 5% alert threshold
+- Posted as PR comments when significant changes are detected (>5%)
+- **Never block merges** - alerts are informational only
+
+#### Performance Label
+
+Add the `performance` label to your PR to:
+- Run comprehensive buffer pool benchmarks (all 5 phases)
+- Generate a detailed base-vs-PR comparison report
+- Get side-by-side performance metrics in a PR comment
+
+This is useful when:
+- Implementing cache eviction algorithms (LRU, Clock, etc.)
+- Modifying buffer manager code
+- Making changes that could impact memory/disk I/O performance
+
+#### JSON Output
+
+Benchmarks support JSON output for CI integration:
+```bash
+# CRUD benchmarks
+cargo run --bin simple_bench 50 --json
+
+# Buffer pool benchmarks (Phase 1 only)
+cargo bench --bench buffer_pool -- 50 12 --json
+```
+
 ### Core Features
 
 The database supports ACID transactions, along with some other niceties like 
