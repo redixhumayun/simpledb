@@ -56,7 +56,12 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult 
     })
 }
 
-fn dirty_eviction(db: &SimpleDB, block_size: usize, iterations: usize, num_buffers: usize) -> BenchResult {
+fn dirty_eviction(
+    db: &SimpleDB,
+    block_size: usize,
+    iterations: usize,
+    num_buffers: usize,
+) -> BenchResult {
     let test_file = "dirtyfile".to_string();
     let buffer_manager = db.buffer_manager();
 
@@ -584,7 +589,10 @@ fn main() {
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!("{}", dirty_eviction(&db, block_size, iterations, num_buffers));
+        println!(
+            "{}",
+            dirty_eviction(&db, block_size, iterations, num_buffers)
+        );
     }
     println!();
 

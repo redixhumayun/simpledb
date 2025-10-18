@@ -66,7 +66,10 @@ fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
     })
 }
 
-fn run_select_benchmarks(db: &SimpleDB, iterations: usize) -> Vec<benchmark_framework::BenchResult> {
+fn run_select_benchmarks(
+    db: &SimpleDB,
+    iterations: usize,
+) -> Vec<benchmark_framework::BenchResult> {
     // Benchmark SELECT operations
     let result1 = benchmark("SELECT (table scan)", iterations, 2, || {
         let txn = Arc::new(db.new_tx());
