@@ -10689,6 +10689,108 @@ mod buffer_manager_tests {
             .unwrap();
         assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
     }
+
+    /// Concurrent stress test: multiple threads hammering same small working set
+    /// Tests for:
+    /// 1. Concurrent eviction races (multiple threads evicting/pinning same buffer slots)
+    /// 2. Pin count correctness (concurrent pin/unpin on same BlockId)
+    /// 3. Stats counter accuracy (AtomicUsize under concurrent updates)
+    /// 4. No panics/deadlocks under high contention
+    #[test]
+    fn test_concurrent_buffer_pool_stress() {
+        use std::thread;
+
+        // Small buffer pool (4 buffers) with small working set (6 blocks)
+        // Forces evictions and contention
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 4);
+        db.buffer_manager.enable_stats();
+
+        let block_size = 400;
+        let num_blocks = 6;
+        let num_threads = 8;
+        let ops_per_thread = 100;
+
+        // Pre-create blocks on disk
+        for i in 0..num_blocks {
+            let block_id = BlockId::new("stressfile".to_string(), i);
+            let mut page = Page::new(block_size);
+            page.set_int(0, i as i32);
+            db.file_manager.lock().unwrap().write(&block_id, &mut page);
+        }
+
+        // Spawn threads that all hammer the same small working set
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                let buffer_manager = db.buffer_manager.clone();
+                thread::spawn(move || {
+                    for op in 0..ops_per_thread {
+                        // Each thread accesses all blocks in round-robin
+                        // This creates maximum contention on buffer slots
+                        let block_num = (thread_id + op) % num_blocks;
+                        let block_id = BlockId::new("stressfile".to_string(), block_num);
+
+                        // Pin block
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+
+                        // Verify we got the right block
+                        {
+                            let guard = buffer.lock().unwrap();
+                            assert_eq!(guard.block_id.as_ref().unwrap(), &block_id);
+                            let value = guard.contents.get_int(0);
+                            assert_eq!(value, block_num as i32);
+                        }
+
+                        // Unpin immediately to maximize churn
+                        buffer_manager.unpin(buffer);
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked during stress test");
+        }
+
+        // Verify stats counters are consistent with deterministic lower bounds
+        // Note: Total may exceed num_threads * ops_per_thread because pin() can call
+        // try_to_pin() multiple times (retries when waiting for buffers)
+        if let Some(stats) = db.buffer_manager.stats() {
+            let (hits, misses) = stats.get();
+            let total = hits + misses;
+            let min_expected = num_threads * ops_per_thread;
+
+            assert!(
+                total >= min_expected,
+                "Stats counter sanity check failed: got {} total accesses (hits={}, misses={}), expected at least {}",
+                total, hits, misses, min_expected
+            );
+
+            // Misses: Must miss on first access to each unique block (6 blocks)
+            assert!(
+                misses >= num_blocks,
+                "Expected at least {} misses (cold start for {} blocks), got {}",
+                num_blocks, num_blocks, misses
+            );
+
+            // Hits: With 4 buffers for 6 blocks, even with thrashing, expect some hits
+            // Conservative lower bound: ~12% hit rate under worst-case thrashing
+            let min_hits = 100;
+            assert!(
+                hits >= min_hits,
+                "Expected at least {} hits under contention (got {}), possible correctness issue",
+                min_hits, hits
+            );
+
+            // Verify buffer pool is consistent (all buffers unpinned)
+            let available = db.buffer_manager.available();
+            assert_eq!(
+                available, 4,
+                "Buffer pool inconsistent: expected 4 available buffers, got {}",
+                available
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
