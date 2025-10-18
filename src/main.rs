@@ -10517,10 +10517,30 @@ impl BufferManager {
     /// If there is an existing buffer, increment the pin count and return it
     /// If not, try to find an unpinned buffer, pin it and then return it
     /// If both cases above fail, return None
+    ///
+    /// # ABA Race at Buffer Pool Layer
+    ///
+    /// There is a TOCTOU race between `find_existing_buffer()` releasing the lock and
+    /// re-acquiring it here. A buffer can be evicted and reloaded with the SAME BlockId
+    /// but DIFFERENT content (e.g., another transaction committed changes to disk, then
+    /// the block was reloaded). The check below detects BlockId changes but not content
+    /// changes for the same BlockId.
+    ///
+    /// **Why this is safe**: Transaction-level locks (via LockTable) prevent isolation
+    /// violations. Transactions acquire slock/xlock on BlockId before calling pin(), and
+    /// hold locks until commit/rollback (Strict 2PL). Even if a buffer is evicted and
+    /// uncommitted data flushed to disk, other transactions cannot read it until locks
+    /// are released. The buffer pool provides physical consistency; LockTable provides
+    /// logical isolation.
+    ///
+    /// **Non-transactional access** (catalog reads, WAL, recovery) bypasses LockTable
+    /// and could observe stale data from this race, but these operations are designed
+    /// to handle such cases.
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
         if let Some(buffer) = self.find_existing_buffer(block_id) {
             let was_unpinned = {
                 let mut guard = buffer.lock().unwrap();
+                // Defensive check: block may have been evicted between find and lock
                 if guard.block_id.as_ref() != Some(block_id) {
                     return None;
                 }
