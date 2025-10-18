@@ -10501,14 +10501,20 @@ impl BufferManager {
                 return Ok(buffer);
             }
 
-            let avail = self.num_available.lock().unwrap();
-            let (avail, wait_res) = self
-                .cond
-                .wait_timeout(avail, Duration::from_secs(Self::MAX_TIME))
-                .unwrap();
-            if wait_res.timed_out() || start.elapsed() > Duration::from_secs(Self::MAX_TIME) {
-                return Err("Timed out waiting for buffer".into());
+            let mut avail = self.num_available.lock().unwrap();
+            while *avail == 0 {
+                let elapsed = start.elapsed();
+                if elapsed >= Duration::from_secs(Self::MAX_TIME) {
+                    return Err("Timed out waiting for buffer".into());
+                }
+                let timeout = Duration::from_secs(Self::MAX_TIME) - elapsed;
+                let (guard, wait_res) = self.cond.wait_timeout(avail, timeout).unwrap();
+                avail = guard;
+                if wait_res.timed_out() {
+                    return Err("Timed out waiting for buffer".into());
+                }
             }
+            drop(avail);
         }
     }
 
