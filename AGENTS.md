@@ -12,8 +12,6 @@ This documentation provides information about the SimpleDB project and also prov
 
 ## Architecture Overview
 
-Almost the entirety of the code can be found in `main.rs`. This is on purpose to keep the code in one place since this repo is for pedgagogical reasons.
-
 There are no dependencies apart from the Rust standard library and that is by design.
 
 The code is designed to construct and answer typical SQL queries. The code will construct a query tree that will use the pull-based iterator pattern in a way that is probably typical in most SQL systems. However, the code leans towards readability rather than performance.
@@ -42,6 +40,14 @@ There is a test suite which provides basic coverage to ensure the code still wor
    cargo build
    cargo test
    # Verify build works and tests pass
+   ```
+
+5. **Run benchmarks before committing**
+   ```bash
+   cargo run --bin simplebench 50
+   # verify that the operations complete and see results
+   cargo bench --bench buffer_pool -- 50 12
+   # verify that the operations complete and see results
    ```
 
 5. **Create PR with descriptive title and summary**
