@@ -40,9 +40,7 @@ jobs:
       run: cargo test --verbose
     
     - name: Run all benchmarks (auto-discovery)
-      run: |
-        chmod +x scripts/run_all_benchmarks.sh
-        ./scripts/run_all_benchmarks.sh 50 12 all_benchmarks.json
+      run: python3 scripts/run_all_benchmarks.py 50 12 all_benchmarks.json
 
     - name: Store benchmark results
       uses: benchmark-action/github-action-benchmark@v1

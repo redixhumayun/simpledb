@@ -86,7 +86,7 @@ cargo bench --bench simple_bench -- 50 12 --json
 cargo bench --bench buffer_pool -- 50 12 --json
 
 # Run ALL benchmarks with auto-discovery (used in CI)
-./scripts/run_all_benchmarks.sh 50 12 output.json
+python3 scripts/run_all_benchmarks.py 50 12 output.json
 ```
 
 ### Roadmap
