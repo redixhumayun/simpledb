@@ -17,6 +17,14 @@ INSERT INTO USERS(id, name) VALUES (1, 'Alice')
 SELECT * FROM USERS
 ```
 
+### Core Features
+
+The database supports ACID transactions, along with some other niceties like
+* A buffer pool to manage memory
+* A WAL to ensure durability
+* A catalog to manage metadata for all tables
+* A query engine with a simple optimizer
+
 ### Benchmarks
 
 Run performance benchmarks:
@@ -80,14 +88,6 @@ cargo bench --bench buffer_pool -- 50 12 --json
 # Run ALL benchmarks with auto-discovery (used in CI)
 ./scripts/run_all_benchmarks.sh 50 12 output.json
 ```
-
-### Core Features
-
-The database supports ACID transactions, along with some other niceties like 
-* A buffer pool to manage memory
-* A WAL to ensure durability
-* A catalog to manage metadata for all tables
-* A query engine with a simple optimizer
 
 ### Roadmap
 
