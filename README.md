@@ -37,18 +37,26 @@ cargo bench --bench buffer_pool -- 50 12
 #### CI Benchmark Tracking
 
 All PRs automatically run **all benchmarks** via auto-discovery:
-- Discovers and runs all benchmark binaries in `src/bin/*_bench.rs`
 - Discovers and runs all cargo benchmarks in `benches/*.rs`
+- Uses standard `cargo bench` for discovery (no manual lists needed!)
 - Results stored historically in the `gh-pages` branch
 - Compared against previous runs with 5% alert threshold
 - Posted as PR comments when significant changes are detected (>5%)
 - **Never block merges** - alerts are informational only
 
-**Adding new benchmarks:** Just create a new file following the naming conventions:
-- `src/bin/my_bench.rs` - Binary benchmark (must support `--json` flag)
-- `benches/my_benchmark.rs` - Cargo benchmark (must support `--json` flag)
+**Adding new benchmarks:** Just create a file in `benches/`:
+```bash
+# Create your benchmark
+touch benches/io_benchmark.rs
 
-The CI will automatically discover and run it!
+# Add [[bench]] entry to Cargo.toml
+[[bench]]
+name = "io_benchmark"
+harness = false
+
+# Implement with --json flag support
+# CI automatically discovers and runs it!
+```
 
 #### Performance Label
 
@@ -66,7 +74,7 @@ This is useful when:
 Benchmarks support JSON output for CI integration:
 ```bash
 # Run a specific benchmark with JSON
-cargo run --bin simple_bench 50 --json
+cargo bench --bench simple_bench -- 50 12 --json
 cargo bench --bench buffer_pool -- 50 12 --json
 
 # Run ALL benchmarks with auto-discovery (used in CI)

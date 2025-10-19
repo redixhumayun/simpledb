@@ -7,9 +7,9 @@ edition = "2021"
 name = "simpledb"
 path = "src/bin/simpledb-cli.rs"
 
-[[bin]]
+[[bench]]
 name = "simple_bench"
-path = "src/bin/simple_bench.rs"
+harness = false
 
 [[bench]]
 name = "buffer_pool"

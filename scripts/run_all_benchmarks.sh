@@ -1,5 +1,5 @@
 #!/bin/bash
-# Auto-discover and run all benchmarks, combining JSON results
+# Auto-discover and run all cargo benchmarks, combining JSON results
 
 set -e
 
@@ -12,27 +12,14 @@ echo "Running all benchmarks with $ITERATIONS iterations..." >&2
 # Array to hold all JSON results
 ALL_RESULTS=()
 
-# 1. Find and run all benchmark binaries (src/bin/*_bench.rs)
-echo "Discovering benchmark binaries..." >&2
-for bench_file in src/bin/*_bench.rs; do
-    if [ -f "$bench_file" ]; then
-        bench_name=$(basename "$bench_file" .rs)
-        echo "Running benchmark binary: $bench_name" >&2
-
-        # Run and capture JSON output
-        result=$(cargo run --release --bin "$bench_name" "$ITERATIONS" --json 2>/dev/null)
-        ALL_RESULTS+=("$result")
-    fi
-done
-
-# 2. Find and run all cargo benchmarks (benches/*.rs)
-echo "Discovering cargo benchmarks..." >&2
+# Discover and run all cargo benchmarks from benches/ directory
+echo "Discovering benchmarks in benches/..." >&2
 for bench_file in benches/*.rs; do
     if [ -f "$bench_file" ] && [ "$(basename "$bench_file")" != "README.md" ]; then
         bench_name=$(basename "$bench_file" .rs)
-        echo "Running cargo benchmark: $bench_name" >&2
+        echo "Running: $bench_name" >&2
 
-        # Run and capture JSON output
+        # Run cargo bench with JSON output
         result=$(cargo bench --bench "$bench_name" -- "$ITERATIONS" "$NUM_BUFFERS" --json 2>/dev/null)
         ALL_RESULTS+=("$result")
     fi
