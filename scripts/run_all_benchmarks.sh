@@ -1,5 +1,9 @@
 #!/bin/bash
 # Auto-discover and run all cargo benchmarks, combining JSON results
+#
+# LIMITATION: All .rs files in benches/ are assumed to be benchmarks defined
+# in Cargo.toml. Do NOT add helper modules directly in benches/ (e.g., benches/common.rs).
+# Instead, use benches/common/mod.rs or similar structure.
 
 set -e
 
@@ -20,7 +24,12 @@ for bench_file in benches/*.rs; do
         echo "Running: $bench_name" >&2
 
         # Run cargo bench with JSON output
-        result=$(cargo bench --bench "$bench_name" -- "$ITERATIONS" "$NUM_BUFFERS" --json 2>/dev/null)
+        # Note: Errors are now visible for debugging. If a benchmark fails, the script stops.
+        if ! result=$(cargo bench --bench "$bench_name" -- "$ITERATIONS" "$NUM_BUFFERS" --json 2>&1 | grep -E '^\['); then
+            echo "ERROR: Failed to run benchmark '$bench_name'" >&2
+            echo "Make sure '$bench_name' is defined in Cargo.toml as [[bench]]" >&2
+            exit 1
+        fi
         ALL_RESULTS+=("$result")
     fi
 done
