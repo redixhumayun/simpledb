@@ -1,0 +1,113 @@
+name: Benchmark Comparison
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+jobs:
+  compare:
+    # Only run when PR is labeled with 'performance' or manually triggered
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'performance'))
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for comparison
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-compare-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-compare-
+
+    - name: Build project
+      run: cargo build --release
+
+    # Save benchmark scripts from PR before switching branches
+    # This ensures consistent measurement tool for both base and PR runs
+    - name: Save benchmark scripts
+      run: cp -r scripts /tmp/scripts
+
+    # Run benchmarks on base branch (master)
+    - name: Checkout base branch
+      run: git checkout ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+
+    - name: Build base branch
+      run: cargo build --release
+
+    - name: Run base benchmarks (all)
+      run: python3 /tmp/scripts/run_all_benchmarks.py 50 12 base_benchmarks.json
+
+    # Run benchmarks on PR branch
+    - name: Checkout PR branch
+      run: git checkout ${{ github.event.pull_request.head.sha }}
+
+    - name: Build PR branch
+      run: cargo build --release
+
+    - name: Run PR benchmarks (all)
+      run: python3 scripts/run_all_benchmarks.py 50 12 pr_benchmarks.json
+
+    # Generate comparison report
+    - name: Generate comparison report
+      run: |
+        chmod +x /tmp/scripts/compare_benchmarks.py
+        python3 /tmp/scripts/compare_benchmarks.py base_benchmarks.json pr_benchmarks.json comparison_report.md
+
+    - name: Comment PR with results
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('comparison_report.md', 'utf8');
+
+          // Find existing comment
+          const comments = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const botComment = comments.data.find(comment =>
+            comment.user.login === 'github-actions[bot]' &&
+            comment.body.includes('Benchmark Comparison Report')
+          );
+
+          const commentBody = report;
+
+          if (botComment) {
+            // Update existing comment
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: commentBody
+            });
+          } else {
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+          }

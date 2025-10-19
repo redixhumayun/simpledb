@@ -39,11 +39,25 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
     
-    - name: Run benchmarks
-      run: cargo run --bin simple_bench 5
-      
+    - name: Run all benchmarks (auto-discovery)
+      run: python3 scripts/run_all_benchmarks.py 50 12 all_benchmarks.json
+
+    - name: Store benchmark results
+      uses: benchmark-action/github-action-benchmark@v1
+      with:
+        name: SimpleDB Benchmarks
+        tool: 'customSmallerIsBetter'
+        output-file-path: all_benchmarks.json
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        # Only push to gh-pages on master branch, not on PRs (permission issue)
+        auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        alert-threshold: '105%'
+        comment-on-alert: true
+        fail-on-alert: false
+        alert-comment-cc-users: '@${{ github.actor }}'
+
     - name: Check formatting
       run: cargo fmt -- --check
-      
+
     - name: Run clippy
       run: cargo clippy -- -D warnings
