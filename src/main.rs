@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -10418,7 +10418,7 @@ pub struct BufferManager {
     num_available: Mutex<usize>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
-    global_lock: Mutex<()>,
+    resident: Mutex<HashMap<BlockId, Weak<Mutex<Buffer>>>>,
 }
 
 impl BufferManager {
@@ -10443,7 +10443,7 @@ impl BufferManager {
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
             stats: OnceLock::new(),
-            global_lock: Mutex::new(()),
+            resident: Mutex::new(HashMap::new()),
         }
     }
 
@@ -10499,11 +10499,8 @@ impl BufferManager {
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
-            {
-                let _guard = self.global_lock.lock().unwrap();
-                if let Some(buffer) = self.try_to_pin(block_id) {
-                    return Ok(buffer);
-                }
+            if let Some(buffer) = self.try_to_pin(block_id) {
+                return Ok(buffer);
             }
 
             let mut avail = self.num_available.lock().unwrap();
@@ -10523,11 +10520,11 @@ impl BufferManager {
         }
     }
 
-    /// Find a buffer to pin this block to
-    /// First check to see if there is an existing buffer for this block
-    /// If there is an existing buffer, increment the pin count and return it
-    /// If not, try to find an unpinned buffer, pin it and then return it
-    /// If both cases above fail, return None
+    /// The function has two clear paths laid out - hit path and miss path
+    /// The hit path will attempt to find the buffer in the resident table and increase the pin count if found
+    /// The miss path will call [`BufferManager::choose_unpinned_buffer`] which will check to see if another
+    /// thread has already added an entry for this [`BlockId`]. If so, an optimization is possible but not implemented
+    /// If not, return so that the top level loop can retry
     ///
     /// # ABA Race at Buffer Pool Layer
     ///
@@ -10548,19 +10545,37 @@ impl BufferManager {
     /// and could observe stale data from this race, but these operations are designed
     /// to handle such cases.
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
-        if let Some(buffer) = self.find_existing_buffer(block_id) {
-            let was_unpinned = {
-                let mut guard = buffer.lock().unwrap();
-                // Defensive check: block may have been evicted between find and lock
-                if guard.block_id.as_ref() != Some(block_id) {
+        //  hit path
+        let buffer = {
+            let mut resident = self.resident.lock().unwrap();
+            match resident.get(block_id) {
+                Some(weak) => match weak.upgrade() {
+                    Some(buffer) => Some(buffer),
+                    None => {
+                        resident.remove(block_id);
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        };
+        if let Some(buffer) = buffer {
+            {
+                let mut buffer_guard = buffer.lock().unwrap();
+                if buffer_guard.block_id.is_some()
+                    && buffer_guard.block_id.as_ref().unwrap() != block_id
+                {
                     return None;
                 }
-                let was_unpinned = !guard.is_pinned();
-                guard.pin();
-                was_unpinned
-            };
-            if was_unpinned {
-                *self.num_available.lock().unwrap() -= 1;
+                let was_unpinned = !buffer_guard.is_pinned();
+                buffer_guard.pin();
+                if was_unpinned {
+                    *self.num_available.lock().unwrap() -= 1;
+                    self.resident
+                        .lock()
+                        .unwrap()
+                        .insert(block_id.clone(), Arc::downgrade(&buffer));
+                }
             }
             if let Some(stats) = self.stats.get() {
                 stats
@@ -10570,24 +10585,36 @@ impl BufferManager {
             return Some(buffer);
         }
 
+        // miss path
         if let Some(stats) = self.stats.get() {
             stats
                 .misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
         if let Some(buffer) = self.choose_unpinned_buffer() {
             {
-                let mut guard = buffer.lock().unwrap();
-                if guard.is_pinned() {
+                let mut frame = buffer.lock().unwrap();
+                let mut resident = self.resident.lock().unwrap();
+                if resident.contains_key(block_id) {
+                    //  treat this as a miss, because some other thread has beat us to adding an entry for this block
+                    //  technically this can be a fast path hit but that optimization will come in later
                     return None;
                 }
-                guard.assign_to_block(block_id);
-                guard.pin();
+                if frame.is_pinned() {
+                    return None;
+                }
+                if let Some(old) = frame.block_id.as_ref() {
+                    resident.remove(old);
+                }
+                frame.assign_to_block(block_id);
+                frame.pin();
+                *self.num_available.lock().unwrap() -= 1;
+                resident.insert(block_id.clone(), Arc::downgrade(&buffer));
             }
-            *self.num_available.lock().unwrap() -= 1;
             return Some(buffer);
         }
+
+        //  The block is not pinned to any frame and there are no free frames left
         None
     }
 
@@ -10595,12 +10622,14 @@ impl BufferManager {
     /// If all of the pins have been removed, managed metadata & notify waiting threads
     pub fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
         let mut buffer_guard = buffer.lock().unwrap();
-        assert!(buffer_guard.pins > 0);
+        assert!(
+            buffer_guard.pins > 0,
+            "While trying to unpin a block, the pins were already 0. This is incorrect"
+        );
         let was_one = buffer_guard.pins == 1;
         buffer_guard.unpin();
         if was_one {
-            let mut avail = self.num_available.lock().unwrap();
-            *avail += 1;
+            *self.num_available.lock().unwrap() += 1;
             self.cond.notify_all();
         }
     }
