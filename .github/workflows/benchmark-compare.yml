@@ -41,6 +41,11 @@ jobs:
     - name: Build project
       run: cargo build --release
 
+    # Save benchmark scripts from PR before switching branches
+    # This ensures consistent measurement tool for both base and PR runs
+    - name: Save benchmark scripts
+      run: cp -r scripts /tmp/scripts
+
     # Run benchmarks on base branch (master)
     - name: Checkout base branch
       run: git checkout ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
@@ -49,7 +54,7 @@ jobs:
       run: cargo build --release
 
     - name: Run base benchmarks (all)
-      run: python3 scripts/run_all_benchmarks.py 50 12 base_benchmarks.json
+      run: python3 /tmp/scripts/run_all_benchmarks.py 50 12 base_benchmarks.json
 
     # Run benchmarks on PR branch
     - name: Checkout PR branch
@@ -64,8 +69,8 @@ jobs:
     # Generate comparison report
     - name: Generate comparison report
       run: |
-        chmod +x scripts/compare_benchmarks.py
-        python3 scripts/compare_benchmarks.py base_benchmarks.json pr_benchmarks.json comparison_report.md
+        chmod +x /tmp/scripts/compare_benchmarks.py
+        python3 /tmp/scripts/compare_benchmarks.py base_benchmarks.json pr_benchmarks.json comparison_report.md
 
     - name: Comment PR with results
       uses: actions/github-script@v7
