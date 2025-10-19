@@ -48,11 +48,10 @@ jobs:
     - name: Build base branch
       run: cargo build --release
 
-    - name: Run base benchmarks (simple_bench)
-      run: cargo run --release --bin simple_bench 50 --json > base_simple_bench.json
-
-    - name: Run base benchmarks (buffer_pool)
-      run: cargo bench --bench buffer_pool -- 50 12 --json > base_buffer_pool.json
+    - name: Run base benchmarks (all)
+      run: |
+        chmod +x scripts/run_all_benchmarks.sh
+        ./scripts/run_all_benchmarks.sh 50 12 base_benchmarks.json
 
     # Run benchmarks on PR branch
     - name: Checkout PR branch
@@ -61,11 +60,10 @@ jobs:
     - name: Build PR branch
       run: cargo build --release
 
-    - name: Run PR benchmarks (simple_bench)
-      run: cargo run --release --bin simple_bench 50 --json > pr_simple_bench.json
-
-    - name: Run PR benchmarks (buffer_pool)
-      run: cargo bench --bench buffer_pool -- 50 12 --json > pr_buffer_pool.json
+    - name: Run PR benchmarks (all)
+      run: |
+        chmod +x scripts/run_all_benchmarks.sh
+        ./scripts/run_all_benchmarks.sh 50 12 pr_benchmarks.json
 
     # Generate comparison report
     - name: Generate comparison report
@@ -94,7 +92,7 @@ jobs:
                 return 0
             return ((pr - base) / base) * 100
 
-        def compare_benchmarks(base_file, pr_file, benchmark_name):
+        def compare_benchmarks(base_file, pr_file):
             base_data = load_json(base_file)
             pr_data = load_json(pr_file)
 
@@ -102,7 +100,6 @@ jobs:
             pr_lookup = {item['name']: item['value'] for item in pr_data}
 
             lines = []
-            lines.append(f"\n### {benchmark_name}\n")
             lines.append("| Benchmark | Base | PR | Change | Status |")
             lines.append("|-----------|------|----|---------:|--------|")
 
@@ -130,8 +127,7 @@ jobs:
 
         # Generate full report
         report = ["## 📊 Benchmark Comparison Report\n"]
-        report.append(compare_benchmarks('base_simple_bench.json', 'pr_simple_bench.json', 'CRUD Operations'))
-        report.append(compare_benchmarks('base_buffer_pool.json', 'pr_buffer_pool.json', 'Buffer Pool (Phase 1)'))
+        report.append(compare_benchmarks('base_benchmarks.json', 'pr_benchmarks.json'))
         report.append("\n---")
         report.append("\n**Note:** Changes < 5% are considered within normal variance.")
         report.append("\n⚠️ = Performance regression detected")

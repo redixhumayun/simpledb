@@ -36,18 +36,25 @@ cargo bench --bench buffer_pool -- 50 12
 
 #### CI Benchmark Tracking
 
-All PRs automatically track CRUD operation performance (INSERT, SELECT, UPDATE, DELETE). Results are:
-- Stored historically in the `gh-pages` branch
+All PRs automatically run **all benchmarks** via auto-discovery:
+- Discovers and runs all benchmark binaries in `src/bin/*_bench.rs`
+- Discovers and runs all cargo benchmarks in `benches/*.rs`
+- Results stored historically in the `gh-pages` branch
 - Compared against previous runs with 5% alert threshold
 - Posted as PR comments when significant changes are detected (>5%)
 - **Never block merges** - alerts are informational only
 
+**Adding new benchmarks:** Just create a new file following the naming conventions:
+- `src/bin/my_bench.rs` - Binary benchmark (must support `--json` flag)
+- `benches/my_benchmark.rs` - Cargo benchmark (must support `--json` flag)
+
+The CI will automatically discover and run it!
+
 #### Performance Label
 
 Add the `performance` label to your PR to:
-- Run comprehensive buffer pool benchmarks (all 5 phases)
 - Generate a detailed base-vs-PR comparison report
-- Get side-by-side performance metrics in a PR comment
+- Get side-by-side performance metrics for ALL benchmarks in a PR comment
 
 This is useful when:
 - Implementing cache eviction algorithms (LRU, Clock, etc.)
@@ -58,11 +65,12 @@ This is useful when:
 
 Benchmarks support JSON output for CI integration:
 ```bash
-# CRUD benchmarks
+# Run a specific benchmark with JSON
 cargo run --bin simple_bench 50 --json
-
-# Buffer pool benchmarks (Phase 1 only)
 cargo bench --bench buffer_pool -- 50 12 --json
+
+# Run ALL benchmarks with auto-discovery (used in CI)
+./scripts/run_all_benchmarks.sh 50 12 output.json
 ```
 
 ### Core Features
