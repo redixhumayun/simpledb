@@ -100,7 +100,12 @@ fn dirty_eviction(
 
 // Phase 2: Access Pattern Benchmarks
 
-fn sequential_scan(db: &SimpleDB, block_size: usize, num_buffers: usize, iterations: usize) -> BenchResult {
+fn sequential_scan(
+    db: &SimpleDB,
+    block_size: usize,
+    num_buffers: usize,
+    iterations: usize,
+) -> BenchResult {
     let test_file = "seqfile".to_string();
     let buffer_manager = db.buffer_manager();
     let total_blocks = num_buffers * 10; // Working set > pool
@@ -123,7 +128,12 @@ fn sequential_scan(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     })
 }
 
-fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterations: usize) -> BenchResult {
+fn repeated_access(
+    db: &SimpleDB,
+    block_size: usize,
+    num_buffers: usize,
+    iterations: usize,
+) -> BenchResult {
     let test_file = "repeatfile".to_string();
     let buffer_manager = db.buffer_manager();
     let working_set = 10.min(num_buffers - 2); // Small working set < pool
@@ -148,7 +158,12 @@ fn repeated_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterati
     })
 }
 
-fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iterations: usize) -> BenchResult {
+fn random_access(
+    db: &SimpleDB,
+    block_size: usize,
+    working_set_size: usize,
+    iterations: usize,
+) -> BenchResult {
     let test_file = format!("randomfile_{working_set_size}");
     let buffer_manager = db.buffer_manager();
     let total_accesses = 500;
@@ -181,7 +196,12 @@ fn random_access(db: &SimpleDB, block_size: usize, working_set_size: usize, iter
     )
 }
 
-fn zipfian_access(db: &SimpleDB, block_size: usize, num_buffers: usize, iterations: usize) -> BenchResult {
+fn zipfian_access(
+    db: &SimpleDB,
+    block_size: usize,
+    num_buffers: usize,
+    iterations: usize,
+) -> BenchResult {
     let test_file = "zipffile".to_string();
     let buffer_manager = db.buffer_manager();
     let total_blocks = num_buffers * 3;
