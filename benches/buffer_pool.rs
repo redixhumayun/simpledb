@@ -522,6 +522,9 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
 
 fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    let bm = db.buffer_manager();
+    let base = Arc::as_ptr(&bm) as usize;
+    println!("BufferManager base: 0x{:x}", base);
 
     println!("Phase 5: Concurrent Access");
     println!();
@@ -535,7 +538,7 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
     println!();
     println!("5.2 Buffer Starvation (cond.wait() latency):");
     println!("{}", "-".repeat(70));
-    buffer_starvation(&db, block_size, num_buffers);
+    // buffer_starvation(&db, block_size, num_buffers);
 }
 
 fn main() {
@@ -605,104 +608,62 @@ fn main() {
     println!();
 
     // Phase 1
-    println!("Phase 1: Core Latency Benchmarks");
-    print_header();
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!("{}", pin_unpin_overhead(&db, block_size, iterations));
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!("{}", cold_pin(&db, block_size, iterations));
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!(
-            "{}",
-            dirty_eviction(&db, block_size, iterations, num_buffers)
-        );
-    }
-    println!();
+    // println!("Phase 1: Core Latency Benchmarks");
+    // print_header();
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     println!("{}", pin_unpin_overhead(&db, block_size, iterations));
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     println!("{}", cold_pin(&db, block_size, iterations));
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     println!(
+    //         "{}",
+    //         dirty_eviction(&db, block_size, iterations, num_buffers)
+    //     );
+    // }
+    // println!();
 
     // Phase 2
-    println!("Phase 2: Access Pattern Benchmarks");
-    println!("Operation                      | Throughput (mean)          | Throughput (median)");
-    println!("{}", "-".repeat(95));
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = sequential_scan(&db, block_size, num_buffers, iterations);
-        let total_blocks = num_buffers * 10;
-        let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = repeated_access(&db, block_size, num_buffers, iterations);
-        let total_accesses = 1000;
-        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = random_access(&db, block_size, 10, iterations);
-        let total_accesses = 500;
-        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = random_access(&db, block_size, 50, iterations);
-        let total_accesses = 500;
-        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = random_access(&db, block_size, 100, iterations);
-        let total_accesses = 500;
-        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        let result = zipfian_access(&db, block_size, num_buffers, iterations);
-        let total_accesses = 500;
-        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
-        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        println!(
-            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            result.operation, mean_throughput, median_throughput
-        );
-    }
-    println!();
+    // println!("Phase 2: Access Pattern Benchmarks");
+    // println!("Operation            | Throughput (mean)          | Throughput (median)");
+    // println!("{}", "-".repeat(75));
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     sequential_scan(&db, block_size, num_buffers, iterations);
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     repeated_access(&db, block_size, num_buffers, iterations);
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     random_access(&db, block_size, 10, iterations);
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     random_access(&db, block_size, 50, iterations);
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     random_access(&db, block_size, 100, iterations);
+    // }
+    // {
+    //     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    //     zipfian_access(&db, block_size, num_buffers, iterations);
+    // }
+    // println!();
 
     // Phase 3
-    pool_size_scaling(block_size, iterations);
-    memory_pressure_test(block_size, iterations);
+    // pool_size_scaling(block_size, iterations);
+    // memory_pressure_test(block_size, iterations);
     println!();
 
     // Phase 4
-    hit_rate_benchmarks(block_size, num_buffers, iterations);
+    // hit_rate_benchmarks(block_size, num_buffers, iterations);
     println!();
 
     // Phase 5
