@@ -11591,3 +11591,45 @@ mod durability_tests {
 fn main() {
     let db = SimpleDB::new("random", 800, 4, true);
 }
+
+#[cfg(test)]
+mod offset_smoke_tests {
+    use super::*;
+
+    #[test]
+    fn prints_buffer_manager_num_available_offset() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let bm = Arc::clone(&db.buffer_manager);
+
+        println!(
+            "num_available offset: 0x{:X}",
+            core::mem::offset_of!(BufferManager, num_available)
+        );
+
+        // Get pointer to the actual BufferManager inside the Arc
+        let bm_ptr = Arc::as_ptr(&bm);
+        let bm_addr = bm_ptr as usize;
+
+        // Calculate num_available address
+        let num_avail_addr = unsafe { std::ptr::addr_of!((*bm_ptr).num_available) as usize };
+
+        println!("BufferManager base: 0x{:X}", bm_addr);
+        println!("num_available addr: 0x{:X}", num_avail_addr);
+        println!("Offset: 0x{:X}", num_avail_addr - bm_addr);
+
+        // Lock and check data address
+        {
+            let guard = bm.num_available.lock().unwrap();
+            let data_addr = &*guard as *const usize as usize;
+            println!("Data inside mutex:  0x{:X}", data_addr);
+            println!(
+                "Data offset from BufferManager: 0x{:X}",
+                data_addr - bm_addr
+            );
+            println!(
+                "Data offset from num_available: 0x{:X}",
+                data_addr - num_avail_addr
+            );
+        }
+    }
+}
