@@ -119,13 +119,18 @@ fn sequential_scan(
     }
 
     // Benchmark: complete scan as one workload
-    benchmark("Sequential Scan", iterations, 2, || {
-        for i in 0..total_blocks {
-            let block_id = BlockId::new(test_file.clone(), i);
-            let buffer = buffer_manager.pin(&block_id).unwrap();
-            buffer_manager.unpin(buffer);
-        }
-    })
+    benchmark(
+        &format!("Sequential Scan ({} blocks)", total_blocks),
+        iterations,
+        2,
+        || {
+            for i in 0..total_blocks {
+                let block_id = BlockId::new(test_file.clone(), i);
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
+            }
+        },
+    )
 }
 
 fn repeated_access(
@@ -148,14 +153,19 @@ fn repeated_access(
     }
 
     // Benchmark: repeated access pattern as one workload
-    benchmark("Repeated Access", iterations, 2, || {
-        for i in 0..total_accesses {
-            let block_idx = i % working_set;
-            let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer = buffer_manager.pin(&block_id).unwrap();
-            buffer_manager.unpin(buffer);
-        }
-    })
+    benchmark(
+        &format!("Repeated Access ({} ops)", total_accesses),
+        iterations,
+        2,
+        || {
+            for i in 0..total_accesses {
+                let block_idx = i % working_set;
+                let block_id = BlockId::new(test_file.clone(), block_idx);
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
+            }
+        },
+    )
 }
 
 fn random_access(
@@ -183,7 +193,7 @@ fn random_access(
 
     // Benchmark: random access pattern as one workload
     benchmark(
-        &format!("Random (K={working_set_size})"),
+        &format!("Random (K={}, {} ops)", working_set_size, total_accesses),
         iterations,
         2,
         || {
@@ -231,13 +241,18 @@ fn zipfian_access(
         .collect();
 
     // Benchmark: zipfian access pattern as one workload
-    benchmark("Zipfian (80/20)", iterations, 2, || {
-        for &block_idx in &zipfian_indices {
-            let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer = buffer_manager.pin(&block_id).unwrap();
-            buffer_manager.unpin(buffer);
-        }
-    })
+    benchmark(
+        &format!("Zipfian (80/20, {} ops)", total_accesses),
+        iterations,
+        2,
+        || {
+            for &block_idx in &zipfian_indices {
+                let block_id = BlockId::new(test_file.clone(), block_idx);
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
+            }
+        },
+    )
 }
 
 // Phase 3: Pool Size Sensitivity
@@ -611,8 +626,8 @@ fn main() {
 
     // Phase 2
     println!("Phase 2: Access Pattern Benchmarks");
-    println!("Operation            | Throughput (mean)          | Throughput (median)");
-    println!("{}", "-".repeat(75));
+    println!("Operation                      | Throughput (mean)          | Throughput (median)");
+    println!("{}", "-".repeat(95));
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = sequential_scan(&db, block_size, num_buffers, iterations);
@@ -620,8 +635,8 @@ fn main() {
         let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
         let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Sequential Scan", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     {
@@ -631,8 +646,8 @@ fn main() {
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Repeated Access", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     {
@@ -642,8 +657,8 @@ fn main() {
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Random (K= 10)", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     {
@@ -653,8 +668,8 @@ fn main() {
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Random (K= 50)", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     {
@@ -664,8 +679,8 @@ fn main() {
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Random (K=100)", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     {
@@ -675,8 +690,8 @@ fn main() {
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         println!(
-            "{:20} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
-            "Zipfian (80/20)", mean_throughput, median_throughput
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
         );
     }
     println!();
