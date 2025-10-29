@@ -10438,7 +10438,7 @@ impl<'a> LatchTableGuard<'a> {
     }
 }
 
-impl<'a> Drop for LatchTableGuard<'a> {
+impl Drop for LatchTableGuard<'_> {
     fn drop(&mut self) {
         let mut block_latch_table_guard = self.latch_table.lock().unwrap();
         if let Some(ptr) = block_latch_table_guard.get(&self.block_id) {
@@ -10648,10 +10648,7 @@ impl BufferManager {
         //  2. T1 and T2 are trying to pin block B1
         //      not possible because of the block latch
         loop {
-            let frame = match self.choose_unpinned_frame() {
-                Some(frame) => frame,
-                None => return None,
-            };
+            let frame = self.choose_unpinned_frame()?;
             {
                 let mut frame_guard = frame.lock().unwrap();
                 if frame_guard.is_pinned() {
