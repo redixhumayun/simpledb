@@ -629,31 +629,73 @@ fn main() {
 
     // Phase 2
     println!("Phase 2: Access Pattern Benchmarks");
-    println!("Operation            | Throughput (mean)          | Throughput (median)");
-    println!("{}", "-".repeat(75));
+    println!("Operation                      | Throughput (mean)          | Throughput (median)");
+    println!("{}", "-".repeat(95));
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        sequential_scan(&db, block_size, num_buffers, iterations);
+        let result = sequential_scan(&db, block_size, num_buffers, iterations);
+        let total_blocks = num_buffers * 10;
+        let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        repeated_access(&db, block_size, num_buffers, iterations);
+        let result = repeated_access(&db, block_size, num_buffers, iterations);
+        let total_accesses = 1000;
+        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        random_access(&db, block_size, 10, iterations);
+        let result = random_access(&db, block_size, 10, iterations);
+        let total_accesses = 500;
+        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        random_access(&db, block_size, 50, iterations);
+        let result = random_access(&db, block_size, 50, iterations);
+        let total_accesses = 500;
+        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        random_access(&db, block_size, 100, iterations);
+        let result = random_access(&db, block_size, 100, iterations);
+        let total_accesses = 500;
+        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        zipfian_access(&db, block_size, num_buffers, iterations);
+        let result = zipfian_access(&db, block_size, num_buffers, iterations);
+        let total_accesses = 500;
+        let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
+        let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
+        println!(
+            "{:30} | {:>10.0} blocks/sec (mean) | {:>10.0} blocks/sec (median)",
+            result.operation, mean_throughput, median_throughput
+        );
     }
     println!();
 
