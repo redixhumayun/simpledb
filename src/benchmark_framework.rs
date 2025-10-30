@@ -31,18 +31,22 @@ impl BenchResult {
     }
 }
 
-pub fn parse_bench_args() -> (usize, usize, bool) {
+pub fn parse_bench_args() -> (usize, usize, bool, Option<String>) {
     let args: Vec<String> = env::args().collect();
     let mut numeric_args = Vec::new();
     let mut json_output = false;
+    let mut filter: Option<String> = None;
 
-    // Collect all numeric args and check for flags
+    // Collect all numeric args, check for flags, and capture filter string
     for arg in args.iter().skip(1) {
         if arg == "--json" {
             json_output = true;
         } else if !arg.starts_with("--") {
             if let Ok(n) = arg.parse::<usize>() {
                 numeric_args.push(n);
+            } else {
+                // Non-numeric, non-flag argument is treated as filter
+                filter = Some(arg.clone());
             }
         }
     }
@@ -50,7 +54,14 @@ pub fn parse_bench_args() -> (usize, usize, bool) {
     let iterations = numeric_args.first().copied().unwrap_or(10);
     let num_buffers = numeric_args.get(1).copied().unwrap_or(12);
 
-    (iterations, num_buffers, json_output)
+    (iterations, num_buffers, json_output, filter)
+}
+
+pub fn should_run(bench_name: &str, filter: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some(f) => bench_name.contains(f),
+    }
 }
 
 pub fn benchmark<F>(name: &str, iterations: usize, warmup: usize, mut operation: F) -> BenchResult
