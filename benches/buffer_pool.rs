@@ -1319,7 +1319,6 @@ fn main() {
         if !phase5_has_output {
             println!("Phase 5: Concurrent Access");
             println!();
-            phase5_has_output = true;
         }
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         run_buffer_starvation_benchmark(&db, block_size, num_buffers);
