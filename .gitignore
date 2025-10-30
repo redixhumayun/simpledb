@@ -3,3 +3,7 @@
 /bench-data
 /random
 node_modules
+perf.*
+*.txt
+.DS_Store
+/output

@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -9676,7 +9676,7 @@ impl RecoveryManager {
     /// Write the [`LogRecord`] to set the value of an integer in a [`Buffer`]
     fn set_int(
         &self,
-        buffer: &Buffer,
+        buffer: &BufferFrame,
         offset: usize,
         _new_value: i32,
     ) -> Result<Lsn, Box<dyn Error>> {
@@ -9694,7 +9694,7 @@ impl RecoveryManager {
     /// Write the [`LogRecord`] to set the value of a String in a [`Buffer`]
     fn set_string(
         &self,
-        buffer: &Buffer,
+        buffer: &BufferFrame,
         offset: usize,
         _new_value: &str,
     ) -> Result<Lsn, Box<dyn Error>> {
@@ -10140,7 +10140,7 @@ impl LogRecord {
 /// Wrapper for the value contained in the hash map of the [`BufferList`]
 #[derive(Debug)]
 struct HashMapValue {
-    buffer: Arc<Mutex<Buffer>>,
+    buffer: Arc<Mutex<BufferFrame>>,
     count: usize,
 }
 
@@ -10166,7 +10166,7 @@ impl BufferList {
     }
 
     /// Get the buffer associated with the provided block_id
-    fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
+    fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<BufferFrame>>> {
         self.buffers
             .borrow()
             .get(block_id)
@@ -10295,7 +10295,7 @@ mod buffer_list_tests {
 }
 
 #[derive(Debug)]
-pub struct Buffer {
+pub struct BufferFrame {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     contents: Page,
@@ -10304,7 +10304,8 @@ pub struct Buffer {
     txn: Option<usize>,
     lsn: Option<Lsn>,
 }
-impl Buffer {
+
+impl BufferFrame {
     fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
         let size = file_manager.lock().unwrap().block_size();
         Self {
@@ -10410,15 +10411,54 @@ impl BufferStats {
     }
 }
 
+struct LatchTableGuard<'a> {
+    latch_table: &'a Mutex<HashMap<BlockId, Arc<Mutex<()>>>>,
+    block_id: BlockId,
+    latch: Arc<Mutex<()>>,
+}
+
+impl<'a> LatchTableGuard<'a> {
+    fn new(table: &'a Mutex<HashMap<BlockId, Arc<Mutex<()>>>>, block_id: &BlockId) -> Self {
+        let latch = {
+            let mut guard = table.lock().unwrap();
+            let block_latch_ptr = guard
+                .entry(block_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            Arc::clone(block_latch_ptr)
+        };
+        Self {
+            latch_table: table,
+            block_id: block_id.clone(),
+            latch,
+        }
+    }
+
+    fn lock(&'a self) -> MutexGuard<'a, ()> {
+        self.latch.lock().unwrap()
+    }
+}
+
+impl Drop for LatchTableGuard<'_> {
+    fn drop(&mut self) {
+        let mut block_latch_table_guard = self.latch_table.lock().unwrap();
+        if let Some(ptr) = block_latch_table_guard.get(&self.block_id) {
+            if Arc::strong_count(ptr) == 2 {
+                block_latch_table_guard.remove(&self.block_id);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BufferManager {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
-    buffer_pool: Vec<Arc<Mutex<Buffer>>>,
+    buffer_pool: Vec<Arc<Mutex<BufferFrame>>>,
     num_available: Mutex<usize>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
-    global_lock: Mutex<()>,
+    latch_table: Mutex<HashMap<BlockId, Arc<Mutex<()>>>>,
+    resident_table: Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
 }
 
 impl BufferManager {
@@ -10430,7 +10470,7 @@ impl BufferManager {
     ) -> Self {
         let buffer_pool = (0..num_buffers)
             .map(|_| {
-                Arc::new(Mutex::new(Buffer::new(
+                Arc::new(Mutex::new(BufferFrame::new(
                     Arc::clone(&file_manager),
                     Arc::clone(&log_manager),
                 )))
@@ -10443,7 +10483,8 @@ impl BufferManager {
             num_available: Mutex::new(num_buffers),
             cond: Condvar::new(),
             stats: OnceLock::new(),
-            global_lock: Mutex::new(()),
+            latch_table: Mutex::new(HashMap::new()),
+            resident_table: Mutex::new(HashMap::new()),
         }
     }
 
@@ -10494,16 +10535,13 @@ impl BufferManager {
         }
     }
 
-    /// Depends on the [`BufferManager::try_to_pin`] method to get a [`Buffer`] back
+    /// Depends on the [`BufferManager::try_to_pin`] method to get a [`BufferFrame`] back
     /// This method will not perform any metadata operations on the buffer
-    pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<Buffer>>, Box<dyn Error>> {
+    pub fn pin(&self, block_id: &BlockId) -> Result<Arc<Mutex<BufferFrame>>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
-            {
-                let _guard = self.global_lock.lock().unwrap();
-                if let Some(buffer) = self.try_to_pin(block_id) {
-                    return Ok(buffer);
-                }
+            if let Some(buffer) = self.try_to_pin(block_id) {
+                return Ok(buffer);
             }
 
             let mut avail = self.num_available.lock().unwrap();
@@ -10523,11 +10561,11 @@ impl BufferManager {
         }
     }
 
-    /// Find a buffer to pin this block to
-    /// First check to see if there is an existing buffer for this block
-    /// If there is an existing buffer, increment the pin count and return it
-    /// If not, try to find an unpinned buffer, pin it and then return it
-    /// If both cases above fail, return None
+    /// The function has two clear paths laid out - hit path and miss path
+    /// The hit path will attempt to find the buffer in the resident table and increase the pin count if found
+    /// The miss path will call [`BufferManager::choose_unpinned_frame`] which will return the first unpinned
+    /// frame.
+    /// If all frames are occupied, return to the top level loop
     ///
     /// # ABA Race at Buffer Pool Layer
     ///
@@ -10547,83 +10585,114 @@ impl BufferManager {
     /// **Non-transactional access** (catalog reads, WAL, recovery) bypasses LockTable
     /// and could observe stale data from this race, but these operations are designed
     /// to handle such cases.
-    fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
-        if let Some(buffer) = self.find_existing_buffer(block_id) {
-            let was_unpinned = {
-                let mut guard = buffer.lock().unwrap();
-                // Defensive check: block may have been evicted between find and lock
-                if guard.block_id.as_ref() != Some(block_id) {
-                    return None;
+    fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<BufferFrame>>> {
+        //  Wrap the latch table in a guard which will prune it appropriately
+        let latch_table_guard = LatchTableGuard::new(&self.latch_table, block_id);
+        let block_latch = latch_table_guard.lock();
+
+        //  check the resident table for the associated frame
+        let start_resident = Instant::now();
+        let frame_ptr = {
+            let mut resident_guard = self.resident_table.lock().unwrap();
+            match resident_guard.get(block_id) {
+                Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
+                    Some(frame_ptr) => Some(frame_ptr),
+                    None => {
+                        //  this is a dangling pointer, clean it up and go back to top level loop
+                        resident_guard.remove(block_id);
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        };
+
+        //  fast hit path, found the frame in the resident table
+        if let Some(frame_ptr) = frame_ptr {
+            {
+                let mut frame_guard = frame_ptr.lock().unwrap();
+                if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+                    if frame_block_id != block_id {
+                        self.resident_table.lock().unwrap().remove(block_id);
+                        return None;
+                    }
                 }
-                let was_unpinned = !guard.is_pinned();
-                guard.pin();
-                was_unpinned
-            };
-            if was_unpinned {
-                *self.num_available.lock().unwrap() -= 1;
+                let was_unpinned = !frame_guard.is_pinned();
+                frame_guard.pin();
+                if was_unpinned {
+                    *self.num_available.lock().unwrap() -= 1;
+                }
+                if let Some(stats) = self.stats.get() {
+                    stats
+                        .hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
-            if let Some(stats) = self.stats.get() {
-                stats
-                    .hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            return Some(buffer);
+            return Some(frame_ptr);
         }
 
+        //  slow miss path, did not find frame in resident table
         if let Some(stats) = self.stats.get() {
             stats
                 .misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Some(buffer) = self.choose_unpinned_buffer() {
+        //  It is possible for two threads to race here which leads to a few different possibilities
+        //  Assume threads T1 and T2 are racing
+        //  1. T1 and T2 are trying to pin blocks B1 and B2
+        //      1.1 T1 and T2 get frames F1 and F2 - no race condition
+        //      1.2 T1 and T2 get frame F1 - race condition
+        //          this is handled by the check to see if the frame is already pinned
+        //          if it is, that implies another thread beat us there
+        //  2. T1 and T2 are trying to pin block B1
+        //      not possible because of the block latch
+        loop {
+            let frame = self.choose_unpinned_frame()?;
             {
-                let mut guard = buffer.lock().unwrap();
-                if guard.is_pinned() {
-                    return None;
+                let mut frame_guard = frame.lock().unwrap();
+                if frame_guard.is_pinned() {
+                    //  we lost the race condition, try again immediately
+                    continue;
                 }
-                guard.assign_to_block(block_id);
-                guard.pin();
+                if let Some(old) = frame_guard.block_id.as_ref() {
+                    self.resident_table.lock().unwrap().remove(old);
+                }
+                frame_guard.assign_to_block(block_id);
+                frame_guard.pin();
             }
+            self.resident_table
+                .lock()
+                .unwrap()
+                .insert(block_id.clone(), Arc::downgrade(&frame));
             *self.num_available.lock().unwrap() -= 1;
-            return Some(buffer);
+            return Some(frame);
         }
-        None
     }
 
     /// Decrement the pin count for the provided buffer
     /// If all of the pins have been removed, managed metadata & notify waiting threads
-    pub fn unpin(&self, buffer: Arc<Mutex<Buffer>>) {
-        let mut buffer_guard = buffer.lock().unwrap();
-        assert!(buffer_guard.pins > 0);
-        let was_one = buffer_guard.pins == 1;
-        buffer_guard.unpin();
+    pub fn unpin(&self, frame: Arc<Mutex<BufferFrame>>) {
+        let mut frame_guard = frame.lock().unwrap();
+        assert!(
+            frame_guard.pins > 0,
+            "While trying to unpin a block, the pins were already 0. This is incorrect"
+        );
+        let was_one = frame_guard.pins == 1;
+        frame_guard.unpin();
         if was_one {
-            let mut avail = self.num_available.lock().unwrap();
-            *avail += 1;
+            *self.num_available.lock().unwrap() += 1;
             self.cond.notify_all();
         }
     }
 
-    /// Look for a buffer associated with this specific [`BlockId`]
-    fn find_existing_buffer(&self, block_id: &BlockId) -> Option<Arc<Mutex<Buffer>>> {
-        for buffer in &self.buffer_pool {
-            let buffer_guard = buffer.lock().unwrap();
-            if buffer_guard.block_id.is_some()
-                && buffer_guard.block_id.as_ref().unwrap() == block_id
-            {
-                return Some(Arc::clone(buffer));
-            }
-        }
-        None
-    }
-
     /// Try to find an unpinned buffer and return pointer to that, if present
-    fn choose_unpinned_buffer(&self) -> Option<Arc<Mutex<Buffer>>> {
-        for buffer in &self.buffer_pool {
-            let buffer_guard = buffer.lock().unwrap();
-            if !buffer_guard.is_pinned() {
-                return Some(Arc::clone(buffer));
+    /// This currently does a linear scan but we should use a better replacement policy
+    fn choose_unpinned_frame(&self) -> Option<Arc<Mutex<BufferFrame>>> {
+        for frame in &self.buffer_pool {
+            let frame_guard = frame.lock().unwrap();
+            if !frame_guard.is_pinned() {
+                return Some(Arc::clone(frame));
             }
         }
         None
@@ -10699,6 +10768,11 @@ mod buffer_manager_tests {
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
         assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
+
+        println!(
+            "The size of the latch table: {}",
+            buffer_manager.latch_table.lock().unwrap().len()
+        );
     }
 
     /// Concurrent stress test: multiple threads hammering same small working set
@@ -11561,4 +11635,46 @@ mod durability_tests {
 
 fn main() {
     let db = SimpleDB::new("random", 800, 4, true);
+}
+
+#[cfg(test)]
+mod offset_smoke_tests {
+    use super::*;
+
+    #[test]
+    fn prints_buffer_manager_num_available_offset() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let bm = Arc::clone(&db.buffer_manager);
+
+        println!(
+            "num_available offset: 0x{:X}",
+            core::mem::offset_of!(BufferManager, num_available)
+        );
+
+        // Get pointer to the actual BufferManager inside the Arc
+        let bm_ptr = Arc::as_ptr(&bm);
+        let bm_addr = bm_ptr as usize;
+
+        // Calculate num_available address
+        let num_avail_addr = unsafe { std::ptr::addr_of!((*bm_ptr).num_available) as usize };
+
+        println!("BufferManager base: 0x{:X}", bm_addr);
+        println!("num_available addr: 0x{:X}", num_avail_addr);
+        println!("Offset: 0x{:X}", num_avail_addr - bm_addr);
+
+        // Lock and check data address
+        {
+            let guard = bm.num_available.lock().unwrap();
+            let data_addr = &*guard as *const usize as usize;
+            println!("Data inside mutex:  0x{:X}", data_addr);
+            println!(
+                "Data offset from BufferManager: 0x{:X}",
+                data_addr - bm_addr
+            );
+            println!(
+                "Data offset from num_available: 0x{:X}",
+                data_addr - num_avail_addr
+            );
+        }
+    }
 }

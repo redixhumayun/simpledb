@@ -54,7 +54,7 @@ jobs:
       run: cargo build --release
 
     - name: Run base benchmarks (all)
-      run: python3 /tmp/scripts/run_all_benchmarks.py 50 12 base_benchmarks.json
+      run: python3 /tmp/scripts/run_all_benchmarks.py 100 12 base_benchmarks.json
 
     # Run benchmarks on PR branch
     - name: Checkout PR branch
@@ -64,7 +64,7 @@ jobs:
       run: cargo build --release
 
     - name: Run PR benchmarks (all)
-      run: python3 scripts/run_all_benchmarks.py 50 12 pr_benchmarks.json
+      run: python3 scripts/run_all_benchmarks.py 100 12 pr_benchmarks.json
 
     # Generate comparison report
     - name: Generate comparison report
