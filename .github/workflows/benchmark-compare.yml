@@ -9,10 +9,18 @@ jobs:
   compare:
     # Only run when PR is labeled with 'performance' or manually triggered
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'performance'))
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'performance'))
+      ) && (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
 
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - linux
+      - simpledb-bench
     permissions:
       contents: read
       pull-requests: write
