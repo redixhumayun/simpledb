@@ -176,21 +176,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Run benchmarks and collect results
+    // In JSON mode (CI), ignore filter and run all benchmarks
+    let effective_filter = if json_output { None } else { filter_ref };
     let mut results = Vec::new();
 
-    if should_run("INSERT", filter_ref) {
+    if should_run("INSERT", effective_filter) {
         results.push(run_insert_benchmarks(&db, iterations));
     }
 
-    if should_run("SELECT", filter_ref) {
+    if should_run("SELECT", effective_filter) {
         results.extend(run_select_benchmarks(&db, iterations));
     }
 
-    if should_run("UPDATE", filter_ref) {
+    if should_run("UPDATE", effective_filter) {
         results.push(run_update_benchmarks(&db, iterations));
     }
 
-    if should_run("DELETE", filter_ref) {
+    if should_run("DELETE", effective_filter) {
         results.push(run_delete_benchmarks(&db, iterations));
     }
 

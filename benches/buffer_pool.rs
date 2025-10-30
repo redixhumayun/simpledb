@@ -1067,14 +1067,8 @@ fn main() {
             ));
         }
 
-        // Filter results based on benchmark name
-        let filtered_results: Vec<_> = results
-            .into_iter()
-            .filter(|r| should_run(&r.operation, filter_ref))
-            .collect();
-
-        // Output as JSON array
-        let json_results: Vec<String> = filtered_results.iter().map(|r| r.to_json()).collect();
+        // Output as JSON array - filter is ignored in JSON mode (CI always needs all benchmarks)
+        let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
         println!("[{}]", json_results.join(","));
         return;
     }

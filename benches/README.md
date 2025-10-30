@@ -52,9 +52,16 @@ Both benchmarks support `--json` flag for machine-readable output:
 ```bash
 cargo bench --bench buffer_pool -- 50 12 --json
 # Output: [{"name":"Pin/Unpin (hit)","unit":"ns","value":583},...]
+```
 
-cargo bench --bench buffer_pool -- 50 12 --json "Zipfian"
-# Output: filtered JSON results
+**Important:** Filters are **ignored** in JSON mode. All benchmarks always run and output when `--json` is specified, regardless of filter argument.
+
+**Why?** JSON mode is for CI only. CI needs complete historical data across all benchmarks for trend tracking. Filtering would create gaps in the time-series data displayed at the GitHub Pages dashboard.
+
+```bash
+# These produce identical output (all benchmarks):
+cargo bench --bench buffer_pool -- 50 12 --json
+cargo bench --bench buffer_pool -- 50 12 --json "Random"
 ```
 
 ## CI Integration
