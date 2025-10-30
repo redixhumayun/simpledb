@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1761808299366,
+  "lastUpdate": 1761819382583,
   "repoUrl": "https://github.com/redixhumayun/simpledb",
   "entries": {
     "SimpleDB Benchmarks": [
@@ -306,6 +306,155 @@ window.BENCHMARK_DATA = {
           {
             "name": "DELETE (single record)",
             "value": 6121118,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "redixhumayun@gmail.com",
+            "name": "Zaid Humayun",
+            "username": "redixhumayun"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3e38f2e63216ba17f602d0fb6321209320d2a543",
+          "message": "Merge pull request #43 from redixhumayun/feature/benchmarking-cli-execution\n\nThis PR splits up the benchmarks into smaller execution units so that it's easier to run from the CLI by specifying the name of a benchmark and filtering on that name. However, it's still not isolated to the level where it will be useful for performance profiling. That work still remains to be done.",
+          "timestamp": "2025-10-30T15:45:19+05:30",
+          "tree_id": "b7afed612a67b4fc1c12b694f915b70246557f92",
+          "url": "https://github.com/redixhumayun/simpledb/commit/3e38f2e63216ba17f602d0fb6321209320d2a543"
+        },
+        "date": 1761819381568,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Pin/Unpin (hit)",
+            "value": 1026,
+            "unit": "ns"
+          },
+          {
+            "name": "Cold Pin (miss)",
+            "value": 4900,
+            "unit": "ns"
+          },
+          {
+            "name": "Dirty Eviction",
+            "value": 100541,
+            "unit": "ns"
+          },
+          {
+            "name": "Sequential Scan (120 blocks)",
+            "value": 564983,
+            "unit": "ns"
+          },
+          {
+            "name": "Seq Scan MT x4 (120 blocks)",
+            "value": 987249,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access (1000 ops)",
+            "value": 4725089,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access MT x4 (1000 ops)",
+            "value": 7241061,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=10, 500 ops)",
+            "value": 2138498,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=10, 500 ops)",
+            "value": 3425880,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=50, 500 ops)",
+            "value": 2296574,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=50, 500 ops)",
+            "value": 4429110,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=100, 500 ops)",
+            "value": 2364837,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=100, 500 ops)",
+            "value": 4541708,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian (80/20, 500 ops)",
+            "value": 2164232,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian MT x4 (80/20, 500 ops)",
+            "value": 3629334,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (2 threads, 1000 ops)",
+            "value": 15473801,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (4 threads, 1000 ops)",
+            "value": 34268950,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (8 threads, 1000 ops)",
+            "value": 70461393,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (4 threads, K=4, 1000 ops)",
+            "value": 3514383,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (8 threads, K=4, 1000 ops)",
+            "value": 6675307,
+            "unit": "ns"
+          },
+          {
+            "name": "INSERT (single record)",
+            "value": 6072945,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT (table scan)",
+            "value": 2518604,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT COUNT(*)",
+            "value": 3141321,
+            "unit": "ns"
+          },
+          {
+            "name": "UPDATE (single record)",
+            "value": 6244337,
+            "unit": "ns"
+          },
+          {
+            "name": "DELETE (single record)",
+            "value": 6452609,
             "unit": "ns"
           }
         ]
