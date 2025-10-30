@@ -1113,31 +1113,17 @@ fn main() {
     }
 
     // Phase 2
-    let mut phase2_has_output = false;
-    let mut ensure_phase2_header = || {
-        if !phase2_has_output {
-            println!("Phase 2: Access Pattern Benchmarks");
-            let op_header = format!("{:<48}", "Operation");
-            println!(
-                "{}  | {:>20} | {:>20}",
-                op_header, "Throughput (mean)", "Throughput (median)"
-            );
-            println!("{}", "-".repeat(95));
-            phase2_has_output = true;
-        }
-    };
+    let mut phase2_results: Vec<(String, f64, f64)> = Vec::new();
 
     if should_run("Sequential Scan", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = sequential_scan(&db, block_size, num_buffers, iterations);
         let total_blocks = num_buffers * 10;
         let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
         let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Seq Scan MT", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_blocks = num_buffers * 10;
@@ -1151,19 +1137,17 @@ fn main() {
         );
         let mean_throughput = total_blocks as f64 / result.mean.as_secs_f64();
         let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Repeated Access (1000 ops)", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = repeated_access(&db, block_size, num_buffers, iterations);
         let total_accesses = 1000;
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Repeated Access MT", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 1000;
@@ -1177,19 +1161,17 @@ fn main() {
         );
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random (K=10,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 10, iterations);
         let total_accesses = 500;
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random MT x4 (K=10,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1203,19 +1185,17 @@ fn main() {
         );
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random (K=50,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 50, iterations);
         let total_accesses = 500;
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random MT x4 (K=50,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1229,19 +1209,17 @@ fn main() {
         );
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random (K=100,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 100, iterations);
         let total_accesses = 500;
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Random MT x4 (K=100,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1255,19 +1233,17 @@ fn main() {
         );
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Zipfian (80/20,", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = zipfian_access(&db, block_size, num_buffers, iterations);
         let total_accesses = 500;
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
     if should_run("Zipfian MT", filter_ref) {
-        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1281,10 +1257,20 @@ fn main() {
         );
         let mean_throughput = total_accesses as f64 / result.mean.as_secs_f64();
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
-        print_phase2_row(result.operation, mean_throughput, median_throughput);
+        phase2_results.push((result.operation, mean_throughput, median_throughput));
     }
 
-    if phase2_has_output {
+    if !phase2_results.is_empty() {
+        println!("Phase 2: Access Pattern Benchmarks");
+        let op_header = format!("{:<48}", "Operation");
+        println!(
+            "{}  | {:>20} | {:>20}",
+            op_header, "Throughput (mean)", "Throughput (median)"
+        );
+        println!("{}", "-".repeat(95));
+        for (operation, mean_throughput, median_throughput) in phase2_results {
+            print_phase2_row(operation, mean_throughput, median_throughput);
+        }
         println!();
     }
 
