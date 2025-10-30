@@ -428,7 +428,10 @@ fn multithreaded_pin(
     }
 
     benchmark(
-        &format!("Concurrent ({} threads, {} ops)", num_threads, ops_per_thread),
+        &format!(
+            "Concurrent ({} threads, {} ops)",
+            num_threads, ops_per_thread
+        ),
         iterations,
         2,
         || {
@@ -525,9 +528,6 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
 
 fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usize) {
     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-    let bm = db.buffer_manager();
-    let base = Arc::as_ptr(&bm) as usize;
-    println!("BufferManager base: 0x{:x}", base);
 
     println!("Phase 5: Concurrent Access");
     println!();
