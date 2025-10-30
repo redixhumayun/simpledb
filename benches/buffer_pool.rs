@@ -1302,8 +1302,10 @@ fn main() {
     }
 
     // Phase 4
-    if should_run("Hit Rate", filter_ref) || should_run("Sequential Scan", filter_ref)
-        || should_run("Repeated Access", filter_ref) || should_run("Zipfian", filter_ref)
+    if should_run("Hit Rate", filter_ref)
+        || should_run("Sequential Scan", filter_ref)
+        || should_run("Repeated Access", filter_ref)
+        || should_run("Zipfian", filter_ref)
         || should_run("Random", filter_ref)
     {
         hit_rate_benchmarks(block_size, num_buffers, iterations);
@@ -1311,7 +1313,8 @@ fn main() {
     }
 
     // Phase 5
-    if should_run("Concurrent", filter_ref) || should_run("Hotset", filter_ref)
+    if should_run("Concurrent", filter_ref)
+        || should_run("Hotset", filter_ref)
         || should_run("Starvation", filter_ref)
     {
         concurrent_benchmarks(block_size, num_buffers, iterations);
