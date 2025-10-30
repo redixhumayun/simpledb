@@ -410,7 +410,13 @@ fn hit_rate_benchmarks(block_size: usize, num_buffers: usize, iterations: usize)
 
 // Phase 5: Concurrent Access
 
-fn multithreaded_pin(db: &SimpleDB, block_size: usize, num_threads: usize, ops_per_thread: usize) {
+fn multithreaded_pin(
+    db: &SimpleDB,
+    block_size: usize,
+    num_threads: usize,
+    ops_per_thread: usize,
+    iterations: usize,
+) -> BenchResult {
     let test_file = "concurrent_test".to_string();
 
     // Pre-create blocks (each thread gets its own range)
@@ -421,39 +427,36 @@ fn multithreaded_pin(db: &SimpleDB, block_size: usize, num_threads: usize, ops_p
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
     }
 
-    let start = Instant::now();
+    benchmark(
+        &format!("Concurrent ({} threads, {} ops)", num_threads, ops_per_thread),
+        iterations,
+        2,
+        || {
+            // Spawn threads
+            let handles: Vec<_> = (0..num_threads)
+                .map(|thread_id| {
+                    let test_file = test_file.clone();
+                    let buffer_manager = db.buffer_manager();
 
-    // Spawn threads
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let test_file = test_file.clone();
-            let buffer_manager = db.buffer_manager();
+                    thread::spawn(move || {
+                        for i in 0..ops_per_thread {
+                            // Each thread accesses blocks in its own range to reduce contention
+                            let block_num = (thread_id * 10) + (i % 10);
+                            let block_id = BlockId::new(test_file.clone(), block_num);
 
-            thread::spawn(move || {
-                for i in 0..ops_per_thread {
-                    // Each thread accesses blocks in its own range to reduce contention
-                    let block_num = (thread_id * 10) + (i % 10);
-                    let block_id = BlockId::new(test_file.clone(), block_num);
+                            let buffer = buffer_manager.pin(&block_id).unwrap();
+                            buffer_manager.unpin(buffer);
+                        }
+                    })
+                })
+                .collect();
 
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-            })
-        })
-        .collect();
-
-    // Wait for all threads
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    let elapsed = start.elapsed();
-    let total_ops = num_threads * ops_per_thread;
-    let throughput = total_ops as f64 / elapsed.as_secs_f64();
-
-    println!(
-        "{num_threads} threads, {ops_per_thread} ops/thread | {throughput:>10.0} ops/sec | {elapsed:>10.2?} total"
-    );
+            // Wait for all threads
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        },
+    )
 }
 
 fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
@@ -520,7 +523,7 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
     println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
-fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
+fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usize) {
     let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
     let bm = db.buffer_manager();
     let base = Arc::as_ptr(&bm) as usize;
@@ -531,9 +534,30 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize) {
 
     println!("5.1 Multi-threaded Pin/Unpin (lock contention):");
     println!("{}", "-".repeat(70));
-    multithreaded_pin(&db, block_size, 2, 1000);
-    multithreaded_pin(&db, block_size, 4, 1000);
-    multithreaded_pin(&db, block_size, 8, 1000);
+
+    let result_2 = multithreaded_pin(&db, block_size, 2, 1000, iterations);
+    let total_ops_2 = 2 * 1000;
+    let throughput_2 = total_ops_2 as f64 / result_2.mean.as_secs_f64();
+    println!(
+        "2 threads, 1000 ops/thread | {throughput_2:>10.0} ops/sec | {:>10.2?} total",
+        result_2.mean
+    );
+
+    let result_4 = multithreaded_pin(&db, block_size, 4, 1000, iterations);
+    let total_ops_4 = 4 * 1000;
+    let throughput_4 = total_ops_4 as f64 / result_4.mean.as_secs_f64();
+    println!(
+        "4 threads, 1000 ops/thread | {throughput_4:>10.0} ops/sec | {:>10.2?} total",
+        result_4.mean
+    );
+
+    let result_8 = multithreaded_pin(&db, block_size, 8, 1000, iterations);
+    let total_ops_8 = 8 * 1000;
+    let throughput_8 = total_ops_8 as f64 / result_8.mean.as_secs_f64();
+    println!(
+        "8 threads, 1000 ops/thread | {throughput_8:>10.0} ops/sec | {:>10.2?} total",
+        result_8.mean
+    );
 
     println!();
     println!("5.2 Buffer Starvation (cond.wait() latency):");
@@ -546,7 +570,7 @@ fn main() {
     let block_size = 4096;
 
     if json_output {
-        // In JSON mode, run Phase 1 and Phase 2 benchmarks and output JSON
+        // In JSON mode, run Phase 1, Phase 2, and Phase 5 benchmarks and output JSON
         let mut results = Vec::new();
 
         // Phase 1: Core Latency Benchmarks
@@ -587,6 +611,20 @@ fn main() {
         {
             let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
             results.push(zipfian_access(&db, block_size, num_buffers, iterations));
+        }
+
+        // Phase 5: Concurrent Access Benchmarks
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(multithreaded_pin(&db, block_size, 2, 1000, iterations));
+        }
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(multithreaded_pin(&db, block_size, 4, 1000, iterations));
+        }
+        {
+            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            results.push(multithreaded_pin(&db, block_size, 8, 1000, iterations));
         }
 
         // Output as JSON array
@@ -709,7 +747,7 @@ fn main() {
     println!();
 
     // Phase 5
-    concurrent_benchmarks(block_size, num_buffers);
+    concurrent_benchmarks(block_size, num_buffers, iterations);
 
     println!();
     println!("All benchmarks completed!");
