@@ -38,9 +38,48 @@ jobs:
     
     - name: Run tests
       run: cargo test --verbose
-    
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+
+  benchmarks:
+    name: Benchmarks
+    runs-on:
+      - self-hosted
+      - linux
+      - simpledb-bench
+    needs: test
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Build (release)
+      run: cargo build --release
+
     - name: Run all benchmarks (auto-discovery)
-      run: python3 scripts/run_all_benchmarks.py 50 12 all_benchmarks.json
+      run: python3 scripts/run_all_benchmarks.py 100 12 all_benchmarks.json
 
     - name: Store benchmark results
       uses: benchmark-action/github-action-benchmark@v1
@@ -49,15 +88,8 @@ jobs:
         tool: 'customSmallerIsBetter'
         output-file-path: all_benchmarks.json
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        # Only push to gh-pages on master branch, not on PRs (permission issue)
         auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
         alert-threshold: '105%'
         comment-on-alert: true
         fail-on-alert: false
         alert-comment-cc-users: '@${{ github.actor }}'
-
-    - name: Check formatting
-      run: cargo fmt -- --check
-
-    - name: Run clippy
-      run: cargo clippy -- -D warnings
