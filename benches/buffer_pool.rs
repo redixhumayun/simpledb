@@ -851,16 +851,11 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
     println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
-fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usize) {
-    let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-
-    println!("Phase 5: Concurrent Access");
-    println!();
-
-    println!("5.1 Multi-threaded Pin/Unpin (lock contention):");
+fn run_multithreaded_pin_benchmarks(db: &SimpleDB, block_size: usize, iterations: usize) {
+    println!("Multi-threaded Pin/Unpin (lock contention):");
     println!("{}", "-".repeat(70));
 
-    let result_2 = multithreaded_pin(&db, block_size, 2, 1000, iterations);
+    let result_2 = multithreaded_pin(db, block_size, 2, 1000, iterations);
     let total_ops_2 = 2 * 1000;
     let throughput_2 = total_ops_2 as f64 / result_2.mean.as_secs_f64();
     println!(
@@ -868,7 +863,7 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usiz
         result_2.mean
     );
 
-    let result_4 = multithreaded_pin(&db, block_size, 4, 1000, iterations);
+    let result_4 = multithreaded_pin(db, block_size, 4, 1000, iterations);
     let total_ops_4 = 4 * 1000;
     let throughput_4 = total_ops_4 as f64 / result_4.mean.as_secs_f64();
     println!(
@@ -876,22 +871,24 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usiz
         result_4.mean
     );
 
-    let result_8 = multithreaded_pin(&db, block_size, 8, 1000, iterations);
+    let result_8 = multithreaded_pin(db, block_size, 8, 1000, iterations);
     let total_ops_8 = 8 * 1000;
     let throughput_8 = total_ops_8 as f64 / result_8.mean.as_secs_f64();
     println!(
         "8 threads, 1000 ops/thread | {throughput_8:>10.0} ops/sec | {:>10.2?} total",
         result_8.mean
     );
-
     println!();
-    println!("5.2 Hot-set Contention (shared buffers):");
+}
+
+fn run_hotset_contention_benchmarks(db: &SimpleDB, block_size: usize, iterations: usize) {
+    println!("Hot-set Contention (shared buffers):");
     println!("{}", "-".repeat(70));
 
     let hot_set_size = 4;
 
     let hot_result_4 =
-        multithreaded_hotset_contention(&db, block_size, 4, 1000, hot_set_size, iterations);
+        multithreaded_hotset_contention(db, block_size, 4, 1000, hot_set_size, iterations);
     let hot_total_ops_4 = 4 * 1000;
     let hot_throughput_4 = hot_total_ops_4 as f64 / hot_result_4.mean.as_secs_f64();
     println!(
@@ -900,18 +897,21 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usiz
     );
 
     let hot_result_8 =
-        multithreaded_hotset_contention(&db, block_size, 8, 1000, hot_set_size, iterations);
+        multithreaded_hotset_contention(db, block_size, 8, 1000, hot_set_size, iterations);
     let hot_total_ops_8 = 8 * 1000;
     let hot_throughput_8 = hot_total_ops_8 as f64 / hot_result_8.mean.as_secs_f64();
     println!(
         "8 threads, K={hot_set_size}, 1000 ops/thread | {hot_throughput_8:>10.0} ops/sec | {:>10.2?} total",
         hot_result_8.mean
     );
-
     println!();
-    println!("5.3 Buffer Starvation (cond.wait() latency):");
+}
+
+fn run_buffer_starvation_benchmark(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+    println!("Buffer Starvation (cond.wait() latency):");
     println!("{}", "-".repeat(70));
-    buffer_starvation(&db, block_size, num_buffers);
+    buffer_starvation(db, block_size, num_buffers);
+    println!();
 }
 
 fn main() {
@@ -1293,12 +1293,36 @@ fn main() {
     }
 
     // Phase 5
-    if should_run("Concurrent", filter_ref)
-        || should_run("Hotset", filter_ref)
-        || should_run("Starvation", filter_ref)
-    {
-        concurrent_benchmarks(block_size, num_buffers, iterations);
-        println!();
+    let mut phase5_has_output = false;
+
+    if should_run("Multi-threaded Pin", filter_ref) || should_run("Concurrent", filter_ref) {
+        if !phase5_has_output {
+            println!("Phase 5: Concurrent Access");
+            println!();
+            phase5_has_output = true;
+        }
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        run_multithreaded_pin_benchmarks(&db, block_size, iterations);
+    }
+
+    if should_run("Hotset", filter_ref) || should_run("Hot-set", filter_ref) {
+        if !phase5_has_output {
+            println!("Phase 5: Concurrent Access");
+            println!();
+            phase5_has_output = true;
+        }
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        run_hotset_contention_benchmarks(&db, block_size, iterations);
+    }
+
+    if should_run("Starvation", filter_ref) {
+        if !phase5_has_output {
+            println!("Phase 5: Concurrent Access");
+            println!();
+            phase5_has_output = true;
+        }
+        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+        run_buffer_starvation_benchmark(&db, block_size, num_buffers);
     }
 
     println!("All benchmarks completed!");
