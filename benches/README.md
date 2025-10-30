@@ -1,66 +1,86 @@
 # SimpleDB Benchmarks
 
-This directory contains the stdlib-only benchmarking framework for SimpleDB.
+Stdlib-only benchmarking framework with CLI filtering support.
 
-## Usage
-
-Run benchmarks with default iterations (10):
+## Quick Start
 
 ```bash
-cargo run --bin simple_bench
+# SQL benchmarks - run all
+cargo bench --bench simple_bench -- 50
+
+# SQL benchmarks - run only INSERT
+cargo bench --bench simple_bench -- 50 "INSERT"
+
+# Buffer pool benchmarks - run all
+cargo bench --bench buffer_pool -- 50 12
+
+# Buffer pool benchmarks - run only Random K=10
+cargo bench --bench buffer_pool -- 50 12 "Random (K=10,"
 ```
 
-Or specify custom iteration count:
+## Filtering Benchmarks
+
+Filter using substring matching on benchmark names:
 
 ```bash
-cargo run --bin simple_bench 50    # 50 iterations per operation
-cargo run --bin simple_bench 100   # 100 iterations per operation
+# Syntax: -- <iterations> [num_buffers] [filter]
+cargo bench --bench buffer_pool -- 100 12 "Pin/Unpin"      # Phase 1: Pin/Unpin only
+cargo bench --bench buffer_pool -- 100 12 "Zipfian"        # Phase 2+4: Zipfian tests
+cargo bench --bench buffer_pool -- 100 12 "Random (K=10,"  # Specific K value (not K=100)
+cargo bench --bench simple_bench -- 100 "SELECT"           # Both SELECT benchmarks
 ```
 
-## What's Benchmarked
+**Use case:** Isolate specific workloads for profiling (flamegraphs, perf analysis) without noise from other benchmarks.
 
-The benchmark suite measures performance of core database operations:
+## Benchmark Suites
 
-- **INSERT**: Single row insertion with transaction commit
-- **SELECT**: Table scan and query execution  
-- **UPDATE**: Single record modification
-- **DELETE**: Single record removal
+### simple_bench.rs
+SQL operation benchmarks: INSERT, SELECT (table scan + COUNT), UPDATE, DELETE
 
-## Output Format
+### buffer_pool.rs
+Buffer manager microbenchmarks across 5 phases:
+- **Phase 1:** Core latency (pin/unpin hit, cold pin, dirty eviction)
+- **Phase 2:** Access patterns (sequential, repeated, random, zipfian) - single + multi-threaded
+- **Phase 3:** Pool size scaling, memory pressure
+- **Phase 4:** Hit rate measurement
+- **Phase 5:** Concurrent access, hotset contention, starvation
 
-```
-SimpleDB Stdlib-Only Benchmark Suite
-====================================
-Running benchmarks with 50 iterations per operation
+## JSON Output for CI
 
-Operation            |       Mean |     Median |     StdDev |    Iters
-----------------------------------------------------------------------
-INSERT (empty table) |     7.22ms |     7.16ms |   229.59µs |       50
-SELECT (table scan)  |     2.76ms |     2.75ms |    42.68µs |       50
-```
-
-## Buffer Pool Benchmarks
-
-These are implemented as a Cargo bench target (`benches/buffer_pool.rs`). Per `Cargo.toml`, run it with:
+Both benchmarks support `--json` flag for machine-readable output:
 
 ```bash
-cargo bench --bench buffer_pool
+cargo bench --bench buffer_pool -- 50 12 --json
+# Output: [{"name":"Pin/Unpin (hit)","unit":"ns","value":583},...]
+
+cargo bench --bench buffer_pool -- 50 12 --json "Zipfian"
+# Output: filtered JSON results
 ```
 
-You can pass arguments to control iterations and buffer pool size (parsed by the benchmark itself):
+## CI Integration
 
-```bash
-# Syntax: cargo bench --bench buffer_pool -- <iterations> <num_buffers>
-cargo bench --bench buffer_pool -- 50 32
-cargo bench --bench buffer_pool -- 100 128
+**Files:**
+- `.github/workflows/benchmark.yml` - CI workflow
+- Performance tracked at: https://redixhumayun.github.io/simpledb/dev/bench/
+
+**How it works:**
+1. CI runs benchmarks with `--json` flag on every push
+2. JSON output captured and stored via `github-action-benchmark`
+3. Historical data committed to `gh-pages` branch
+4. Charts rendered at GitHub Pages URL
+
+**View graphs:** Click individual benchmark names in the dashboard to see trends over time.
+
+## Implementation
+
+**Framework:** `src/benchmark_framework.rs`
+- `parse_bench_args()` - CLI arg parsing (iterations, num_buffers, json flag, filter string)
+- `should_run()` - Substring matching for filtering
+- `benchmark()` - Timing harness with warmup, mean, median, stddev
+
+**Pattern:** Each benchmark conditionally executes based on filter:
+```rust
+if should_run("benchmark_name", filter_ref) {
+    results.push(run_benchmark(...));
+}
 ```
-
-Notes:
-- **iterations**: number of timing samples per microbenchmark (default 10)
-- **num_buffers**: buffer pool size in frames (default 12)
-- Output is printed directly by the benchmark (harness is disabled), covering:
-  - Phase 1: core latency (pin/unpin hit, cold pin, dirty eviction)
-  - Phase 2: access patterns (sequential, repeated, random K, zipfian)
-  - Phase 3: pool size scaling + memory pressure
-  - Phase 4: hit-rate stats
-  - Phase 5: concurrent access and starvation

@@ -8,7 +8,7 @@ use simpledb::SimpleDB;
 
 use simpledb::benchmark_framework;
 
-use benchmark_framework::{benchmark, parse_bench_args, print_header};
+use benchmark_framework::{benchmark, parse_bench_args, print_header, should_run};
 
 fn cleanup_bench_data() {
     let bench_path = Path::new("./bench-data");
@@ -140,7 +140,8 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (iterations, _num_buffers, json_output) = parse_bench_args();
+    let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
+    let filter_ref = filter.as_deref();
 
     if !json_output {
         println!("SimpleDB Stdlib-Only Benchmark Suite");
@@ -176,19 +177,33 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Run benchmarks and collect results
     let mut results = Vec::new();
-    results.push(run_insert_benchmarks(&db, iterations));
-    results.extend(run_select_benchmarks(&db, iterations));
-    results.push(run_update_benchmarks(&db, iterations));
-    results.push(run_delete_benchmarks(&db, iterations));
+
+    if should_run("INSERT", filter_ref) {
+        results.push(run_insert_benchmarks(&db, iterations));
+    }
+
+    if should_run("SELECT", filter_ref) {
+        results.extend(run_select_benchmarks(&db, iterations));
+    }
+
+    if should_run("UPDATE", filter_ref) {
+        results.push(run_update_benchmarks(&db, iterations));
+    }
+
+    if should_run("DELETE", filter_ref) {
+        results.push(run_delete_benchmarks(&db, iterations));
+    }
+
+    let filtered_results = results;
 
     // Output results
     if json_output {
         // Output as JSON array for github-action-benchmark
-        let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
+        let json_results: Vec<String> = filtered_results.iter().map(|r| r.to_json()).collect();
         println!("[{}]", json_results.join(","));
     } else {
         // Output as human-readable table
-        for result in &results {
+        for result in &filtered_results {
             println!("{result}");
         }
         println!();

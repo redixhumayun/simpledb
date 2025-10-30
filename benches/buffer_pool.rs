@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Instant;
 
 use simpledb::{
-    benchmark_framework::{benchmark, parse_bench_args, print_header, BenchResult},
+    benchmark_framework::{benchmark, parse_bench_args, print_header, should_run, BenchResult},
     test_utils::generate_random_number,
     BlockId, Page, SimpleDB, TestDir,
 };
@@ -915,7 +915,8 @@ fn concurrent_benchmarks(block_size: usize, num_buffers: usize, iterations: usiz
 }
 
 fn main() {
-    let (iterations, num_buffers, json_output) = parse_bench_args();
+    let (iterations, num_buffers, json_output, filter) = parse_bench_args();
+    let filter_ref = filter.as_deref();
     let block_size = 4096;
 
     if json_output {
@@ -1066,8 +1067,14 @@ fn main() {
             ));
         }
 
+        // Filter results based on benchmark name
+        let filtered_results: Vec<_> = results
+            .into_iter()
+            .filter(|r| should_run(&r.operation, filter_ref))
+            .collect();
+
         // Output as JSON array
-        let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
+        let json_results: Vec<String> = filtered_results.iter().map(|r| r.to_json()).collect();
         println!("[{}]", json_results.join(","));
         return;
     }
@@ -1085,34 +1092,49 @@ fn main() {
     println!();
 
     // Phase 1
-    println!("Phase 1: Core Latency Benchmarks");
-    print_header();
-    {
+    let mut phase1_results = Vec::new();
+
+    if should_run("Pin/Unpin (hit)", filter_ref) {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!("{}", pin_unpin_overhead(&db, block_size, iterations));
+        phase1_results.push(pin_unpin_overhead(&db, block_size, iterations));
     }
-    {
+
+    if should_run("Cold Pin (miss)", filter_ref) {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!("{}", cold_pin(&db, block_size, iterations));
+        phase1_results.push(cold_pin(&db, block_size, iterations));
     }
-    {
+
+    if should_run("Dirty Eviction", filter_ref) {
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        println!(
-            "{}",
-            dirty_eviction(&db, block_size, iterations, num_buffers)
-        );
+        phase1_results.push(dirty_eviction(&db, block_size, iterations, num_buffers));
     }
-    println!();
+
+    if !phase1_results.is_empty() {
+        println!("Phase 1: Core Latency Benchmarks");
+        print_header();
+        for result in phase1_results {
+            println!("{}", result);
+        }
+        println!();
+    }
 
     // Phase 2
-    println!("Phase 2: Access Pattern Benchmarks");
-    let op_header = format!("{:<48}", "Operation");
-    println!(
-        "{}  | {:>20} | {:>20}",
-        op_header, "Throughput (mean)", "Throughput (median)"
-    );
-    println!("{}", "-".repeat(95));
-    {
+    let mut phase2_has_output = false;
+    let mut ensure_phase2_header = || {
+        if !phase2_has_output {
+            println!("Phase 2: Access Pattern Benchmarks");
+            let op_header = format!("{:<48}", "Operation");
+            println!(
+                "{}  | {:>20} | {:>20}",
+                op_header, "Throughput (mean)", "Throughput (median)"
+            );
+            println!("{}", "-".repeat(95));
+            phase2_has_output = true;
+        }
+    };
+
+    if should_run("Sequential Scan", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = sequential_scan(&db, block_size, num_buffers, iterations);
         let total_blocks = num_buffers * 10;
@@ -1120,7 +1142,8 @@ fn main() {
         let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Seq Scan MT", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_blocks = num_buffers * 10;
@@ -1136,7 +1159,8 @@ fn main() {
         let median_throughput = total_blocks as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Repeated Access (1000 ops)", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = repeated_access(&db, block_size, num_buffers, iterations);
         let total_accesses = 1000;
@@ -1144,7 +1168,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Repeated Access MT", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 1000;
@@ -1160,7 +1185,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random (K=10,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 10, iterations);
         let total_accesses = 500;
@@ -1168,7 +1194,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random MT x4 (K=10,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1184,7 +1211,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random (K=50,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 50, iterations);
         let total_accesses = 500;
@@ -1192,7 +1220,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random MT x4 (K=50,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1208,7 +1237,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random (K=100,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = random_access(&db, block_size, 100, iterations);
         let total_accesses = 500;
@@ -1216,7 +1246,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Random MT x4 (K=100,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1232,7 +1263,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Zipfian (80/20,", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let result = zipfian_access(&db, block_size, num_buffers, iterations);
         let total_accesses = 500;
@@ -1240,7 +1272,8 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    {
+    if should_run("Zipfian MT", filter_ref) {
+        ensure_phase2_header();
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
         let mt_threads = 4;
         let total_accesses = 500;
@@ -1256,20 +1289,34 @@ fn main() {
         let median_throughput = total_accesses as f64 / result.median.as_secs_f64();
         print_phase2_row(result.operation, mean_throughput, median_throughput);
     }
-    println!();
+
+    if phase2_has_output {
+        println!();
+    }
 
     // Phase 3
-    pool_size_scaling(block_size, iterations);
-    memory_pressure_test(block_size, iterations);
-    println!();
+    if should_run("Pool Size", filter_ref) || should_run("Memory Pressure", filter_ref) {
+        pool_size_scaling(block_size, iterations);
+        memory_pressure_test(block_size, iterations);
+        println!();
+    }
 
     // Phase 4
-    hit_rate_benchmarks(block_size, num_buffers, iterations);
-    println!();
+    if should_run("Hit Rate", filter_ref) || should_run("Sequential Scan", filter_ref)
+        || should_run("Repeated Access", filter_ref) || should_run("Zipfian", filter_ref)
+        || should_run("Random", filter_ref)
+    {
+        hit_rate_benchmarks(block_size, num_buffers, iterations);
+        println!();
+    }
 
     // Phase 5
-    concurrent_benchmarks(block_size, num_buffers, iterations);
+    if should_run("Concurrent", filter_ref) || should_run("Hotset", filter_ref)
+        || should_run("Starvation", filter_ref)
+    {
+        concurrent_benchmarks(block_size, num_buffers, iterations);
+        println!();
+    }
 
-    println!();
     println!("All benchmarks completed!");
 }
