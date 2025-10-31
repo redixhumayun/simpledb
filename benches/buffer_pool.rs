@@ -42,7 +42,6 @@ fn partition_work(total: usize, workers: usize) -> Vec<usize> {
 struct ThroughputRow {
     label: String,
     mean: f64,
-    median: f64,
     mean_duration: Duration,
 }
 
@@ -50,11 +49,9 @@ impl ThroughputRow {
     fn from_benchmark(result: BenchResult, total_ops: usize) -> Self {
         let mean_duration = result.mean;
         let mean = total_ops as f64 / mean_duration.as_secs_f64();
-        let median = total_ops as f64 / result.median.as_secs_f64();
         ThroughputRow {
             label: result.operation,
             mean,
-            median,
             mean_duration,
         }
     }
@@ -183,19 +180,18 @@ fn render_throughput_section(title: &str, unit_label: &str, rows: &[ThroughputRo
     let op_header = format!("{:<48}", "Operation");
     println!("{title}");
     println!(
-        "{}  | {:>20} | {:>20} | {:>15}",
+        "{}  | {:>20} | {:>15}",
         op_header,
-        format!("{unit_label} (mean)"),
-        format!("{unit_label} (median)"),
+        format!("{unit_label}"),
         "Mean Duration"
     );
-    println!("{}", "-".repeat(115));
+    println!("{}", "-".repeat(95));
 
     for row in rows {
         let op_display = format!("{:<48}", row.label);
         println!(
-            "{op_display}  | {:>10.0} {unit_label} | {:>10.0} {unit_label} | {:>10.2?}",
-            row.mean, row.median, row.mean_duration,
+            "{op_display}  | {:>10.0} {unit_label} | {:>10.2?}",
+            row.mean, row.mean_duration,
         );
     }
     println!();
