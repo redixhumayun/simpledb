@@ -13,6 +13,15 @@ All benchmarks are run on the following hardware
   - Random write (4 KiB blocks): 83.5k IOPS, 326 MiB/s.
   - Random read (4 KiB blocks): 109k IOPS, 426 MiB/s.
 
+  Commands (run from a scratch directory with ~4 GiB free):
+
+  ```bash
+  fio --name=seqwrite --filename=fiotest.bin --size=4G --bs=1M --rw=write --direct=1 --ioengine=libaio --numjobs=1 --iodepth=16
+  fio --name=seqread  --filename=fiotest.bin --size=4G --bs=1M --rw=read  --direct=1 --ioengine=libaio --numjobs=1 --iodepth=16
+  fio --name=randwrite --filename=fiotest.bin --size=4G --bs=4k --rw=randwrite --direct=1 --ioengine=libaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  fio --name=randread  --filename=fiotest.bin --size=4G --bs=4k --rw=randread  --direct=1 --ioengine=libaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  ```
+
 ## Quick Start
 
 ```bash
