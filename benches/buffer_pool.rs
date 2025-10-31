@@ -198,6 +198,7 @@ fn render_throughput_section(title: &str, unit_label: &str, rows: &[ThroughputRo
 }
 
 struct PinCase {
+    filter_token: &'static str,
     threads: usize,
     ops_per_thread: usize,
 }
@@ -206,9 +207,17 @@ impl PinCase {
     const fn total_ops(&self) -> usize {
         self.threads * self.ops_per_thread
     }
+
+    fn label(&self) -> String {
+        format!(
+            "{} threads, {} ops/thread",
+            self.threads, self.ops_per_thread
+        )
+    }
 }
 
 struct HotsetCase {
+    filter_token: &'static str,
     threads: usize,
     ops_per_thread: usize,
     hot_set_size: usize,
@@ -218,18 +227,28 @@ impl HotsetCase {
     const fn total_ops(&self) -> usize {
         self.threads * self.ops_per_thread
     }
+
+    fn label(&self) -> String {
+        format!(
+            "{} threads, K={}, {} ops/thread",
+            self.threads, self.hot_set_size, self.ops_per_thread
+        )
+    }
 }
 
 const PIN_CASES: &[PinCase] = &[
     PinCase {
+        filter_token: "[pin:t2]",
         threads: 2,
         ops_per_thread: 1000,
     },
     PinCase {
+        filter_token: "[pin:t4]",
         threads: 4,
         ops_per_thread: 1000,
     },
     PinCase {
+        filter_token: "[pin:t8]",
         threads: 8,
         ops_per_thread: 1000,
     },
@@ -237,11 +256,13 @@ const PIN_CASES: &[PinCase] = &[
 
 const HOTSET_CASES: &[HotsetCase] = &[
     HotsetCase {
+        filter_token: "[hotset:t4_k4]",
         threads: 4,
         ops_per_thread: 1000,
         hot_set_size: 4,
     },
     HotsetCase {
+        filter_token: "[hotset:t8_k4]",
         threads: 8,
         ops_per_thread: 1000,
         hot_set_size: 4,
@@ -1019,10 +1040,19 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
     println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
-fn run_multithreaded_pin_benchmarks(db: &SimpleDB, block_size: usize, iterations: usize) {
+fn run_multithreaded_pin_benchmarks(
+    db: &SimpleDB,
+    block_size: usize,
+    iterations: usize,
+    cases: &[&PinCase],
+) {
     let mut rows = Vec::new();
 
-    for case in PIN_CASES {
+    if cases.is_empty() {
+        return;
+    }
+
+    for case in cases {
         let result = multithreaded_pin(
             db,
             block_size,
@@ -1031,10 +1061,7 @@ fn run_multithreaded_pin_benchmarks(db: &SimpleDB, block_size: usize, iterations
             iterations,
         );
         let mut row = ThroughputRow::from_benchmark(result, case.total_ops());
-        row.label = format!(
-            "{} threads, {} ops/thread",
-            case.threads, case.ops_per_thread
-        );
+        row.label = case.label();
         rows.push(row);
     }
 
@@ -1045,10 +1072,19 @@ fn run_multithreaded_pin_benchmarks(db: &SimpleDB, block_size: usize, iterations
     );
 }
 
-fn run_hotset_contention_benchmarks(db: &SimpleDB, block_size: usize, iterations: usize) {
+fn run_hotset_contention_benchmarks(
+    db: &SimpleDB,
+    block_size: usize,
+    iterations: usize,
+    cases: &[&HotsetCase],
+) {
     let mut rows = Vec::new();
 
-    for case in HOTSET_CASES {
+    if cases.is_empty() {
+        return;
+    }
+
+    for case in cases {
         let result = multithreaded_hotset_contention(
             db,
             block_size,
@@ -1058,10 +1094,7 @@ fn run_hotset_contention_benchmarks(db: &SimpleDB, block_size: usize, iterations
             iterations,
         );
         let mut row = ThroughputRow::from_benchmark(result, case.total_ops());
-        row.label = format!(
-            "{} threads, K={}, {} ops/thread",
-            case.threads, case.hot_set_size, case.ops_per_thread
-        );
+        row.label = case.label();
         rows.push(row);
     }
 
@@ -1279,24 +1312,38 @@ fn main() {
     // Phase 5
     let mut phase5_has_output = false;
 
-    if should_run("Multi-threaded Pin", filter_ref) {
+    let pin_cases: Vec<&PinCase> = match filter_ref {
+        None => PIN_CASES.iter().collect(),
+        Some(_) => PIN_CASES
+            .iter()
+            .filter(|case| should_run(case.filter_token, filter_ref))
+            .collect(),
+    };
+    if !pin_cases.is_empty() {
         if !phase5_has_output {
             println!("Phase 5: Concurrent Access");
             println!();
             phase5_has_output = true;
         }
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        run_multithreaded_pin_benchmarks(&db, block_size, iterations);
+        run_multithreaded_pin_benchmarks(&db, block_size, iterations, &pin_cases);
     }
 
-    if should_run("Hotset", filter_ref) {
+    let hotset_cases: Vec<&HotsetCase> = match filter_ref {
+        None => HOTSET_CASES.iter().collect(),
+        Some(_) => HOTSET_CASES
+            .iter()
+            .filter(|case| should_run(case.filter_token, filter_ref))
+            .collect(),
+    };
+    if !hotset_cases.is_empty() {
         if !phase5_has_output {
             println!("Phase 5: Concurrent Access");
             println!();
             phase5_has_output = true;
         }
         let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        run_hotset_contention_benchmarks(&db, block_size, iterations);
+        run_hotset_contention_benchmarks(&db, block_size, iterations, &hotset_cases);
     }
 
     if should_run("Starvation", filter_ref) {
