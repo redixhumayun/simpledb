@@ -120,3 +120,31 @@ pub fn print_header() {
     );
     println!("{}", "-".repeat(70));
 }
+
+pub struct ThroughputRow {
+    pub label: String,
+    pub throughput: f64,
+    pub unit: String,
+    pub mean_duration: Duration,
+}
+
+pub fn render_throughput_section(title: &str, rows: &[ThroughputRow]) {
+    if rows.is_empty() {
+        return;
+    }
+
+    println!("{}", title);
+    println!(
+        "{:<48}  | {:>20} | {:>15}",
+        "Operation", "Throughput", "Mean Duration"
+    );
+    println!("{}", "-".repeat(95));
+
+    for row in rows {
+        println!(
+            "{:<48}  | {:>10.2} {:>8} | {:>10.2?}",
+            row.label, row.throughput, row.unit, row.mean_duration
+        );
+    }
+    println!();
+}

@@ -123,6 +123,10 @@ impl SimpleDB {
     pub fn buffer_manager(&self) -> Arc<BufferManager> {
         Arc::clone(&self.buffer_manager)
     }
+
+    pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        Arc::clone(&self.log_manager)
+    }
 }
 
 struct MultiBufferProductPlan {
@@ -10875,7 +10879,7 @@ mod buffer_manager_tests {
 }
 
 #[derive(Debug)]
-struct LogManager {
+pub struct LogManager {
     file_manager: SharedFS,
     log_file: String,
     log_page: Page,
@@ -10910,7 +10914,7 @@ impl LogManager {
     }
 
     /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
-    fn flush_lsn(&mut self, lsn: Lsn) {
+    pub fn flush_lsn(&mut self, lsn: Lsn) {
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -10933,7 +10937,7 @@ impl LogManager {
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
-    fn append(&mut self, log_record: Vec<u8>) -> Lsn {
+    pub fn append(&mut self, log_record: Vec<u8>) -> Lsn {
         let mut boundary = self.log_page.get_int(0) as usize;
         let bytes_needed = log_record.len() + Page::INT_BYTES;
         if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
@@ -10979,7 +10983,7 @@ impl LogManager {
     }
 }
 
-struct LogIterator {
+pub struct LogIterator {
     file_manager: SharedFS,
     current_block: BlockId,
     page: Page,
