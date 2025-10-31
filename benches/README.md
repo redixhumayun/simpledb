@@ -36,11 +36,13 @@ cargo bench --bench buffer_pool -- 50 12
 
 # Buffer pool benchmarks - run only Random K=10
 cargo bench --bench buffer_pool -- 50 12 "Random (K=10,"
+# Buffer pool benchmarks - run only the 8-thread pin workload
+cargo bench --bench buffer_pool -- 100 12 pin:t8
 ```
 
 ## Filtering Benchmarks
 
-Filter using substring matching on benchmark names:
+Filter using substring matching on benchmark names (Phase 1-4) or case tokens (Phase 5):
 
 ```bash
 # Syntax: -- <iterations> [num_buffers] [filter]
@@ -48,6 +50,10 @@ cargo bench --bench buffer_pool -- 100 12 "Pin/Unpin"      # Phase 1: Pin/Unpin 
 cargo bench --bench buffer_pool -- 100 12 "Zipfian"        # Phase 2+4: Zipfian tests
 cargo bench --bench buffer_pool -- 100 12 "Random (K=10,"  # Specific K value (not K=100)
 cargo bench --bench simple_bench -- 100 "SELECT"           # Both SELECT benchmarks
+
+# Phase 5 case tokens (no quotes needed):
+cargo bench --bench buffer_pool -- 200 12 pin:t4           # Multi-threaded pin, 4 threads
+cargo bench --bench buffer_pool -- 200 12 hotset:t8_k4     # Hot-set contention, 8 threads, K=4
 ```
 
 **Use case:** Isolate specific workloads for profiling (flamegraphs, perf analysis) without noise from other benchmarks.
@@ -63,7 +69,8 @@ Buffer manager microbenchmarks across 5 phases:
 - **Phase 2:** Access patterns (sequential, repeated, random, zipfian) - single + multi-threaded
 - **Phase 3:** Pool size scaling, memory pressure
 - **Phase 4:** Hit rate measurement
-- **Phase 5:** Concurrent access, hotset contention, starvation
+- **Phase 5:** Concurrent access, hotset contention, starvation  
+  _Case tokens:_ `pin:t2`, `pin:t4`, `pin:t8`, `hotset:t4_k4`, `hotset:t8_k4`
 
 ## JSON Output for CI
 
