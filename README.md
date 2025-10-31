@@ -27,20 +27,7 @@ The database supports ACID transactions, along with some other niceties like
 
 ### Benchmarks
 
-Run performance benchmarks:
-```bash
-cargo run --bin simple_bench
-```
-
-Or with custom iterations:
-```bash
-cargo run --bin simple_bench 100
-```
-
-Run buffer pool benchmarks:
-```bash
-cargo bench --bench buffer_pool -- 50 12
-```
+Look at the [benchmarks README](benches/README.md) for more details.
 
 #### CI Benchmark Tracking
 

@@ -2,6 +2,17 @@
 
 Stdlib-only benchmarking framework with CLI filtering support.
 
+## Hardware
+
+All benchmarks are run on the following hardware
+
+- **Platform**: Dell XPS 13-9370, Intel i7-8650U (4C/8T, 1 socket), 16 GB DDR4-2133, Netac NVMe SSD 512 GB (PCIe), Ubuntu Linux 6.8.0-86-generic.
+- **Storage capability (fio, direct I/O)**:
+  - Sequential write (1 MiB blocks): 1.27 GiB/s, 1.27k IOPS.
+  - Sequential read (1 MiB blocks): 2.97 GiB/s, 2.97k IOPS.
+  - Random write (4 KiB blocks): 83.5k IOPS, 326 MiB/s.
+  - Random read (4 KiB blocks): 109k IOPS, 426 MiB/s.
+
 ## Quick Start
 
 ```bash
