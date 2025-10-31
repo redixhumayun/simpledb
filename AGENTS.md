@@ -50,11 +50,22 @@ There is a test suite which provides basic coverage to ensure the code still wor
    # verify that the operations complete and see results
    ```
 
-5. **Create PR with descriptive title and summary**
+6. **Run cargo formatting before committing**
+   ```bash
+   # check whether clippy reports errors
+   cargo clippy -- -D warnings
+   # check cargo formatting
+   cargo fmt -- --check
+   # run cargo fix
+   cargo clippy --fix
+   # fix remaining errors before committing
+   ```
+
+7. **Create PR with descriptive title and summary**
    - Include what was implemented
    - Note any breaking changes
 
-6. **Address feedback as separate commits**
+8. **Address feedback as separate commits**
 
 ## Response Style
 
