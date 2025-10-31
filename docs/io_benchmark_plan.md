@@ -6,7 +6,7 @@ Create comprehensive benchmarks to measure raw I/O performance characteristics a
 
 ## Motivation
 
-Issue [#15](https://github.com/redixhumayun/simpledb/issues/15) originally covered both buffer pool and I/O benchmarks. PR [#36](https://github.com/redixhumayun/simpledb/pull/36) completed the buffer pool portion. This document focuses on the remaining I/O benchmarking requirements.
+Issue [#15](https://github.com/redixhumayun/simpledb/issues/15) originally covered both buffer pool and I/O benchmarks. PR [#36](https://github.com/redixhumayun/simpledb/pull/36) completed the buffer pool portion. This document focuses on the remaining I/O benchmarking requirements. Issue [#37](https://github.com/redixhumayun/simpledb/issues/37) tracks IO benchmarks.
 
 **Why separate I/O benchmarks?**
 - **Isolation**: Buffer pool benchmarks measure caching effectiveness; I/O benchmarks measure disk performance
@@ -79,21 +79,26 @@ for block_size in [1024, 4096, 8192, 16384, 65536] {
 ```rust
 // 1. WAL append without fsync (best case)
 benchmark("WAL append (no fsync)", || {
-    log_manager.append(record);  // No sync
+    let log = Arc::clone(&log_manager);
+    let lsn = log.lock().unwrap().append(make_record()); // Synthetic WAL payload
+    flush_policy.record(lsn, &log); // FlushPolicy::None => no-op
 });
 
 // 2. WAL append with immediate fsync (worst case)
 benchmark("WAL append + fsync", || {
-    log_manager.append(record);
-    log_manager.flush();  // Sync every write
+    let log = Arc::clone(&log_manager);
+    let lsn = log.lock().unwrap().append(make_record());
+    flush_policy.record(lsn, &log); // FlushPolicy::Immediate => flush_lsn(lsn)
 });
 
 // 3. Group commit (batched fsync)
 benchmark("WAL group commit", || {
+    let log = Arc::clone(&log_manager);
     for i in 0..batch_size {
-        log_manager.append(record);
+        let lsn = log.lock().unwrap().append(make_record_for_batch(i));
+        flush_policy.record(lsn, &log); // FlushPolicy::Group => flush every N
     }
-    log_manager.flush();  // One sync per batch
+    flush_policy.finish_batch(&log); // Flush left-over entries
 });
 ```
 
@@ -114,14 +119,21 @@ benchmark("WAL group commit", || {
 **Implementation**:
 ```rust
 benchmark("70/30 read/write", || {
+    let log = Arc::clone(&log_manager);
     for op in &operations {
         match op {
             Read(block_id) => file_manager.read(block_id, &mut page),
-            Write(block_id) => file_manager.write(block_id, &mut page),
+            Write(block_id) => {
+                file_manager.write(block_id, &mut page);
+                let lsn = log.lock().unwrap().append(record_for(block_id));
+                flush_policy.record(lsn, &log); // none, per-op fsync, or group commit
+            }
         }
     }
 });
 ```
+
+**Flush policy**: benchmark variants cover no fsync, immediate fsync, and batched group commit so mixed workloads align with WAL-only measurements.
 
 **Metrics**:
 - Combined throughput
@@ -134,10 +146,16 @@ benchmark("70/30 read/write", || {
 **Implementation**:
 ```rust
 let handles: Vec<_> = (0..num_threads).map(|thread_id| {
-    thread::spawn(|| {
+    let log = Arc::clone(&log_manager);
+    let policy = flush_policy.clone(); // Clone per thread
+    thread::spawn(move || {
+        let mut policy = policy;
         for _ in 0..ops_per_thread {
             // Each thread does mix of reads/writes
+            let lsn = log.lock().unwrap().append(record_for_thread(thread_id));
+            policy.record(lsn, &log);
         }
+        policy.finish_batch(&log);
     })
 }).collect();
 ```
@@ -146,6 +164,50 @@ let handles: Vec<_> = (0..num_threads).map(|thread_id| {
 - Aggregate throughput (all threads)
 - Per-thread latency
 - Contention overhead
+- Shared-file case: all threads operate on one pre-sized file with overlapping block ranges (exercises intra-file locking)
+- Sharded case: each thread uses a disjoint, pre-sized file or non-overlapping block range (captures scale-out behavior without coordination)
+- All files must be pre-sized before the run; file-extension cost is out of scope for these benchmarks.
+
+**Flush policy abstraction**: All benchmarks share a small helper that wraps `LogManager::flush_lsn` decisions so variants stay consistent:
+
+```rust
+#[derive(Clone)]
+enum FlushPolicy {
+    None,
+    Immediate,
+    Group { batch: usize, pending: usize, last_lsn: Option<Lsn> },
+}
+
+impl FlushPolicy {
+    fn record(&mut self, lsn: Lsn, log: &Arc<Mutex<LogManager>>) {
+        match self {
+            FlushPolicy::None => {}
+            FlushPolicy::Immediate => log.lock().unwrap().flush_lsn(lsn),
+            FlushPolicy::Group { batch, pending, last_lsn } => {
+                *pending += 1;
+                *last_lsn = Some(lsn);
+                if *pending == *batch {
+                    log.lock().unwrap().flush_lsn(last_lsn.unwrap());
+                    *pending = 0;
+                    *last_lsn = None;
+                }
+            }
+        }
+    }
+
+    fn finish_batch(&mut self, log: &Arc<Mutex<LogManager>>) {
+        if let FlushPolicy::Group { pending, last_lsn, .. } = self {
+            if *pending > 0 {
+                log.lock().unwrap().flush_lsn(last_lsn.unwrap());
+                *pending = 0;
+                *last_lsn = None;
+            }
+        }
+    }
+}
+```
+
+Each benchmark initializes the policy variant it wants (none, immediate, group) and calls `record`/`finish_batch` around every WAL append.
 
 ## Benchmark Structure
 
@@ -237,6 +299,7 @@ Benchmarks remain unchanged; only the FileManager implementation swaps.
 - [PR #36](https://github.com/redixhumayun/simpledb/pull/36) - Completed buffer pool benchmarks
 - [Issue #12](https://github.com/redixhumayun/simpledb/issues/12) - Direct I/O implementation (prerequisite for comparison benchmarks)
 - [Issue #17](https://github.com/redixhumayun/simpledb/issues/17) - LRU buffer replacement (related to buffer pool performance)
+- [Issue #37](https://github.com/redixhumayun/simpledb/issues/37) - New issue set up to track IO benchmarks
 
 ## References
 
