@@ -351,12 +351,7 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) -> Be
     let test_file = "testfile".to_string();
     let buffer_manager = db.buffer_manager();
 
-    {
-        let mut file_manager = db.file_manager.lock().unwrap();
-        let mut page = Page::new(block_size);
-        page.set_int(80, 1);
-        file_manager.write(&BlockId::new(test_file.clone(), 1), &mut page);
-    }
+    precreate_blocks(db, &test_file, block_size, 2);
 
     benchmark("Pin/Unpin (hit)", iterations, 5, || {
         let block_id = BlockId::new(test_file.clone(), 1);
