@@ -498,7 +498,7 @@ fn zipfian_access(
     let test_file = "zipffile".to_string();
     let buffer_manager = db.buffer_manager();
     let total_blocks = num_buffers * 3;
-    let hot_set_size = (total_blocks as f64 * 0.2) as usize; // 20% hot
+    let hot_set_size = ((total_blocks as f64 * 0.2) as usize).max(1); // 20% hot
     let total_accesses = 500;
 
     // Pre-create blocks
