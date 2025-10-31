@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1761893162453,
+  "lastUpdate": 1761905884397,
   "repoUrl": "https://github.com/redixhumayun/simpledb",
   "entries": {
     "SimpleDB Benchmarks": [
@@ -1051,6 +1051,155 @@ window.BENCHMARK_DATA = {
           {
             "name": "DELETE (single record)",
             "value": 101425549,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "redixhumayun@gmail.com",
+            "name": "Zaid Humayun",
+            "username": "redixhumayun"
+          },
+          "committer": {
+            "email": "redixhumayun@gmail.com",
+            "name": "Zaid Humayun",
+            "username": "redixhumayun"
+          },
+          "distinct": true,
+          "id": "1d37faf6877ea985f3151d33bf36f6e00bf625a2",
+          "message": "Updated README with exact commands used to get IO perf numbers",
+          "timestamp": "2025-10-31T15:45:12+05:30",
+          "tree_id": "0e26d37ae36f326adc037c99aa238c0ecc387a74",
+          "url": "https://github.com/redixhumayun/simpledb/commit/1d37faf6877ea985f3151d33bf36f6e00bf625a2"
+        },
+        "date": 1761905882976,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Pin/Unpin (hit)",
+            "value": 799,
+            "unit": "ns"
+          },
+          {
+            "name": "Cold Pin (miss)",
+            "value": 6375,
+            "unit": "ns"
+          },
+          {
+            "name": "Dirty Eviction",
+            "value": 5000041,
+            "unit": "ns"
+          },
+          {
+            "name": "Sequential Scan (120 blocks)",
+            "value": 728910,
+            "unit": "ns"
+          },
+          {
+            "name": "Seq Scan MT x4 (120 blocks)",
+            "value": 994085,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access (1000 ops)",
+            "value": 6120621,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access MT x4 (1000 ops)",
+            "value": 6464571,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=10, 500 ops)",
+            "value": 2777649,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=10, 500 ops)",
+            "value": 2880633,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=50, 500 ops)",
+            "value": 3008963,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=50, 500 ops)",
+            "value": 3823404,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=100, 500 ops)",
+            "value": 3008674,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=100, 500 ops)",
+            "value": 3896622,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian (80/20, 500 ops)",
+            "value": 2839742,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian MT x4 (80/20, 500 ops)",
+            "value": 3117880,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (2 threads, 1000 ops)",
+            "value": 13607121,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (4 threads, 1000 ops)",
+            "value": 27907740,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (8 threads, 1000 ops)",
+            "value": 67271564,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (4 threads, K=4, 1000 ops)",
+            "value": 3795756,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (8 threads, K=4, 1000 ops)",
+            "value": 8031937,
+            "unit": "ns"
+          },
+          {
+            "name": "INSERT (single record)",
+            "value": 101443053,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT (table scan)",
+            "value": 40307321,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT COUNT(*)",
+            "value": 41763561,
+            "unit": "ns"
+          },
+          {
+            "name": "UPDATE (single record)",
+            "value": 90629055,
+            "unit": "ns"
+          },
+          {
+            "name": "DELETE (single record)",
+            "value": 101396178,
             "unit": "ns"
           }
         ]
