@@ -42,6 +42,11 @@ Run buffer pool benchmarks:
 cargo bench --bench buffer_pool -- 50 12
 ```
 
+Run an individual buffer-pool workload (useful for profiling):
+```bash
+cargo bench --bench buffer_pool -- 100 12 pin:t8   # Only the 8-thread pin benchmark
+```
+
 #### CI Benchmark Tracking
 
 All PRs automatically run **all benchmarks** via auto-discovery:
