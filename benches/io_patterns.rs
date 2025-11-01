@@ -520,7 +520,7 @@ fn render_block_size_table(results: &[BlockSizeResult]) {
         "{:<15} | {:>20} | {:>15}",
         "Block Size", "Throughput (MB/s)", "Mean Duration"
     );
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(100));
 
     for result in results {
         println!(
@@ -540,14 +540,14 @@ fn render_wal_comparison(results: &[WalResult]) {
 
     println!("Phase 3: WAL Performance (100-byte records)");
     println!(
-        "{:<30} | {:>20} | {:>15}",
+        "{:<40} | {:>20} | {:>15}",
         "Flush Strategy", "Commits/sec", "Mean Duration"
     );
-    println!("{}", "-".repeat(75));
+    println!("{}", "-".repeat(100));
 
     for result in results {
         println!(
-            "{:<30} | {:>20.2} | {:>15.2?}",
+            "{:<40} | {:>20.2} | {:>15?}",
             result.label, result.commits_per_sec, result.mean_duration
         );
     }
