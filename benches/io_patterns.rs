@@ -563,6 +563,12 @@ fn main() {
     let filter_ref = filter.as_deref();
     let block_size = 4096;
 
+    // Cap iterations for fsync-heavy phases (3-5) to avoid excessive runtime.
+    // Phases 3-5 involve real fsync operations which have constant ~2-4ms cost.
+    // At 100 iterations, these phases would perform 50,000+ fsyncs (~10 minutes).
+    // 5 iterations provides statistical validity without excessive runtime.
+    let fsync_iterations = iterations.min(5);
+
     if json_output {
         // Phase 1 - no filters in JSON mode
         let mut results = vec![
@@ -572,14 +578,14 @@ fn main() {
             random_write(block_size, 1000, 1000, iterations),
         ];
 
-        // Phase 3 - no filters in JSON mode
-        results.push(wal_append_no_fsync(block_size, iterations));
-        results.push(wal_append_immediate_fsync(block_size, iterations));
-        results.push(wal_group_commit(block_size, 10, iterations));
-        results.push(wal_group_commit(block_size, 50, iterations));
-        results.push(wal_group_commit(block_size, 100, iterations));
+        // Phase 3 - no filters in JSON mode (use fsync_iterations)
+        results.push(wal_append_no_fsync(block_size, fsync_iterations));
+        results.push(wal_append_immediate_fsync(block_size, fsync_iterations));
+        results.push(wal_group_commit(block_size, 10, fsync_iterations));
+        results.push(wal_group_commit(block_size, 50, fsync_iterations));
+        results.push(wal_group_commit(block_size, 100, fsync_iterations));
 
-        // Phase 4 - no filters in JSON mode
+        // Phase 4 - no filters in JSON mode (use fsync_iterations)
         for read_pct in [70, 50, 10] {
             for policy in [
                 FlushPolicy::None,
@@ -591,12 +597,12 @@ fn main() {
                 },
             ] {
                 results.push(mixed_workload(
-                    block_size, read_pct, 500, policy, iterations,
+                    block_size, read_pct, 500, policy, fsync_iterations,
                 ));
             }
         }
 
-        // Phase 5 - no filters in JSON mode
+        // Phase 5 - no filters in JSON mode (use fsync_iterations)
         for threads in [2, 4, 8, 16] {
             for policy in [
                 FlushPolicy::None,
@@ -611,10 +617,10 @@ fn main() {
                     threads,
                     100,
                     policy.clone(),
-                    iterations,
+                    fsync_iterations,
                 ));
                 results.push(concurrent_io_sharded(
-                    block_size, threads, 100, policy, iterations,
+                    block_size, threads, 100, policy, fsync_iterations,
                 ));
             }
         }
@@ -624,6 +630,12 @@ fn main() {
         return;
     }
 
+    // Cap iterations for fsync-heavy phases (3-5) to avoid excessive runtime.
+    // Phases 3-5 involve real fsync operations which have constant ~2-4ms cost.
+    // At 100 iterations, these phases would perform 50,000+ fsyncs (~10 minutes).
+    // 5 iterations provides statistical validity without excessive runtime.
+    let fsync_iterations = iterations.min(5);
+
     // Human-readable mode
     println!("SimpleDB I/O Performance Benchmark Suite");
     println!("=========================================");
@@ -631,6 +643,12 @@ fn main() {
         "Running benchmarks with {} iterations per operation",
         iterations
     );
+    if fsync_iterations < iterations {
+        println!(
+            "Note: Phases 3-5 (fsync-heavy) capped at {} iterations to avoid excessive runtime",
+            fsync_iterations
+        );
+    }
     println!("Block size: {} bytes", block_size);
     println!(
         "Environment: {} ({})",
@@ -695,7 +713,7 @@ fn main() {
     let mut wal_results = Vec::new();
 
     if should_run("wal_no_fsync", filter_ref) {
-        let no_fsync = wal_append_no_fsync(block_size, iterations);
+        let no_fsync = wal_append_no_fsync(block_size, fsync_iterations);
         wal_results.push(WalResult {
             label: "No fsync (1000 ops)".to_string(),
             commits_per_sec: 1000.0 / no_fsync.mean.as_secs_f64(),
@@ -704,7 +722,7 @@ fn main() {
     }
 
     if should_run("wal_immediate", filter_ref) {
-        let immediate = wal_append_immediate_fsync(block_size, iterations);
+        let immediate = wal_append_immediate_fsync(block_size, fsync_iterations);
         wal_results.push(WalResult {
             label: "Immediate fsync (100 ops)".to_string(),
             commits_per_sec: 100.0 / immediate.mean.as_secs_f64(),
@@ -715,7 +733,7 @@ fn main() {
     for batch_size in [10, 50, 100] {
         let token = format!("wal_group_{}", batch_size);
         if should_run(&token, filter_ref) {
-            let group = wal_group_commit(block_size, batch_size, iterations);
+            let group = wal_group_commit(block_size, batch_size, fsync_iterations);
             wal_results.push(WalResult {
                 label: format!("Group commit batch={} (1000 ops)", batch_size),
                 commits_per_sec: 1000.0 / group.mean.as_secs_f64(),
@@ -750,7 +768,7 @@ fn main() {
             let token = format!("mixed_{}r_{}", read_pct, policy_name);
             if should_run(&token, filter_ref) {
                 mixed_results.push(mixed_workload(
-                    block_size, read_pct, 500, policy, iterations,
+                    block_size, read_pct, 500, policy, fsync_iterations,
                 ));
             }
         }
@@ -801,7 +819,7 @@ fn main() {
                     threads,
                     100,
                     policy.clone(),
-                    iterations,
+                    fsync_iterations,
                 ));
             }
 
@@ -812,7 +830,7 @@ fn main() {
                     threads,
                     100,
                     policy.clone(),
-                    iterations,
+                    fsync_iterations,
                 ));
             }
         }
