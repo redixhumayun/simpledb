@@ -135,14 +135,14 @@ pub fn render_throughput_section(title: &str, rows: &[ThroughputRow]) {
 
     println!("{}", title);
     println!(
-        "{:<48}  | {:>20} | {:>15}",
+        "{:<48} | {:>20} | {:>15}",
         "Operation", "Throughput", "Mean Duration"
     );
-    println!("{}", "-".repeat(95));
+    println!("{}", "-".repeat(93));
 
     for row in rows {
         println!(
-            "{:<48}  | {:>10.2} {:>8} | {:>10.2?}",
+            "{:<48} | {:>10.2} {:>9} | {:>15.2?}",
             row.label, row.throughput, row.unit, row.mean_duration
         );
     }
