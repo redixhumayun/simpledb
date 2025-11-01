@@ -6854,11 +6854,12 @@ enum BinaryOperator {
     Modulo,
 }
 
+// Metadata helpers are constructed once at boot and stay read-only during steady state.
 struct MetadataManager {
     table_manager: Arc<TableManager>,
     view_manager: Arc<ViewManager>,
     index_manager: Arc<IndexManager>,
-    stat_manager: Arc<Mutex<StatManager>>,
+    stat_manager: Arc<StatManager>,
 }
 
 impl MetadataManager {
@@ -6869,7 +6870,7 @@ impl MetadataManager {
             Arc::clone(&table_manager),
             Arc::clone(&txn),
         ));
-        let stat_manager = Arc::new(Mutex::new(StatManager::new(Arc::clone(&table_manager))));
+        let stat_manager = Arc::new(StatManager::new(Arc::clone(&table_manager)));
         let index_manager = Arc::new(IndexManager::new(
             is_new,
             Arc::clone(&table_manager),
@@ -6925,10 +6926,7 @@ impl MetadataManager {
     }
 
     fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
-        self.stat_manager
-            .lock()
-            .unwrap()
-            .get_stat_info(table_name, layout, txn)
+        self.stat_manager.get_stat_info(table_name, layout, txn)
     }
 }
 
@@ -6936,7 +6934,8 @@ impl MetadataManager {
 mod metadata_manager_tests {
     use super::UpdateScan;
     use crate::{
-        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB, TableScan,
+        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB,
+        TableScan, Transaction,
     };
     use std::sync::Arc;
 
@@ -7039,12 +7038,71 @@ mod metadata_manager_tests {
 
         tx.commit().unwrap();
     }
+
+    #[test]
+    fn stat_manager_concurrent_access() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let setup_txn = Arc::new(db.new_tx());
+        let mdm = Arc::new(MetadataManager::new(true, Arc::clone(&setup_txn)));
+
+        let table_name = "stat_concurrent";
+        let mut schema = Schema::new();
+        schema.add_int_field("val");
+        mdm.create_table(table_name, schema.clone(), Arc::clone(&setup_txn));
+
+        let layout = mdm.get_layout(table_name, Arc::clone(&setup_txn));
+        {
+            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name);
+            for i in 0..20 {
+                table_scan.insert().unwrap();
+                table_scan.set_int("val", i).unwrap();
+            }
+        }
+        setup_txn.commit().unwrap();
+
+        let layout_txn = Arc::new(db.new_tx());
+        let layout = mdm.get_layout(table_name, Arc::clone(&layout_txn));
+        layout_txn.commit().unwrap();
+
+        // Prime the cache so concurrent readers hit the fast path
+        let prime_txn = Arc::new(db.new_tx());
+        mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&prime_txn));
+        prime_txn.commit().unwrap();
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = Arc::clone(&db.log_manager);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let lock_table = Arc::clone(&db.lock_table);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mdm_clone = Arc::clone(&mdm);
+            let layout_clone = layout.clone();
+            let fm = Arc::clone(&file_manager);
+            let lm = Arc::clone(&log_manager);
+            let bm = Arc::clone(&buffer_manager);
+            let lt = Arc::clone(&lock_table);
+            handles.push(std::thread::spawn(move || {
+                let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
+                for _ in 0..10 {
+                    let stats =
+                        mdm_clone.get_stat_info(table_name, layout_clone.clone(), Arc::clone(&txn));
+                    assert_eq!(stats.num_records, 20);
+                }
+                txn.commit().unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }
 
 struct IndexManager {
     layout: Layout,
     table_manager: Arc<TableManager>,
-    stat_manager: Arc<Mutex<StatManager>>,
+    stat_manager: Arc<StatManager>,
 }
 
 impl IndexManager {
@@ -7056,7 +7114,7 @@ impl IndexManager {
     fn new(
         is_new: bool,
         table_manager: Arc<TableManager>,
-        stat_manager: Arc<Mutex<StatManager>>,
+        stat_manager: Arc<StatManager>,
         txn: Arc<Transaction>,
     ) -> Self {
         if is_new {
@@ -7110,11 +7168,9 @@ impl IndexManager {
                 let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
                 let index_name = table_scan.get_string(Self::INDEX_COL_NAME).unwrap();
                 let layout = self.table_manager.get_layout(table_name, Arc::clone(&txn));
-                let stat_info = self.stat_manager.lock().unwrap().get_stat_info(
-                    table_name,
-                    layout.clone(),
-                    Arc::clone(&txn),
-                );
+                let stat_info =
+                    self.stat_manager
+                        .get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
                 let index_info = IndexInfo::new(
                     &index_name,
                     &field_name,
@@ -7325,51 +7381,58 @@ trait Index {
     fn delete(&mut self, data_val: &Constant, data_rid: &RID);
 }
 
-struct StatManager {
-    table_manager: Arc<TableManager>,
+struct StatState {
     table_stats: HashMap<String, StatInfo>,
     num_calls: usize,
+}
+
+struct StatManager {
+    table_manager: Arc<TableManager>,
+    state: Mutex<StatState>,
 }
 
 impl StatManager {
     fn new(table_manager: Arc<TableManager>) -> Self {
         Self {
             table_manager,
-            table_stats: HashMap::new(),
-            num_calls: 0,
+            state: Mutex::new(StatState {
+                table_stats: HashMap::new(),
+                num_calls: 0,
+            }),
         }
     }
 
     /// Returns the statistics for a given table
     /// Refreshes all stats for all tables based on a counter
-    fn get_stat_info(
-        &mut self,
-        table_name: &str,
-        layout: Layout,
-        txn: Arc<Transaction>,
-    ) -> StatInfo {
+    fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
         debug!("getting stat info for {}", table_name);
-        self.num_calls += 1;
-        if self.num_calls > 100 {
-            self.refresh_stats(Arc::clone(&txn));
+        {
+            let mut state = self.state.lock().unwrap();
+            state.num_calls += 1;
+            if state.num_calls > 100 {
+                self.refresh_stats_inner(&mut state, Arc::clone(&txn));
+            }
+
+            if let Some(stats) = state.table_stats.get(table_name) {
+                debug!("found table stats {:?}", stats);
+                return stats.clone();
+            }
         }
 
-        if let Some(stats) = self.table_stats.get(table_name) {
-            debug!("found table stats {:?}", stats);
-            stats.clone()
-        } else {
-            debug!("going to calculate table stats");
-            let table_stats = self.calculate_table_stats(table_name, layout, txn);
-            debug!("table stats {:?}", table_stats.clone());
-            self.table_stats
-                .insert(table_name.to_string(), table_stats.clone());
-            table_stats
-        }
+        debug!("going to calculate table stats");
+        let table_stats = self.calculate_table_stats(table_name, layout, Arc::clone(&txn));
+        let mut state = self.state.lock().unwrap();
+        debug!("table stats {:?}", table_stats);
+        state
+            .table_stats
+            .entry(table_name.to_string())
+            .or_insert_with(|| table_stats.clone())
+            .clone()
     }
 
     /// Refreshes the statistics for all tables in the database
-    fn refresh_stats(&mut self, txn: Arc<Transaction>) {
-        self.table_stats.clear();
+    fn refresh_stats_inner(&self, state: &mut StatState, txn: Arc<Transaction>) {
+        state.table_stats.clear();
         let table_catalog_layout = self
             .table_manager
             .get_layout(TableManager::TABLE_CAT_TABLE_NAME, Arc::clone(&txn));
@@ -7382,8 +7445,9 @@ impl StatManager {
             let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
             let table_stats = self.calculate_table_stats(&table_name, layout, Arc::clone(&txn));
-            self.table_stats.insert(table_name, table_stats);
+            state.table_stats.insert(table_name, table_stats);
         }
+        state.num_calls = 0;
     }
 
     /// Calculates the [`StatInfo`] for a given table
