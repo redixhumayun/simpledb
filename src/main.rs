@@ -6934,7 +6934,8 @@ impl MetadataManager {
 mod metadata_manager_tests {
     use super::UpdateScan;
     use crate::{
-        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB, TableScan,
+        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB,
+        TableScan, Transaction,
     };
     use std::sync::Arc;
 
@@ -7036,6 +7037,65 @@ mod metadata_manager_tests {
         assert!(idx_b.distinct_values("B") == 1); //  we have an index on B
 
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn stat_manager_concurrent_access() {
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let setup_txn = Arc::new(db.new_tx());
+        let mdm = Arc::new(MetadataManager::new(true, Arc::clone(&setup_txn)));
+
+        let table_name = "stat_concurrent";
+        let mut schema = Schema::new();
+        schema.add_int_field("val");
+        mdm.create_table(table_name, schema.clone(), Arc::clone(&setup_txn));
+
+        let layout = mdm.get_layout(table_name, Arc::clone(&setup_txn));
+        {
+            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name);
+            for i in 0..20 {
+                table_scan.insert().unwrap();
+                table_scan.set_int("val", i).unwrap();
+            }
+        }
+        setup_txn.commit().unwrap();
+
+        let layout_txn = Arc::new(db.new_tx());
+        let layout = mdm.get_layout(table_name, Arc::clone(&layout_txn));
+        layout_txn.commit().unwrap();
+
+        // Prime the cache so concurrent readers hit the fast path
+        let prime_txn = Arc::new(db.new_tx());
+        mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&prime_txn));
+        prime_txn.commit().unwrap();
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = Arc::clone(&db.log_manager);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let lock_table = Arc::clone(&db.lock_table);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mdm_clone = Arc::clone(&mdm);
+            let layout_clone = layout.clone();
+            let fm = Arc::clone(&file_manager);
+            let lm = Arc::clone(&log_manager);
+            let bm = Arc::clone(&buffer_manager);
+            let lt = Arc::clone(&lock_table);
+            handles.push(std::thread::spawn(move || {
+                let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
+                for _ in 0..10 {
+                    let stats =
+                        mdm_clone.get_stat_info(table_name, layout_clone.clone(), Arc::clone(&txn));
+                    assert_eq!(stats.num_records, 20);
+                }
+                txn.commit().unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -7350,7 +7410,7 @@ impl StatManager {
             let mut state = self.state.lock().unwrap();
             state.num_calls += 1;
             if state.num_calls > 100 {
-                self.refresh_stats_locked(&mut state, Arc::clone(&txn));
+                self.refresh_stats_inner(&mut state, Arc::clone(&txn));
             }
 
             if let Some(stats) = state.table_stats.get(table_name) {
@@ -7361,18 +7421,17 @@ impl StatManager {
 
         debug!("going to calculate table stats");
         let table_stats = self.calculate_table_stats(table_name, layout, Arc::clone(&txn));
-        {
-            let mut state = self.state.lock().unwrap();
-            debug!("table stats {:?}", table_stats);
-            state
-                .table_stats
-                .insert(table_name.to_string(), table_stats.clone());
-        }
-        table_stats
+        let mut state = self.state.lock().unwrap();
+        debug!("table stats {:?}", table_stats);
+        state
+            .table_stats
+            .entry(table_name.to_string())
+            .or_insert_with(|| table_stats.clone())
+            .clone()
     }
 
     /// Refreshes the statistics for all tables in the database
-    fn refresh_stats_locked(&self, state: &mut StatState, txn: Arc<Transaction>) {
+    fn refresh_stats_inner(&self, state: &mut StatState, txn: Arc<Transaction>) {
         state.table_stats.clear();
         let table_catalog_layout = self
             .table_manager
@@ -7388,6 +7447,7 @@ impl StatManager {
             let table_stats = self.calculate_table_stats(&table_name, layout, Arc::clone(&txn));
             state.table_stats.insert(table_name, table_stats);
         }
+        state.num_calls = 0;
     }
 
     /// Calculates the [`StatInfo`] for a given table
