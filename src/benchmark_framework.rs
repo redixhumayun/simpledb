@@ -141,9 +141,10 @@ pub fn render_throughput_section(title: &str, rows: &[ThroughputRow]) {
     println!("{}", "-".repeat(93));
 
     for row in rows {
+        let throughput_str = format!("{:.2} {}", row.throughput, row.unit);
         println!(
-            "{:<48} | {:>10.2} {:>9} | {:>15.2?}",
-            row.label, row.throughput, row.unit, row.mean_duration
+            "{:<48} | {:>20} | {:>15.2?}",
+            row.label, throughput_str, row.mean_duration
         );
     }
     println!();
