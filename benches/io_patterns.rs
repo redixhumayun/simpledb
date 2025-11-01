@@ -347,7 +347,6 @@ fn mixed_workload(
         iterations,
         2,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new(block_size);
             let mut policy = flush_policy.clone();
 
@@ -355,10 +354,10 @@ fn mixed_workload(
                 let block_id = BlockId::new(file.clone(), block_indices[i]);
 
                 if is_read {
-                    fm.read(&block_id, &mut page);
+                    db.file_manager.lock().unwrap().read(&block_id, &mut page);
                 } else {
                     page.set_int(0, i as i32);
-                    fm.write(&block_id, &mut page);
+                    db.file_manager.lock().unwrap().write(&block_id, &mut page);
                     let record = make_wal_record(100);
                     let lsn = log.lock().unwrap().append(record);
                     policy.record(lsn, &log);
