@@ -395,7 +395,7 @@ fn concurrent_io_shared(
         2,
         || {
             let handles: Vec<_> = (0..num_threads)
-                .map(|tid| {
+                .map(|_tid| {
                     let file = file.clone();
                     let log = Arc::clone(&log);
                     let mut policy = flush_policy.clone();
@@ -405,7 +405,7 @@ fn concurrent_io_shared(
                         let mut page = Page::new(block_size);
 
                         for i in 0..ops_per_thread {
-                            let block_num = (tid * 100 + i) % total_blocks;
+                            let block_num = generate_random_number() % total_blocks;
                             let block_id = BlockId::new(file.clone(), block_num);
 
                             // 70% read / 30% write
@@ -597,7 +597,11 @@ fn main() {
                 },
             ] {
                 results.push(mixed_workload(
-                    block_size, read_pct, 500, policy, fsync_iterations,
+                    block_size,
+                    read_pct,
+                    500,
+                    policy,
+                    fsync_iterations,
                 ));
             }
         }
@@ -620,7 +624,11 @@ fn main() {
                     fsync_iterations,
                 ));
                 results.push(concurrent_io_sharded(
-                    block_size, threads, 100, policy, fsync_iterations,
+                    block_size,
+                    threads,
+                    100,
+                    policy,
+                    fsync_iterations,
                 ));
             }
         }
@@ -768,7 +776,11 @@ fn main() {
             let token = format!("mixed_{}r_{}", read_pct, policy_name);
             if should_run(&token, filter_ref) {
                 mixed_results.push(mixed_workload(
-                    block_size, read_pct, 500, policy, fsync_iterations,
+                    block_size,
+                    read_pct,
+                    500,
+                    policy,
+                    fsync_iterations,
                 ));
             }
         }
