@@ -82,6 +82,7 @@ impl WALFlushPolicy {
 // Core Infrastructure: DataSyncPolicy Abstraction
 // ============================================================================
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum DataSyncPolicy {
     None,
     Immediate,
@@ -636,7 +637,7 @@ fn render_block_size_table(results: &[BlockSizeResult]) {
         "{:<15} | {:>20} | {:>15}",
         "Block Size", "Throughput (MB/s)", "Mean Duration"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(120));
 
     for result in results {
         println!(
@@ -659,7 +660,7 @@ fn render_wal_comparison(results: &[WalResult]) {
         "{:<40} | {:>20} | {:>15}",
         "Flush Strategy", "Commits/sec", "Mean Duration"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(120));
 
     for result in results {
         println!(

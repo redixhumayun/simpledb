@@ -13,7 +13,7 @@ impl fmt::Display for BenchResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:40} | {:>10.2?} | {:>10.2?} | {:>10.2?} | {:>8}",
+            "{:60} | {:>10.2?} | {:>10.2?} | {:>10.2?} | {:>8}",
             self.operation, self.mean, self.median, self.std_dev, self.iterations
         )
     }
@@ -115,10 +115,10 @@ where
 
 pub fn print_header() {
     println!(
-        "{:40} | {:>10} | {:>10} | {:>10} | {:>8}",
+        "{:60} | {:>10} | {:>10} | {:>10} | {:>8}",
         "Operation", "Mean", "Median", "StdDev", "Iters"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(120));
 }
 
 pub struct ThroughputRow {
@@ -135,15 +135,15 @@ pub fn render_throughput_section(title: &str, rows: &[ThroughputRow]) {
 
     println!("{}", title);
     println!(
-        "{:<48} | {:>20} | {:>15}",
+        "{:<60} | {:>20} | {:>15}",
         "Operation", "Throughput", "Mean Duration"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(120));
 
     for row in rows {
         let throughput_str = format!("{:.2} {}", row.throughput, row.unit);
         println!(
-            "{:<48} | {:>20} | {:>15.2?}",
+            "{:<60} | {:>20} | {:>15.2?}",
             row.label, throughput_str, row.mean_duration
         );
     }
