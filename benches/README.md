@@ -13,8 +13,8 @@ All benchmarks reference the following machines.
 - **fio (direct I/O)**  
   - Sequential write, 1 MiB: **1.27 GiB/s · 1.27 k IOPS**  
   - Sequential read, 1 MiB: **2.97 GiB/s · 2.97 k IOPS**  
-  - Random write, 4 KiB: **83.5 k IOPS · 326 MiB/s**  
-  - Random read, 4 KiB: **109 k IOPS · 426 MiB/s**  
+  - Random write, 4 KiB: **326 MiB/s · 83.5 k IOPS**  
+  - Random read, 4 KiB: **426 MiB/s · 109 k IOPS** 
   - Random write, 4 KiB + per-op `fdatasync`: **≈0.80 MiB/s · ≈200 IOPS**
 
   ```bash
@@ -32,8 +32,8 @@ All benchmarks reference the following machines.
 - **fio (direct I/O)**  
   - Sequential write, 1 MiB: **4.80 GiB/s · 4.8 k IOPS**  
   - Sequential read, 1 MiB: **6.45 GiB/s · 6.4 k IOPS**  
-  - Random write, 4 KiB: **19.4 k IOPS · 75.7 MiB/s**  
-  - Random read, 4 KiB: **42.1 k IOPS · 165 MiB/s**  
+  - Random write, 4 KiB: **75.7 MiB/s · 19.4 k IOPS**  
+  - Random read, 4 KiB: **165 MiB/s · 42.1 k IOPS**  
   - Random write, 4 KiB + per-op `F_FULLFSYNC`: **≈27.9 MiB/s · ≈7.1 k IOPS**
 
   ```bash
