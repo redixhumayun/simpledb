@@ -4,39 +4,48 @@ Stdlib-only benchmarking framework with CLI filtering support.
 
 ## Hardware
 
-All benchmarks are run on the following hardware
+All benchmarks reference the following machines.
 
-- **Platform**: Dell XPS 13-9370, Intel i7-8650U (4C/8T, 1 socket), 16 GB DDR4-2133, Netac NVMe SSD 512 GB (PCIe), Ubuntu Linux 6.8.0-86-generic.
-- **Storage capability (fio, direct I/O)**:
-  - Sequential write (1 MiB blocks): 1.27 GiB/s, 1.27k IOPS.
-  - Sequential read (1 MiB blocks): 2.97 GiB/s, 2.97k IOPS.
-  - Random write (4 KiB blocks): 83.5k IOPS, 326 MiB/s.
-  - Random read (4 KiB blocks): 109k IOPS, 426 MiB/s.
+### Linux runner (Dell XPS 13‑9370, Netac NVMe, Ubuntu 6.8.0‑86)
 
-  Commands (run from a scratch directory with ~4 GiB free):
+- **CPU / Memory**: Intel i7‑8650U (4C/8T), 16 GB DDR4‑2133
+- **Storage**: Netac 512 GB NVMe (PCIe)
+- **fio (direct I/O)**  
+  - Sequential write, 1 MiB: **1.27 GiB/s · 1.27 k IOPS**  
+  - Sequential read, 1 MiB: **2.97 GiB/s · 2.97 k IOPS**  
+  - Random write, 4 KiB: **83.5 k IOPS · 326 MiB/s**  
+  - Random read, 4 KiB: **109 k IOPS · 426 MiB/s**  
+  - Random write, 4 KiB + per-op `fdatasync`: **≈0.80 MiB/s · ≈200 IOPS**
 
   ```bash
   fio --name=seqwrite --filename=fiotest.bin --size=4G --bs=1M --rw=write --direct=1 --ioengine=libaio --numjobs=1 --iodepth=16
   fio --name=seqread  --filename=fiotest.bin --size=4G --bs=1M --rw=read  --direct=1 --ioengine=libaio --numjobs=1 --iodepth=16
   fio --name=randwrite --filename=fiotest.bin --size=4G --bs=4k --rw=randwrite --direct=1 --ioengine=libaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
   fio --name=randread  --filename=fiotest.bin --size=4G --bs=4k --rw=randread  --direct=1 --ioengine=libaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  fio --name=randwrite_fsync --filename=fiotest.bin --size=2G --bs=4k --rw=randwrite --direct=1 --ioengine=libaio --iodepth=1 --fsync=1 --time_based --runtime=60
   ```
 
-- **Platform**: MacBook Pro (14-inch, 2021) M1 Pro (6P+2E cores), 16 GB unified memory, Apple SSD AP0512R 512 GB, macOS Sequoia.
-- **Storage capability (fio, direct I/O)**:
-  - Sequential write (1 MiB blocks): 4.80 GiB/s, 4.8k IOPS.
-  - Sequential read (1 MiB blocks): 6.45 GiB/s, 6.4k IOPS.
-  - Random write (4 KiB blocks): 19.4k IOPS, 75.7 MiB/s.
-  - Random read (4 KiB blocks): 42.1k IOPS, 165 MiB/s.
+### macOS runner (MacBook Pro 14" 2021, M1 Pro, Apple SSD AP0512R, macOS Sequoia)
 
-  Commands (run from a scratch directory with ≥4 GiB free):
+- **CPU / Memory**: Apple M1 Pro (6P+2E cores), 16 GB unified
+- **Storage**: Apple SSD AP0512R 512 GB (Apple Fabric NVMe)
+- **fio (direct I/O)**  
+  - Sequential write, 1 MiB: **4.80 GiB/s · 4.8 k IOPS**  
+  - Sequential read, 1 MiB: **6.45 GiB/s · 6.4 k IOPS**  
+  - Random write, 4 KiB: **19.4 k IOPS · 75.7 MiB/s**  
+  - Random read, 4 KiB: **42.1 k IOPS · 165 MiB/s**  
+  - Random write, 4 KiB + per-op `F_FULLFSYNC`: **≈27.9 MiB/s · ≈7.1 k IOPS**
 
   ```bash
   fio --name=seqwrite --filename=/tmp/fiotest.bin --size=4G --bs=1M --rw=write --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=16
   fio --name=seqread  --filename=/tmp/fiotest.bin --size=4G --bs=1M --rw=read  --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=16
   fio --name=randwrite --filename=/tmp/fiotest.bin --size=4G --bs=4k --rw=randwrite --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
   fio --name=randread  --filename=/tmp/fiotest.bin --size=4G --bs=4k --rw=randread  --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  # Requires building fio from source so configure reports "fcntl(F_FULLFSYNC) yes"
+  fio --name=randwrite_fsync_full --filename=/tmp/fiotest.bin --size=2G --bs=4k --rw=randwrite --direct=1 --ioengine=posixaio --iodepth=1 --fsync=1 --time_based --runtime=60
   ```
+
+> **Note:** The per-operation durability test shows a massive gap (≈200 IOPS vs ≈7 k IOPS). Apple’s controller acknowledges `F_FULLFSYNC` after staging data in a capacitor-backed, power-loss-protected cache; the Netac NVMe must program TLC NAND immediately on each `fdatasync`, incurring ~5 ms per flush. This is purely a hardware/firmware difference.
 
 ## Quick Start
 
