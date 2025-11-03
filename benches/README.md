@@ -22,6 +22,22 @@ All benchmarks are run on the following hardware
   fio --name=randread  --filename=fiotest.bin --size=4G --bs=4k --rw=randread  --direct=1 --ioengine=libaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
   ```
 
+- **Platform**: MacBook Pro (14-inch, 2021) M1 Pro (6P+2E cores), 16 GB unified memory, Apple SSD AP0512R 512 GB, macOS Sequoia.
+- **Storage capability (fio, direct I/O)**:
+  - Sequential write (1 MiB blocks): 4.80 GiB/s, 4.8k IOPS.
+  - Sequential read (1 MiB blocks): 6.45 GiB/s, 6.4k IOPS.
+  - Random write (4 KiB blocks): 19.4k IOPS, 75.7 MiB/s.
+  - Random read (4 KiB blocks): 42.1k IOPS, 165 MiB/s.
+
+  Commands (run from a scratch directory with ≥4 GiB free):
+
+  ```bash
+  fio --name=seqwrite --filename=/tmp/fiotest.bin --size=4G --bs=1M --rw=write --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=16
+  fio --name=seqread  --filename=/tmp/fiotest.bin --size=4G --bs=1M --rw=read  --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=16
+  fio --name=randwrite --filename=/tmp/fiotest.bin --size=4G --bs=4k --rw=randwrite --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  fio --name=randread  --filename=/tmp/fiotest.bin --size=4G --bs=4k --rw=randread  --direct=1 --ioengine=posixaio --numjobs=1 --iodepth=32 --runtime=60 --time_based
+  ```
+
 ## Quick Start
 
 ```bash

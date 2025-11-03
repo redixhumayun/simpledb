@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use simpledb::FileSystemInterface;
 use simpledb::{
     benchmark_framework::{
         benchmark, parse_bench_args, print_header, render_throughput_section, should_run,
@@ -13,14 +14,16 @@ use simpledb::{
     BlockId, LogManager, Page, SimpleDB, TestDir,
 };
 
+type BenchFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+
 type Lsn = usize;
 
 // ============================================================================
-// Core Infrastructure: FlushPolicy Abstraction
+// Core Infrastructure: WALFlushPolicy Abstraction
 // ============================================================================
 
 #[derive(Clone, Debug)]
-enum FlushPolicy {
+enum WALFlushPolicy {
     None,
     Immediate,
     Group {
@@ -30,14 +33,14 @@ enum FlushPolicy {
     },
 }
 
-impl FlushPolicy {
+impl WALFlushPolicy {
     fn record(&mut self, lsn: Lsn, log: &Arc<Mutex<LogManager>>) {
         match self {
-            FlushPolicy::None => {}
-            FlushPolicy::Immediate => {
+            WALFlushPolicy::None => {}
+            WALFlushPolicy::Immediate => {
                 log.lock().unwrap().flush_lsn(lsn);
             }
-            FlushPolicy::Group {
+            WALFlushPolicy::Group {
                 batch,
                 pending,
                 last_lsn,
@@ -54,7 +57,7 @@ impl FlushPolicy {
     }
 
     fn finish_batch(&mut self, log: &Arc<Mutex<LogManager>>) {
-        if let FlushPolicy::Group {
+        if let WALFlushPolicy::Group {
             pending, last_lsn, ..
         } = self
         {
@@ -68,9 +71,64 @@ impl FlushPolicy {
 
     fn label(&self) -> String {
         match self {
-            FlushPolicy::None => "no-fsync".to_string(),
-            FlushPolicy::Immediate => "immediate-fsync".to_string(),
-            FlushPolicy::Group { batch, .. } => format!("group-{}", batch),
+            WALFlushPolicy::None => "no-fsync".to_string(),
+            WALFlushPolicy::Immediate => "immediate-fsync".to_string(),
+            WALFlushPolicy::Group { batch, .. } => format!("group-{}", batch),
+        }
+    }
+}
+
+// ============================================================================
+// Core Infrastructure: DataSyncPolicy Abstraction
+// ============================================================================
+#[derive(Clone, Debug)]
+enum DataSyncPolicy {
+    None,
+    Immediate,
+    Batched { batch: usize, pending: usize },
+}
+
+impl DataSyncPolicy {
+    fn label(&self) -> String {
+        match self {
+            DataSyncPolicy::None => "data-nosync".to_string(),
+            DataSyncPolicy::Immediate => "data-fsync".to_string(),
+            DataSyncPolicy::Batched { batch, .. } => format!("data-batch-{}", batch),
+        }
+    }
+
+    fn record(&mut self, file: &str, fm: &BenchFS) {
+        match self {
+            DataSyncPolicy::None => (),
+            DataSyncPolicy::Immediate => {
+                let mut fm = fm.lock().unwrap();
+                fm.sync(file);
+                fm.sync_directory();
+            }
+            DataSyncPolicy::Batched { batch, pending } => {
+                *pending += 1;
+                if *pending == *batch {
+                    let mut fm = fm.lock().unwrap();
+                    fm.sync(file);
+                    fm.sync_directory();
+                    *pending = 0;
+                }
+            }
+        }
+    }
+
+    fn finish_batch(&mut self, file: &str, fm: &BenchFS) {
+        match self {
+            DataSyncPolicy::None => (),
+            DataSyncPolicy::Immediate => (),
+            DataSyncPolicy::Batched { batch: _, pending } => {
+                if *pending > 0 {
+                    let mut fm = fm.lock().unwrap();
+                    fm.sync(file);
+                    fm.sync_directory();
+                    *pending = 0;
+                }
+            }
         }
     }
 }
@@ -250,7 +308,7 @@ fn wal_append_no_fsync(block_size: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test(block_size);
     let log = db.log_manager();
     let total_ops = 1000;
-    let mut policy = FlushPolicy::None;
+    let mut policy = WALFlushPolicy::None;
 
     benchmark("WAL append (no fsync)", iterations, 2, || {
         for _ in 0..total_ops {
@@ -269,7 +327,7 @@ fn wal_append_immediate_fsync(block_size: usize, iterations: usize) -> BenchResu
     // This keeps benchmark runtime reasonable (~1s vs ~10s) without affecting commits/sec
     // calculations since the ratio remains constant: 100ops/0.5s = 1000ops/5s = 200 commits/sec
     let total_ops = 100;
-    let mut policy = FlushPolicy::Immediate;
+    let mut policy = WALFlushPolicy::Immediate;
 
     benchmark("WAL append + immediate fsync", iterations, 2, || {
         for _ in 0..total_ops {
@@ -285,7 +343,7 @@ fn wal_group_commit(block_size: usize, batch_size: usize, iterations: usize) -> 
     let (db, _test_dir) = setup_io_test(block_size);
     let log = db.log_manager();
     let total_ops = 1000;
-    let mut policy = FlushPolicy::Group {
+    let mut policy = WALFlushPolicy::Group {
         batch: batch_size,
         pending: 0,
         last_lsn: None,
@@ -320,7 +378,7 @@ fn mixed_workload(
     block_size: usize,
     read_pct: usize,
     total_ops: usize,
-    flush_policy: FlushPolicy,
+    flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test(block_size);
@@ -376,7 +434,7 @@ fn concurrent_io_shared(
     block_size: usize,
     num_threads: usize,
     ops_per_thread: usize,
-    flush_policy: FlushPolicy,
+    flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test(block_size);
@@ -435,7 +493,7 @@ fn concurrent_io_sharded(
     block_size: usize,
     num_threads: usize,
     ops_per_thread: usize,
-    flush_policy: FlushPolicy,
+    flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test(block_size);
@@ -488,6 +546,64 @@ fn concurrent_io_sharded(
             for handle in handles {
                 handle.join().unwrap();
             }
+        },
+    )
+}
+
+// ============================================================================
+// Phase 6: Random Write Durability (Data File Sync)
+// ============================================================================
+
+fn random_write_durability(
+    block_size: usize,
+    total_ops: usize,
+    wal_policy: WALFlushPolicy,
+    data_policy: DataSyncPolicy,
+    iterations: usize,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test(block_size);
+    let file = "randwrite_durable".to_string();
+    let working_set = 10_000; // 10k * 4KB ~= 40MB, large enough to avoid trivial cache reuse
+
+    // Pre-create blocks to avoid extension cost during timed section
+    precreate_blocks_direct(&db, &file, working_set);
+
+    // Pre-generate random indices (reuse across iterations for deterministic workloads)
+    let block_indices: Vec<usize> = (0..total_ops)
+        .map(|_| generate_random_number() % working_set)
+        .collect();
+
+    let log = db.log_manager();
+    let policy_label = wal_policy.label();
+    let data_label = data_policy.label();
+
+    benchmark(
+        &format!("Random Write durability {} {}", policy_label, data_label),
+        iterations,
+        2,
+        || {
+            let mut page = Page::new(block_size);
+            let mut wal_policy = wal_policy.clone();
+            let mut data_policy = data_policy.clone();
+            let fm = Arc::clone(&db.file_manager);
+
+            for (i, &block_num) in block_indices.iter().enumerate() {
+                let block_id = BlockId::new(file.clone(), block_num);
+
+                page.set_int(0, i as i32);
+                {
+                    fm.lock().unwrap().write(&block_id, &mut page);
+                }
+
+                let record = make_wal_record(100);
+                let lsn = log.lock().unwrap().append(record);
+                wal_policy.record(lsn, &log);
+
+                data_policy.record(&file, &fm);
+            }
+
+            wal_policy.finish_batch(&log);
+            data_policy.finish_batch(&file, &fm);
         },
     )
 }
@@ -588,9 +704,9 @@ fn main() {
         // Phase 4 - no filters in JSON mode (use fsync_iterations)
         for read_pct in [70, 50, 10] {
             for policy in [
-                FlushPolicy::None,
-                FlushPolicy::Immediate,
-                FlushPolicy::Group {
+                WALFlushPolicy::None,
+                WALFlushPolicy::Immediate,
+                WALFlushPolicy::Group {
                     batch: 10,
                     pending: 0,
                     last_lsn: None,
@@ -609,8 +725,8 @@ fn main() {
         // Phase 5 - no filters in JSON mode (use fsync_iterations)
         for threads in [2, 4, 8, 16] {
             for policy in [
-                FlushPolicy::None,
-                FlushPolicy::Group {
+                WALFlushPolicy::None,
+                WALFlushPolicy::Group {
                     batch: 10,
                     pending: 0,
                     last_lsn: None,
@@ -632,6 +748,22 @@ fn main() {
                 ));
             }
         }
+
+        // Phase 6 - random write durability (use fsync_iterations, 1000 ops)
+        results.push(random_write_durability(
+            block_size,
+            1000,
+            WALFlushPolicy::Immediate,
+            DataSyncPolicy::None,
+            fsync_iterations,
+        ));
+        results.push(random_write_durability(
+            block_size,
+            1000,
+            WALFlushPolicy::Immediate,
+            DataSyncPolicy::Immediate,
+            fsync_iterations,
+        ));
 
         let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
         println!("[{}]", json_results.join(","));
@@ -762,10 +894,10 @@ fn main() {
 
     for read_pct in [70, 50, 10] {
         for (policy, policy_name) in [
-            (FlushPolicy::None, "no_fsync"),
-            (FlushPolicy::Immediate, "immediate"),
+            (WALFlushPolicy::None, "no_fsync"),
+            (WALFlushPolicy::Immediate, "immediate"),
             (
-                FlushPolicy::Group {
+                WALFlushPolicy::Group {
                     batch: 10,
                     pending: 0,
                     last_lsn: None,
@@ -814,9 +946,9 @@ fn main() {
 
     for threads in [2, 4, 8, 16] {
         for (policy, policy_name) in [
-            (FlushPolicy::None, "no_fsync"),
+            (WALFlushPolicy::None, "no_fsync"),
             (
-                FlushPolicy::Group {
+                WALFlushPolicy::Group {
                     batch: 10,
                     pending: 0,
                     last_lsn: None,
@@ -880,6 +1012,51 @@ fn main() {
             });
         }
         render_throughput_section("Phase 5: Aggregate Throughput", &throughput_rows);
+    }
+
+    // Phase 6: Random Write Durability (WAL + data sync combinations)
+    // Filter tokens: durability_wal_immediate_data_nosync, durability_wal_immediate_data_fsync
+    let mut durability_results = Vec::new();
+    let durability_ops = 1000;
+
+    for (wal_policy, wal_name) in [(WALFlushPolicy::Immediate, "wal_immediate")] {
+        for (data_policy, data_name) in [
+            (DataSyncPolicy::None, "data_nosync"),
+            (DataSyncPolicy::Immediate, "data_fsync"),
+        ] {
+            let token = format!("durability_{}_{}", wal_name, data_name);
+            if should_run(&token, filter_ref) {
+                durability_results.push(random_write_durability(
+                    block_size,
+                    durability_ops,
+                    wal_policy.clone(),
+                    data_policy.clone(),
+                    fsync_iterations,
+                ));
+            }
+        }
+    }
+
+    if !durability_results.is_empty() {
+        render_latency_section(
+            "Phase 6: Random Write Durability (1000 ops)",
+            &durability_results,
+        );
+
+        let mut throughput_rows = Vec::new();
+        for result in &durability_results {
+            let ops_per_sec = durability_ops as f64 / result.mean.as_secs_f64();
+            throughput_rows.push(ThroughputRow {
+                label: result.operation.clone(),
+                throughput: ops_per_sec,
+                unit: "ops/s".to_string(),
+                mean_duration: result.mean,
+            });
+        }
+        render_throughput_section(
+            "Phase 6: Random Write Durability Throughput",
+            &throughput_rows,
+        );
     }
 
     println!("All benchmarks completed!");
