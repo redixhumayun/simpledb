@@ -58,6 +58,7 @@ impl SimpleDB {
         block_size: usize,
         num_buffers: usize,
         clean: bool,
+        lock_timeout_ms: u64,
     ) -> Self {
         let file_manager: SharedFS = Arc::new(Mutex::new(Box::new(
             FileManager::new(&path, block_size, clean).unwrap(),
@@ -71,7 +72,7 @@ impl SimpleDB {
             Arc::clone(&log_manager),
             num_buffers,
         ));
-        let lock_table = Arc::new(LockTable::new(100)); // 100ms timeout
+        let lock_table = Arc::new(LockTable::new(lock_timeout_ms));
         let txn = Arc::new(Transaction::new(
             Arc::clone(&file_manager),
             Arc::clone(&log_manager),
@@ -116,7 +117,7 @@ impl SimpleDB {
             .as_millis();
         let thread_id = std::thread::current().id();
         let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
-        let db = Self::new(&test_dir, block_size, num_buffers, true);
+        let db = Self::new(&test_dir, block_size, num_buffers, true, 5000);
         (db, test_dir)
     }
 
@@ -8670,11 +8671,7 @@ impl Transaction {
             buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
             buffer_manager,
             log_manager,
-            concurrency_manager: ConcurrencyManager::new(
-                tx_id,
-                Self::TXN_SLEEP_TIMEOUT,
-                lock_table,
-            ),
+            concurrency_manager: ConcurrencyManager::new(tx_id, lock_table),
             file_manager,
         }
     }
@@ -8923,12 +8920,25 @@ mod transaction_tests {
     }
 
     #[test]
-    #[ignore]
     fn test_transaction_multi_threaded_multiple_readers_single_writer() {
         let file = generate_filename();
         let block_size = 512;
         let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10);
         let block_id = BlockId::new(file.to_string(), 1);
+
+        // Initialize data before spawning threads
+        let init_txn = Transaction::new(
+            test_db.file_manager.clone(),
+            test_db.log_manager.clone(),
+            test_db.buffer_manager.clone(),
+            test_db.lock_table.clone(),
+        );
+        init_txn.pin_internal(&block_id);
+        init_txn.set_int(&block_id, 80, 0, false).unwrap();
+        init_txn
+            .set_string(&block_id, 40, "initial", false)
+            .unwrap();
+        init_txn.commit().unwrap();
 
         let reader_threads = 10;
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -8942,8 +8952,18 @@ mod transaction_tests {
             handles.push(std::thread::spawn(move || {
                 let txn = Transaction::new(fm, lm, bm, lt);
                 txn.pin_internal(&bid);
-                txn.get_int(&bid, 80).unwrap();
-                txn.get_string(&bid, 40).unwrap();
+
+                // Verify we read a valid state (either initial or final)
+                let val = txn.get_int(&bid, 80).unwrap();
+                assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
+
+                let s = txn.get_string(&bid, 40).unwrap();
+                assert!(
+                    s == "initial" || s == "final",
+                    "Read invalid string value: {}",
+                    s
+                );
+
                 txn.commit().unwrap();
             }));
         }
@@ -8955,13 +8975,25 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         );
         txn.pin_internal(&block_id);
-        txn.set_int(&block_id, 80, 1, false).unwrap();
-        txn.set_string(&block_id, 40, "Hello", false).unwrap();
+        txn.set_int(&block_id, 80, 42, false).unwrap();
+        txn.set_string(&block_id, 40, "final", false).unwrap();
         txn.commit().unwrap();
 
         handles
             .into_iter()
             .for_each(|handle| handle.join().unwrap());
+
+        // Verify final state
+        let final_txn = Transaction::new(
+            test_db.file_manager.clone(),
+            test_db.log_manager.clone(),
+            test_db.buffer_manager.clone(),
+            test_db.lock_table.clone(),
+        );
+        final_txn.pin_internal(&block_id);
+        assert_eq!(final_txn.get_int(&block_id, 80).unwrap(), 42);
+        assert_eq!(final_txn.get_string(&block_id, 40).unwrap(), "final");
+        final_txn.commit().unwrap();
     }
 
     #[test]
@@ -9140,7 +9172,7 @@ mod transaction_tests {
 
         //  Phase 1: Create and populate database and then drop it
         {
-            let db = SimpleDB::new(&dir, 512, 3, true);
+            let db = SimpleDB::new(&dir, 512, 3, true, 100);
             let t1 = Transaction::new(
                 Arc::clone(&db.file_manager),
                 Arc::clone(&db.log_manager),
@@ -9155,7 +9187,7 @@ mod transaction_tests {
 
         //  Phase 2: Recover and verify
         {
-            let db = SimpleDB::new(&dir, 512, 3, false);
+            let db = SimpleDB::new(&dir, 512, 3, false, 100);
             let t2 = Transaction::new(
                 Arc::clone(&db.file_manager),
                 Arc::clone(&db.log_manager),
@@ -9577,9 +9609,6 @@ mod lock_table_tests {
     }
 }
 
-/// The static instance of the lock table
-static LOCK_TABLE_GENERATOR: OnceLock<Arc<LockTable>> = OnceLock::new();
-
 #[derive(Debug)]
 enum LockType {
     Shared,
@@ -9593,7 +9622,7 @@ struct ConcurrencyManager {
     tx_id: TransactionID,
 }
 impl ConcurrencyManager {
-    fn new(tx_id: TransactionID, timeout: u64, lock_table: Arc<LockTable>) -> Self {
+    fn new(tx_id: TransactionID, lock_table: Arc<LockTable>) -> Self {
         Self {
             lock_table,
             locks: RefCell::new(HashMap::new()),
@@ -11702,7 +11731,7 @@ mod durability_tests {
 }
 
 fn main() {
-    let db = SimpleDB::new("random", 800, 4, true);
+    let db = SimpleDB::new("random", 800, 4, true, 100);
 }
 
 #[cfg(test)]
