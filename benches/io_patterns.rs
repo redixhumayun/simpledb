@@ -85,7 +85,6 @@ impl WALFlushPolicy {
 enum DataSyncPolicy {
     None,
     Immediate,
-    Batched { batch: usize, pending: usize },
 }
 
 impl DataSyncPolicy {
@@ -93,7 +92,6 @@ impl DataSyncPolicy {
         match self {
             DataSyncPolicy::None => "data-nosync".to_string(),
             DataSyncPolicy::Immediate => "data-fsync".to_string(),
-            DataSyncPolicy::Batched { batch, .. } => format!("data-batch-{}", batch),
         }
     }
 
@@ -104,30 +102,6 @@ impl DataSyncPolicy {
                 let mut fm = fm.lock().unwrap();
                 fm.sync(file);
                 fm.sync_directory();
-            }
-            DataSyncPolicy::Batched { batch, pending } => {
-                *pending += 1;
-                if *pending == *batch {
-                    let mut fm = fm.lock().unwrap();
-                    fm.sync(file);
-                    fm.sync_directory();
-                    *pending = 0;
-                }
-            }
-        }
-    }
-
-    fn finish_batch(&mut self, file: &str, fm: &BenchFS) {
-        match self {
-            DataSyncPolicy::None => (),
-            DataSyncPolicy::Immediate => (),
-            DataSyncPolicy::Batched { batch: _, pending } => {
-                if *pending > 0 {
-                    let mut fm = fm.lock().unwrap();
-                    fm.sync(file);
-                    fm.sync_directory();
-                    *pending = 0;
-                }
             }
         }
     }
@@ -603,7 +577,6 @@ fn random_write_durability(
             }
 
             wal_policy.finish_batch(&log);
-            data_policy.finish_batch(&file, &fm);
         },
     )
 }
