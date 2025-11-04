@@ -82,7 +82,6 @@ impl WALFlushPolicy {
 // Core Infrastructure: DataSyncPolicy Abstraction
 // ============================================================================
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 enum DataSyncPolicy {
     None,
     Immediate,
