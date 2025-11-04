@@ -2,10 +2,13 @@
 
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use simpledb::{
-    benchmark_framework::{benchmark, parse_bench_args, print_header, should_run, BenchResult},
+    benchmark_framework::{
+        benchmark, parse_bench_args, print_header, render_throughput_section, should_run,
+        BenchResult, ThroughputRow,
+    },
     test_utils::generate_random_number,
     BlockId, Page, SimpleDB, TestDir,
 };
@@ -39,21 +42,18 @@ fn partition_work(total: usize, workers: usize) -> Vec<usize> {
         .collect()
 }
 
-struct ThroughputRow {
-    label: String,
-    mean: f64,
-    mean_duration: Duration,
-}
-
-impl ThroughputRow {
-    fn from_benchmark(result: BenchResult, total_ops: usize) -> Self {
-        let mean_duration = result.mean;
-        let mean = total_ops as f64 / mean_duration.as_secs_f64();
-        ThroughputRow {
-            label: result.operation,
-            mean,
-            mean_duration,
-        }
+fn throughput_row_from_benchmark(
+    result: BenchResult,
+    total_ops: usize,
+    unit: &str,
+) -> ThroughputRow {
+    let mean_duration = result.mean;
+    let throughput = total_ops as f64 / mean_duration.as_secs_f64();
+    ThroughputRow {
+        label: result.operation,
+        throughput,
+        unit: unit.to_string(),
+        mean_duration,
     }
 }
 
@@ -168,31 +168,6 @@ fn render_latency_section(title: &str, results: &[BenchResult]) {
     print_header();
     for result in results {
         println!("{result}");
-    }
-    println!();
-}
-
-fn render_throughput_section(title: &str, unit_label: &str, rows: &[ThroughputRow]) {
-    if rows.is_empty() {
-        return;
-    }
-
-    let op_header = format!("{:<48}", "Operation");
-    println!("{title}");
-    println!(
-        "{}  | {:>20} | {:>15}",
-        op_header,
-        format!("{unit_label}"),
-        "Mean Duration"
-    );
-    println!("{}", "-".repeat(95));
-
-    for row in rows {
-        let op_display = format!("{:<48}", row.label);
-        println!(
-            "{op_display}  | {:>10.0} {unit_label} | {:>10.2?}",
-            row.mean, row.mean_duration,
-        );
     }
     println!();
 }
@@ -735,14 +710,10 @@ fn zipfian_access_multithreaded(
                 .map(|_| {
                     let rand_val = generate_random_number();
                     let is_hot = (rand_val % 100) < 80;
-                    if is_hot {
+                    if is_hot || cold_span == 0 {
                         generate_random_number() % hot_set_size
                     } else {
-                        if cold_span == 0 {
-                            generate_random_number() % hot_set_size
-                        } else {
-                            hot_set_size + (generate_random_number() % cold_span)
-                        }
+                        hot_set_size + (generate_random_number() % cold_span)
                     }
                 })
                 .collect()
@@ -1055,16 +1026,12 @@ fn run_multithreaded_pin_benchmarks(
             case.ops_per_thread,
             iterations,
         );
-        let mut row = ThroughputRow::from_benchmark(result, case.total_ops());
+        let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
         row.label = case.label();
         rows.push(row);
     }
 
-    render_throughput_section(
-        "Multi-threaded Pin/Unpin (lock contention)",
-        "ops/sec",
-        &rows,
-    );
+    render_throughput_section("Multi-threaded Pin/Unpin (lock contention)", &rows);
 }
 
 fn run_hotset_contention_benchmarks(
@@ -1088,12 +1055,12 @@ fn run_hotset_contention_benchmarks(
             case.hot_set_size,
             iterations,
         );
-        let mut row = ThroughputRow::from_benchmark(result, case.total_ops());
+        let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
         row.label = case.label();
         rows.push(row);
     }
 
-    render_throughput_section("Hot-set Contention (shared buffers)", "ops/sec", &rows);
+    render_throughput_section("Hot-set Contention (shared buffers)", &rows);
 }
 
 fn run_buffer_starvation_benchmark(db: &SimpleDB, block_size: usize, num_buffers: usize) {
@@ -1194,16 +1161,16 @@ fn main() {
         if should_run(case.filter_token, filter_ref) {
             let result = case.run(block_size, num_buffers, iterations);
             let total_ops = case.total_ops(num_buffers);
-            phase2_rows.push(ThroughputRow::from_benchmark(result, total_ops));
+            phase2_rows.push(throughput_row_from_benchmark(
+                result,
+                total_ops,
+                "blocks/sec",
+            ));
         }
     }
 
     if !phase2_rows.is_empty() {
-        render_throughput_section(
-            "Phase 2: Access Pattern Benchmarks",
-            "blocks/sec",
-            &phase2_rows,
-        );
+        render_throughput_section("Phase 2: Access Pattern Benchmarks", &phase2_rows);
     }
 
     // Phase 3
