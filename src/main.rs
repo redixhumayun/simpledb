@@ -31,6 +31,7 @@ use parser::{
 pub use test_utils::TestDir;
 pub mod benchmark_framework;
 mod btree;
+mod intrusive_dll;
 mod parser;
 
 type Lsn = usize;
