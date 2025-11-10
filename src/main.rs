@@ -29,6 +29,8 @@ use parser::{
 };
 
 pub use test_utils::TestDir;
+
+use crate::intrusive_dll::{IntrusiveList, IntrusiveNode};
 pub mod benchmark_framework;
 mod btree;
 mod intrusive_dll;
@@ -10408,10 +10410,13 @@ pub struct BufferFrame {
     pins: usize,
     txn: Option<usize>,
     lsn: Option<Lsn>,
+    prev_idx: Option<usize>,
+    next_idx: Option<usize>,
+    index: usize,
 }
 
 impl BufferFrame {
-    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
+    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
         let size = file_manager.lock().unwrap().block_size();
         Self {
             file_manager,
@@ -10421,6 +10426,9 @@ impl BufferFrame {
             pins: 0,
             txn: None,
             lsn: None,
+            prev_idx: None,
+            next_idx: None,
+            index,
         }
     }
 
@@ -10475,6 +10483,42 @@ impl BufferFrame {
     /// Reset the pin count for this buffer
     fn reset_pins(&mut self) {
         self.pins = 0;
+    }
+}
+
+impl IntrusiveNode for BufferFrame {
+    fn prev(&self) -> Option<usize> {
+        self.prev_idx
+    }
+
+    fn set_prev(&mut self, prev: Option<usize>) {
+        self.prev_idx = prev
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.next_idx
+    }
+
+    fn set_next(&mut self, next: Option<usize>) {
+        self.next_idx = next
+    }
+}
+
+impl<'a> IntrusiveNode for MutexGuard<'a, BufferFrame> {
+    fn prev(&self) -> Option<usize> {
+        self.prev_idx
+    }
+
+    fn set_prev(&mut self, prev: Option<usize>) {
+        self.prev_idx = prev
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.next_idx
+    }
+
+    fn set_next(&mut self, next: Option<usize>) {
+        self.next_idx = next
     }
 }
 
@@ -10564,6 +10608,8 @@ pub struct BufferManager {
     stats: OnceLock<Arc<BufferStats>>,
     latch_table: Mutex<HashMap<BlockId, Arc<Mutex<()>>>>,
     resident_table: Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
+    #[cfg(feature = "replacement_lru")]
+    intrusive_list: Mutex<IntrusiveList>,
 }
 
 impl BufferManager {
@@ -10573,14 +10619,24 @@ impl BufferManager {
         log_manager: Arc<Mutex<LogManager>>,
         num_buffers: usize,
     ) -> Self {
-        let buffer_pool = (0..num_buffers)
-            .map(|_| {
+        let buffer_pool: Vec<Arc<Mutex<BufferFrame>>> = (0..num_buffers)
+            .map(|index| {
                 Arc::new(Mutex::new(BufferFrame::new(
                     Arc::clone(&file_manager),
                     Arc::clone(&log_manager),
+                    index,
                 )))
             })
             .collect();
+        let mut intrusive_list = IntrusiveList::new();
+        {
+            let mut guards = buffer_pool
+                .iter()
+                .map(|frame| frame.lock().unwrap())
+                .collect::<Vec<MutexGuard<'_, BufferFrame>>>();
+            intrusive_list.from_nodes(&mut guards);
+        }
+
         Self {
             file_manager,
             log_manager,
@@ -10590,6 +10646,8 @@ impl BufferManager {
             stats: OnceLock::new(),
             latch_table: Mutex::new(HashMap::new()),
             resident_table: Mutex::new(HashMap::new()),
+            #[cfg(feature = "replacement_lru")]
+            intrusive_list: Mutex::new(intrusive_list),
         }
     }
 
@@ -10696,7 +10754,6 @@ impl BufferManager {
         let block_latch = latch_table_guard.lock();
 
         //  check the resident table for the associated frame
-        let start_resident = Instant::now();
         let frame_ptr = {
             let mut resident_guard = self.resident_table.lock().unwrap();
             match resident_guard.get(block_id) {
@@ -10715,13 +10772,10 @@ impl BufferManager {
         //  fast hit path, found the frame in the resident table
         if let Some(frame_ptr) = frame_ptr {
             {
-                let mut frame_guard = frame_ptr.lock().unwrap();
-                if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
-                    if frame_block_id != block_id {
-                        self.resident_table.lock().unwrap().remove(block_id);
-                        return None;
-                    }
-                }
+                let mut frame_guard = match self.record_hit(&frame_ptr, block_id) {
+                    Some(frame_guard) => frame_guard,
+                    None => return None,
+                };
                 let was_unpinned = !frame_guard.is_pinned();
                 frame_guard.pin();
                 if was_unpinned {
@@ -10743,36 +10797,46 @@ impl BufferManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        //  It is possible for two threads to race here which leads to a few different possibilities
-        //  Assume threads T1 and T2 are racing
-        //  1. T1 and T2 are trying to pin blocks B1 and B2
-        //      1.1 T1 and T2 get frames F1 and F2 - no race condition
-        //      1.2 T1 and T2 get frame F1 - race condition
-        //          this is handled by the check to see if the frame is already pinned
-        //          if it is, that implies another thread beat us there
-        //  2. T1 and T2 are trying to pin block B1
-        //      not possible because of the block latch
-        loop {
-            let frame = self.choose_unpinned_frame()?;
-            {
-                let mut frame_guard = frame.lock().unwrap();
-                if frame_guard.is_pinned() {
-                    //  we lost the race condition, try again immediately
-                    continue;
-                }
-                if let Some(old) = frame_guard.block_id.as_ref() {
-                    self.resident_table.lock().unwrap().remove(old);
-                }
-                frame_guard.assign_to_block(block_id);
-                frame_guard.pin();
-            }
-            self.resident_table
-                .lock()
-                .unwrap()
-                .insert(block_id.clone(), Arc::downgrade(&frame));
-            *self.num_available.lock().unwrap() -= 1;
-            return Some(frame);
+        let (tail_idx, mut frame_guard) = match self.evict_frame() {
+            Some((idx, guard)) => (idx, guard),
+            None => return None,
+        };
+
+        if let Some(old) = frame_guard.block_id.as_ref() {
+            self.resident_table.lock().unwrap().remove(old);
         }
+        frame_guard.assign_to_block(block_id);
+        frame_guard.pin();
+        drop(frame_guard);
+        {
+            let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+            let current_head = intrusive_list_guard.peek_head();
+            match current_head {
+                Some(head) => {
+                    if tail_idx != head {
+                        let mut frame_guard = self.buffer_pool[tail_idx].lock().unwrap();
+                        let mut current_head_guard =
+                            current_head.map(|head| self.buffer_pool[head].lock().unwrap());
+                        intrusive_list_guard.insert_at_head(
+                            tail_idx,
+                            &mut frame_guard,
+                            current_head_guard.as_mut(),
+                        );
+                    }
+                }
+                None => {
+                    let mut frame_guard = self.buffer_pool[tail_idx].lock().unwrap();
+                    intrusive_list_guard.insert_at_head(tail_idx, &mut frame_guard, None);
+                }
+            }
+        }
+
+        self.resident_table.lock().unwrap().insert(
+            block_id.clone(),
+            Arc::downgrade(&self.buffer_pool[tail_idx]),
+        );
+        *self.num_available.lock().unwrap() -= 1;
+        return Some(Arc::clone(&self.buffer_pool[tail_idx]));
     }
 
     /// Decrement the pin count for the provided buffer
@@ -10791,6 +10855,45 @@ impl BufferManager {
         }
     }
 
+    #[cfg(feature = "replacement_lru")]
+    fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, BufferFrame>)> {
+        assert!(self.buffer_pool.len() > 1, "This invariant is here because I don't want to handle the edge case where I have a single frame pool because its not realistic");
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let tail = match intrusive_list_guard.peek_tail() {
+            Some(tail) => tail,
+            None => return None,
+        };
+        let mut current = tail;
+        loop {
+            let mut current_guard = self.buffer_pool[current].lock().unwrap();
+            if current_guard.is_pinned() {
+                if let Some(head) = intrusive_list_guard.peek_head() {
+                    if current_guard.index == head {
+                        return None;
+                    } else {
+                        current = current_guard
+                            .prev()
+                            .expect("Every node apart from head should have a prev pointer");
+                    }
+                }
+                continue;
+            }
+            let mut prev_node = current_guard
+                .prev()
+                .map(|prev| self.buffer_pool[prev].lock().unwrap());
+            let mut next_node = current_guard
+                .next()
+                .map(|next| self.buffer_pool[next].lock().unwrap());
+            intrusive_list_guard.remove_node(
+                current,
+                &mut current_guard,
+                prev_node.as_mut(),
+                next_node.as_mut(),
+            );
+            return Some((current, current_guard));
+        }
+    }
+
     /// Try to find an unpinned buffer and return pointer to that, if present
     /// This currently does a linear scan but we should use a better replacement policy
     fn choose_unpinned_frame(&self) -> Option<Arc<Mutex<BufferFrame>>> {
@@ -10801,6 +10904,65 @@ impl BufferManager {
             }
         }
         None
+    }
+
+    #[cfg(feature = "replacement_lru")]
+    fn record_hit<'a>(
+        &'a self,
+        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        block_id: &BlockId,
+    ) -> Option<MutexGuard<'a, BufferFrame>> {
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let mut frame_guard = frame_ptr.lock().unwrap();
+        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+            if frame_block_id != block_id {
+                self.resident_table.lock().unwrap().remove(block_id);
+                return None;
+            }
+        }
+        let current_head = intrusive_list_guard.peek_head();
+        if let Some(head) = current_head {
+            if frame_guard.index == head {
+                //  recording a hit on the current head is a no-op
+                return Some(frame_guard);
+            }
+        }
+        let predecessor_index = frame_guard.prev();
+
+        let adjacent_to_head =
+            matches!((predecessor_index, current_head), (Some(prev), Some(head)) if prev == head);
+
+        if adjacent_to_head {
+            let mut current_head_guard =
+                current_head.map(|current_head| self.buffer_pool[current_head].lock().unwrap());
+            let mut next_guard = frame_guard
+                .next()
+                .map(|idx| self.buffer_pool[idx].lock().unwrap());
+            let head_guard = current_head_guard
+                .as_mut()
+                .expect("Head guard must exist when list is non-empty");
+            intrusive_list_guard.promote_successor_to_head(
+                head_guard,
+                &mut frame_guard,
+                next_guard.as_mut(),
+            );
+        } else {
+            let mut current_head_guard =
+                current_head.map(|current_head| self.buffer_pool[current_head].lock().unwrap());
+            let mut prev_guard =
+                predecessor_index.map(|prev| self.buffer_pool[prev].lock().unwrap());
+            let mut next_guard = frame_guard
+                .next()
+                .map(|idx| self.buffer_pool[idx].lock().unwrap());
+            intrusive_list_guard.move_to_head(
+                frame_guard.index,
+                &mut frame_guard,
+                current_head_guard.as_mut(),
+                prev_guard.as_mut(),
+                next_guard.as_mut(),
+            );
+        }
+        Some(frame_guard)
     }
 
     /// Debug assertion to verify buffer count invariants
@@ -10873,11 +11035,7 @@ mod buffer_manager_tests {
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
         assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
-
-        println!(
-            "The size of the latch table: {}",
-            buffer_manager.latch_table.lock().unwrap().len()
-        );
+        assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
 
     /// Concurrent stress test: multiple threads hammering same small working set
