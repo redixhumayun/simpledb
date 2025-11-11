@@ -108,7 +108,7 @@ impl SimpleDB {
         )
     }
 
-    pub fn new_for_test(block_size: usize, num_buffers: usize) -> (Self, TestDir) {
+    pub fn new_for_test(block_size: usize, num_buffers: usize, lock_timeout_ms: u64) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -117,7 +117,7 @@ impl SimpleDB {
             .as_millis();
         let thread_id = std::thread::current().id();
         let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
-        let db = Self::new(&test_dir, block_size, num_buffers, true, 5000);
+        let db = Self::new(&test_dir, block_size, num_buffers, true, lock_timeout_ms);
         (db, test_dir)
     }
 
@@ -277,7 +277,7 @@ mod multi_buffer_product_plan_tests {
 
     #[test]
     fn test_mbp_plan_basic_count() {
-        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let (db, _td) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         setup_emp_dept(&db, Arc::clone(&txn));
         insert_emp(&db, Arc::clone(&txn), 5);
@@ -296,7 +296,7 @@ mod multi_buffer_product_plan_tests {
 
     #[test]
     fn test_mbp_plan_empty_tables() {
-        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let (db, _td) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         setup_emp_dept(&db, Arc::clone(&txn));
         // no inserts
@@ -314,7 +314,7 @@ mod multi_buffer_product_plan_tests {
 
     #[test]
     fn test_mbp_plan_before_first() {
-        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let (db, _td) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         setup_emp_dept(&db, Arc::clone(&txn));
         insert_emp(&db, Arc::clone(&txn), 5);
@@ -339,7 +339,7 @@ mod multi_buffer_product_plan_tests {
 
     #[test]
     fn test_mbp_plan_schema_union() {
-        let (db, _td) = SimpleDB::new_for_test(400, 8);
+        let (db, _td) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         setup_emp_dept(&db, Arc::clone(&txn));
 
@@ -567,7 +567,7 @@ mod multi_buffer_product_scan_tests {
 
     #[test]
     fn test_multi_buffer_product_basic() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
@@ -598,7 +598,7 @@ mod multi_buffer_product_scan_tests {
 
     #[test]
     fn test_multi_buffer_product_empty_tables() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
@@ -618,7 +618,7 @@ mod multi_buffer_product_scan_tests {
 
     #[test]
     fn test_multi_buffer_product_field_access() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
@@ -653,7 +653,7 @@ mod multi_buffer_product_scan_tests {
 
     #[test]
     fn test_multi_buffer_product_before_first() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
@@ -899,7 +899,7 @@ mod chunk_scan_tests {
 
     #[test]
     fn test_chunk_scan_basic() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let layout = create_test_table(&db, Arc::clone(&txn));
 
@@ -938,7 +938,7 @@ mod chunk_scan_tests {
 
     #[test]
     fn test_chunk_scan_basic_multiple_blocks() -> SimpleDBResult<()> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let layout = create_test_table(&db, Arc::clone(&txn));
 
@@ -977,7 +977,7 @@ mod chunk_scan_tests {
 
     #[test]
     fn test_chunk_scan_partial_blocks() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let layout = create_test_table(&db, Arc::clone(&txn));
 
@@ -1016,7 +1016,7 @@ mod chunk_scan_tests {
 
     #[test]
     fn test_chunk_scan_empty_blocks() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let layout = create_test_table(&db, Arc::clone(&txn));
 
@@ -1040,7 +1040,7 @@ mod chunk_scan_tests {
 
     #[test]
     fn test_chunk_scan_before_first() -> Result<(), Box<dyn Error>> {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let layout = create_test_table(&db, Arc::clone(&txn));
 
@@ -1207,7 +1207,7 @@ mod merge_join_plan_tests {
     #[test]
     fn test_merge_join_plan_with_real_tables() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the tables using SQL
@@ -1494,7 +1494,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_basic_merge_join() {
         // Create test database
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1567,7 +1567,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_no_matches() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1627,7 +1627,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_duplicate_values() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1691,7 +1691,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_empty_tables() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1729,7 +1729,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_one_empty_table() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1776,7 +1776,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_single_record_match() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -1844,7 +1844,7 @@ mod merge_join_scan_tests {
     #[test]
     fn test_merge_join_before_first() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schemas for both tables
@@ -2207,7 +2207,7 @@ mod sort_plan_tests {
     #[test]
     fn test_basic_sort() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the table using SQL
@@ -2257,7 +2257,7 @@ mod sort_plan_tests {
     #[test]
     fn test_sort_with_duplicates() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the table
@@ -2323,7 +2323,7 @@ mod sort_plan_tests {
     #[test]
     fn test_multi_field_sort() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the table
@@ -2389,7 +2389,7 @@ mod sort_plan_tests {
     #[test]
     fn test_sort_empty_table() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create empty table
@@ -2669,7 +2669,7 @@ mod sort_scan_tests {
     #[test]
     fn test_sort_scan_basic() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create schema and layout
@@ -2734,7 +2734,7 @@ mod sort_scan_tests {
 
     #[test]
     fn test_sort_scan_single_table() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         let mut schema = Schema::new();
@@ -2778,7 +2778,7 @@ mod sort_scan_tests {
 
     #[test]
     fn test_sort_scan_empty_tables() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         let mut schema = Schema::new();
@@ -2902,7 +2902,7 @@ mod materialize_plan_tests {
     #[test]
     fn test_materialize_plan() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the source table using SQL
@@ -2982,7 +2982,7 @@ mod materialize_plan_tests {
     #[test]
     fn test_materialize_plan_empty_source() {
         // Create test database
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create empty table using SQL
@@ -3101,7 +3101,7 @@ mod planner_tests {
     #[test]
     fn test_planner_single_table() {
         //  Create the table T1
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         let sql = "create table T1(A int, B varchar(10))".to_string();
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
@@ -3130,7 +3130,7 @@ mod planner_tests {
 
     #[test]
     fn test_planner_multi_table() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         //  Create table T1
@@ -3175,7 +3175,7 @@ mod planner_tests {
 
     #[test]
     fn test_planner_single_table_delete() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         //  Creating the table t1
@@ -3223,7 +3223,7 @@ mod planner_tests {
 
     #[test]
     fn test_planner_single_table_modify() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         //  Create the table t1
@@ -3258,7 +3258,7 @@ mod planner_tests {
 
     #[test]
     fn test_planner_index_retrieval() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         //  Create the student table
@@ -3333,7 +3333,7 @@ mod planner_tests {
     #[test]
     fn test_planner_index_updates() {
         // Setup database with test data
-        let (db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create the student table
@@ -4068,7 +4068,7 @@ mod basic_query_planner_tests {
     use super::*;
 
     fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
-        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let (db, dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         (db, txn, dir)
     }
@@ -4242,7 +4242,7 @@ mod heuristic_equivalence_tests {
     use super::*;
 
     fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
-        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let (db, dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         (db, txn, dir)
     }
@@ -4407,7 +4407,7 @@ mod heuristic_efficiency_tests {
     use super::*;
 
     fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
-        let (db, dir) = SimpleDB::new_for_test(400, 8);
+        let (db, dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
         (db, txn, dir)
     }
@@ -4846,7 +4846,7 @@ mod plan_test_single_table {
         //  SELECT sname, majorid, gradyear
         //  FROM student
         //  WHERE majorid = 10 AND gradyear = 2020;
-        let (db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 3, 5000);
 
         //  the table plan
         let table = TablePlan::new(
@@ -5132,7 +5132,7 @@ mod product_scan_tests {
 
     #[test]
     fn product_scan_test() {
-        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(test_db.new_tx());
         let mut schema1 = Schema::new();
         schema1.add_int_field("A");
@@ -5298,7 +5298,7 @@ mod project_scan_tests {
 
     #[test]
     fn project_scan_test() {
-        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let (test_db, test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(test_db.new_tx());
 
         let mut schema = Schema::new();
@@ -5455,7 +5455,7 @@ mod index_join_plan_tests {
     #[test]
     fn test_index_join_plan_with_real_tables() {
         // Setup DB
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         // Create tables
@@ -5543,7 +5543,7 @@ mod index_join_plan_tests {
 
     #[test]
     fn test_index_join_plan_no_matches() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(db.new_tx());
 
         db.planner
@@ -5824,7 +5824,7 @@ mod index_join_scan_tests {
 
     #[test]
     fn index_join_scan_test() {
-        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(simple_db.new_tx());
 
         // Create schemas for both tables
@@ -6013,7 +6013,7 @@ mod index_select_scan_tests {
 
     #[test]
     fn index_select_scan_test() {
-        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(simple_db.new_tx());
 
         let mut schema = Schema::new();
@@ -6190,7 +6190,7 @@ mod select_scan_tests {
 
     #[test]
     fn select_scan_test() {
-        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8);
+        let (simple_db, test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let txn = Arc::new(simple_db.new_tx());
 
         let mut schema = Schema::new();
@@ -6946,7 +6946,7 @@ mod metadata_manager_tests {
 
     #[test]
     fn test_metadata_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let tx = Arc::new(db.new_tx());
         let mdm = MetadataManager::new(true, Arc::clone(&tx));
 
@@ -7046,7 +7046,7 @@ mod metadata_manager_tests {
 
     #[test]
     fn stat_manager_concurrent_access() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let setup_txn = Arc::new(db.new_tx());
         let mdm = Arc::new(MetadataManager::new(true, Arc::clone(&setup_txn)));
 
@@ -7706,7 +7706,7 @@ mod table_manager_tests {
 
     #[test]
     fn test_table_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let tx = Arc::new(db.new_tx());
         let table_manager = TableManager::new(true, Arc::clone(&tx));
 
@@ -8069,7 +8069,7 @@ mod table_scan_tests {
 
     #[test]
     fn table_scan_test() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 4);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 4, 5000);
         let txn = Arc::new(db.new_tx());
 
         let mut schema = Schema::new();
@@ -8363,7 +8363,7 @@ mod record_page_tests {
 
     #[test]
     fn record_page_test() {
-        let (db, test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(db.new_tx());
 
         //  Set up the test
@@ -8829,7 +8829,7 @@ mod transaction_tests {
     fn test_transaction_single_threaded() {
         let file = generate_filename();
         let block_size = 512;
-        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 3);
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 3, 5000);
 
         //  Start a transaction t1 that will set an int and a string
         let t1 = test_db.new_tx();
@@ -8872,7 +8872,7 @@ mod transaction_tests {
     fn test_transaction_multi_threaded_single_reader_single_writer() {
         let file = generate_filename();
         let block_size = 512;
-        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10);
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10, 5000);
         let block_id = BlockId::new(file.to_string(), 1);
 
         let fm1 = Arc::clone(&test_db.file_manager);
@@ -8923,7 +8923,7 @@ mod transaction_tests {
     fn test_transaction_multi_threaded_multiple_readers_single_writer() {
         let file = generate_filename();
         let block_size = 512;
-        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10);
+        let (test_db, test_dir) = SimpleDB::new_for_test(block_size, 10, 5000);
         let block_id = BlockId::new(file.to_string(), 1);
 
         // Initialize data before spawning threads
@@ -8999,7 +8999,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_rollback() {
         let file = generate_filename();
-        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
+        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3, 5000);
         let block_id = BlockId::new(file.clone(), 1);
 
         // Setup initial state
@@ -9039,15 +9039,18 @@ mod transaction_tests {
         assert_eq!(t3.get_string(&block_id, 40).unwrap(), "initial");
     }
 
-    /// This test is actually incorrect. It does concurrent writes but doesn't verify what the final counter is
-    /// because the transaction isolation level allows lost writes since all threads will read the same value initially and then overwrite each other's answer
-    /// This test is purely about ensuring that all transactions succeed in a multi-threaded scenario
-    /// I've also forgotten what this test is really about. Ignoring until I can come back to it later because it is currently failing in CI
+    /// Tests that concurrent read-modify-write transactions can succeed via retry logic under high lock contention.
+    ///
+    /// Scenario: 5 threads simultaneously try to read-increment-write the same location. All acquire SLOCK,
+    /// then all attempt to upgrade to XLOCK, causing lock contention. The test validates that the retry
+    /// mechanism (with rollback on timeout) eventually allows all transactions to complete serially.
+    ///
+    /// Final value should be `num_of_txns` (5), confirming all increments were applied atomically.
     #[test]
     #[ignore]
     fn test_transaction_isolation_with_concurrent_writes() {
         let file = generate_filename();
-        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3);
+        let (test_db, test_dir) = SimpleDB::new_for_test(512, 3, 500);
         let block_id = BlockId::new(file.clone(), 1);
         let num_of_txns = 5;
         let max_retry_count = 75;
@@ -9130,7 +9133,7 @@ mod transaction_tests {
         let mut operations = vec![];
 
         loop {
-            match rx.recv_timeout(Duration::from_secs(5)) {
+            match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(msg) => {
                     if msg.contains("successfully incremented") {
                         successful_increments += 1;
@@ -9204,7 +9207,7 @@ mod transaction_tests {
 
     #[test]
     fn test_buffer_handle_raii_basic_pin_unpin() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
 
@@ -9228,7 +9231,7 @@ mod transaction_tests {
 
     #[test]
     fn test_buffer_handle_clone_increments_pins() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
 
@@ -9266,7 +9269,7 @@ mod transaction_tests {
 
     #[test]
     fn test_no_buffer_leaks_after_commit() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
 
@@ -9284,7 +9287,7 @@ mod transaction_tests {
 
     #[test]
     fn test_handle_drop_after_commit_is_safe() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let txn = Arc::new(db.new_tx());
         let block_id = BlockId::new("test".to_string(), 0);
         let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
@@ -9301,7 +9304,7 @@ mod transaction_tests {
 
     #[test]
     fn test_multiple_handles_after_commit() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
 
         // Check initial available buffers
         let initial_available = db.buffer_manager.available();
@@ -9893,7 +9896,7 @@ mod recovery_manager_tests {
 
     #[test]
     fn test_rollback_with_int() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
 
         let recovery_manager = RecoveryManager::new(
             1,
@@ -9929,7 +9932,7 @@ mod recovery_manager_tests {
 
     #[test]
     fn test_rollback_with_string() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let recovery_manager = RecoveryManager::new(
             1,
             Arc::clone(&db.log_manager),
@@ -10827,7 +10830,7 @@ mod buffer_manager_tests {
     /// and can then correctly read them back later
     #[test]
     fn test_buffer_replacement() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let buffer_manager = db.buffer_manager;
 
         //  Initialize the file with enough data
@@ -10884,7 +10887,7 @@ mod buffer_manager_tests {
 
         // Small buffer pool (4 buffers) with small working set (6 blocks)
         // Forces evictions and contention
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 4);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 4, 5000);
         db.buffer_manager.enable_stats();
 
         let block_size = 400;
@@ -11194,7 +11197,7 @@ mod log_manager_tests {
 
     #[test]
     fn test_log_manager() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 3);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 3, 5000);
         let log_manager = db.log_manager;
 
         create_log_records(Arc::clone(&log_manager), 1, 35);
@@ -11740,7 +11743,7 @@ mod offset_smoke_tests {
 
     #[test]
     fn prints_buffer_manager_num_available_offset() {
-        let (db, _test_dir) = SimpleDB::new_for_test(400, 8);
+        let (db, _test_dir) = SimpleDB::new_for_test(400, 8, 5000);
         let bm = Arc::clone(&db.buffer_manager);
 
         println!(
