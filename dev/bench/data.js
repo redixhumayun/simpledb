@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1762251696916,
+  "lastUpdate": 1762858596892,
   "repoUrl": "https://github.com/redixhumayun/simpledb",
   "entries": {
     "SimpleDB Benchmarks": [
@@ -2156,6 +2156,335 @@ window.BENCHMARK_DATA = {
           {
             "name": "DELETE (single record)",
             "value": 22073420,
+            "unit": "ns"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "redixhumayun@gmail.com",
+            "name": "Zaid Humayun",
+            "username": "redixhumayun"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "785f2a20985a96c31e2e152ea9b93c06a84836d9",
+          "message": "Merge pull request #51 from redixhumayun/feature/multithreading-tests\n\nFixes the flaky test_transaction_isolation_with_concurrent_writes test",
+          "timestamp": "2025-11-11T16:21:27+05:30",
+          "tree_id": "42ca0b1bc2cce08fe3ec48ae8bb96c122c57cc96",
+          "url": "https://github.com/redixhumayun/simpledb/commit/785f2a20985a96c31e2e152ea9b93c06a84836d9"
+        },
+        "date": 1762858595566,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Pin/Unpin (hit)",
+            "value": 815,
+            "unit": "ns"
+          },
+          {
+            "name": "Cold Pin (miss)",
+            "value": 6882,
+            "unit": "ns"
+          },
+          {
+            "name": "Dirty Eviction",
+            "value": 5002574,
+            "unit": "ns"
+          },
+          {
+            "name": "Sequential Scan (120 blocks)",
+            "value": 738731,
+            "unit": "ns"
+          },
+          {
+            "name": "Seq Scan MT x4 (120 blocks)",
+            "value": 972671,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access (1000 ops)",
+            "value": 6099064,
+            "unit": "ns"
+          },
+          {
+            "name": "Repeated Access MT x4 (1000 ops)",
+            "value": 6246010,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=10, 500 ops)",
+            "value": 2831565,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=50, 500 ops)",
+            "value": 3015995,
+            "unit": "ns"
+          },
+          {
+            "name": "Random (K=100, 500 ops)",
+            "value": 3031464,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=10, 500 ops)",
+            "value": 2858260,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=50, 500 ops)",
+            "value": 3797623,
+            "unit": "ns"
+          },
+          {
+            "name": "Random MT x4 (K=100, 500 ops)",
+            "value": 3926194,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian (80/20, 500 ops)",
+            "value": 2862755,
+            "unit": "ns"
+          },
+          {
+            "name": "Zipfian MT x4 (80/20, 500 ops)",
+            "value": 3083569,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (2 threads, 1000 ops)",
+            "value": 13527764,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (4 threads, 1000 ops)",
+            "value": 28257509,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent (8 threads, 1000 ops)",
+            "value": 67137460,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (4 threads, K=4, 1000 ops)",
+            "value": 3017499,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent Hotset (8 threads, K=4, 1000 ops)",
+            "value": 7986014,
+            "unit": "ns"
+          },
+          {
+            "name": "Sequential Read (1000 blocks)",
+            "value": 2572953,
+            "unit": "ns"
+          },
+          {
+            "name": "Sequential Write (1000 blocks)",
+            "value": 2721274,
+            "unit": "ns"
+          },
+          {
+            "name": "Random Read (K=1000, 1000 ops)",
+            "value": 2570608,
+            "unit": "ns"
+          },
+          {
+            "name": "Random Write (K=1000, 1000 ops)",
+            "value": 2705527,
+            "unit": "ns"
+          },
+          {
+            "name": "WAL append (no fsync)",
+            "value": 130975501,
+            "unit": "ns"
+          },
+          {
+            "name": "WAL append + immediate fsync",
+            "value": 515237173,
+            "unit": "ns"
+          },
+          {
+            "name": "WAL group commit (batch=10)",
+            "value": 630214175,
+            "unit": "ns"
+          },
+          {
+            "name": "WAL group commit (batch=50)",
+            "value": 228015250,
+            "unit": "ns"
+          },
+          {
+            "name": "WAL group commit (batch=100)",
+            "value": 179045968,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 70/30R/W no-fsync",
+            "value": 18050382,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 70/30R/W immediate-fsync",
+            "value": 722158795,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 70/30R/W group-10",
+            "value": 88003065,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 50/50R/W no-fsync",
+            "value": 32009310,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 50/50R/W immediate-fsync",
+            "value": 1361421793,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 50/50R/W group-10",
+            "value": 150016914,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 10/90R/W no-fsync",
+            "value": 60043293,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 10/90R/W immediate-fsync",
+            "value": 2330809352,
+            "unit": "ns"
+          },
+          {
+            "name": "Mixed 10/90R/W group-10",
+            "value": 283114246,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 2T no-fsync",
+            "value": 7095968,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 2T no-fsync",
+            "value": 7026170,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 2T group-10",
+            "value": 37043943,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 2T group-10",
+            "value": 36983869,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 4T no-fsync",
+            "value": 15075026,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 4T no-fsync",
+            "value": 14952469,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 4T group-10",
+            "value": 74931671,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 4T group-10",
+            "value": 75070866,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 8T no-fsync",
+            "value": 30934329,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 8T no-fsync",
+            "value": 30930173,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 8T group-10",
+            "value": 152016008,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 8T group-10",
+            "value": 151071895,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 16T no-fsync",
+            "value": 61916536,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 16T no-fsync",
+            "value": 61806142,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent shared 16T group-10",
+            "value": 307055727,
+            "unit": "ns"
+          },
+          {
+            "name": "Concurrent sharded 16T group-10",
+            "value": 299990230,
+            "unit": "ns"
+          },
+          {
+            "name": "Random Write durability immediate-fsync data-nosync",
+            "value": 5163227609,
+            "unit": "ns"
+          },
+          {
+            "name": "Random Write durability immediate-fsync data-fsync",
+            "value": 10152563820,
+            "unit": "ns"
+          },
+          {
+            "name": "INSERT (single record)",
+            "value": 22259426,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT (table scan)",
+            "value": 5405960,
+            "unit": "ns"
+          },
+          {
+            "name": "SELECT COUNT(*)",
+            "value": 5500980,
+            "unit": "ns"
+          },
+          {
+            "name": "UPDATE (single record)",
+            "value": 21301413,
+            "unit": "ns"
+          },
+          {
+            "name": "DELETE (single record)",
+            "value": 22013170,
             "unit": "ns"
           }
         ]
