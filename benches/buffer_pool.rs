@@ -14,11 +14,11 @@ use simpledb::{
 };
 
 fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    SimpleDB::new_for_test(block_size, num_buffers)
+    SimpleDB::new_for_test(block_size, num_buffers, 5000)
 }
 
 fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers);
+    let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers, 5000);
     db.buffer_manager().enable_stats();
     (db, test_dir)
 }

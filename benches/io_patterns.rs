@@ -112,7 +112,7 @@ impl DataSyncPolicy {
 // ============================================================================
 
 fn setup_io_test(block_size: usize) -> (SimpleDB, TestDir) {
-    SimpleDB::new_for_test(block_size, 12) // 12 buffers (enough for tests)
+    SimpleDB::new_for_test(block_size, 12, 5000) // 12 buffers (enough for tests)
 }
 
 fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {

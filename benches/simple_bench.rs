@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cleanup_bench_data();
 
     // Initialize database with clean=true for fresh benchmark runs
-    let db = SimpleDB::new("./bench-data", 1024, 64, true);
+    let db = SimpleDB::new("./bench-data", 1024, 64, true, 100);
 
     // Setup test table
     setup_test_table(&db)?;

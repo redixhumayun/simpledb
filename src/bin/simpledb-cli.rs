@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     // Initialize database
-    let db = SimpleDB::new("./simpledb-data", 1024, 8, false);
+    let db = SimpleDB::new("./simpledb-data", 1024, 8, false, 100);
 
     // Main REPL loop
     loop {
