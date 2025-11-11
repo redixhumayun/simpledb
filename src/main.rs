@@ -108,7 +108,11 @@ impl SimpleDB {
         )
     }
 
-    pub fn new_for_test(block_size: usize, num_buffers: usize, lock_timeout_ms: u64) -> (Self, TestDir) {
+    pub fn new_for_test(
+        block_size: usize,
+        num_buffers: usize,
+        lock_timeout_ms: u64,
+    ) -> (Self, TestDir) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
