@@ -10410,8 +10410,11 @@ pub struct BufferFrame {
     pins: usize,
     txn: Option<usize>,
     lsn: Option<Lsn>,
+    #[cfg(feature = "replacement_lru")]
     prev_idx: Option<usize>,
+    #[cfg(feature = "replacement_lru")]
     next_idx: Option<usize>,
+    #[cfg(feature = "replacement_lru")]
     index: usize,
 }
 
@@ -10426,8 +10429,11 @@ impl BufferFrame {
             pins: 0,
             txn: None,
             lsn: None,
+            #[cfg(feature = "replacement_lru")]
             prev_idx: None,
+            #[cfg(feature = "replacement_lru")]
             next_idx: None,
+            #[cfg(feature = "replacement_lru")]
             index,
         }
     }
@@ -10856,6 +10862,8 @@ impl BufferManager {
     }
 
     #[cfg(feature = "replacement_lru")]
+    /// Pick the least-recently-used unpinned frame, unlink it from the list, and return its index
+    /// plus locked guard so the caller can repurpose it.
     fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, BufferFrame>)> {
         assert!(self.buffer_pool.len() > 1, "This invariant is here because I don't want to handle the edge case where I have a single frame pool because its not realistic");
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
@@ -10894,19 +10902,10 @@ impl BufferManager {
         }
     }
 
-    /// Try to find an unpinned buffer and return pointer to that, if present
-    /// This currently does a linear scan but we should use a better replacement policy
-    fn choose_unpinned_frame(&self) -> Option<Arc<Mutex<BufferFrame>>> {
-        for frame in &self.buffer_pool {
-            let frame_guard = frame.lock().unwrap();
-            if !frame_guard.is_pinned() {
-                return Some(Arc::clone(frame));
-            }
-        }
-        None
-    }
-
     #[cfg(feature = "replacement_lru")]
+    /// Record a cache hit by moving the frame to the head of the LRU list. Returns the locked
+    /// guard if the metadata is still valid, otherwise drops the stale resident entry and signals
+    /// the caller to retry by returning `None`.
     fn record_hit<'a>(
         &'a self,
         frame_ptr: &'a Arc<Mutex<BufferFrame>>,
