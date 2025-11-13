@@ -27,7 +27,8 @@ name = "simpledb"
 path = "src/main.rs"
 
 [features]
-default = ["replacement_lru"]
+default = ["replacement_clock"]
 replacement_lru = []
+replacement_clock = []
 
 [dependencies]

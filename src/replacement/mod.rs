@@ -1,0 +1,15 @@
+#[cfg(all(feature = "replacement_lru", feature = "replacement_clock"))]
+compile_error!("Enable only one buffer replacement policy feature (LRU or Clock)");
+
+#[cfg(not(any(feature = "replacement_lru", feature = "replacement_clock")))]
+compile_error!("At least one buffer replacement policy feature must be enabled");
+
+#[cfg(feature = "replacement_lru")]
+mod lru;
+#[cfg(feature = "replacement_lru")]
+pub use lru::PolicyState;
+
+#[cfg(feature = "replacement_clock")]
+mod clock;
+#[cfg(feature = "replacement_clock")]
+pub use clock::PolicyState;
