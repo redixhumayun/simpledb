@@ -1,8 +1,11 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+};
 
 use crate::{
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BufferFrame,
+    BlockId, BufferFrame,
 };
 
 #[derive(Debug)]
@@ -26,13 +29,22 @@ impl PolicyState {
     pub fn record_hit<'a>(
         &self,
         buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
-        mut frame_guard: MutexGuard<'a, BufferFrame>,
-    ) -> MutexGuard<'a, BufferFrame> {
+        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        block_id: &BlockId,
+        resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
+    ) -> Option<MutexGuard<'a, BufferFrame>> {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let mut frame_guard = frame_ptr.lock().unwrap();
+        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+            if frame_block_id != block_id {
+                resident_table.lock().unwrap().remove(block_id);
+                return None;
+            }
+        }
         let current_head = intrusive_list_guard.peek_head();
         if let Some(head) = current_head {
             if frame_guard.index == head {
-                return frame_guard;
+                return Some(frame_guard);
             }
         }
         let predecessor_index = frame_guard.prev();
@@ -70,7 +82,7 @@ impl PolicyState {
                 next_guard.as_mut(),
             );
         }
-        frame_guard
+        Some(frame_guard)
     }
 
     pub fn on_frame_assigned(

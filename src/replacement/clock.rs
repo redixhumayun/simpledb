@@ -1,6 +1,9 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+};
 
-use crate::BufferFrame;
+use crate::{BlockId, BufferFrame};
 
 #[derive(Debug)]
 pub struct PolicyState {
@@ -23,10 +26,19 @@ impl PolicyState {
     pub fn record_hit<'a>(
         &self,
         _buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
-        mut frame_guard: MutexGuard<'a, BufferFrame>,
-    ) -> MutexGuard<'a, BufferFrame> {
+        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        block_id: &BlockId,
+        resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
+    ) -> Option<MutexGuard<'a, BufferFrame>> {
+        let mut frame_guard = frame_ptr.lock().unwrap();
+        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+            if frame_block_id != block_id {
+                resident_table.lock().unwrap().remove(block_id);
+                return None;
+            }
+        }
         frame_guard.ref_bit = true;
-        frame_guard
+        Some(frame_guard)
     }
 
     pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {

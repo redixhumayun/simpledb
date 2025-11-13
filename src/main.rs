@@ -10854,17 +10854,12 @@ impl BufferManager {
         frame_ptr: &'a Arc<Mutex<BufferFrame>>,
         block_id: &BlockId,
     ) -> Option<MutexGuard<'a, BufferFrame>> {
-        let frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
-            if frame_block_id != block_id {
-                self.resident_table.lock().unwrap().remove(block_id);
-                return None;
-            }
-        }
-        let frame_guard = self
-            .policy
-            .record_hit(&self.buffer_pool, frame_guard);
-        Some(frame_guard)
+        self.policy.record_hit(
+            &self.buffer_pool,
+            frame_ptr,
+            block_id,
+            &self.resident_table,
+        )
     }
 
     /// Debug assertion to verify buffer count invariants
