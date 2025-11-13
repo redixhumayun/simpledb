@@ -10781,10 +10781,7 @@ impl BufferManager {
         //  fast hit path, found the frame in the resident table
         if let Some(frame_ptr) = frame_ptr {
             {
-                let mut frame_guard = match self.record_hit(&frame_ptr, block_id) {
-                    Some(frame_guard) => frame_guard,
-                    None => return None,
-                };
+                let mut frame_guard = self.record_hit(&frame_ptr, block_id)?;
                 let was_unpinned = !frame_guard.is_pinned();
                 frame_guard.pin();
                 if was_unpinned {
@@ -10825,7 +10822,7 @@ impl BufferManager {
             Arc::downgrade(&self.buffer_pool[tail_idx]),
         );
         *self.num_available.lock().unwrap() -= 1;
-        return Some(Arc::clone(&self.buffer_pool[tail_idx]));
+        Some(Arc::clone(&self.buffer_pool[tail_idx]))
     }
 
     /// Decrement the pin count for the provided buffer
