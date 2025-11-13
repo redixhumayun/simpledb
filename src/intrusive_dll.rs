@@ -19,12 +19,13 @@ impl IntrusiveList {
         }
     }
 
-    pub fn from_nodes<T: IntrusiveNode>(&mut self, nodes: &mut [T]) {
-        self.head = None;
-        self.tail = None;
+    pub fn from_nodes<T: IntrusiveNode>(nodes: &mut [T]) -> Self {
+        let mut intrusive_list = IntrusiveList::new();
+        intrusive_list.head = None;
+        intrusive_list.tail = None;
 
         if nodes.is_empty() {
-            return;
+            return intrusive_list;
         }
 
         let last = nodes.len() - 1;
@@ -32,8 +33,9 @@ impl IntrusiveList {
             node.set_prev(if index == 0 { None } else { Some(index - 1) });
             node.set_next(if index == last { None } else { Some(index + 1) });
         }
-        self.head = Some(0);
-        self.tail = Some(last);
+        intrusive_list.head = Some(0);
+        intrusive_list.tail = Some(last);
+        intrusive_list
     }
 
     /// Insert the given node into the head of the list
@@ -91,9 +93,15 @@ impl IntrusiveList {
         let prev_idx = node.prev();
         let next_idx = node.next();
 
-        prev_node.map(|prev_node| prev_node.set_next(next_idx));
-        next_node.map(|next_node| next_node.set_prev(prev_idx));
-        curr_head.map(|curr_head| curr_head.set_prev(Some(index)));
+        if let Some(prev_node) = prev_node {
+            prev_node.set_next(next_idx)
+        }
+        if let Some(next_node) = next_node {
+            next_node.set_prev(prev_idx)
+        }
+        if let Some(curr_head) = curr_head {
+            curr_head.set_prev(Some(index))
+        }
         node.set_prev(None);
         node.set_next(self.head);
         self.head = Some(index);
@@ -133,7 +141,9 @@ impl IntrusiveList {
         let successor_index = head_node.next().unwrap();
         let next_idx = successor_node.next();
         head_node.set_next(next_idx);
-        next_node.map(|next_node| next_node.set_prev(Some(head_index)));
+        if let Some(next_node) = next_node {
+            next_node.set_prev(Some(head_index))
+        }
 
         successor_node.set_prev(None);
         successor_node.set_next(Some(head_index));
@@ -213,8 +223,12 @@ impl IntrusiveList {
             ),
         }
 
-        prev_node.map(|prev| prev.set_next(next_idx));
-        next_node.map(|next| next.set_prev(prev_idx));
+        if let Some(prev) = prev_node {
+            prev.set_next(next_idx)
+        }
+        if let Some(next) = next_node {
+            next.set_prev(prev_idx)
+        }
 
         if self.head == Some(index) {
             self.head = next_idx;
@@ -295,7 +309,7 @@ mod intrusive_dll_tests {
         }
     }
 
-    impl<'a, T> IntrusiveNode for NodeHandle<'a, T> {
+    impl<T> IntrusiveNode for NodeHandle<'_, T> {
         fn prev(&self) -> Option<usize> {
             self.cell.borrow().prev()
         }

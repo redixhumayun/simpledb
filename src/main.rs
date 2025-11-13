@@ -31,7 +31,6 @@ use parser::{
 pub use test_utils::TestDir;
 
 #[cfg(feature = "replacement_lru")]
-#[cfg(feature = "replacement_lru")]
 use crate::intrusive_dll::IntrusiveNode;
 pub mod benchmark_framework;
 mod btree;
@@ -10522,7 +10521,7 @@ impl IntrusiveNode for BufferFrame {
 }
 
 #[cfg(feature = "replacement_lru")]
-impl<'a> IntrusiveNode for MutexGuard<'a, BufferFrame> {
+impl IntrusiveNode for MutexGuard<'_, BufferFrame> {
     fn prev(&self) -> Option<usize> {
         self.prev_idx
     }

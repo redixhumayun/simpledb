@@ -15,12 +15,11 @@ pub struct PolicyState {
 
 impl PolicyState {
     pub fn new(buffer_pool: &[Arc<Mutex<BufferFrame>>]) -> Self {
-        let mut intrusive_list = IntrusiveList::new();
         let mut guards = buffer_pool
             .iter()
             .map(|frame| frame.lock().unwrap())
             .collect::<Vec<MutexGuard<'_, BufferFrame>>>();
-        intrusive_list.from_nodes(&mut guards);
+        let intrusive_list = IntrusiveList::from_nodes(&mut guards);
         Self {
             intrusive_list: Mutex::new(intrusive_list),
         }
@@ -116,10 +115,7 @@ impl PolicyState {
             "Buffer pools must have more than one frame for LRU replacement"
         );
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
-        let tail = match intrusive_list_guard.peek_tail() {
-            Some(tail) => tail,
-            None => return None,
-        };
+        let tail = intrusive_list_guard.peek_tail()?;
         let mut current = tail;
         loop {
             let mut current_guard = buffer_pool[current].lock().unwrap();
