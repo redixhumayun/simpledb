@@ -66,6 +66,51 @@ cargo bench --bench buffer_pool -- 50 12 "Random (K=10,"
 cargo bench --bench buffer_pool -- 100 12 pin:t8
 ```
 
+## Replacement Policy Summary
+
+All runs use `cargo bench --bench buffer_pool -- 100 12` (pool=12, block=4 KiB). Raw logs live in `docs/benchmarks/replacement_policies/…`.
+
+### macOS (M1 Pro, macOS Sequoia)
+
+| Benchmark (Phase)                  | Master (first-unpinned) | Replacement LRU | Replacement Clock |
+|------------------------------------|-------------------------|-----------------|-------------------|
+| Pin/Unpin hit latency (P1)         | 0.319 µs                | **0.290 µs**    | **0.272 µs**      |
+| Cold pin latency (P1)              | 4.95 µs                 | **2.61 µs**     | **2.26 µs**       |
+| Sequential Scan throughput (P2)    | 0.159 M blocks/s (0 % hits) | **0.242 M blocks/s (0 %)** | **0.329 M blocks/s (0 %)** |
+| Sequential Scan MT throughput (P2) | 0.150 M blocks/s        | **0.191 M blocks/s** | 0.145 M blocks/s  |
+| Repeated Access throughput (P2)    | 0.30 M ops/s (0 % hits) | **3.56 M ops/s (100 %)** | **3.81 M ops/s (100 %)** |
+| Repeated Access MT throughput (P2) | 0.27 M ops/s            | **0.96 M ops/s**| **1.06 M ops/s**  |
+| Random K=10 throughput (P2)        | 0.32 M ops/s (10 % hits) | **3.50 M ops/s (100 %)** | **3.82 M ops/s (100 %)** |
+| Random K=50 throughput (P2)        | 0.30 M ops/s (2 % hits) | **0.62 M ops/s (22 %)**| **0.60 M ops/s (27 %)**  |
+| Random K=100 throughput (P2)       | 0.30 M ops/s (2 % hits) | **0.54 M ops/s (14 %)**| **0.54 M ops/s (14 %)**  |
+| Zipfian throughput (P2)            | 0.324 M ops/s (9 % hits) | **1.51 M ops/s (77 %)** | **1.50 M ops/s (76 %)** |
+| Zipfian MT throughput (P2)         | 0.276 M ops/s           | **0.55 M ops/s**| **0.63 M ops/s**  |
+| Multi-thread pin:t2 (P5)           | 0.29 M ops/s            | **1.25 M ops/s**| **1.47 M ops/s**  |
+| Multi-thread pin:t8 (P5)           | 0.11 M ops/s            | **0.23 M ops/s**| 0.16 M ops/s      |
+
+### Linux (i7-8650U, Ubuntu 6.8.0-86)
+
+| Benchmark (Phase)                  | Master (first-unpinned) | Replacement LRU | Replacement Clock |
+|------------------------------------|-------------------------|-----------------|-------------------|
+| Pin/Unpin hit latency (P1)         | 0.829 µs                | **0.804 µs**    | **0.793 µs**      |
+| Cold pin latency (P1)              | 6.41 µs                 | **4.11 µs**     | 4.57 µs           |
+| Sequential Scan throughput (P2)    | 0.163 M blocks/s (0 % hits) | **0.251 M blocks/s (0 %)** | **0.255 M blocks/s (0 %)** |
+| Sequential Scan MT throughput (P2) | 0.121 M blocks/s        | **0.182 M blocks/s** | 0.160 M blocks/s  |
+| Repeated Access throughput (P2)    | 0.16 M ops/s (0 % hits) | **1.18 M ops/s (100 %)** | **1.25 M ops/s (100 %)** |
+| Repeated Access MT throughput (P2) | 0.18 M ops/s            | **1.23 M ops/s**| **1.21 M ops/s**  |
+| Random K=10 throughput (P2)        | 0.18 M ops/s (10 % hits) | **1.20 M ops/s (100 %)** | **1.25 M ops/s (100 %)** |
+| Random K=50 throughput (P2)        | 0.17 M ops/s (3 % hits) | **0.31 M ops/s (23 %)**| **0.31 M ops/s (24 %)**  |
+| Random K=100 throughput (P2)       | 0.16 M ops/s (1 % hits) | **0.27 M ops/s (10 %)**| **0.28 M ops/s (13 %)**  |
+| Zipfian throughput (P2)            | 0.175 M ops/s (9 % hits) | **0.69 M ops/s (81 %)** | **0.67 M ops/s (76 %)** |
+| Zipfian MT throughput (P2)         | 0.174 M ops/s           | **0.70 M ops/s**| **0.65 M ops/s**  |
+| Multi-thread pin:t2 (P5)           | 0.15 M ops/s            | **0.22 M ops/s**| **0.22 M ops/s**  |
+| Multi-thread pin:t8 (P5)           | 0.13 M ops/s            | **0.18 M ops/s**| 0.14 M ops/s      |
+
+_Notes_:  
+- Times are medians from Phase 1 latency benches. Throughputs are means from Phase 2 (Repeated/Random) and Phase 5 (pin:t2/pin:t8).  
+- Clock shows higher hit-path latency on macOS due to the extra hand mutex; Linux latency stays near parity with LRU/master.
+- Phase 3 (pool/memory scaling) is not summarized here—see the raw log files for those details.
+
 ## Filtering Benchmarks
 
 Filter using substring matching on benchmark names (Phase 1-4) or case tokens (Phase 5):
