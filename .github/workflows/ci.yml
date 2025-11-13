@@ -16,7 +16,7 @@ jobs:
       matrix:
         features:
           - ""
-          - "--no-default-features --features replacement_lru"
+          - "--no-default-features --features replacement_clock"
     
     steps:
     - uses: actions/checkout@v4
