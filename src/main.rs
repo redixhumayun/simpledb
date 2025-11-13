@@ -10818,8 +10818,7 @@ impl BufferManager {
         frame_guard.pin();
         drop(frame_guard);
 
-        self.policy
-            .on_frame_assigned(&self.buffer_pool, tail_idx);
+        self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
 
         self.resident_table.lock().unwrap().insert(
             block_id.clone(),
@@ -10854,12 +10853,8 @@ impl BufferManager {
         frame_ptr: &'a Arc<Mutex<BufferFrame>>,
         block_id: &BlockId,
     ) -> Option<MutexGuard<'a, BufferFrame>> {
-        self.policy.record_hit(
-            &self.buffer_pool,
-            frame_ptr,
-            block_id,
-            &self.resident_table,
-        )
+        self.policy
+            .record_hit(&self.buffer_pool, frame_ptr, block_id, &self.resident_table)
     }
 
     /// Debug assertion to verify buffer count invariants

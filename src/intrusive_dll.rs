@@ -190,7 +190,8 @@ impl IntrusiveList {
             (None, None) => {}
             (Some(idx), None) => panic!(
                 "Invariant broken: node {} reported prev {:?} but prev node not supplied",
-                index, Some(idx)
+                index,
+                Some(idx)
             ),
             (None, Some(_)) => panic!(
                 "Invariant broken: node {} reported no prev but prev node supplied",
@@ -203,7 +204,8 @@ impl IntrusiveList {
             (None, None) => {}
             (Some(idx), None) => panic!(
                 "Invariant broken: node {} reported next {:?} but next node not supplied",
-                index, Some(idx)
+                index,
+                Some(idx)
             ),
             (None, Some(_)) => panic!(
                 "Invariant broken: node {} reported no next but next node supplied",

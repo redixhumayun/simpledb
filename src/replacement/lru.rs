@@ -69,8 +69,7 @@ impl PolicyState {
         } else {
             let mut current_head_guard =
                 current_head.map(|current_head| buffer_pool[current_head].lock().unwrap());
-            let mut prev_guard =
-                predecessor_index.map(|prev| buffer_pool[prev].lock().unwrap());
+            let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock().unwrap());
             let mut next_guard = frame_guard
                 .next()
                 .map(|idx| buffer_pool[idx].lock().unwrap());
@@ -85,11 +84,7 @@ impl PolicyState {
         Some(frame_guard)
     }
 
-    pub fn on_frame_assigned(
-        &self,
-        buffer_pool: &[Arc<Mutex<BufferFrame>>],
-        frame_idx: usize,
-    ) {
+    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
         let current_head = intrusive_list_guard.peek_head();
         match current_head {
