@@ -3688,7 +3688,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
     }
 }
 
-trait UpdatePlanner {
+pub trait UpdatePlanner {
     fn execute_insert(
         &self,
         data: InsertData,
@@ -4529,7 +4529,7 @@ mod heuristic_efficiency_tests {
     }
 }
 
-trait QueryPlanner {
+pub trait QueryPlanner {
     fn create_plan(
         &self,
         query_data: QueryData,
@@ -6294,7 +6294,7 @@ mod select_scan_tests {
 }
 
 #[derive(Debug, Clone)]
-struct Predicate {
+pub struct Predicate {
     root: PredicateNode,
 }
 
@@ -6644,7 +6644,7 @@ impl Predicate {
 }
 
 #[derive(Clone, Debug)]
-struct Term {
+pub struct Term {
     lhs: Expression,
     rhs: Expression,
     comparison_op: ComparisonOp,
@@ -6777,7 +6777,7 @@ impl Term {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Expression {
+pub enum Expression {
     Constant(Constant),
     FieldName(String),
     BinaryOp {
@@ -6876,7 +6876,7 @@ impl Expression {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum BinaryOperator {
+pub enum BinaryOperator {
     Add,
     Subtract,
     Divide,
@@ -7407,7 +7407,7 @@ impl Index for HashIndex {
 }
 
 /// Interface for traversing and modifying an index
-trait Index {
+pub trait Index {
     /// Position the index before the first record having the specified search key
     fn before_first(&mut self, search_key: &Constant);
 
@@ -7820,7 +7820,7 @@ mod table_manager_tests {
 }
 
 #[derive(Clone)]
-struct TableScan {
+pub struct TableScan {
     txn: Arc<Transaction>,
     layout: Layout,
     file_name: String,
@@ -9411,7 +9411,7 @@ struct LockState {
 
 /// Global struct used by all transactions to keep track of locks
 #[derive(Debug)]
-struct LockTable {
+pub struct LockTable {
     lock_table: Mutex<HashMap<BlockId, LockState>>,
     cond_var: Condvar,
     timeout: u64,
