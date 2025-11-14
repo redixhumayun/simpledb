@@ -1,6 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use simpledb::{Constant, FieldType, SimpleDB, Transaction};
+use simpledb::{BTreeIndex, Constant, FieldType, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -49,6 +49,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 show_buffers(&db);
                 continue;
             }
+            "recover" | "RECOVER" => {
+                match recover_database(&db) {
+                    Ok(result) => println!("{result}"),
+                    Err(e) => println!("Error: {e}"),
+                }
+                continue;
+            }
             "" => continue, // Empty input
             _ => {
                 // Check for DESCRIBE <table> command
@@ -86,6 +93,7 @@ fn show_help() {
     println!("  SHOW TABLES         - List all tables");
     println!("  SHOW BUFFERS        - Display buffer pool statistics");
     println!("  DESCRIBE <table>    - Show table schema and statistics");
+    println!("  RECOVER             - Recover database from log");
     println!();
     println!("Supported SQL:");
     println!("  CREATE TABLE table_name(field_name type, ...)");
@@ -131,12 +139,19 @@ fn show_buffers(db: &SimpleDB) {
     println!("  Available buffers: {}", available);
 }
 
+fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
+    let txn = Arc::new(db.new_tx());
+    txn.recover()?;
+    Ok("Database recovery completed successfully.".to_string())
+}
+
 fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Error>> {
     let txn = Arc::new(db.new_tx());
     let layout = db.metadata_manager().get_layout(table_name, Arc::clone(&txn));
     let stat_info = db
         .metadata_manager()
         .get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
+    let indexes = db.metadata_manager().get_index_info(table_name, Arc::clone(&txn));
     txn.commit()?;
 
     let mut result = format!("Table: {}\n", table_name);
@@ -161,6 +176,38 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
         result.push_str(&format!("{:<20} {:<15}\n", field, type_str));
     }
 
+    // Show index information
+    if !indexes.is_empty() {
+        result.push_str("\nIndexes:\n");
+        for (field_name, index_info) in indexes {
+            // Use the accessor methods to get comprehensive index information
+            let idx_schema = index_info.table_schema();
+            let idx_stats = index_info.stat_info();
+            let blocks = index_info.blocks_accessed();
+            let records = index_info.records_output();
+            let distinct = index_info.distinct_values(&field_name);
+
+            // Calculate BTree search cost for comparison
+            let records_per_block = if layout.slot_size > 0 {
+                db.new_tx().block_size() / layout.slot_size
+            } else {
+                1
+            };
+            let btree_cost = BTreeIndex::search_cost(blocks, records_per_block);
+
+            result.push_str(&format!(
+                "  - {}: {} fields, {} records, {} blocks, {} output records, {} distinct values, BTree cost: {}\n",
+                field_name,
+                idx_schema.fields.len(),
+                idx_stats.num_records,
+                blocks,
+                records,
+                distinct,
+                btree_cost
+            ));
+        }
+    }
+
     Ok(result)
 }
 
@@ -178,13 +225,17 @@ fn execute_sql(db: &SimpleDB, sql: &str) -> Result<String, Box<dyn Error>> {
         execute_update(db, sql, Arc::clone(&txn))
     };
 
-    //  commit the txn
+    //  commit the txn or rollback on error
     match result {
         Ok(_) => {
             txn.commit()?;
             result
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // Rollback on error
+            txn.rollback()?;
+            Err(e)
+        }
     }
 }
 

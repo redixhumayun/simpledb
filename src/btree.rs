@@ -15,6 +15,12 @@ pub struct BTreeIndex {
     root_block: BlockId,
 }
 
+impl std::fmt::Display for BTreeIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BTreeIndex({})", self.index_name)
+    }
+}
+
 impl BTreeIndex {
     pub fn new(
         txn: Arc<Transaction>,
@@ -62,10 +68,15 @@ impl BTreeIndex {
         })
     }
 
-    fn search_cost(num_of_blocks: usize, records_per_block: usize) -> usize {
+    pub fn search_cost(num_of_blocks: usize, records_per_block: usize) -> usize {
         (1 + num_of_blocks.ilog(records_per_block))
             .try_into()
             .unwrap()
+    }
+
+    /// Returns the name of this index
+    pub fn index_name(&self) -> &str {
+        &self.index_name
     }
 }
 

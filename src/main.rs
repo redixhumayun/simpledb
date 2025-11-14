@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 pub mod test_utils;
-use btree::BTreeIndex;
+pub use btree::BTreeIndex;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
     QueryData,
@@ -5216,6 +5216,11 @@ where
     fn new(scan: S, field_list: Vec<String>) -> Self {
         Self { scan, field_list }
     }
+
+    /// Returns the list of fields in this projection
+    pub fn projected_fields(&self) -> &[String] {
+        &self.field_list
+    }
 }
 
 impl<S> Iterator for ProjectScan<S>
@@ -6941,7 +6946,7 @@ impl MetadataManager {
             .create_index(index_name, table_name, field_name, txn);
     }
 
-    fn get_index_info(
+    pub fn get_index_info(
         &self,
         table_name: &str,
         txn: Arc<Transaction>,
@@ -7215,7 +7220,7 @@ impl IndexManager {
 }
 
 #[derive(Debug, Clone)]
-struct IndexInfo {
+pub struct IndexInfo {
     index_name: String,
     field_name: String,
     txn: Arc<Transaction>,
@@ -7284,19 +7289,19 @@ impl IndexInfo {
     }
 
     /// This function returns the number of blocks that would need to be searched for this index on a specific field
-    fn blocks_accessed(&self) -> usize {
+    pub fn blocks_accessed(&self) -> usize {
         let records_per_block = self.txn.block_size() / self.index_layout.slot_size;
         let num_blocks = self.stat_info.num_records / records_per_block;
         HashIndex::search_cost(num_blocks)
     }
 
     /// This function returns the number of records that we would expect to get when using this index on a specific field
-    fn records_output(&self) -> usize {
+    pub fn records_output(&self) -> usize {
         self.stat_info.num_records / self.stat_info.distinct_values(&self.field_name)
     }
 
     /// This function returns the number of distinct values for a specific field in this index
-    fn distinct_values(&self, field_name: &str) -> usize {
+    pub fn distinct_values(&self, field_name: &str) -> usize {
         if self.field_name == field_name {
             1
         } else {
@@ -8703,6 +8708,11 @@ pub struct Transaction {
 impl Transaction {
     const TXN_SLEEP_TIMEOUT: u64 = 100; //  time the txn will sleep for
 
+    /// Returns the transaction sleep timeout in milliseconds
+    pub fn sleep_timeout() -> u64 {
+        Self::TXN_SLEEP_TIMEOUT
+    }
+
     fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
@@ -8742,7 +8752,7 @@ impl Transaction {
     /// Rollback this transaction
     /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
     /// It will also handle meta operations like unpinning buffers
-    fn rollback(&self) -> Result<(), Box<dyn Error>> {
+    pub fn rollback(&self) -> Result<(), Box<dyn Error>> {
         self.recovery_manager.rollback(self).unwrap();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
@@ -8750,7 +8760,7 @@ impl Transaction {
     }
 
     /// Recover the database on start-up or after a crash
-    fn recover(&self) -> Result<(), Box<dyn Error>> {
+    pub fn recover(&self) -> Result<(), Box<dyn Error>> {
         self.recovery_manager.recover(self).unwrap();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
@@ -8874,7 +8884,7 @@ impl Transaction {
     }
 
     /// Get the block size
-    fn block_size(&self) -> usize {
+    pub fn block_size(&self) -> usize {
         self.file_manager.lock().unwrap().block_size()
     }
 }
@@ -9620,7 +9630,7 @@ mod lock_table_tests {
             let readers = 10;
             for i in 0..readers {
                 lt_1.acquire_shared_lock(i, &bid_1).unwrap();
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(super::Transaction::sleep_timeout()));
                 lt_1.release_locks(i, &bid_1).unwrap();
             }
         });
