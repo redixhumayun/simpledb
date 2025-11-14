@@ -89,7 +89,7 @@ impl SimpleDB {
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
         let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
-        let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
+        let _update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
         let index_update_planner = IndexUpdatePlanner::new(Arc::clone(&metadata_manager));
         let planner = Arc::new(Planner::new(
             Box::new(query_planner),
@@ -509,15 +509,15 @@ impl<S1> UpdateScan for MultiBufferProductScan<S1>
 where
     S1: UpdateScan + Clone + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -533,7 +533,7 @@ where
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 }
@@ -864,15 +864,15 @@ impl Iterator for ChunkScan {
 }
 
 impl UpdateScan for ChunkScan {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -888,7 +888,7 @@ impl UpdateScan for ChunkScan {
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 }
@@ -1358,7 +1358,7 @@ where
             match &self.scan_state {
                 MergeJoinScanState::BeforeFirst => match (self.scan_1.next(), self.scan_2.next()) {
                     (None, None) | (None, Some(Ok(_))) | (Some(Ok(_)), None) => return None,
-                    (None, Some(Err(e))) | (Some(Err(e)), None) => return None,
+                    (None, Some(Err(_e))) | (Some(Err(_e)), None) => return None,
                     (Some(Ok(_)), Some(Err(e))) | (Some(Err(e)), Some(Ok(_))) => {
                         return Some(Err(e))
                     }
@@ -1473,15 +1473,15 @@ impl<S> UpdateScan for MergeJoinScan<S>
 where
     S: Scan + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -1497,7 +1497,7 @@ where
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 }
@@ -6435,7 +6435,7 @@ impl Predicate {
         match node {
             PredicateNode::Empty => None,
             PredicateNode::Term(term) => term.equates_with_constant(field_name),
-            PredicateNode::Composite { op, operands } => {
+            PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
                     if let Some(val) = self.evaluate_equates_with_constant(operand, field_name) {
                         return Some(val);
@@ -6475,7 +6475,7 @@ impl Predicate {
         match node {
             PredicateNode::Empty => None,
             PredicateNode::Term(term) => term.equates_with_field(field_name),
-            PredicateNode::Composite { op, operands } => {
+            PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
                     if let Some(field) = self.evaluate_equates_with_field(operand, field_name) {
                         return Some(field);
@@ -10788,7 +10788,7 @@ impl BufferManager {
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<BufferFrame>>> {
         //  Wrap the latch table in a guard which will prune it appropriately
         let latch_table_guard = LatchTableGuard::new(&self.latch_table, block_id);
-        let block_latch = latch_table_guard.lock();
+        let _block_latch = latch_table_guard.lock();
 
         //  check the resident table for the associated frame
         let frame_ptr = {
@@ -11343,7 +11343,7 @@ impl Page {
 
     /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
     fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
-        let length_bytes = &self.contents[offset..offset + Self::INT_BYTES];
+        let _length_bytes = &self.contents[offset..offset + Self::INT_BYTES];
         let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
             .try_into()
             .unwrap();
@@ -11355,7 +11355,7 @@ impl Page {
     /// Set a slice of bytes at the given offset. Write the length and then the bytes
     fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
         let length = bytes.len() as u32;
-        let length_bytes = length.to_be_bytes();
+        let _length_bytes = length.to_be_bytes();
         self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
         offset += Self::INT_BYTES;
         self.contents[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -11814,7 +11814,7 @@ mod durability_tests {
 }
 
 fn main() {
-    let db = SimpleDB::new("random", 800, 4, true, 100);
+    let _db = SimpleDB::new("random", 800, 4, true, 100);
 }
 
 #[cfg(test)]
