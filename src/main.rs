@@ -150,7 +150,7 @@ impl SimpleDB {
     }
 }
 
-struct MultiBufferProductPlan {
+pub struct MultiBufferProductPlan {
     lhs: Arc<dyn Plan>,
     rhs: Arc<dyn Plan>,
     txn: Arc<Transaction>,
@@ -158,7 +158,7 @@ struct MultiBufferProductPlan {
 }
 
 impl MultiBufferProductPlan {
-    fn new(lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>, txn: Arc<Transaction>) -> SimpleDBResult<Self> {
+    pub fn new(lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>, txn: Arc<Transaction>) -> SimpleDBResult<Self> {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
@@ -171,7 +171,7 @@ impl MultiBufferProductPlan {
         })
     }
 
-    fn create_temp_table(&self, plan: &Arc<dyn Plan>) -> SimpleDBResult<TempTable> {
+    pub fn create_temp_table(&self, plan: &Arc<dyn Plan>) -> SimpleDBResult<TempTable> {
         let temp_table = TempTable::new(Arc::clone(&self.txn), plan.schema());
         let mut source_scan = plan.open();
         let mut table_scan = temp_table.open();
@@ -373,7 +373,7 @@ mod multi_buffer_product_plan_tests {
     }
 }
 
-struct MultiBufferProductScan<S1>
+pub struct MultiBufferProductScan<S1>
 where
     S1: Scan + Clone,
 {
@@ -392,7 +392,7 @@ impl<S1> MultiBufferProductScan<S1>
 where
     S1: Scan + Clone,
 {
-    fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
+    pub fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
         debug!("Creating multi buffer product scan for {}.tbl", table_name);
         let file_name = format!("{table_name}.tbl");
         let available_buffers = txn.available_buffs();
@@ -419,7 +419,7 @@ where
         scan
     }
 
-    fn load_next_set_of_chunks(&mut self) -> bool {
+    pub fn load_next_set_of_chunks(&mut self) -> bool {
         if self.next_start_block_num >= self.txn.size(&self.file_name) {
             return false;
         }
@@ -712,7 +712,7 @@ mod multi_buffer_product_scan_tests {
 }
 
 #[derive(Clone)]
-struct ChunkScan {
+pub struct ChunkScan {
     txn: Arc<Transaction>,
     layout: Layout,
     file_name: String,
@@ -726,7 +726,7 @@ struct ChunkScan {
 }
 
 impl ChunkScan {
-    fn new(
+    pub fn new(
         txn: Arc<Transaction>,
         layout: Layout,
         table_name: &str,
@@ -765,7 +765,7 @@ impl ChunkScan {
         scan
     }
 
-    fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) {
         let offset = block_num - self.first_block_num;
         debug!(
             "Moving chunk scan to block {} which is offset {}",
@@ -1099,7 +1099,7 @@ mod chunk_scan_tests {
 /// We are trying to find the number of buffers to reserve and how many blocks
 /// of the input record to read
 /// This is a root because the cost of the merge side of merge join is logarithmic
-fn best_root(available_buffers: usize, num_of_blocks: usize) -> usize {
+pub fn best_root(available_buffers: usize, num_of_blocks: usize) -> usize {
     let buffers = available_buffers - 2; //  reserve some buffers
     if buffers <= 1 {
         return buffers;
@@ -1117,7 +1117,7 @@ fn best_root(available_buffers: usize, num_of_blocks: usize) -> usize {
 /// We are trying to find the number of buffers to reserve and how many blocks
 /// of the input record to read
 /// This is a factor because the cost of the productscan is linear
-fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
+pub fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
     let buffers = available_buffers - 2; // reserve some buffers
     if buffers <= 1 {
         return buffers;
@@ -1131,7 +1131,7 @@ fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
     k
 }
 
-struct MergeJoinPlan {
+pub struct MergeJoinPlan {
     plan_1: Arc<dyn Plan>,
     plan_2: Arc<dyn Plan>,
     field_name_1: String,
@@ -1141,7 +1141,7 @@ struct MergeJoinPlan {
 }
 
 impl MergeJoinPlan {
-    fn new(
+    pub fn new(
         plan_1: Arc<dyn Plan>,
         plan_2: Arc<dyn Plan>,
         txn: Arc<Transaction>,
@@ -1313,13 +1313,13 @@ mod merge_join_plan_tests {
     }
 }
 
-enum MergeJoinScanState {
+pub enum MergeJoinScanState {
     BeforeFirst,
     SeekMatch,
     InGroup(Constant),
 }
 
-struct MergeJoinScan<S>
+pub struct MergeJoinScan<S>
 where
     S: Scan,
 {
@@ -1335,7 +1335,7 @@ impl<S> MergeJoinScan<S>
 where
     S: Scan,
 {
-    fn new(scan_1: S, scan_2: SortScan, field_name_1: String, field_name_2: String) -> Self {
+    pub fn new(scan_1: S, scan_2: SortScan, field_name_1: String, field_name_2: String) -> Self {
         Self {
             scan_1,
             scan_2,
@@ -1932,7 +1932,7 @@ mod merge_join_scan_tests {
     }
 }
 
-struct SortPlan {
+pub struct SortPlan {
     source_plan: Arc<dyn Plan>,
     txn: Arc<Transaction>,
     schema: Schema,
@@ -1940,7 +1940,7 @@ struct SortPlan {
 }
 
 impl SortPlan {
-    fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
+    pub fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
         let schema = source_plan.schema();
         let record_comparator = RecordComparator::new(field_list);
         Self {
@@ -1968,7 +1968,7 @@ impl SortPlan {
         Ok(())
     }
 
-    fn split_into_runs(
+    pub fn split_into_runs(
         &self,
         mut source_scan: Box<dyn UpdateScan>,
     ) -> Result<Vec<TempTable>, Box<dyn Error>> {
@@ -2019,7 +2019,7 @@ impl SortPlan {
         Ok(temp_tables)
     }
 
-    fn do_merge_iters(
+    pub fn do_merge_iters(
         &self,
         mut temp_tables: Vec<TempTable>,
     ) -> Result<Vec<TempTable>, Box<dyn Error>> {
@@ -2035,7 +2035,7 @@ impl SortPlan {
         Ok(temp_tables)
     }
 
-    fn merge(&self, table_1: TempTable, table_2: TempTable) -> Result<TempTable, Box<dyn Error>> {
+    pub fn merge(&self, table_1: TempTable, table_2: TempTable) -> Result<TempTable, Box<dyn Error>> {
         let mut scan_1 = Some(table_1.open());
         let mut scan_2 = Some(table_2.open());
         let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
@@ -2439,7 +2439,7 @@ mod sort_plan_tests {
 }
 
 #[derive(Clone, Copy)]
-enum SortScanState {
+pub enum SortScanState {
     BeforeFirst,
     OnFirst,
     OnSecond,
@@ -2448,7 +2448,7 @@ enum SortScanState {
     Done,
 }
 
-struct SortScan {
+pub struct SortScan {
     s1: TableScan,
     s2: Option<TableScan>,
     current_scan: SortScanState,
@@ -2457,7 +2457,7 @@ struct SortScan {
 }
 
 impl SortScan {
-    fn new(mut runs: Vec<TempTable>, record_comparator: RecordComparator) -> Self {
+    pub fn new(mut runs: Vec<TempTable>, record_comparator: RecordComparator) -> Self {
         assert!(runs.len() <= 2);
         let s1 = runs.remove(0).open();
         let s2 = runs.pop().map(|t| t.open());
@@ -2470,7 +2470,7 @@ impl SortScan {
         }
     }
 
-    fn set_current_scan(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn set_current_scan(&mut self) -> Result<(), Box<dyn Error>> {
         match self
             .record_comparator
             .compare(&self.s1, self.s2.as_ref().unwrap())
@@ -2496,7 +2496,7 @@ impl SortScan {
         }
     }
 
-    fn save_position(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn save_position(&mut self) -> Result<(), Box<dyn Error>> {
         let rid_1 = self.s1.get_rid()?;
         let rid_2 = self.s2.as_ref().map(|s| s.get_rid()).transpose()?;
         self.saved_rids[0] = Some(rid_1);
@@ -2504,7 +2504,7 @@ impl SortScan {
         Ok(())
     }
 
-    fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
         let rid_1 = self.saved_rids[0]
             .ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
         self.s1.move_to_row_id(rid_1);
@@ -2826,12 +2826,12 @@ mod sort_scan_tests {
 }
 
 #[derive(Clone)]
-struct RecordComparator {
+pub struct RecordComparator {
     field_list: Vec<String>,
 }
 
 impl RecordComparator {
-    fn new(field_list: Vec<String>) -> Self {
+    pub fn new(field_list: Vec<String>) -> Self {
         Self { field_list }
     }
 
@@ -2848,13 +2848,13 @@ impl RecordComparator {
     }
 }
 
-struct MaterializePlan {
+pub struct MaterializePlan {
     source_plan: Arc<dyn Plan>,
     txn: Arc<Transaction>,
 }
 
 impl MaterializePlan {
-    fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>) -> Self {
+    pub fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>) -> Self {
         Self { source_plan, txn }
     }
 }
@@ -3033,17 +3033,17 @@ mod materialize_plan_tests {
     }
 }
 
-static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
+pub static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
-struct TempTable {
+pub struct TempTable {
     txn: Arc<Transaction>,
     table_name: String,
     layout: Layout,
 }
 
 impl TempTable {
-    fn new(txn: Arc<Transaction>, schema: Schema) -> Self {
+    pub fn new(txn: Arc<Transaction>, schema: Schema) -> Self {
         let table_id = TEMP_TABLE_ID_GENERATOR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let table_name = format!("TempTable{table_id}");
         let layout = Layout::new(schema);
@@ -3054,7 +3054,7 @@ impl TempTable {
         }
     }
 
-    fn open(&self) -> TableScan {
+    pub fn open(&self) -> TableScan {
         TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name)
     }
 }
@@ -3065,7 +3065,7 @@ pub struct Planner {
 }
 
 impl Planner {
-    fn new(query_planner: Box<dyn QueryPlanner>, update_planner: Box<dyn UpdatePlanner>) -> Self {
+    pub fn new(query_planner: Box<dyn QueryPlanner>, update_planner: Box<dyn UpdatePlanner>) -> Self {
         Self {
             query_planner,
             update_planner,
@@ -3457,7 +3457,7 @@ struct IndexUpdatePlanner {
 }
 
 impl IndexUpdatePlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+    pub fn new(metadata_manager: Arc<MetadataManager>) -> Self {
         Self { metadata_manager }
     }
 }
@@ -3589,7 +3589,7 @@ struct BasicUpdatePlanner {
 }
 
 impl BasicUpdatePlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+    pub fn new(metadata_manager: Arc<MetadataManager>) -> Self {
         Self { metadata_manager }
     }
 }
@@ -3723,7 +3723,7 @@ trait UpdatePlanner {
 
 /// This is the "physical" portion of the optimizer. It decides on the physical implementation of a node to use
 /// For instance, whether to use an [IndexSelectPlan] or a regular [SelectPlan] depending on the availability of certain resources
-struct TablePlanner {
+pub struct TablePlanner {
     table_name: String,
     predicate: Predicate,
     txn: Arc<Transaction>,
@@ -3734,7 +3734,7 @@ struct TablePlanner {
 }
 
 impl TablePlanner {
-    fn new(
+    pub fn new(
         table_name: String,
         predicate: Predicate,
         txn: Arc<Transaction>,
@@ -3909,7 +3909,7 @@ struct HeuristicQueryPlanner {
 }
 
 impl HeuristicQueryPlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+    pub fn new(metadata_manager: Arc<MetadataManager>) -> Self {
         Self {
             table_planners: Vec::new(),
             metadata_manager,
@@ -3921,7 +3921,7 @@ impl HeuristicQueryPlanner {
     /// 1. Heuristic 5a - Choose the table producing the smallest output when deciding join order
     /// 2. Heuristic 4 - Join only previously chosen tables and try to produce smallest possible output
     /// 3. Heuristic 8 - Apply projection nodes to reduce the output, especially at the output of materialized nodes
-    fn create_plan_internal(
+    pub fn create_plan_internal(
         &mut self,
         query_data: QueryData,
         txn: Arc<Transaction>,
@@ -3963,7 +3963,7 @@ impl HeuristicQueryPlanner {
 
     /// Find the [SelectPlan] with the lowest record output
     /// This will apply heuristic 5a
-    fn get_lowest_select_plan(&mut self) -> SimpleDBResult<Arc<dyn Plan>> {
+    pub fn get_lowest_select_plan(&mut self) -> SimpleDBResult<Arc<dyn Plan>> {
         let (idx, plan) = self
             .table_planners
             .iter()
@@ -3978,7 +3978,7 @@ impl HeuristicQueryPlanner {
     /// Find the right table to construct a join plan with and construct the best join plan
     /// Choose the table to join with current_plan by minimizing the current output
     /// This will apply heuristic 4
-    fn get_lowest_join_plan(
+    pub fn get_lowest_join_plan(
         &mut self,
         current_plan: &Arc<dyn Plan>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
@@ -4001,7 +4001,7 @@ impl HeuristicQueryPlanner {
 
     /// Find the right table to construct a product plan with
     /// Choose the table to do a product with current_plan by minimizing the output
-    fn get_lowest_product_plan(
+    pub fn get_lowest_product_plan(
         &mut self,
         current_plan: Arc<dyn Plan>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
@@ -4038,7 +4038,7 @@ struct BasicQueryPlanner {
 }
 
 impl BasicQueryPlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+    pub fn new(metadata_manager: Arc<MetadataManager>) -> Self {
         Self { metadata_manager }
     }
 }
@@ -4544,7 +4544,7 @@ struct ProductPlan {
 }
 
 impl ProductPlan {
-    fn new(plan_1: Arc<dyn Plan>, plan_2: Arc<dyn Plan>) -> Result<Self, Box<dyn Error>> {
+    pub fn new(plan_1: Arc<dyn Plan>, plan_2: Arc<dyn Plan>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&plan_1.schema())?;
         schema.add_all_from_schema(&plan_2.schema())?;
@@ -4614,7 +4614,7 @@ struct ProjectPlan {
 }
 
 impl ProjectPlan {
-    fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
+    pub fn new(plan: Arc<dyn Plan>, fields_list: Vec<&str>) -> Result<Self, Box<dyn Error>> {
         let mut schema = Schema::new();
 
         // Handle wildcard expansion
@@ -4665,14 +4665,14 @@ impl Plan for ProjectPlan {
     }
 }
 
-struct IndexSelectPlan {
+pub struct IndexSelectPlan {
     plan: Arc<dyn Plan>,
     ii: IndexInfo,
     value: Constant,
 }
 
 impl IndexSelectPlan {
-    fn new(plan: Arc<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
+    pub fn new(plan: Arc<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
         Self { plan, ii, value }
     }
 }
@@ -4725,7 +4725,7 @@ struct SelectPlan {
 }
 
 impl SelectPlan {
-    fn new(plan: Arc<dyn Plan>, predicate: Predicate) -> Self {
+    pub fn new(plan: Arc<dyn Plan>, predicate: Predicate) -> Self {
         Self { plan, predicate }
     }
 }
@@ -4780,7 +4780,7 @@ struct TablePlan {
 }
 
 impl TablePlan {
-    fn new(
+    pub fn new(
         table_name: &str,
         txn: Arc<Transaction>,
         metadata_manager: Arc<MetadataManager>,
@@ -4998,7 +4998,7 @@ where
     S1: Scan,
     S2: Scan,
 {
-    fn new(s1: S1, s2: S2) -> Self {
+    pub fn new(s1: S1, s2: S2) -> Self {
         let mut scan = Self { s1, s2 };
         scan.before_first().unwrap();
         scan
@@ -5213,7 +5213,7 @@ impl<S> ProjectScan<S>
 where
     S: Scan,
 {
-    fn new(scan: S, field_list: Vec<String>) -> Self {
+    pub fn new(scan: S, field_list: Vec<String>) -> Self {
         Self { scan, field_list }
     }
 
@@ -5383,7 +5383,7 @@ mod project_scan_tests {
     }
 }
 
-struct IndexJoinPlan {
+pub struct IndexJoinPlan {
     plan_1: Arc<dyn Plan>,
     plan_2: Arc<dyn Plan>,
     index_info: IndexInfo,
@@ -5392,7 +5392,7 @@ struct IndexJoinPlan {
 }
 
 impl IndexJoinPlan {
-    fn new(
+    pub fn new(
         plan_1: Arc<dyn Plan>,
         plan_2: Arc<dyn Plan>,
         index_info: IndexInfo,
@@ -5638,7 +5638,7 @@ enum IndexJoinScanState {
     Done,
 }
 
-struct IndexJoinScan<S, I>
+pub struct IndexJoinScan<S, I>
 where
     S: Scan,
     I: Index,
@@ -5655,7 +5655,7 @@ where
     S: Scan,
     I: Index,
 {
-    fn new(lhs: S, index: I, rhs: TableScan, join_field: String) -> Self {
+    pub fn new(lhs: S, index: I, rhs: TableScan, join_field: String) -> Self {
         Self {
             lhs,
             rhs,
@@ -5665,7 +5665,7 @@ where
         }
     }
 
-    fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
         self.index
             .before_first(&self.lhs.get_value(&self.join_field)?);
         Ok(())
@@ -5932,7 +5932,7 @@ mod index_join_scan_tests {
     }
 }
 
-struct IndexSelectScan<I>
+pub struct IndexSelectScan<I>
 where
     I: Index,
 {
@@ -5945,7 +5945,7 @@ impl<I> IndexSelectScan<I>
 where
     I: Index,
 {
-    fn new(scan: TableScan, index: I, value: Constant) -> Self {
+    pub fn new(scan: TableScan, index: I, value: Constant) -> Self {
         Self { scan, index, value }
     }
 }
@@ -6118,7 +6118,7 @@ impl<S> SelectScan<S>
 where
     S: Scan,
 {
-    fn new(scan: S, predicate: Predicate) -> Self {
+    pub fn new(scan: S, predicate: Predicate) -> Self {
         Self { scan, predicate }
     }
 }
@@ -6316,7 +6316,7 @@ enum BooleanConnective {
 }
 
 impl Predicate {
-    fn new(terms: Vec<Term>) -> Self {
+    pub fn new(terms: Vec<Term>) -> Self {
         match terms.len() {
             0 => Self {
                 root: PredicateNode::Empty,
@@ -6333,7 +6333,7 @@ impl Predicate {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         matches!(self.root, PredicateNode::Empty)
     }
 
@@ -6494,7 +6494,7 @@ impl Predicate {
     /// Construct a sub-predicate which will apply to the union of the two schemas provided
     /// but will not apply to either individually. This is done to avoid redundant predicates
     /// which would have already been applied by individual select sub-predicates on a specific relation
-    fn sub_predicate_for_join(
+    pub fn sub_predicate_for_join(
         &self,
         schema_1: &Schema,
         schema_2: &Schema,
@@ -6512,7 +6512,7 @@ impl Predicate {
 
     /// This function will take in a schema and evaluate which parts of this predicate apply
     /// to that schema. It will construct and return a new sub-predicate
-    fn sub_predicate_for_select(&self, schema: &Schema) -> Predicate {
+    pub fn sub_predicate_for_select(&self, schema: &Schema) -> Predicate {
         let term_ok = |term: &Term| term.applies_to(schema);
         Predicate {
             root: self.filter_node(&self.root, &term_ok),
@@ -6661,7 +6661,7 @@ enum ComparisonOp {
 }
 
 impl Term {
-    fn new(lhs: Expression, rhs: Expression) -> Self {
+    pub fn new(lhs: Expression, rhs: Expression) -> Self {
         Self {
             lhs,
             rhs,
@@ -6893,7 +6893,7 @@ pub struct MetadataManager {
 }
 
 impl MetadataManager {
-    fn new(is_new: bool, txn: Arc<Transaction>) -> Self {
+    pub fn new(is_new: bool, txn: Arc<Transaction>) -> Self {
         let table_manager = Arc::new(TableManager::new(is_new, Arc::clone(&txn)));
         let view_manager = Arc::new(ViewManager::new(
             is_new,
@@ -6927,7 +6927,7 @@ impl MetadataManager {
         self.view_manager.create_view(view_name, view_def, txn);
     }
 
-    fn get_view_def(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
+    pub fn get_view_def(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
         self.view_manager.get_view(view_name, txn)
     }
 
@@ -7145,7 +7145,7 @@ impl IndexManager {
     const TABLE_COL_NAME: &str = "table_name";
     const TABLE_FIELD_NAME: &str = "field_name";
 
-    fn new(
+    pub fn new(
         is_new: bool,
         table_manager: Arc<TableManager>,
         stat_manager: Arc<StatManager>,
@@ -7243,7 +7243,7 @@ impl IndexInfo {
     const BLOCK_NUM_FIELD: &str = "block"; //   the block number
     const ID_FIELD: &str = "id"; //  the record id (slot number)
     const DATA_FIELD: &str = "dataval"; //  the data field
-    fn new(
+    pub fn new(
         index_name: &str,
         field_name: &str,
         txn: Arc<Transaction>,
@@ -7274,7 +7274,7 @@ impl IndexInfo {
         }
     }
 
-    fn open(&self) -> impl Index {
+    pub fn open(&self) -> impl Index {
         // HashIndex::new(
         //     Arc::clone(&self.txn),
         //     &self.index_name,
@@ -7320,7 +7320,7 @@ impl IndexInfo {
     }
 }
 
-struct HashIndex {
+pub struct HashIndex {
     txn: Arc<Transaction>,
     index_name: String,
     layout: Layout,
@@ -7331,7 +7331,7 @@ struct HashIndex {
 impl HashIndex {
     const NUM_BUCKETS: usize = 100;
 
-    fn new(txn: Arc<Transaction>, index_name: &str, layout: Layout) -> Self {
+    pub fn new(txn: Arc<Transaction>, index_name: &str, layout: Layout) -> Self {
         Self {
             txn,
             index_name: index_name.to_string(),
@@ -7341,7 +7341,7 @@ impl HashIndex {
         }
     }
 
-    fn search_cost(num_blocks: usize) -> usize {
+    pub fn search_cost(num_blocks: usize) -> usize {
         num_blocks / Self::NUM_BUCKETS
     }
 }
@@ -7436,7 +7436,7 @@ struct StatManager {
 }
 
 impl StatManager {
-    fn new(table_manager: Arc<TableManager>) -> Self {
+    pub fn new(table_manager: Arc<TableManager>) -> Self {
         Self {
             table_manager,
             state: Mutex::new(StatState {
@@ -7530,7 +7530,7 @@ pub struct StatInfo {
 }
 
 impl StatInfo {
-    fn new(num_block: usize, num_records: usize) -> Self {
+    pub fn new(num_block: usize, num_records: usize) -> Self {
         Self {
             num_blocks: num_block,
             num_records,
@@ -7552,7 +7552,7 @@ impl ViewManager {
     const VIEW_NAME_COL: &str = "view_name";
     const VIEW_DEF_COL: &str = "view_col";
 
-    fn new(is_new: bool, table_manager: Arc<TableManager>, txn: Arc<Transaction>) -> Self {
+    pub fn new(is_new: bool, table_manager: Arc<TableManager>, txn: Arc<Transaction>) -> Self {
         if is_new {
             let mut schema = Schema::new();
             schema.add_string_field(Self::VIEW_NAME_COL, TableManager::MAX_NAME_LENGTH);
@@ -7578,7 +7578,7 @@ impl ViewManager {
     }
 
     /// Returns the view definition for a given view name
-    fn get_view(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
+    pub fn get_view(&self, view_name: &str, txn: Arc<Transaction>) -> Option<String> {
         let layout = self
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
@@ -7612,7 +7612,7 @@ impl TableManager {
     const FIELD_LENGTH_COL: &str = "length";
     const FIELD_OFFSET_COL: &str = "offset";
 
-    fn new(is_new: bool, tx: Arc<Transaction>) -> Self {
+    pub fn new(is_new: bool, tx: Arc<Transaction>) -> Self {
         //  Create the table catalog layout
         let mut table_cat_schema = Schema::new();
         table_cat_schema.add_string_field(Self::TABLE_NAME_COL, Self::MAX_NAME_LENGTH);
@@ -7830,7 +7830,7 @@ struct TableScan {
 }
 
 impl TableScan {
-    fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
+    pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
         let file_name = format!("{table_name}.tbl");
         let mut scan = Self {
@@ -7859,7 +7859,7 @@ impl TableScan {
     }
 
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
-    fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
@@ -7887,11 +7887,11 @@ impl TableScan {
     }
 
     /// Moves the [`RecordPage`] to the start of the file
-    fn move_to_start(&mut self) {
+    pub fn move_to_start(&mut self) {
         self.move_to_block(0);
     }
 
-    fn move_to_row_id(&mut self, row_id: RID) {
+    pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
@@ -8206,7 +8206,7 @@ pub struct RID {
 }
 
 impl RID {
-    fn new(block_num: usize, slot: usize) -> Self {
+    pub fn new(block_num: usize, slot: usize) -> Self {
         Self { block_num, slot }
     }
 }
@@ -8218,7 +8218,7 @@ struct RecordPageIterator<'a> {
 }
 
 impl<'a> RecordPageIterator<'a> {
-    fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
+    pub fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
         Self {
             record_page,
             current_slot: None,
@@ -8275,7 +8275,7 @@ struct RecordPage {
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
-    fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
+    pub fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         let handle = tx.pin(&block_id);
         Self { tx, handle, layout }
     }
@@ -8489,7 +8489,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    fn new(schema: Schema) -> Self {
+    pub fn new(schema: Schema) -> Self {
         let mut offsets = HashMap::new();
         let mut offset = Page::INT_BYTES;
         for field in schema.fields.iter() {
@@ -8565,7 +8565,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Schema {
             fields: Vec::new(),
             info: HashMap::new(),
@@ -8713,7 +8713,7 @@ impl Transaction {
         Self::TXN_SLEEP_TIMEOUT
     }
 
-    fn new(
+    pub fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
         buffer_manager: Arc<BufferManager>,
@@ -9418,7 +9418,7 @@ struct LockTable {
 }
 
 impl LockTable {
-    fn new(timeout: u64) -> Self {
+    pub fn new(timeout: u64) -> Self {
         Self {
             lock_table: Mutex::new(HashMap::new()),
             cond_var: Condvar::new(),
@@ -9696,7 +9696,7 @@ struct ConcurrencyManager {
     tx_id: TransactionID,
 }
 impl ConcurrencyManager {
-    fn new(tx_id: TransactionID, lock_table: Arc<LockTable>) -> Self {
+    pub fn new(tx_id: TransactionID, lock_table: Arc<LockTable>) -> Self {
         Self {
             lock_table,
             locks: RefCell::new(HashMap::new()),
@@ -9763,7 +9763,7 @@ struct RecoveryManager {
 }
 
 impl RecoveryManager {
-    fn new(
+    pub fn new(
         tx_num: usize,
         log_manager: Arc<Mutex<LogManager>>,
         buffer_manager: Arc<BufferManager>,
@@ -9894,7 +9894,7 @@ mod recovery_manager_tests {
     }
 
     impl MockTransaction {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 pinned_blocks: Vec::new(),
                 modified_ints: Mutex::new(Vec::new()),
@@ -10328,7 +10328,7 @@ struct BufferList {
 }
 
 impl BufferList {
-    fn new(buffer_manager: Arc<BufferManager>) -> Self {
+    pub fn new(buffer_manager: Arc<BufferManager>) -> Self {
         Self {
             buffers: RefCell::new(HashMap::new()),
             buffer_manager,
@@ -10485,7 +10485,7 @@ pub struct BufferFrame {
 }
 
 impl BufferFrame {
-    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
+    pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
         let size = file_manager.lock().unwrap().block_size();
         Self {
             file_manager,
@@ -10606,7 +10606,7 @@ pub struct BufferStats {
 }
 
 impl BufferStats {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
@@ -10643,7 +10643,7 @@ struct LatchTableGuard<'a> {
 }
 
 impl<'a> LatchTableGuard<'a> {
-    fn new(table: &'a Mutex<HashMap<BlockId, Arc<Mutex<()>>>>, block_id: &BlockId) -> Self {
+    pub fn new(table: &'a Mutex<HashMap<BlockId, Arc<Mutex<()>>>>, block_id: &BlockId) -> Self {
         let latch = {
             let mut guard = table.lock().unwrap();
             let block_latch_ptr = guard
@@ -10689,7 +10689,7 @@ pub struct BufferManager {
 
 impl BufferManager {
     const MAX_TIME: u64 = 10; //  10 seconds
-    fn new(
+    pub fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
         num_buffers: usize,
@@ -11105,7 +11105,7 @@ pub struct LogManager {
 }
 
 impl LogManager {
-    fn new(file_manager: SharedFS, log_file: &str) -> Self {
+    pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
         let bytes = vec![0; file_manager.lock().unwrap().block_size()];
         let mut log_page = Page::from_bytes(bytes);
         let log_size = file_manager.lock().unwrap().length(log_file.to_string());
@@ -11208,7 +11208,7 @@ pub struct LogIterator {
 }
 
 impl LogIterator {
-    fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
+    pub fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
         let block_size = file_manager.lock().unwrap().block_size();
         let mut page = Page::new(block_size);
         file_manager.lock().unwrap().read(&current_block, &mut page);
@@ -11223,7 +11223,7 @@ impl LogIterator {
         }
     }
 
-    fn move_to_block(&mut self) {
+    pub fn move_to_block(&mut self) {
         self.file_manager
             .lock()
             .unwrap()
