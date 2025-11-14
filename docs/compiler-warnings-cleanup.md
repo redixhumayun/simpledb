@@ -323,19 +323,38 @@ fn main() {
 
 ### Warning Count
 - **Started**: 118 warnings
-- **Current**: 115 warnings
-- **Eliminated**: 3 warnings
+- **Current**: 88 warnings
+- **Eliminated**: 30 warnings (25% reduction)
 
 ### In Progress
-- [ ] Additional unused variable/field fixes
-- [ ] Remaining introspection commands (DESCRIBE table)
+- None currently
 
-### Next Steps
+### Accomplishments
 1. ~~Add basic introspection commands~~ ✅
-2. Add DESCRIBE table command (uses stat_info, table_schema)
-3. Fix remaining unused variable warnings systematically
-4. Extend parser for additional operators (<=, >=, !=, arithmetic)
-5. Optionally integrate alternative query planners/join strategies
+2. ~~Add DESCRIBE table command~~ ✅
+3. ~~Fix unused variable warnings systematically~~ ✅ (30 eliminated)
+
+### Next Steps (Optional Future Work)
+1. Extend parser for additional operators (<=, >=, !=, arithmetic) - 5 warnings
+2. Integrate alternative query planners/join strategies - ~15 warnings
+3. Add actual usage for remaining utility methods - ~30 warnings
+4. Remove truly dead code if confirmed unused - ~30 warnings
+
+### Remaining 88 Warnings Breakdown
+- **Dead code** (57): Unused structs, methods, enum variants for advanced features
+  - Query optimization: HeuristicQueryPlanner, TablePlanner, IndexJoinPlan, etc.
+  - Join strategies: MergeJoinPlan/Scan, SortPlan/Scan, MultiBufferProductPlan/Scan
+  - Advanced features: HashIndex, MaterializePlan, TempTable
+  - Utility functions: best_root, best_factor, various trait methods
+
+- **Unused variables** (15): Remaining stubs in test-only implementations
+- **Never-read fields** (8): Fields in structs that aren't exposed via getters yet
+- **Unused imports** (1): CLI imports (harmless)
+- **Other** (7): Misc items like orphaned main(), enum variants
+
+Most remaining warnings are for **legitimate code** that exists for future features or
+testing, not actual problems. Integration would require significant work extending the
+query planner, parser, and CLI.
 
 ---
 
