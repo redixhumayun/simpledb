@@ -9059,7 +9059,6 @@ mod transaction_tests {
     ///
     /// Final value should be `num_of_txns` (5), confirming all increments were applied atomically.
     #[test]
-    #[ignore]
     fn test_transaction_isolation_with_concurrent_writes() {
         let file = generate_filename();
         let (test_db, test_dir) = SimpleDB::new_for_test(512, 3, 500);
