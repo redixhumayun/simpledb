@@ -107,7 +107,7 @@ All runs use `cargo bench --bench buffer_pool -- 100 12` (pool=12, block=4 KiB
 | Multi-thread pin:t8 (P5)           | 0.13 M ops/s            | **0.18 M ops/s**| 0.14 M ops/s      |
 
 _Notes_:  
-- Times are medians from Phase 1 latency benches. Throughputs are means from Phase 2 (Repeated/Random) and Phase 5 (pin:t2/pin:t8).  
+- Times are means from Phase 1 latency benches. Throughputs are means from Phase 2 (Repeated/Random) and Phase 5 (pin:t2/pin:t8).  
 - Clock shows higher hit-path latency on macOS due to the extra hand mutex; Linux latency stays near parity with LRU/master.
 - Phase 3 (pool/memory scaling) is not summarized here—see the raw log files for those details.
 
