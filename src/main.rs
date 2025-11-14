@@ -30,11 +30,11 @@ use parser::{
 
 pub use test_utils::TestDir;
 
-#[cfg(feature = "replacement_lru")]
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 use crate::intrusive_dll::IntrusiveNode;
 pub mod benchmark_framework;
 mod btree;
-#[cfg(feature = "replacement_lru")]
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 mod intrusive_dll;
 mod parser;
 mod replacement;
@@ -10415,13 +10415,13 @@ pub struct BufferFrame {
     pins: usize,
     txn: Option<usize>,
     lsn: Option<Lsn>,
-    #[cfg(feature = "replacement_lru")]
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     prev_idx: Option<usize>,
-    #[cfg(feature = "replacement_lru")]
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     next_idx: Option<usize>,
-    #[cfg(feature = "replacement_lru")]
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     index: usize,
-    #[cfg(feature = "replacement_clock")]
+    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
     ref_bit: bool,
 }
 
@@ -10436,13 +10436,13 @@ impl BufferFrame {
             pins: 0,
             txn: None,
             lsn: None,
-            #[cfg(feature = "replacement_lru")]
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             prev_idx: None,
-            #[cfg(feature = "replacement_lru")]
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             next_idx: None,
-            #[cfg(feature = "replacement_lru")]
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             index,
-            #[cfg(feature = "replacement_clock")]
+            #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: false,
         }
     }
@@ -10501,7 +10501,7 @@ impl BufferFrame {
     }
 }
 
-#[cfg(feature = "replacement_lru")]
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for BufferFrame {
     fn prev(&self) -> Option<usize> {
         self.prev_idx
@@ -10520,7 +10520,7 @@ impl IntrusiveNode for BufferFrame {
     }
 }
 
-#[cfg(feature = "replacement_lru")]
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for MutexGuard<'_, BufferFrame> {
     fn prev(&self) -> Option<usize> {
         self.prev_idx

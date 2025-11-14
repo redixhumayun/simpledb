@@ -70,6 +70,12 @@ This doc captures design-level guidance for three candidate replacement policies
     - (Release queue mutex)
     - `Frame mutex`
   - Hand advancement skips pinned frames and keeps their visited bits untouched until they become eligible.
+- **Expected behavior (benchmarks)**:
+  - Single-thread or lightly contended locality-heavy workloads (Repeated Access, Random K=10, Zipf) should match LRU hit rates and throughput, potentially edging slightly ahead of Clock thanks to the double-pass eviction (visited bit only cleared at the tail).
+  - Mid-sized working sets (Random K=50/100) should show modest improvement over Clock by reducing “one bad miss” evictions—expect hit rates slightly closer to LRU with overhead closer to Clock.
+  - Scan-heavy workloads (Sequential, Sequential MT) should remain comparable to Clock; no gains expected beyond the shared intrusive-list ordering.
+  - Highly concurrent workloads (pin:t8, Sequential MT) should behave like LRU or better because SIEVE doesn’t serialize on a global clock hand; no single mutex guards the sweep aside from the existing list lock.
+  - If benchmarks show regressions on locality-heavy or contention-heavy workloads relative to LRU/Clock, revisit the locking order or visited-bit handling.
 
 ## Cross-Policy Considerations
 
