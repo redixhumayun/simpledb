@@ -265,6 +265,10 @@ const ACCESS_CASES: &[AccessCase] = &[
         pattern: AccessPattern::SequentialMt { threads: 4 },
     },
     AccessCase {
+        filter_token: "Seq Scan MT x16",
+        pattern: AccessPattern::SequentialMt { threads: 16 },
+    },
+    AccessCase {
         filter_token: "Repeated Access (1000 ops)",
         pattern: AccessPattern::Repeated { total_ops: 1000 },
     },
@@ -272,6 +276,13 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Repeated Access MT",
         pattern: AccessPattern::RepeatedMt {
             threads: 4,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x16",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 16,
             total_ops: 1000,
         },
     },
@@ -305,9 +316,25 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x16 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 16,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=50,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x16 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 16,
             working_set: 50,
             total_ops: 500,
         },
@@ -321,6 +348,14 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x16 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 16,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Zipfian (80/20,",
         pattern: AccessPattern::Zipfian { total_ops: 500 },
     },
@@ -328,6 +363,13 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Zipfian MT",
         pattern: AccessPattern::ZipfianMt {
             threads: 4,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x16",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 16,
             total_ops: 500,
         },
     },
