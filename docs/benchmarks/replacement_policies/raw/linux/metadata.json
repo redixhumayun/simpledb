@@ -1,0 +1,121 @@
+{
+  "platform": "linux",
+  "title": "Linux (i7-8650U, Ubuntu 6.8.0-86)",
+  "environment": "linux (x86_64)",
+  "iterations": 100,
+  "num_buffers": 12,
+  "generated_at": "2025-11-14T11:40:02.857583+00:00",
+  "policies": {
+    "replacement_lru": {
+      "display": "Replacement LRU (`--no-default-features --features replacement_lru`)",
+      "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_lru.json",
+      "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_lru.txt",
+      "hit_rates": {
+        "Sequential Scan": {
+          "hit_rate": 0.0,
+          "hits": 0,
+          "misses": 12240
+        },
+        "Repeated Access": {
+          "hit_rate": 100.0,
+          "hits": 101990,
+          "misses": 10
+        },
+        "Zipfian (80/20)": {
+          "hit_rate": 80.4,
+          "hits": 40996,
+          "misses": 10004
+        },
+        "Random (K=10)": {
+          "hit_rate": 100.0,
+          "hits": 50990,
+          "misses": 10
+        },
+        "Random (K=50)": {
+          "hit_rate": 25.0,
+          "hits": 12749,
+          "misses": 38251
+        },
+        "Random (K=100)": {
+          "hit_rate": 11.6,
+          "hits": 5916,
+          "misses": 45084
+        }
+      }
+    },
+    "replacement_clock": {
+      "display": "Replacement Clock (`--no-default-features --features replacement_clock`)",
+      "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_clock.json",
+      "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_clock.txt",
+      "hit_rates": {
+        "Sequential Scan": {
+          "hit_rate": 0.0,
+          "hits": 0,
+          "misses": 13260
+        },
+        "Repeated Access": {
+          "hit_rate": 100.0,
+          "hits": 101990,
+          "misses": 10
+        },
+        "Zipfian (80/20)": {
+          "hit_rate": 75.6,
+          "hits": 38650,
+          "misses": 12456
+        },
+        "Random (K=10)": {
+          "hit_rate": 100.0,
+          "hits": 50990,
+          "misses": 10
+        },
+        "Random (K=50)": {
+          "hit_rate": 26.0,
+          "hits": 13257,
+          "misses": 37745
+        },
+        "Random (K=100)": {
+          "hit_rate": 10.6,
+          "hits": 5406,
+          "misses": 45598
+        }
+      }
+    },
+    "replacement_sieve": {
+      "display": "Replacement SIEVE (`--no-default-features --features replacement_sieve`)",
+      "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_sieve.json",
+      "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_sieve.txt",
+      "hit_rates": {
+        "Sequential Scan": {
+          "hit_rate": 0.0,
+          "hits": 0,
+          "misses": 13260
+        },
+        "Repeated Access": {
+          "hit_rate": 100.0,
+          "hits": 101990,
+          "misses": 10
+        },
+        "Zipfian (80/20)": {
+          "hit_rate": 62.5,
+          "hits": 32945,
+          "misses": 19737
+        },
+        "Random (K=10)": {
+          "hit_rate": 100.0,
+          "hits": 50990,
+          "misses": 10
+        },
+        "Random (K=50)": {
+          "hit_rate": 23.3,
+          "hits": 12646,
+          "misses": 41618
+        },
+        "Random (K=100)": {
+          "hit_rate": 11.9,
+          "hits": 6528,
+          "misses": 48245
+        }
+      }
+    }
+  }
+}
