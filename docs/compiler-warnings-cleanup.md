@@ -323,8 +323,8 @@ fn main() {
 
 ### Warning Count
 - **Started**: 118 warnings
-- **Current**: 77 warnings
-- **Eliminated**: 41 warnings (35% reduction)
+- **Current**: 68 warnings
+- **Eliminated**: 50 warnings (42% reduction)
 
 ### In Progress
 - None currently
@@ -342,16 +342,16 @@ fn main() {
 3. Add actual usage for remaining utility methods - ~30 warnings
 4. Remove truly dead code if confirmed unused - ~30 warnings
 
-### Remaining 77 Warnings Breakdown
-- **Dead code** (57): Unused structs, methods, enum variants for advanced features
-  - Query optimization: HeuristicQueryPlanner, TablePlanner, IndexJoinPlan, etc.
-  - Join strategies: MergeJoinPlan/Scan, SortPlan/Scan, MultiBufferProductPlan/Scan
-  - Advanced features: HashIndex, MaterializePlan, TempTable
-  - Utility functions: best_root, best_factor, various trait methods
+### Remaining 68 Warnings Breakdown
 
-- **Never-read fields** (3): Remaining fields in ProjectScan and btree.rs
-- **Unused imports** (1): CLI imports (can be fixed with cargo fix)
-- **Other** (16): Misc enum variants, utility methods
+All remaining warnings are **dead code** for advanced database features:
+
+- **Query optimization** (15): HeuristicQueryPlanner, TablePlanner, IndexJoinPlan, IndexSelectPlan, IndexSelectScan, etc.
+- **Join strategies** (12): MergeJoinPlan/Scan, SortPlan/Scan, MultiBufferProductPlan/Scan, RecordComparator
+- **Advanced features** (8): HashIndex, MaterializePlan, TempTable, TEMP_TABLE_ID_GENERATOR
+- **Utility functions & methods** (25): best_root, best_factor, various trait methods for advanced operations
+- **Enum variants** (5): Comparison operators (<=, >=, !=), arithmetic operators
+- **Misc** (3): TransactionOperations trait, field_list in ProjectScan, index_name in BTreeIndex
 
 Most remaining warnings are for **legitimate code** that exists for future features or
 testing, not actual problems. Integration would require significant work extending the
