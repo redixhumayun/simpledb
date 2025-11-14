@@ -5992,15 +5992,15 @@ impl<I> UpdateScan for IndexSelectScan<I>
 where
     I: Index + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
         unreachable!()
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
         unreachable!()
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
         unreachable!()
     }
 
@@ -6016,7 +6016,7 @@ where
         unreachable!()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         unreachable!()
     }
 }

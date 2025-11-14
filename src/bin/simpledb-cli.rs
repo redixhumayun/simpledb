@@ -1,6 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use simpledb::{Constant, FieldInfo, FieldType, Layout, SimpleDB, StatInfo, Transaction};
+use simpledb::{Constant, FieldType, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
