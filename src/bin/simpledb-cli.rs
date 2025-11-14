@@ -1,6 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use simpledb::{Constant, SimpleDB, Transaction};
+use simpledb::{Constant, FieldInfo, FieldType, Layout, SimpleDB, StatInfo, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -50,7 +50,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
             "" => continue, // Empty input
-            _ => {}
+            _ => {
+                // Check for DESCRIBE <table> command
+                let input_lower = input.to_lowercase();
+                if input_lower.starts_with("describe ") || input_lower.starts_with("desc ") {
+                    let table_name = if input_lower.starts_with("describe ") {
+                        input[9..].trim()
+                    } else {
+                        input[5..].trim()
+                    };
+                    match describe_table(&db, table_name) {
+                        Ok(result) => println!("{result}"),
+                        Err(e) => println!("Error: {e}"),
+                    }
+                    continue;
+                }
+            }
         }
 
         // Execute SQL command
@@ -70,6 +85,7 @@ fn show_help() {
     println!("  SHOW DATABASE       - Display database information");
     println!("  SHOW TABLES         - List all tables");
     println!("  SHOW BUFFERS        - Display buffer pool statistics");
+    println!("  DESCRIBE <table>    - Show table schema and statistics");
     println!();
     println!("Supported SQL:");
     println!("  CREATE TABLE table_name(field_name type, ...)");
@@ -82,6 +98,7 @@ fn show_help() {
     println!("  CREATE TABLE students(id int, name varchar(50))");
     println!("  INSERT INTO students(id, name) VALUES (1, 'Alice')");
     println!("  SELECT * FROM students");
+    println!("  DESCRIBE students");
 }
 
 fn show_database_info(db: &SimpleDB) {
@@ -112,6 +129,39 @@ fn show_buffers(db: &SimpleDB) {
     let available = db.buffer_manager().available();
     println!("Buffer Pool Information:");
     println!("  Available buffers: {}", available);
+}
+
+fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Error>> {
+    let txn = Arc::new(db.new_tx());
+    let layout = db.metadata_manager().get_layout(table_name, Arc::clone(&txn));
+    let stat_info = db
+        .metadata_manager()
+        .get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
+    txn.commit()?;
+
+    let mut result = format!("Table: {}\n", table_name);
+    result.push_str(&format!("Slot Size: {} bytes\n", layout.slot_size));
+    result.push_str(&format!(
+        "Statistics: {} blocks, {} records\n",
+        stat_info.num_blocks, stat_info.num_records
+    ));
+    result.push_str("\nFields:\n");
+    result.push_str(&format!(
+        "{:<20} {:<15}\n",
+        "Name", "Type"
+    ));
+    result.push_str(&format!("{}\n", "-".repeat(35)));
+
+    for field in &layout.schema.fields {
+        let field_info = &layout.schema.info[field];
+        let type_str = match field_info.field_type {
+            FieldType::Int => "int".to_string(),
+            FieldType::String => format!("varchar({})", field_info.length),
+        };
+        result.push_str(&format!("{:<20} {:<15}\n", field, type_str));
+    }
+
+    Ok(result)
 }
 
 fn execute_sql(db: &SimpleDB, sql: &str) -> Result<String, Box<dyn Error>> {

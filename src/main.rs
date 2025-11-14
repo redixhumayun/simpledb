@@ -6914,7 +6914,7 @@ impl MetadataManager {
         self.table_manager.create_table(table_name, &schema, txn);
     }
 
-    fn get_layout(&self, table_name: &str, txn: Arc<Transaction>) -> Layout {
+    pub fn get_layout(&self, table_name: &str, txn: Arc<Transaction>) -> Layout {
         self.table_manager.get_layout(table_name, txn)
     }
 
@@ -6950,7 +6950,7 @@ impl MetadataManager {
         self.index_manager.get_index_info(table_name, txn)
     }
 
-    fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
+    pub fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
         self.stat_manager.get_stat_info(table_name, layout, txn)
     }
 
@@ -7509,9 +7509,9 @@ impl StatManager {
 }
 
 #[derive(Clone, Debug)]
-struct StatInfo {
-    num_blocks: usize,
-    num_records: usize,
+pub struct StatInfo {
+    pub num_blocks: usize,
+    pub num_records: usize,
 }
 
 impl StatInfo {
@@ -8467,10 +8467,10 @@ mod record_page_tests {
 }
 
 #[derive(Clone, Debug)]
-struct Layout {
-    schema: Schema,
+pub struct Layout {
+    pub schema: Schema,
     offsets: HashMap<String, usize>, //  map the field name to the offset
-    slot_size: usize,
+    pub slot_size: usize,
 }
 
 impl Layout {
@@ -8522,7 +8522,7 @@ mod layout_tests {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum FieldType {
+pub enum FieldType {
     Int = 0,
     String = 1,
 }
@@ -8538,15 +8538,15 @@ impl From<i32> for FieldType {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct FieldInfo {
-    field_type: FieldType,
-    length: usize,
+pub struct FieldInfo {
+    pub field_type: FieldType,
+    pub length: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Schema {
     pub fields: Vec<String>,
-    info: HashMap<String, FieldInfo>,
+    pub info: HashMap<String, FieldInfo>,
 }
 
 impl Schema {
