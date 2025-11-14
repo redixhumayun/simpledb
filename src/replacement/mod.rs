@@ -1,5 +1,9 @@
-#[cfg(all(feature = "replacement_lru", feature = "replacement_clock"))]
-compile_error!("Enable only one buffer replacement policy feature (LRU or Clock)");
+#[cfg(any(
+    all(feature = "replacement_lru", feature = "replacement_clock"),
+    all(feature = "replacement_lru", feature = "replacement_sieve"),
+    all(feature = "replacement_clock", feature = "replacement_sieve"),
+))]
+compile_error!("Enable only one buffer replacement policy feature (LRU, Clock, or SIEVE)");
 
 #[cfg(not(any(
     feature = "replacement_lru",
