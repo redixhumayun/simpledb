@@ -2649,15 +2649,15 @@ impl Scan for SortScan {
 }
 
 impl UpdateScan for SortScan {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
@@ -2673,7 +2673,7 @@ impl UpdateScan for SortScan {
         todo!()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 }
@@ -5135,7 +5135,7 @@ where
         panic!("Get RID not supported in ProductScan");
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
         panic!("Move to RID not supported in ProductScan");
     }
 }
@@ -7303,6 +7303,16 @@ impl IndexInfo {
             self.stat_info.distinct_values(&self.field_name)
         }
     }
+
+    /// Returns the table schema for this index
+    pub fn table_schema(&self) -> &Schema {
+        &self.table_schema
+    }
+
+    /// Returns statistics for this index
+    pub fn stat_info(&self) -> &StatInfo {
+        &self.stat_info
+    }
 }
 
 struct HashIndex {
@@ -8833,8 +8843,18 @@ impl Transaction {
     }
 
     /// Get the available buffers for this transaction
-    fn available_buffs(&self) -> usize {
+    pub fn available_buffs(&self) -> usize {
         self.buffer_manager.available()
+    }
+
+    /// Get the log manager for monitoring purposes
+    pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        Arc::clone(&self.log_manager)
+    }
+
+    /// Get the buffer manager for monitoring purposes
+    pub fn buffer_manager(&self) -> Arc<BufferManager> {
+        Arc::clone(&self.buffer_manager)
     }
 
     /// Get the size of this file in blocks
@@ -10725,6 +10745,16 @@ impl BufferManager {
         *self.num_available.lock().unwrap()
     }
 
+    /// Get the file manager for monitoring purposes
+    pub fn file_manager(&self) -> SharedFS {
+        Arc::clone(&self.file_manager)
+    }
+
+    /// Get the log manager for monitoring purposes
+    pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        Arc::clone(&self.log_manager)
+    }
+
     /// Flushes the dirty buffers modified by this specific transaction
     fn flush_all(&self, txn_num: usize) {
         for buffer in &self.buffer_pool {
@@ -11813,9 +11843,7 @@ mod durability_tests {
     }
 }
 
-fn main() {
-    let _db = SimpleDB::new("random", 800, 4, true, 100);
-}
+// Orphaned main function removed - CLI binary is in src/bin/simpledb-cli.rs
 
 #[cfg(test)]
 mod offset_smoke_tests {
