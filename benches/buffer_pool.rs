@@ -227,6 +227,11 @@ const PIN_CASES: &[PinCase] = &[
         threads: 8,
         ops_per_thread: 1000,
     },
+    PinCase {
+        filter_token: "[pin:t16]",
+        threads: 16,
+        ops_per_thread: 1000,
+    },
 ];
 
 const HOTSET_CASES: &[HotsetCase] = &[
@@ -239,6 +244,12 @@ const HOTSET_CASES: &[HotsetCase] = &[
     HotsetCase {
         filter_token: "[hotset:t8_k4]",
         threads: 8,
+        ops_per_thread: 1000,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t16_k4]",
+        threads: 16,
         ops_per_thread: 1000,
         hot_set_size: 4,
     },
