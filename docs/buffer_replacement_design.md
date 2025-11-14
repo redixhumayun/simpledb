@@ -100,27 +100,30 @@ This doc captures design-level guidance for three candidate replacement policies
 
 **macOS (aarch64, pool=12, block=4 KiB) — raw runs captured in `docs/benchmarks/replacement_policies/macos_buffer_pool.md`**
 
-| Benchmark                        | Master (first-unpinned) | LRU feature | Clock feature | Δ (LRU vs Master) | Δ (Clock vs Master) |
-|----------------------------------|-------------------------|-------------|---------------|-------------------|---------------------|
-| Pin/Unpin hit latency            | 0.319 µs                | **0.290 µs** | **0.272 µs**  | 1.1× faster       | 1.2× faster         |
-| Cold pin latency                 | 4.95 µs                 | **2.61 µs** | **2.26 µs**   | 1.9× faster       | 2.2× faster         |
-| Repeated Access throughput       | 0.30 M ops/s (0 % hits) | **3.56 M ops/s (100 %)** | **3.81 M ops/s (100 %)** | 11.8× faster | 12.7× faster |
-| Random K=10 throughput           | 0.32 M ops/s (10 %)     | **3.50 M ops/s (100 %)** | **3.82 M ops/s (100 %)** | 11.1× faster | 11.9× faster |
-| Zipf 80/20 throughput            | 0.32 M ops/s (9 %)      | **1.51 M ops/s (77 %)** | **1.50 M ops/s (76 %)** | 4.7× faster | 4.7× faster |
-| 2-thread pin/unpin throughput    | 0.29 M ops/s            | **1.25 M ops/s** | **1.47 M ops/s** | 4.3× faster | 5.1× faster |
-| 8-thread pin/unpin throughput    | 0.11 M ops/s            | **0.23 M ops/s** | 0.16 M ops/s | 2.1× faster | 1.5× faster |
+|Benchmark|Master|LRU feature|Clock feature|SIEVE feature|Δ (LRU vs Master)|Δ (Clock vs Master)|Δ (SIEVE vs Master)|
+|---|---|---|---|---|---|---|---|
+|Pin/Unpin hit latency|0.319 µs|0.918 µs|0.973 µs|1.32 µs|0.35× (slower)|0.33× (slower)|0.24× (slower)|
+|Cold pin latency|4.95 µs|7.03 µs|7.38 µs|10.14 µs|0.70× (slower)|0.67× (slower)|0.49× (slower)|
+|Repeated Access throughput|0.302 M ops/s (0 % hits)|3.531 M ops/s (100 % hits)|3.792 M ops/s (100 % hits)|3.799 M ops/s (100 % hits)|11.7× faster|12.6× faster|12.6× faster|
+|Random K=10 throughput|0.316 M ops/s (10 % hits)|3.500 M ops/s (100 % hits)|3.798 M ops/s (100 % hits)|3.773 M ops/s (100 % hits)|11.1× faster|12.0× faster|12.0× faster|
+|Zipf 80/20 throughput|0.324 M ops/s (9 % hits)|1.741 M ops/s (82 % hits)|1.532 M ops/s (76 % hits)|1.261 M ops/s (70 % hits)|5.4× faster|4.7× faster|3.9× faster|
+|2-thread pin/unpin throughput|0.292 M ops/s|1.338 M ops/s|1.501 M ops/s|1.295 M ops/s|4.6× faster|5.1× faster|4.4× faster|
+|8-thread pin/unpin throughput|0.108 M ops/s|0.189 M ops/s|0.160 M ops/s|0.191 M ops/s|1.7× faster|1.5× faster|1.8× faster|
+
+
 
 **Linux (x86_64, pool=12, block=4 KiB) — raw runs captured in `docs/benchmarks/replacement_policies/linux_buffer_pool.md`**
 
-| Benchmark                        | Master (first-unpinned) | LRU feature | Clock feature | Δ (LRU vs Master) | Δ (Clock vs Master) |
-|----------------------------------|-------------------------|-------------|---------------|-------------------|---------------------|
-| Pin/Unpin hit latency            | 0.829 µs                | **0.804 µs** | **0.793 µs**  | ~1.0× (parity)    | ~1.0× (parity)      |
-| Cold pin latency                 | 6.41 µs                 | **4.11 µs** | **4.57 µs**   | 1.6× faster       | 1.4× faster         |
-| Repeated Access throughput       | 0.16 M ops/s (0 % hits) | **1.18 M ops/s (100 %)** | **1.25 M ops/s (100 %)** | 7.3× faster | 7.7× faster |
-| Random K=10 throughput           | 0.18 M ops/s (10 %)     | **1.20 M ops/s (100 %)** | **1.25 M ops/s (100 %)** | 6.8× faster | 7.2× faster |
-| Zipf 80/20 throughput            | 0.18 M ops/s (9 %)      | **0.69 M ops/s (81 %)** | **0.67 M ops/s (76 %)** | 4.0× faster | 3.8× faster |
-| 2-thread pin/unpin throughput    | 0.15 M ops/s            | **0.22 M ops/s** | **0.22 M ops/s** | 1.5× faster | 1.6× faster |
-| 8-thread pin/unpin throughput    | 0.13 M ops/s            | **0.18 M ops/s** | **0.14 M ops/s** | 1.5× faster | 1.1× faster |
+|Benchmark|Master|LRU feature|Clock feature|SIEVE feature|Δ (LRU vs Master)|Δ (Clock vs Master)|Δ (SIEVE vs Master)|
+|---|---|---|---|---|---|---|---|
+|Pin/Unpin hit latency|0.829 µs|1.09 µs|0.800 µs|1.06 µs|0.76× (slower)|1.0× faster|0.78× (slower)|
+|Cold pin latency|6.41 µs|4.49 µs|4.11 µs|4.05 µs|1.4× faster|1.6× faster|1.6× faster|
+|Repeated Access throughput|0.162 M ops/s (0 % hits)|1.180 M ops/s (100 % hits)|1.189 M ops/s (100 % hits)|1.224 M ops/s (100 % hits)|7.3× faster|7.3× faster|7.6× faster|
+|Random K=10 throughput|0.175 M ops/s (10 % hits)|1.201 M ops/s (100 % hits)|1.138 M ops/s (100 % hits)|1.204 M ops/s (100 % hits)|6.9× faster|6.5× faster|6.9× faster|
+|Zipf 80/20 throughput|0.175 M ops/s (9 % hits)|0.756 M ops/s (76 % hits)|0.566 M ops/s (77 % hits)|0.537 M ops/s (68 % hits)|4.3× faster|3.2× faster|3.1× faster|
+|2-thread pin/unpin throughput|0.145 M ops/s|0.220 M ops/s|0.213 M ops/s|0.217 M ops/s|1.5× faster|1.5× faster|1.5× faster|
+|8-thread pin/unpin throughput|0.126 M ops/s|0.184 M ops/s|0.125 M ops/s|0.182 M ops/s|1.5× faster|0.99× (slower)|1.4× faster|
+
 
 Clock figures captured via `cargo bench --bench buffer_pool -- 100 12` on the respective macOS (M-series) and Linux (x86_64) hosts.
 

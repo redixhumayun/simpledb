@@ -71,43 +71,48 @@ cargo bench --bench buffer_pool -- 100 12 pin:t8
 All runs use `cargo bench --bench buffer_pool -- 100 12` (pool=12, block=4 KiB). Raw logs live in `docs/benchmarks/replacement_policies/…`.
 
 ### macOS (M1 Pro, macOS Sequoia)
-
-| Benchmark (Phase)                  | Master (first-unpinned) | Replacement LRU | Replacement Clock |
-|------------------------------------|-------------------------|-----------------|-------------------|
-| Pin/Unpin hit latency (P1)         | 0.319 µs                | **0.290 µs**    | **0.272 µs**      |
-| Cold pin latency (P1)              | 4.95 µs                 | **2.61 µs**     | **2.26 µs**       |
-| Sequential Scan throughput (P2)    | 0.159 M blocks/s (0 % hits) | **0.242 M blocks/s (0 %)** | **0.329 M blocks/s (0 %)** |
-| Sequential Scan MT throughput (P2) | 0.150 M blocks/s        | **0.191 M blocks/s** | 0.145 M blocks/s  |
-| Repeated Access throughput (P2)    | 0.30 M ops/s (0 % hits) | **3.56 M ops/s (100 %)** | **3.81 M ops/s (100 %)** |
-| Repeated Access MT throughput (P2) | 0.27 M ops/s            | **0.96 M ops/s**| **1.06 M ops/s**  |
-| Random K=10 throughput (P2)        | 0.32 M ops/s (10 % hits) | **3.50 M ops/s (100 %)** | **3.82 M ops/s (100 %)** |
-| Random K=50 throughput (P2)        | 0.30 M ops/s (2 % hits) | **0.62 M ops/s (22 %)**| **0.60 M ops/s (27 %)**  |
-| Random K=100 throughput (P2)       | 0.30 M ops/s (2 % hits) | **0.54 M ops/s (14 %)**| **0.54 M ops/s (14 %)**  |
-| Zipfian throughput (P2)            | 0.324 M ops/s (9 % hits) | **1.51 M ops/s (77 %)** | **1.50 M ops/s (76 %)** |
-| Zipfian MT throughput (P2)         | 0.276 M ops/s           | **0.55 M ops/s**| **0.63 M ops/s**  |
-| Multi-thread pin:t2 (P5)           | 0.29 M ops/s            | **1.25 M ops/s**| **1.47 M ops/s**  |
-| Multi-thread pin:t8 (P5)           | 0.11 M ops/s            | **0.23 M ops/s**| 0.16 M ops/s      |
+|Benchmark (Phase)|Master (first-unpinned)|Replacement LRU|Replacement Clock|Replacement SIEVE|
+|---|---|---|---|---|
+|Pin/Unpin hit latency (P1)|**0.319 µs**|0.918 µs|0.973 µs|1.32 µs|
+|Cold pin latency (P1)|**4.95 µs**|7.03 µs|7.38 µs|10.14 µs|
+|Sequential Scan throughput (P2)|0.159 M blocks/s (0 % hits)|0.158 M blocks/s (0 % hits)|0.251 M blocks/s (0 % hits)|**0.282 M blocks/s (0 % hits)**|
+|Sequential Scan MT throughput (P2)|0.150 M blocks/s|0.129 M blocks/s|0.150 M blocks/s|**0.172 M blocks/s**|
+|Repeated Access throughput (P2)|0.302 M ops/s (0 % hits)|3.531 M ops/s (100 % hits)|3.792 M ops/s (100 % hits)|**3.799 M ops/s (100 % hits)**|
+|Repeated Access MT throughput (P2)|0.267 M ops/s|0.948 M ops/s|1.041 M ops/s|**1.068 M ops/s**|
+|Random K=10 throughput (P2)|0.316 M ops/s (10 % hits)|3.500 M ops/s (100 % hits)|**3.798 M ops/s (100 % hits)**|3.773 M ops/s (100 % hits)|
+|Random K=50 throughput (P2)|0.302 M ops/s (2 % hits)|0.571 M ops/s (23 % hits)|**0.601 M ops/s (26 % hits)**|0.581 M ops/s (21 % hits)|
+|Random K=100 throughput (P2)|0.299 M ops/s (2 % hits)|0.462 M ops/s (15 % hits)|**0.530 M ops/s (10 % hits)**|0.499 M ops/s (13 % hits)|
+|Zipfian throughput (P2)|0.324 M ops/s (9 % hits)|**1.741 M ops/s (82 % hits)**|1.532 M ops/s (76 % hits)|1.261 M ops/s (70 % hits)|
+|Zipfian MT throughput (P2)|0.276 M ops/s|0.487 M ops/s|0.544 M ops/s|**0.547 M ops/s**|
+|Multi-thread pin:t2 (P5)|0.29 M ops/s|1.34 M ops/s|**1.50 M ops/s**|1.29 M ops/s|
+|Multi-thread pin:t8 (P5)|0.11 M ops/s|0.19 M ops/s|0.16 M ops/s|**0.19 M ops/s**|
+|Multi-thread pin:t16 (P5)|—|0.10 M ops/s|**0.14 M ops/s**|0.10 M ops/s|
+|Hot-set t8_k4 (P5)|0.68 M ops/s|0.50 M ops/s|0.70 M ops/s|**0.71 M ops/s**|
+|Hot-set t16_k4 (P5)|—|0.33 M ops/s|0.54 M ops/s|**0.55 M ops/s**|
 
 ### Linux (i7-8650U, Ubuntu 6.8.0-86)
-
-| Benchmark (Phase)                  | Master (first-unpinned) | Replacement LRU | Replacement Clock |
-|------------------------------------|-------------------------|-----------------|-------------------|
-| Pin/Unpin hit latency (P1)         | 0.829 µs                | **0.804 µs**    | **0.793 µs**      |
-| Cold pin latency (P1)              | 6.41 µs                 | **4.11 µs**     | 4.57 µs           |
-| Sequential Scan throughput (P2)    | 0.163 M blocks/s (0 % hits) | **0.251 M blocks/s (0 %)** | **0.255 M blocks/s (0 %)** |
-| Sequential Scan MT throughput (P2) | 0.121 M blocks/s        | **0.182 M blocks/s** | 0.160 M blocks/s  |
-| Repeated Access throughput (P2)    | 0.16 M ops/s (0 % hits) | **1.18 M ops/s (100 %)** | **1.25 M ops/s (100 %)** |
-| Repeated Access MT throughput (P2) | 0.18 M ops/s            | **1.23 M ops/s**| **1.21 M ops/s**  |
-| Random K=10 throughput (P2)        | 0.18 M ops/s (10 % hits) | **1.20 M ops/s (100 %)** | **1.25 M ops/s (100 %)** |
-| Random K=50 throughput (P2)        | 0.17 M ops/s (3 % hits) | **0.31 M ops/s (23 %)**| **0.31 M ops/s (24 %)**  |
-| Random K=100 throughput (P2)       | 0.16 M ops/s (1 % hits) | **0.27 M ops/s (10 %)**| **0.28 M ops/s (13 %)**  |
-| Zipfian throughput (P2)            | 0.175 M ops/s (9 % hits) | **0.69 M ops/s (81 %)** | **0.67 M ops/s (76 %)** |
-| Zipfian MT throughput (P2)         | 0.174 M ops/s           | **0.70 M ops/s**| **0.65 M ops/s**  |
-| Multi-thread pin:t2 (P5)           | 0.15 M ops/s            | **0.22 M ops/s**| **0.22 M ops/s**  |
-| Multi-thread pin:t8 (P5)           | 0.13 M ops/s            | **0.18 M ops/s**| 0.14 M ops/s      |
+|Benchmark (Phase)|Master (first-unpinned)|Replacement LRU|Replacement Clock|Replacement SIEVE|
+|---|---|---|---|---|
+|Pin/Unpin hit latency (P1)|0.829 µs|1.09 µs|**0.800 µs**|1.06 µs|
+|Cold pin latency (P1)|6.41 µs|4.49 µs|4.11 µs|**4.05 µs**|
+|Sequential Scan throughput (P2)|0.163 M blocks/s (0 % hits)|**0.255 M blocks/s (0 % hits)**|0.253 M blocks/s (0 % hits)|0.250 M blocks/s (0 % hits)|
+|Sequential Scan MT throughput (P2)|0.121 M blocks/s|**0.179 M blocks/s**|0.171 M blocks/s|0.178 M blocks/s|
+|Repeated Access throughput (P2)|0.162 M ops/s (0 % hits)|1.180 M ops/s (100 % hits)|1.189 M ops/s (100 % hits)|**1.224 M ops/s (100 % hits)**|
+|Repeated Access MT throughput (P2)|0.175 M ops/s|1.212 M ops/s|**1.260 M ops/s**|1.253 M ops/s|
+|Random K=10 throughput (P2)|0.175 M ops/s (10 % hits)|1.201 M ops/s (100 % hits)|1.138 M ops/s (100 % hits)|**1.204 M ops/s (100 % hits)**|
+|Random K=50 throughput (P2)|0.165 M ops/s (3 % hits)|**0.308 M ops/s (22 % hits)**|0.297 M ops/s (21 % hits)|0.300 M ops/s (20 % hits)|
+|Random K=100 throughput (P2)|0.163 M ops/s (1 % hits)|**0.279 M ops/s (13 % hits)**|0.255 M ops/s (12 % hits)|0.276 M ops/s (12 % hits)|
+|Zipfian throughput (P2)|0.175 M ops/s (9 % hits)|**0.756 M ops/s (76 % hits)**|0.566 M ops/s (77 % hits)|0.537 M ops/s (68 % hits)|
+|Zipfian MT throughput (P2)|0.174 M ops/s|**0.753 M ops/s**|0.611 M ops/s|0.557 M ops/s|
+|Multi-thread pin:t2 (P5)|0.14 M ops/s|**0.22 M ops/s**|0.21 M ops/s|0.22 M ops/s|
+|Multi-thread pin:t8 (P5)|0.13 M ops/s|**0.18 M ops/s**|0.13 M ops/s|0.18 M ops/s|
+|Multi-thread pin:t16 (P5)|—|0.12 M ops/s|**0.12 M ops/s**|0.10 M ops/s|
+|Hot-set t8_k4 (P5)|**1.00 M ops/s**|0.81 M ops/s|0.86 M ops/s|0.86 M ops/s|
+|Hot-set t16_k4 (P5)|—|0.76 M ops/s|**0.91 M ops/s**|0.90 M ops/s|
 
 _Notes_:  
-- Times are means from Phase 1 latency benches. Throughputs are means from Phase 2 (Repeated/Random) and Phase 5 (pin:t2/pin:t8).  
+- Times are means from Phase 1 latency benches. Throughputs are means from Phase 2 (Repeated/Random) and Phase 5 (pin:t2/pin:t8 plus the new pin:t16/hot-set:t16 oversubscription cases).  
+- `—` indicates the master (first-unpinned) policy has not been rerun yet with the new oversubscription cases.
 - Clock shows higher hit-path latency on macOS due to the extra hand mutex; Linux latency stays near parity with LRU/master.
 - Phase 3 (pool/memory scaling) is not summarized here—see the raw log files for those details.
 
@@ -141,7 +146,7 @@ Buffer manager microbenchmarks across 5 phases:
 - **Phase 3:** Pool size scaling, memory pressure
 - **Phase 4:** Hit rate measurement
 - **Phase 5:** Concurrent access, hotset contention, starvation  
-  _Case tokens:_ `pin:t2`, `pin:t4`, `pin:t8`, `hotset:t4_k4`, `hotset:t8_k4`
+  _Case tokens:_ `pin:t2`, `pin:t4`, `pin:t8`, `pin:t16`, `hotset:t4_k4`, `hotset:t8_k4`, `hotset:t16_k4`
 
 ## JSON Output for CI
 
