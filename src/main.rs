@@ -1,5 +1,5 @@
-#![allow(dead_code)]
-#![allow(unused_variables)]
+// #![allow(dead_code)]
+// #![allow(unused_variables)]
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(clippy::only_used_in_recursion)]
 
@@ -89,7 +89,7 @@ impl SimpleDB {
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
         let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
-        // let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
+        let update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
         let index_update_planner = IndexUpdatePlanner::new(Arc::clone(&metadata_manager));
         let planner = Arc::new(Planner::new(
             Box::new(query_planner),
@@ -139,6 +139,14 @@ impl SimpleDB {
 
     pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
         Arc::clone(&self.log_manager)
+    }
+
+    pub fn db_directory(&self) -> &Path {
+        &self.db_directory
+    }
+
+    pub fn metadata_manager(&self) -> Arc<MetadataManager> {
+        Arc::clone(&self.metadata_manager)
     }
 }
 
@@ -6872,7 +6880,7 @@ enum BinaryOperator {
 }
 
 // Metadata helpers are constructed once at boot and stay read-only during steady state.
-struct MetadataManager {
+pub struct MetadataManager {
     table_manager: Arc<TableManager>,
     view_manager: Arc<ViewManager>,
     index_manager: Arc<IndexManager>,
@@ -6944,6 +6952,10 @@ impl MetadataManager {
 
     fn get_stat_info(&self, table_name: &str, layout: Layout, txn: Arc<Transaction>) -> StatInfo {
         self.stat_manager.get_stat_info(table_name, layout, txn)
+    }
+
+    pub fn get_table_names(&self, txn: &Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
+        self.table_manager.get_table_names(Arc::clone(txn))
     }
 }
 
@@ -7707,6 +7719,24 @@ impl TableManager {
             schema
         };
         Layout::new(schema)
+    }
+
+    /// Return a list of all table names in the database
+    fn get_table_names(&self, tx: Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut table_scan = TableScan::new(
+            tx,
+            self.table_catalog_layout.clone(),
+            Self::TABLE_CAT_TABLE_NAME,
+        );
+        let mut tables = Vec::new();
+        while let Some(_) = table_scan.next() {
+            let table_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
+            // Skip internal catalog tables
+            if table_name != Self::TABLE_CAT_TABLE_NAME && table_name != Self::FIELD_CAT_TABLE_NAME {
+                tables.push(table_name);
+            }
+        }
+        Ok(tables)
     }
 }
 
@@ -10691,7 +10721,7 @@ impl BufferManager {
     }
 
     /// Returns the number of unpinned buffers, that is buffers with no pages pinned to them
-    fn available(&self) -> usize {
+    pub fn available(&self) -> usize {
         *self.num_available.lock().unwrap()
     }
 
