@@ -29,9 +29,17 @@ use parser::{
 };
 
 pub use test_utils::TestDir;
+
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+use crate::intrusive_dll::IntrusiveNode;
 pub mod benchmark_framework;
 mod btree;
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+mod intrusive_dll;
 mod parser;
+mod replacement;
+
+use replacement::PolicyState;
 
 type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
@@ -10407,10 +10415,18 @@ pub struct BufferFrame {
     pins: usize,
     txn: Option<usize>,
     lsn: Option<Lsn>,
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+    prev_idx: Option<usize>,
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+    next_idx: Option<usize>,
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+    index: usize,
+    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+    ref_bit: bool,
 }
 
 impl BufferFrame {
-    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>) -> Self {
+    fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
         let size = file_manager.lock().unwrap().block_size();
         Self {
             file_manager,
@@ -10420,6 +10436,14 @@ impl BufferFrame {
             pins: 0,
             txn: None,
             lsn: None,
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+            prev_idx: None,
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+            next_idx: None,
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+            index,
+            #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+            ref_bit: false,
         }
     }
 
@@ -10474,6 +10498,44 @@ impl BufferFrame {
     /// Reset the pin count for this buffer
     fn reset_pins(&mut self) {
         self.pins = 0;
+    }
+}
+
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+impl IntrusiveNode for BufferFrame {
+    fn prev(&self) -> Option<usize> {
+        self.prev_idx
+    }
+
+    fn set_prev(&mut self, prev: Option<usize>) {
+        self.prev_idx = prev
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.next_idx
+    }
+
+    fn set_next(&mut self, next: Option<usize>) {
+        self.next_idx = next
+    }
+}
+
+#[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+impl IntrusiveNode for MutexGuard<'_, BufferFrame> {
+    fn prev(&self) -> Option<usize> {
+        self.prev_idx
+    }
+
+    fn set_prev(&mut self, prev: Option<usize>) {
+        self.prev_idx = prev
+    }
+
+    fn next(&self) -> Option<usize> {
+        self.next_idx
+    }
+
+    fn set_next(&mut self, next: Option<usize>) {
+        self.next_idx = next
     }
 }
 
@@ -10563,6 +10625,7 @@ pub struct BufferManager {
     stats: OnceLock<Arc<BufferStats>>,
     latch_table: Mutex<HashMap<BlockId, Arc<Mutex<()>>>>,
     resident_table: Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
+    policy: PolicyState,
 }
 
 impl BufferManager {
@@ -10572,14 +10635,17 @@ impl BufferManager {
         log_manager: Arc<Mutex<LogManager>>,
         num_buffers: usize,
     ) -> Self {
-        let buffer_pool = (0..num_buffers)
-            .map(|_| {
+        let buffer_pool: Vec<Arc<Mutex<BufferFrame>>> = (0..num_buffers)
+            .map(|index| {
                 Arc::new(Mutex::new(BufferFrame::new(
                     Arc::clone(&file_manager),
                     Arc::clone(&log_manager),
+                    index,
                 )))
             })
             .collect();
+        let policy = PolicyState::new(&buffer_pool);
+
         Self {
             file_manager,
             log_manager,
@@ -10589,6 +10655,7 @@ impl BufferManager {
             stats: OnceLock::new(),
             latch_table: Mutex::new(HashMap::new()),
             resident_table: Mutex::new(HashMap::new()),
+            policy,
         }
     }
 
@@ -10695,7 +10762,6 @@ impl BufferManager {
         let block_latch = latch_table_guard.lock();
 
         //  check the resident table for the associated frame
-        let start_resident = Instant::now();
         let frame_ptr = {
             let mut resident_guard = self.resident_table.lock().unwrap();
             match resident_guard.get(block_id) {
@@ -10714,13 +10780,7 @@ impl BufferManager {
         //  fast hit path, found the frame in the resident table
         if let Some(frame_ptr) = frame_ptr {
             {
-                let mut frame_guard = frame_ptr.lock().unwrap();
-                if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
-                    if frame_block_id != block_id {
-                        self.resident_table.lock().unwrap().remove(block_id);
-                        return None;
-                    }
-                }
+                let mut frame_guard = self.record_hit(&frame_ptr, block_id)?;
                 let was_unpinned = !frame_guard.is_pinned();
                 frame_guard.pin();
                 if was_unpinned {
@@ -10742,36 +10802,26 @@ impl BufferManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        //  It is possible for two threads to race here which leads to a few different possibilities
-        //  Assume threads T1 and T2 are racing
-        //  1. T1 and T2 are trying to pin blocks B1 and B2
-        //      1.1 T1 and T2 get frames F1 and F2 - no race condition
-        //      1.2 T1 and T2 get frame F1 - race condition
-        //          this is handled by the check to see if the frame is already pinned
-        //          if it is, that implies another thread beat us there
-        //  2. T1 and T2 are trying to pin block B1
-        //      not possible because of the block latch
-        loop {
-            let frame = self.choose_unpinned_frame()?;
-            {
-                let mut frame_guard = frame.lock().unwrap();
-                if frame_guard.is_pinned() {
-                    //  we lost the race condition, try again immediately
-                    continue;
-                }
-                if let Some(old) = frame_guard.block_id.as_ref() {
-                    self.resident_table.lock().unwrap().remove(old);
-                }
-                frame_guard.assign_to_block(block_id);
-                frame_guard.pin();
-            }
-            self.resident_table
-                .lock()
-                .unwrap()
-                .insert(block_id.clone(), Arc::downgrade(&frame));
-            *self.num_available.lock().unwrap() -= 1;
-            return Some(frame);
+        let (tail_idx, mut frame_guard) = match self.evict_frame() {
+            Some((idx, guard)) => (idx, guard),
+            None => return None,
+        };
+
+        if let Some(old) = frame_guard.block_id.as_ref() {
+            self.resident_table.lock().unwrap().remove(old);
         }
+        frame_guard.assign_to_block(block_id);
+        frame_guard.pin();
+        drop(frame_guard);
+
+        self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
+
+        self.resident_table.lock().unwrap().insert(
+            block_id.clone(),
+            Arc::downgrade(&self.buffer_pool[tail_idx]),
+        );
+        *self.num_available.lock().unwrap() -= 1;
+        Some(Arc::clone(&self.buffer_pool[tail_idx]))
     }
 
     /// Decrement the pin count for the provided buffer
@@ -10790,16 +10840,17 @@ impl BufferManager {
         }
     }
 
-    /// Try to find an unpinned buffer and return pointer to that, if present
-    /// This currently does a linear scan but we should use a better replacement policy
-    fn choose_unpinned_frame(&self) -> Option<Arc<Mutex<BufferFrame>>> {
-        for frame in &self.buffer_pool {
-            let frame_guard = frame.lock().unwrap();
-            if !frame_guard.is_pinned() {
-                return Some(Arc::clone(frame));
-            }
-        }
-        None
+    fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, BufferFrame>)> {
+        self.policy.evict_frame(&self.buffer_pool)
+    }
+
+    fn record_hit<'a>(
+        &'a self,
+        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        block_id: &BlockId,
+    ) -> Option<MutexGuard<'a, BufferFrame>> {
+        self.policy
+            .record_hit(&self.buffer_pool, frame_ptr, block_id, &self.resident_table)
     }
 
     /// Debug assertion to verify buffer count invariants
@@ -10872,11 +10923,7 @@ mod buffer_manager_tests {
             .pin(&BlockId::new("testfile".to_string(), 1))
             .unwrap();
         assert_eq!(buffer_2.lock().unwrap().contents.get_int(80), 100);
-
-        println!(
-            "The size of the latch table: {}",
-            buffer_manager.latch_table.lock().unwrap().len()
-        );
+        assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
 
     /// Concurrent stress test: multiple threads hammering same small working set

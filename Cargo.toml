@@ -26,4 +26,10 @@ harness = false
 name = "simpledb"
 path = "src/main.rs"
 
+[features]
+default = ["replacement_lru"]
+replacement_lru = []
+replacement_clock = []
+replacement_sieve = []
+
 [dependencies]

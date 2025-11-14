@@ -1,0 +1,149 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+};
+
+use crate::{
+    intrusive_dll::{IntrusiveList, IntrusiveNode},
+    BlockId, BufferFrame,
+};
+
+#[derive(Debug)]
+pub struct PolicyState {
+    intrusive_list: Mutex<IntrusiveList>,
+}
+
+impl PolicyState {
+    pub fn new(buffer_pool: &[Arc<Mutex<BufferFrame>>]) -> Self {
+        let mut guards = buffer_pool
+            .iter()
+            .map(|frame| frame.lock().unwrap())
+            .collect::<Vec<MutexGuard<'_, BufferFrame>>>();
+        let intrusive_list = IntrusiveList::from_nodes(&mut guards);
+        Self {
+            intrusive_list: Mutex::new(intrusive_list),
+        }
+    }
+
+    pub fn record_hit<'a>(
+        &self,
+        buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
+        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        block_id: &BlockId,
+        resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
+    ) -> Option<MutexGuard<'a, BufferFrame>> {
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let mut frame_guard = frame_ptr.lock().unwrap();
+        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+            if frame_block_id != block_id {
+                resident_table.lock().unwrap().remove(block_id);
+                return None;
+            }
+        }
+        let current_head = intrusive_list_guard.peek_head();
+        if let Some(head) = current_head {
+            if frame_guard.index == head {
+                return Some(frame_guard);
+            }
+        }
+        let predecessor_index = frame_guard.prev();
+
+        let adjacent_to_head =
+            matches!((predecessor_index, current_head), (Some(prev), Some(head)) if prev == head);
+
+        if adjacent_to_head {
+            let mut current_head_guard =
+                current_head.map(|current_head| buffer_pool[current_head].lock().unwrap());
+            let mut next_guard = frame_guard
+                .next()
+                .map(|idx| buffer_pool[idx].lock().unwrap());
+            let head_guard = current_head_guard
+                .as_mut()
+                .expect("Head guard must exist when list is non-empty");
+            intrusive_list_guard.promote_successor_to_head(
+                head_guard,
+                &mut frame_guard,
+                next_guard.as_mut(),
+            );
+        } else {
+            let mut current_head_guard =
+                current_head.map(|current_head| buffer_pool[current_head].lock().unwrap());
+            let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock().unwrap());
+            let mut next_guard = frame_guard
+                .next()
+                .map(|idx| buffer_pool[idx].lock().unwrap());
+            intrusive_list_guard.move_to_head(
+                frame_guard.index,
+                &mut frame_guard,
+                current_head_guard.as_mut(),
+                prev_guard.as_mut(),
+                next_guard.as_mut(),
+            );
+        }
+        Some(frame_guard)
+    }
+
+    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let current_head = intrusive_list_guard.peek_head();
+        match current_head {
+            Some(head) => {
+                if frame_idx == head {
+                    return;
+                }
+                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
+                let mut current_head_guard = buffer_pool[head].lock().unwrap();
+                intrusive_list_guard.insert_at_head(
+                    frame_idx,
+                    &mut frame_guard,
+                    Some(&mut current_head_guard),
+                );
+            }
+            None => {
+                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
+                intrusive_list_guard.insert_at_head(frame_idx, &mut frame_guard, None);
+            }
+        }
+    }
+
+    pub fn evict_frame<'a>(
+        &self,
+        buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
+    ) -> Option<(usize, MutexGuard<'a, BufferFrame>)> {
+        assert!(
+            buffer_pool.len() > 1,
+            "Buffer pools must have more than one frame for LRU replacement"
+        );
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let tail = intrusive_list_guard.peek_tail()?;
+        let mut current = tail;
+        loop {
+            let mut current_guard = buffer_pool[current].lock().unwrap();
+            if current_guard.is_pinned() {
+                if let Some(head) = intrusive_list_guard.peek_head() {
+                    if current_guard.index == head {
+                        return None;
+                    } else {
+                        current = current_guard
+                            .prev()
+                            .expect("Every node apart from head should have a prev pointer");
+                    }
+                }
+                continue;
+            }
+            let mut prev_node = current_guard
+                .prev()
+                .map(|prev| buffer_pool[prev].lock().unwrap());
+            let mut next_node = current_guard
+                .next()
+                .map(|next| buffer_pool[next].lock().unwrap());
+            intrusive_list_guard.remove_node(
+                current,
+                &mut current_guard,
+                prev_node.as_mut(),
+                next_node.as_mut(),
+            );
+            return Some((current, current_guard));
+        }
+    }
+}
