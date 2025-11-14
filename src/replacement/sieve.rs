@@ -30,7 +30,7 @@ impl PolicyState {
         Self {
             list_state: Mutex::new(ListState {
                 hand: intrusive_list.peek_tail(),
-                intrusive_list: intrusive_list,
+                intrusive_list,
             }),
             pool_len: buffer_pool.len(),
         }
