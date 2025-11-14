@@ -96,35 +96,35 @@ This doc captures design-level guidance for three candidate replacement policies
   This keeps pointer-arithmetic centralized, testable with dummy node types, and shared between policies that need it.
 - **Block latch scope**: The block latch acquired at the start of `try_to_pin` remains held until the operation succeeds or times out. Policy locks and frame locks nest underneath it following the sequences above.
 
-## LRU Benchmark Impact (reference)
+## Replacement Policy Benchmark Impact
 
 **macOS (aarch64, pool=12, block=4 KiB) — raw runs captured in `docs/benchmarks/replacement_policies/macos_buffer_pool.md`**
 
-|Benchmark|Master|LRU feature|Clock feature|SIEVE feature|Δ (LRU vs Master)|Δ (Clock vs Master)|Δ (SIEVE vs Master)|
-|---|---|---|---|---|---|---|---|
-|Pin/Unpin hit latency|0.319 µs|0.918 µs|0.973 µs|1.32 µs|0.35× (slower)|0.33× (slower)|0.24× (slower)|
-|Cold pin latency|4.95 µs|7.03 µs|7.38 µs|10.14 µs|0.70× (slower)|0.67× (slower)|0.49× (slower)|
-|Repeated Access throughput|0.302 M ops/s (0 % hits)|3.531 M ops/s (100 % hits)|3.792 M ops/s (100 % hits)|3.799 M ops/s (100 % hits)|11.7× faster|12.6× faster|12.6× faster|
-|Random K=10 throughput|0.316 M ops/s (10 % hits)|3.500 M ops/s (100 % hits)|3.798 M ops/s (100 % hits)|3.773 M ops/s (100 % hits)|11.1× faster|12.0× faster|12.0× faster|
-|Zipf 80/20 throughput|0.324 M ops/s (9 % hits)|1.741 M ops/s (82 % hits)|1.532 M ops/s (76 % hits)|1.261 M ops/s (70 % hits)|5.4× faster|4.7× faster|3.9× faster|
-|2-thread pin/unpin throughput|0.292 M ops/s|1.338 M ops/s|1.501 M ops/s|1.295 M ops/s|4.6× faster|5.1× faster|4.4× faster|
-|8-thread pin/unpin throughput|0.108 M ops/s|0.189 M ops/s|0.160 M ops/s|0.191 M ops/s|1.7× faster|1.5× faster|1.8× faster|
+|Benchmark|Replacement LRU|Replacement Clock|Replacement SIEVE|
+|---|---|---|---|
+|Pin/Unpin hit latency|0.918 µs|0.973 µs|1.32 µs|
+|Cold pin latency|7.03 µs|7.38 µs|10.14 µs|
+|Repeated Access throughput|3.531 M ops/s (100 % hits)|3.792 M ops/s (100 % hits)|3.799 M ops/s (100 % hits)|
+|Random K=10 throughput|3.500 M ops/s (100 % hits)|3.798 M ops/s (100 % hits)|3.773 M ops/s (100 % hits)|
+|Zipf 80/20 throughput|1.741 M ops/s (82 % hits)|1.532 M ops/s (76 % hits)|1.261 M ops/s (70 % hits)|
+|2-thread pin/unpin throughput|1.338 M ops/s|1.501 M ops/s|1.295 M ops/s|
+|8-thread pin/unpin throughput|0.189 M ops/s|0.160 M ops/s|0.191 M ops/s|
 
 
 
 **Linux (x86_64, pool=12, block=4 KiB) — raw runs captured in `docs/benchmarks/replacement_policies/linux_buffer_pool.md`**
 
-|Benchmark|Master|LRU feature|Clock feature|SIEVE feature|Δ (LRU vs Master)|Δ (Clock vs Master)|Δ (SIEVE vs Master)|
-|---|---|---|---|---|---|---|---|
-|Pin/Unpin hit latency|0.829 µs|1.09 µs|0.800 µs|1.06 µs|0.76× (slower)|1.0× faster|0.78× (slower)|
-|Cold pin latency|6.41 µs|4.49 µs|4.11 µs|4.05 µs|1.4× faster|1.6× faster|1.6× faster|
-|Repeated Access throughput|0.162 M ops/s (0 % hits)|1.180 M ops/s (100 % hits)|1.189 M ops/s (100 % hits)|1.224 M ops/s (100 % hits)|7.3× faster|7.3× faster|7.6× faster|
-|Random K=10 throughput|0.175 M ops/s (10 % hits)|1.201 M ops/s (100 % hits)|1.138 M ops/s (100 % hits)|1.204 M ops/s (100 % hits)|6.9× faster|6.5× faster|6.9× faster|
-|Zipf 80/20 throughput|0.175 M ops/s (9 % hits)|0.756 M ops/s (76 % hits)|0.566 M ops/s (77 % hits)|0.537 M ops/s (68 % hits)|4.3× faster|3.2× faster|3.1× faster|
-|2-thread pin/unpin throughput|0.145 M ops/s|0.220 M ops/s|0.213 M ops/s|0.217 M ops/s|1.5× faster|1.5× faster|1.5× faster|
-|8-thread pin/unpin throughput|0.126 M ops/s|0.184 M ops/s|0.125 M ops/s|0.182 M ops/s|1.5× faster|0.99× (slower)|1.4× faster|
+|Benchmark|Replacement LRU|Replacement Clock|Replacement SIEVE|
+|---|---|---|---|
+|Pin/Unpin hit latency|1.09 µs|0.800 µs|1.06 µs|
+|Cold pin latency|4.49 µs|4.11 µs|4.05 µs|
+|Repeated Access throughput|1.180 M ops/s (100 % hits)|1.189 M ops/s (100 % hits)|1.224 M ops/s (100 % hits)|
+|Random K=10 throughput|1.201 M ops/s (100 % hits)|1.138 M ops/s (100 % hits)|1.204 M ops/s (100 % hits)|
+|Zipf 80/20 throughput|0.756 M ops/s (76 % hits)|0.566 M ops/s (77 % hits)|0.537 M ops/s (68 % hits)|
+|2-thread pin/unpin throughput|0.220 M ops/s|0.213 M ops/s|0.217 M ops/s|
+|8-thread pin/unpin throughput|0.184 M ops/s|0.125 M ops/s|0.182 M ops/s|
 
 
 Clock figures captured via `cargo bench --bench buffer_pool -- 100 12` on the respective macOS (M-series) and Linux (x86_64) hosts.
 
-These deltas capture the impact of fixing the “first unpinned” policy. Use them as baselines when Clock or SIEVE implementations land to ensure future policies match or exceed the LRU behavior on locality-heavy workloads.
+Use these snapshots as baselines when comparing future replacement policies or tuning metadata overheads.
