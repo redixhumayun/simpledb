@@ -157,11 +157,28 @@ def main() -> None:
     metadata_path = raw_platform_dir / "metadata.json"
     metadata = load_existing_metadata(metadata_path)
 
+    # Default title/environment if not provided
+    if not args.title:
+        if args.platform == "macos":
+            args.title = "macOS (M1 Pro, macOS Sequoia)"
+        elif args.platform == "linux":
+            args.title = "Linux (i7-8650U, Ubuntu 6.8.0-86)"
+        else:
+            args.title = args.platform.title()
+
+    if not args.environment:
+        if args.platform == "macos":
+            args.environment = "macos (aarch64)"
+        elif args.platform == "linux":
+            args.environment = "linux (x86_64)"
+        else:
+            args.environment = ""
+
     metadata.update(
         {
             "platform": args.platform,
-            "title": args.title or args.platform.title(),
-            "environment": args.environment or "",
+            "title": args.title,
+            "environment": args.environment,
             "iterations": args.iterations,
             "num_buffers": args.num_buffers,
             "generated_at": datetime.now(timezone.utc).isoformat(),
