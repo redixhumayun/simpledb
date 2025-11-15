@@ -1,7 +1,4 @@
-// #![allow(dead_code)]
-// #![allow(unused_variables)]
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::only_used_in_recursion)]
 
 use std::{
     any::Any,
@@ -6385,10 +6382,10 @@ impl Predicate {
     where
         S: Scan,
     {
-        self.evaluate_node(&self.root, scan)
+        Predicate::evaluate_node(&self.root, scan)
     }
 
-    fn evaluate_node<S>(&self, node: &PredicateNode, scan: &S) -> Result<bool, Box<dyn Error>>
+    fn evaluate_node<S>(node: &PredicateNode, scan: &S) -> Result<bool, Box<dyn Error>>
     where
         S: Scan,
     {
@@ -6399,7 +6396,7 @@ impl Predicate {
             PredicateNode::Composite { op, operands } => match op {
                 BooleanConnective::And => {
                     for operand in operands {
-                        if !self.evaluate_node(operand, scan)? {
+                        if !Predicate::evaluate_node(operand, scan)? {
                             return Ok(false);
                         }
                     }
@@ -6407,7 +6404,7 @@ impl Predicate {
                 }
                 BooleanConnective::Or => {
                     for operand in operands {
-                        if self.evaluate_node(operand, scan)? {
+                        if Predicate::evaluate_node(operand, scan)? {
                             return Ok(true);
                         }
                     }
@@ -6417,24 +6414,24 @@ impl Predicate {
                     if operands.len() != 1 {
                         return Err("NOT operator must have exactly one operand".into());
                     }
-                    return Ok(!self.evaluate_node(&operands[0], scan)?);
+                    return Ok(!Predicate::evaluate_node(&operands[0], scan)?);
                 }
             },
         }
     }
 
     fn reduction_factor(&self, plan: &Arc<dyn Plan>) -> usize {
-        self.evaluate_reduction_factor(&self.root, plan)
+        Predicate::evaluate_reduction_factor(&self.root, plan)
     }
 
-    fn evaluate_reduction_factor(&self, node: &PredicateNode, plan: &Arc<dyn Plan>) -> usize {
+    fn evaluate_reduction_factor(node: &PredicateNode, plan: &Arc<dyn Plan>) -> usize {
         match node {
             PredicateNode::Empty => 1,
             PredicateNode::Term(term) => term.reduction_factor(plan),
             PredicateNode::Composite { op, operands } => {
                 let mut factor = 1;
                 for operand in operands {
-                    factor *= self.evaluate_reduction_factor(operand, plan);
+                    factor *= Predicate::evaluate_reduction_factor(operand, plan);
                 }
                 match op {
                     BooleanConnective::And => factor,
@@ -6446,11 +6443,10 @@ impl Predicate {
     }
 
     fn equates_with_constant(&self, field_name: &str) -> Option<Constant> {
-        self.evaluate_equates_with_constant(&self.root, field_name)
+        Predicate::evaluate_equates_with_constant(&self.root, field_name)
     }
 
     fn evaluate_equates_with_constant(
-        &self,
         node: &PredicateNode,
         field_name: &str,
     ) -> Option<Constant> {
@@ -6459,7 +6455,7 @@ impl Predicate {
             PredicateNode::Term(term) => term.equates_with_constant(field_name),
             PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
-                    if let Some(val) = self.evaluate_equates_with_constant(operand, field_name) {
+                    if let Some(val) = Predicate::evaluate_equates_with_constant(operand, field_name) {
                         return Some(val);
                     }
                 }
@@ -6478,7 +6474,7 @@ impl Predicate {
     ///   (depth-first), otherwise `None` if no such equality exists.
     /// - Non-equality comparisons and equalities with constants are ignored.
     fn equates_with_field(&self, field_name: &str) -> Option<String> {
-        self.evaluate_equates_with_field(&self.root, field_name)
+        Predicate::evaluate_equates_with_field(&self.root, field_name)
     }
 
     /// Helper used by [equates_with_field] to recursively search the predicate tree
@@ -6490,7 +6486,6 @@ impl Predicate {
     ///   return the first match found.
     /// - `PredicateNode::Empty`: returns `None`.
     fn evaluate_equates_with_field(
-        &self,
         node: &PredicateNode,
         field_name: &str,
     ) -> Option<String> {
@@ -6499,7 +6494,7 @@ impl Predicate {
             PredicateNode::Term(term) => term.equates_with_field(field_name),
             PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
-                    if let Some(field) = self.evaluate_equates_with_field(operand, field_name) {
+                    if let Some(field) = Predicate::evaluate_equates_with_field(operand, field_name) {
                         return Some(field);
                     }
                 }
@@ -6523,7 +6518,7 @@ impl Predicate {
                 && term.applies_to(unioned_schema)
         };
         Predicate {
-            root: self.filter_node(&self.root, &term_ok),
+            root: Predicate::filter_node(&self.root, &term_ok),
         }
     }
 
@@ -6532,13 +6527,13 @@ impl Predicate {
     pub fn sub_predicate_for_select(&self, schema: &Schema) -> Predicate {
         let term_ok = |term: &Term| term.applies_to(schema);
         Predicate {
-            root: self.filter_node(&self.root, &term_ok),
+            root: Predicate::filter_node(&self.root, &term_ok),
         }
     }
 
     /// Determines whether the [PredicateNode] fully applies to the given schema
     /// Used to determine whether the [BooleanConnective::Or] and [BooleanConnective::Not] can be applied to the schema
-    fn node_applies_to<F>(&self, node: &PredicateNode, term_ok: &F) -> bool
+    fn node_applies_to<F>(node: &PredicateNode, term_ok: &F) -> bool
     where
         F: Fn(&Term) -> bool,
     {
@@ -6548,11 +6543,11 @@ impl Predicate {
             PredicateNode::Composite { op, operands } => match op {
                 BooleanConnective::Not => {
                     assert!(operands.len() == 1);
-                    self.node_applies_to(operands.first().unwrap(), term_ok)
+                    Predicate::node_applies_to(operands.first().unwrap(), term_ok)
                 }
                 _ => operands
                     .iter()
-                    .all(|node| self.node_applies_to(node, term_ok)),
+                    .all(|node| Predicate::node_applies_to(node, term_ok)),
             },
         }
     }
@@ -6574,7 +6569,7 @@ impl Predicate {
     ///    Consider a row r with a=1 and some s with b≠2
     ///    Pushed-down filter NOT(a=1) removes r before join, losing valid results.
     ///    TODO: An alternative is to rewrite the rules using De Morgan's Laws
-    fn filter_node<F>(&self, node: &PredicateNode, term_ok: &F) -> PredicateNode
+    fn filter_node<F>(node: &PredicateNode, term_ok: &F) -> PredicateNode
     where
         F: Fn(&Term) -> bool,
     {
@@ -6591,7 +6586,7 @@ impl Predicate {
                 BooleanConnective::And => {
                     let kept: Vec<PredicateNode> = operands
                         .iter()
-                        .map(|node| self.filter_node(node, term_ok))
+                        .map(|node| Predicate::filter_node(node, term_ok))
                         .filter(|node| !matches!(node, PredicateNode::Empty))
                         .collect();
                     match kept.is_empty() {
@@ -6605,11 +6600,11 @@ impl Predicate {
                 BooleanConnective::Or => {
                     if operands
                         .iter()
-                        .all(|node| self.node_applies_to(node, term_ok))
+                        .all(|node| Predicate::node_applies_to(node, term_ok))
                     {
                         let kept: Vec<PredicateNode> = operands
                             .iter()
-                            .map(|node| self.filter_node(node, term_ok))
+                            .map(|node| Predicate::filter_node(node, term_ok))
                             .collect();
                         PredicateNode::Composite {
                             op: BooleanConnective::Or,
@@ -6622,8 +6617,8 @@ impl Predicate {
                 BooleanConnective::Not => {
                     assert!(operands.len() == 1);
                     let inner = &operands[0];
-                    if self.node_applies_to(inner, term_ok) {
-                        let kept = self.filter_node(inner, term_ok);
+                    if Predicate::node_applies_to(inner, term_ok) {
+                        let kept = Predicate::filter_node(inner, term_ok);
                         return PredicateNode::Composite {
                             op: BooleanConnective::Not,
                             operands: vec![kept],
@@ -6636,10 +6631,10 @@ impl Predicate {
     }
 
     fn to_sql(&self) -> String {
-        self.node_to_sql(&self.root)
+        Predicate::node_to_sql(&self.root)
     }
 
-    fn node_to_sql(&self, node: &PredicateNode) -> String {
+    fn node_to_sql(node: &PredicateNode) -> String {
         match node {
             PredicateNode::Empty => String::new(),
             PredicateNode::Term(term) => term.to_sql(),
@@ -6650,7 +6645,7 @@ impl Predicate {
                     BooleanConnective::Not => "NOT",
                 };
                 let terms: Vec<String> =
-                    operands.iter().map(|node| self.node_to_sql(node)).collect();
+                    operands.iter().map(Predicate::node_to_sql).collect();
                 match op {
                     BooleanConnective::Not => format!("{}({})", op_str, terms.join("")),
                     _ => terms.join(op_str),
