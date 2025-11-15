@@ -9210,7 +9210,10 @@ mod transaction_tests {
                                     txn.tx_id
                                 ))
                                 .unwrap();
-                                std::thread::sleep(Duration::from_millis(50));
+                                // Add deterministic jitter so retries don't re-enter lock queue in sync
+                                let jitter_ms =
+                                    25 + ((txn.tx_id + retry_count as u64) % 10) as u64 * 5;
+                                std::thread::sleep(Duration::from_millis(jitter_ms));
                                 continue;
                             }
                             // Other errors should fail the test
