@@ -269,7 +269,7 @@ mod intrusive_dll_tests {
     use crate::intrusive_dll::{IntrusiveList, IntrusiveNode};
 
     struct Node<T> {
-        data: T,
+        _data: T,
         prev: Option<usize>,
         next: Option<usize>,
     }
@@ -277,7 +277,7 @@ mod intrusive_dll_tests {
     impl<T> Node<T> {
         fn new(data: T) -> Self {
             Self {
-                data,
+                _data: data,
                 prev: None,
                 next: None,
             }

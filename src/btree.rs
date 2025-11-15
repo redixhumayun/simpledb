@@ -852,7 +852,7 @@ mod btree_leaf_tests {
     #[test]
     fn test_insert_no_split() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let (tx, mut leaf) = setup_leaf(&db, Constant::Int(10));
+        let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Insert should succeed without splitting
         assert!(leaf.insert(RID::new(1, 1)).unwrap().is_none());
@@ -865,7 +865,7 @@ mod btree_leaf_tests {
     #[test]
     fn test_insert_with_split_different_keys() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let (tx, mut leaf) = setup_leaf(&db, Constant::Int(10));
+        let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Fill the page with different keys
         let mut slot = 0;
@@ -888,7 +888,7 @@ mod btree_leaf_tests {
     #[test]
     fn test_insert_with_overflow_same_keys() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let (tx, mut leaf) = setup_leaf(&db, Constant::Int(10));
+        let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Fill the page with same key
         let mut slot = 0;
@@ -902,7 +902,7 @@ mod btree_leaf_tests {
 
         // Verify overflow block was created
         assert!(split_result.is_none()); //  overflow block returns None
-        let PageType::Leaf(Some(overflow_num)) = leaf.contents.get_flag().unwrap() else {
+        let PageType::Leaf(Some(_)) = leaf.contents.get_flag().unwrap() else {
             panic!("Expected overflow block");
         };
 
@@ -913,7 +913,7 @@ mod btree_leaf_tests {
     #[test]
     fn test_insert_with_existing_overflow() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let (tx, mut leaf) = setup_leaf(&db, Constant::Int(5));
+        let (_, mut leaf) = setup_leaf(&db, Constant::Int(5));
 
         // Create a page with overflow block containing key 10
         leaf.search_key = Constant::Int(10);
@@ -1061,7 +1061,7 @@ impl BTreePage {
 
     /// Returns true if adding two more records would exceed the block size
     /// Used primarily for testing to detect splits before they occur
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_one_off_full(&self) -> Result<bool, Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         Ok(self.slot_pos(current_records + 2) > self.txn.block_size())
