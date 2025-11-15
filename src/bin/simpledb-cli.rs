@@ -173,6 +173,10 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
     let indexes = db
         .metadata_manager()
         .get_index_info(table_name, Arc::clone(&txn));
+
+    // Capture block_size before committing to avoid creating new transactions in the index loop
+    let block_size = txn.block_size();
+
     txn.commit()?;
 
     let mut result = format!("Table: {}\n", table_name);
@@ -207,7 +211,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
 
             // Calculate BTree search cost for comparison
             let records_per_block = if layout.slot_size > 0 {
-                db.new_tx().block_size() / layout.slot_size
+                block_size / layout.slot_size
             } else {
                 1
             };
