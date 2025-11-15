@@ -376,15 +376,15 @@ mod parser_tests {
         assert_eq!(query_data.tables, vec!["users"]);
         matches!(
             query_data.predicate.root,
-            PredicateNode::Composite { ref op, ref operands }
+            PredicateNode::Composite { op: _, operands: _ }
         );
-        let PredicateNode::Composite { op, operands } = &query_data.predicate.root else {
+        let PredicateNode::Composite { op: _, operands } = &query_data.predicate.root else {
             panic!("Expected Composite PredicateNode");
         };
         matches!(
             &operands[0],
             PredicateNode::Term(Term {
-                lhs: Expression::FieldName(id),
+                lhs: Expression::FieldName(_id),
                 rhs: Expression::Constant(Constant::Int(val)),
                 comparison_op: ComparisonOp::Equal,
             }) if *val == 3
@@ -392,7 +392,7 @@ mod parser_tests {
         matches!(
             &operands[1],
             PredicateNode::Term(Term {
-                lhs: Expression::FieldName(name),
+                lhs: Expression::FieldName(_),
                 rhs: Expression::Constant(Constant::String(val)),
                 comparison_op: ComparisonOp::Equal
             }) if val == "john"
