@@ -147,11 +147,15 @@ fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
 
 fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Error>> {
     let txn = Arc::new(db.new_tx());
-    let layout = db.metadata_manager().get_layout(table_name, Arc::clone(&txn));
-    let stat_info = db
+    let layout = db
         .metadata_manager()
-        .get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
-    let indexes = db.metadata_manager().get_index_info(table_name, Arc::clone(&txn));
+        .get_layout(table_name, Arc::clone(&txn));
+    let stat_info =
+        db.metadata_manager()
+            .get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
+    let indexes = db
+        .metadata_manager()
+        .get_index_info(table_name, Arc::clone(&txn));
     txn.commit()?;
 
     let mut result = format!("Table: {}\n", table_name);
@@ -161,10 +165,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
         stat_info.num_blocks, stat_info.num_records
     ));
     result.push_str("\nFields:\n");
-    result.push_str(&format!(
-        "{:<20} {:<15}\n",
-        "Name", "Type"
-    ));
+    result.push_str(&format!("{:<20} {:<15}\n", "Name", "Type"));
     result.push_str(&format!("{}\n", "-".repeat(35)));
 
     for field in &layout.schema.fields {
