@@ -103,6 +103,9 @@ impl<'a> Parser<'a> {
             Some(Token::Delimiter(Lexer::EQUAL)) => ComparisonOp::Equal,
             Some(Token::Delimiter(Lexer::GREATER)) => ComparisonOp::GreaterThan,
             Some(Token::Delimiter(Lexer::LESS)) => ComparisonOp::LessThan,
+            Some(Token::LessOrEqual) => ComparisonOp::LessThanOrEqual,
+            Some(Token::GreaterOrEqual) => ComparisonOp::GreaterThanOrEqual,
+            Some(Token::NotEqual) => ComparisonOp::NotEqual,
             _ => return Err(ParserError::BadSyntax),
         };
         self.lexer
@@ -114,7 +117,7 @@ impl<'a> Parser<'a> {
 
     /// Parses multiple terms connected by AND
     /// Returns: Vec<Term> containing all parsed terms
-    fn terms(&mut self) -> Result<Vec<Term>, ParserError> {
+    fn _terms(&mut self) -> Result<Vec<Term>, ParserError> {
         let mut terms = Vec::new();
         terms.push(self.term()?);
         //  TODO: Handle more boolean connectives
@@ -372,15 +375,15 @@ mod parser_tests {
         assert_eq!(query_data.tables, vec!["users"]);
         matches!(
             query_data.predicate.root,
-            PredicateNode::Composite { ref op, ref operands }
+            PredicateNode::Composite { op: _, operands: _ }
         );
-        let PredicateNode::Composite { op, operands } = &query_data.predicate.root else {
+        let PredicateNode::Composite { op: _, operands } = &query_data.predicate.root else {
             panic!("Expected Composite PredicateNode");
         };
         matches!(
             &operands[0],
             PredicateNode::Term(Term {
-                lhs: Expression::FieldName(id),
+                lhs: Expression::FieldName(_id),
                 rhs: Expression::Constant(Constant::Int(val)),
                 comparison_op: ComparisonOp::Equal,
             }) if *val == 3
@@ -388,7 +391,7 @@ mod parser_tests {
         matches!(
             &operands[1],
             PredicateNode::Term(Term {
-                lhs: Expression::FieldName(name),
+                lhs: Expression::FieldName(_),
                 rhs: Expression::Constant(Constant::String(val)),
                 comparison_op: ComparisonOp::Equal
             }) if val == "john"
@@ -737,6 +740,11 @@ impl<'a> Lexer<'a> {
     const CURLY_OPEN: char = '{';
     const CURLY_CLOSE: char = '}';
     const STAR: char = '*';
+    const BANG: char = '!';
+    const PLUS: char = '+';
+    const MINUS: char = '-';
+    const SLASH: char = '/';
+    const PERCENT: char = '%';
 
     /// Creates a new Lexer with the given SQL string
     fn new(string: &'a str) -> Self {
@@ -801,15 +809,47 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<Token> {
         let c = self.input.peek().cloned()?;
         let token = match c {
+            // Check for multi-character operators
+            Self::LESS => {
+                self.input.next();
+                if self.input.peek() == Some(&Self::EQUAL) {
+                    self.input.next();
+                    Some(Token::LessOrEqual)
+                } else {
+                    Some(Token::Delimiter(Self::LESS))
+                }
+            }
+            Self::GREATER => {
+                self.input.next();
+                if self.input.peek() == Some(&Self::EQUAL) {
+                    self.input.next();
+                    Some(Token::GreaterOrEqual)
+                } else {
+                    Some(Token::Delimiter(Self::GREATER))
+                }
+            }
+            Self::BANG => {
+                self.input.next();
+                if self.input.peek() == Some(&Self::EQUAL) {
+                    self.input.next();
+                    Some(Token::NotEqual)
+                } else {
+                    // Standalone ! is not valid in SQL, skip it
+                    self.next_token()
+                }
+            }
+            // Single-character delimiters
             Self::EQUAL
-            | Self::GREATER
-            | Self::LESS
             | Self::COMMA
             | Self::ROUND_OPEN
             | Self::ROUND_CLOSE
             | Self::CURLY_OPEN
             | Self::CURLY_CLOSE
-            | Self::STAR => {
+            | Self::STAR
+            | Self::PLUS
+            | Self::MINUS
+            | Self::SLASH
+            | Self::PERCENT => {
                 self.input.next();
                 Some(Token::Delimiter(c))
             } // delimiter
@@ -915,6 +955,10 @@ pub enum Token {
     IntConstant(i32),
     StringConstant(String),
     Delimiter(char),
+    // Multi-character operators
+    LessOrEqual,
+    GreaterOrEqual,
+    NotEqual,
 }
 
 #[cfg(test)]

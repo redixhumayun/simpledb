@@ -38,7 +38,7 @@ impl PolicyState {
 
     pub fn record_hit<'a>(
         &self,
-        buffer_pool: &[Arc<Mutex<BufferFrame>>],
+        _buffer_pool: &[Arc<Mutex<BufferFrame>>],
         frame_ptr: &'a Arc<Mutex<BufferFrame>>,
         block_id: &BlockId,
         resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,

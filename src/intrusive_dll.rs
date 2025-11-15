@@ -66,6 +66,7 @@ impl IntrusiveList {
     }
 
     /// Move the given node to the head of the list.
+    #[cfg(feature = "replacement_lru")]
     pub fn move_to_head<T: IntrusiveNode>(
         &mut self,
         index: usize,
@@ -115,6 +116,7 @@ impl IntrusiveList {
     /// # Panics
     /// * If the list is empty or has only one element.
     /// * If the provided nodes do not reflect the list's current ordering.
+    #[cfg(feature = "replacement_lru")]
     pub fn promote_successor_to_head<T: IntrusiveNode>(
         &mut self,
         head_node: &mut T,
@@ -153,30 +155,6 @@ impl IntrusiveList {
         if self.tail == Some(successor_index) {
             self.tail = Some(head_index);
         }
-    }
-
-    /// Remove the node at the tail and return the index so that the node can be reused
-    pub fn evict_tail<T: IntrusiveNode>(
-        &mut self,
-        tail_node: &mut T,
-        prev_node: Option<&mut T>,
-    ) -> usize {
-        assert!(
-            self.tail.is_some(),
-            "Invariant broken: evicting a tail when there is no tail defined"
-        );
-        assert!(tail_node.next().is_none());
-        if self.head == self.tail {
-            //  handle the case of a single node list
-            assert!(prev_node.is_none());
-            let curr_head_idx = self.head;
-            self.head = None;
-            self.tail = None;
-            return curr_head_idx.unwrap();
-        }
-        let tail_idx = self.tail.unwrap();
-        self.remove_node(tail_idx, tail_node, prev_node, None);
-        tail_idx
     }
 
     /// Remove the node at the provided index from the list regardless of position.
@@ -266,7 +244,7 @@ mod intrusive_dll_tests {
     use crate::intrusive_dll::{IntrusiveList, IntrusiveNode};
 
     struct Node<T> {
-        data: T,
+        _data: T,
         prev: Option<usize>,
         next: Option<usize>,
     }
@@ -274,7 +252,7 @@ mod intrusive_dll_tests {
     impl<T> Node<T> {
         fn new(data: T) -> Self {
             Self {
-                data,
+                _data: data,
                 prev: None,
                 next: None,
             }
@@ -461,6 +439,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_list_modifications() {
         let (mut list, nodes) = create_list_with_values(&[1, 2, 3, 4, 5]);
         assert_list_integrity(&list, &nodes);
@@ -490,7 +469,8 @@ mod intrusive_dll_tests {
         let evicted_idx = {
             let mut tail_handle = NodeHandle::new(&nodes[tail_idx]);
             let mut prev_handle = tail_prev_idx.map(|idx| NodeHandle::new(&nodes[idx]));
-            list.evict_tail(&mut tail_handle, prev_handle.as_mut())
+            list.remove_node(tail_idx, &mut tail_handle, prev_handle.as_mut(), None);
+            tail_idx
         };
         assert_eq!(evicted_idx, tail_idx);
         assert_list_integrity(&list, &nodes);
@@ -551,7 +531,8 @@ mod intrusive_dll_tests {
         let evicted_idx = {
             let mut tail_handle = NodeHandle::new(&nodes[tail_idx]);
             let mut prev_handle = prev_idx.map(|idx| NodeHandle::new(&nodes[idx]));
-            list.evict_tail(&mut tail_handle, prev_handle.as_mut())
+            list.remove_node(tail_idx, &mut tail_handle, prev_handle.as_mut(), None);
+            tail_idx
         };
         assert_eq!(evicted_idx, tail_idx);
         assert_eq!(list.tail, prev_idx);
@@ -641,6 +622,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     #[should_panic(expected = "Invariant broken: meaningless to move to head of an empty list")]
     fn test_move_to_head_empty_list_panics() {
         let mut list = IntrusiveList::new();
@@ -650,6 +632,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_move_to_head_single_node() {
         let (mut list, nodes) = create_list_with_values(&[42]);
         assert_list_integrity(&list, &nodes);
@@ -679,7 +662,8 @@ mod intrusive_dll_tests {
         let idx = list.tail.unwrap();
         let evicted_idx = {
             let mut tail_handle = NodeHandle::new(&nodes[idx]);
-            list.evict_tail(&mut tail_handle, None)
+            list.remove_node(idx, &mut tail_handle, None, None);
+            idx
         };
         assert_eq!(evicted_idx, idx);
         assert_eq!(list.head, None);
@@ -690,15 +674,17 @@ mod intrusive_dll_tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invariant broken: evicting a tail when there is no tail defined")]
-    fn test_evict_tail_empty_list_panics() {
+    #[should_panic(expected = "Invariant broken: cannot remove from an empty list")]
+    fn test_remove_node_empty_list_panics() {
         let mut list = IntrusiveList::new();
         let node = RefCell::new(Node::new(1));
         let mut node_handle = NodeHandle::new(&node);
-        list.evict_tail(&mut node_handle, None);
+        // attempt to remove from an empty list should panic
+        list.remove_node(0, &mut node_handle, None, None);
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_move_tail_to_head() {
         let (mut list, nodes) = create_list_with_values(&[1, 2, 3, 4, 5]);
         assert_list_integrity(&list, &nodes);
@@ -729,6 +715,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_promote_successor_to_head_general_case() {
         let (mut list, nodes) = create_list_with_values(&[10, 20, 30]);
         assert_list_integrity(&list, &nodes);
@@ -760,6 +747,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_promote_successor_to_head_when_successor_is_tail() {
         let (mut list, nodes) = create_list_with_values(&[1, 2]);
         assert_list_integrity(&list, &nodes);
