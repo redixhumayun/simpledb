@@ -119,7 +119,15 @@ fn show_database_info(db: &SimpleDB) {
 
 fn show_tables(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
     let txn = Arc::new(db.new_tx());
-    let tables = db.metadata_manager().get_table_names(&txn)?;
+
+    let tables = match db.metadata_manager().get_table_names(&txn) {
+        Ok(t) => t,
+        Err(e) => {
+            txn.rollback()?;
+            return Err(e);
+        }
+    };
+
     txn.commit()?;
 
     if tables.is_empty() {
@@ -141,8 +149,17 @@ fn show_buffers(db: &SimpleDB) {
 
 fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
     let txn = Arc::new(db.new_tx());
-    txn.recover()?;
-    Ok("Database recovery completed successfully.".to_string())
+
+    match txn.recover() {
+        Ok(_) => {
+            txn.commit()?;
+            Ok("Database recovery completed successfully.".to_string())
+        }
+        Err(e) => {
+            txn.rollback()?;
+            Err(e)
+        }
+    }
 }
 
 fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Error>> {
