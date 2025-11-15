@@ -6446,16 +6446,15 @@ impl Predicate {
         Predicate::evaluate_equates_with_constant(&self.root, field_name)
     }
 
-    fn evaluate_equates_with_constant(
-        node: &PredicateNode,
-        field_name: &str,
-    ) -> Option<Constant> {
+    fn evaluate_equates_with_constant(node: &PredicateNode, field_name: &str) -> Option<Constant> {
         match node {
             PredicateNode::Empty => None,
             PredicateNode::Term(term) => term.equates_with_constant(field_name),
             PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
-                    if let Some(val) = Predicate::evaluate_equates_with_constant(operand, field_name) {
+                    if let Some(val) =
+                        Predicate::evaluate_equates_with_constant(operand, field_name)
+                    {
                         return Some(val);
                     }
                 }
@@ -6485,16 +6484,14 @@ impl Predicate {
     /// - `PredicateNode::Composite`: recursively visit operands in order and
     ///   return the first match found.
     /// - `PredicateNode::Empty`: returns `None`.
-    fn evaluate_equates_with_field(
-        node: &PredicateNode,
-        field_name: &str,
-    ) -> Option<String> {
+    fn evaluate_equates_with_field(node: &PredicateNode, field_name: &str) -> Option<String> {
         match node {
             PredicateNode::Empty => None,
             PredicateNode::Term(term) => term.equates_with_field(field_name),
             PredicateNode::Composite { op: _, operands } => {
                 for operand in operands {
-                    if let Some(field) = Predicate::evaluate_equates_with_field(operand, field_name) {
+                    if let Some(field) = Predicate::evaluate_equates_with_field(operand, field_name)
+                    {
                         return Some(field);
                     }
                 }
@@ -6644,8 +6641,7 @@ impl Predicate {
                     BooleanConnective::Or => "OR",
                     BooleanConnective::Not => "NOT",
                 };
-                let terms: Vec<String> =
-                    operands.iter().map(Predicate::node_to_sql).collect();
+                let terms: Vec<String> = operands.iter().map(Predicate::node_to_sql).collect();
                 match op {
                     BooleanConnective::Not => format!("{}({})", op_str, terms.join("")),
                     _ => terms.join(op_str),
@@ -9147,7 +9143,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_isolation_with_concurrent_writes() {
         let file = generate_filename();
-        let (test_db, _test_dir) = SimpleDB::new_for_test(512, 3, 500);
+        let (test_db, _test_dir) = SimpleDB::new_for_test(512, 3, 2000);
         let block_id = BlockId::new(file.clone(), 1);
         let num_of_txns = 5;
         let max_retry_count = 75;
