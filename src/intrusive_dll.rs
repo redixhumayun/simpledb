@@ -439,6 +439,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_list_modifications() {
         let (mut list, nodes) = create_list_with_values(&[1, 2, 3, 4, 5]);
         assert_list_integrity(&list, &nodes);
@@ -621,6 +622,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     #[should_panic(expected = "Invariant broken: meaningless to move to head of an empty list")]
     fn test_move_to_head_empty_list_panics() {
         let mut list = IntrusiveList::new();
@@ -630,6 +632,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_move_to_head_single_node() {
         let (mut list, nodes) = create_list_with_values(&[42]);
         assert_list_integrity(&list, &nodes);
@@ -681,6 +684,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_move_tail_to_head() {
         let (mut list, nodes) = create_list_with_values(&[1, 2, 3, 4, 5]);
         assert_list_integrity(&list, &nodes);
@@ -711,6 +715,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_promote_successor_to_head_general_case() {
         let (mut list, nodes) = create_list_with_values(&[10, 20, 30]);
         assert_list_integrity(&list, &nodes);
@@ -742,6 +747,7 @@ mod intrusive_dll_tests {
     }
 
     #[test]
+    #[cfg(feature = "replacement_lru")]
     fn test_promote_successor_to_head_when_successor_is_tail() {
         let (mut list, nodes) = create_list_with_values(&[1, 2]);
         assert_list_integrity(&list, &nodes);
