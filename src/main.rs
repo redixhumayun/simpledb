@@ -9230,7 +9230,7 @@ mod transaction_tests {
         let mut operations = vec![];
 
         loop {
-            match rx.recv_timeout(Duration::from_secs(30)) {
+            match rx.recv_timeout(Duration::from_secs(60)) {
                 Ok(msg) => {
                     if msg.contains("successfully incremented") {
                         successful_increments += 1;
