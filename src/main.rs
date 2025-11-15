@@ -10861,7 +10861,8 @@ impl BufferManager {
     fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<Mutex<BufferFrame>>> {
         //  Wrap the latch table in a guard which will prune it appropriately
         let latch_table_guard = LatchTableGuard::new(&self.latch_table, block_id);
-        let _block_latch = latch_table_guard.lock();
+        #[allow(unused_variables)]
+        let block_latch = latch_table_guard.lock();
 
         //  check the resident table for the associated frame
         let frame_ptr = {
