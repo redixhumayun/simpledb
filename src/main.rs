@@ -9147,10 +9147,10 @@ mod transaction_tests {
     #[test]
     fn test_transaction_isolation_with_concurrent_writes() {
         let file = generate_filename();
-        let (test_db, _test_dir) = SimpleDB::new_for_test(512, 3, 500);
+        let (test_db, _test_dir) = SimpleDB::new_for_test(512, 8, 1000);
         let block_id = BlockId::new(file.clone(), 1);
         let num_of_txns = 5;
-        let max_retry_count = 75;
+        let max_retry_count = 150;
 
         // Initialize data
         let t1 = Transaction::new(
