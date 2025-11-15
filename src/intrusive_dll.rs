@@ -66,6 +66,7 @@ impl IntrusiveList {
     }
 
     /// Move the given node to the head of the list.
+    #[cfg(feature = "replacement_lru")]
     pub fn move_to_head<T: IntrusiveNode>(
         &mut self,
         index: usize,
@@ -115,6 +116,7 @@ impl IntrusiveList {
     /// # Panics
     /// * If the list is empty or has only one element.
     /// * If the provided nodes do not reflect the list's current ordering.
+    #[cfg(feature = "replacement_lru")]
     pub fn promote_successor_to_head<T: IntrusiveNode>(
         &mut self,
         head_node: &mut T,
