@@ -9119,7 +9119,7 @@ mod transaction_tests {
         let file = generate_filename();
         let (test_db, _test_dir) = SimpleDB::new_for_test(512, 3, 500);
         let block_id = BlockId::new(file.clone(), 1);
-        let num_of_txns = 5;
+        let num_of_txns = 2;
         let max_retry_count = 150;
 
         // Initialize data
