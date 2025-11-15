@@ -726,6 +726,22 @@ pub struct ChunkScan {
 }
 
 impl ChunkScan {
+    pub fn txn(&self) -> &Arc<Transaction> {
+        &self.txn
+    }
+
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    pub fn last_block_num(&self) -> usize {
+        self.last_block_num
+    }
+
+    pub fn current_block_num(&self) -> usize {
+        self.current_block_num
+    }
+
     pub fn new(
         txn: Arc<Transaction>,
         layout: Layout,
@@ -1141,6 +1157,10 @@ pub struct MergeJoinPlan {
 }
 
 impl MergeJoinPlan {
+    pub fn txn(&self) -> &Arc<Transaction> {
+        &self.txn
+    }
+
     pub fn new(
         plan_1: Arc<dyn Plan>,
         plan_2: Arc<dyn Plan>,
@@ -1335,6 +1355,10 @@ impl<S> MergeJoinScan<S>
 where
     S: Scan,
 {
+    pub fn at_new_group(&self) -> bool {
+        self.at_new_group
+    }
+
     pub fn new(scan_1: S, scan_2: SortScan, field_name_1: String, field_name_2: String) -> Self {
         Self {
             scan_1,
@@ -3734,6 +3758,14 @@ pub struct TablePlanner {
 }
 
 impl TablePlanner {
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn metadata_manager(&self) -> &Arc<MetadataManager> {
+        &self.metadata_manager
+    }
+
     pub fn new(
         table_name: String,
         predicate: Predicate,
@@ -3757,6 +3789,7 @@ impl TablePlanner {
         }
     }
 
+    #[allow(dead_code)]
     fn build_base_plan(&self) -> Arc<dyn Plan> {
         Arc::new(TablePlan::new(
             &self.table_name,
@@ -3903,7 +3936,7 @@ impl TablePlanner {
 /// This struct applies a bunch of heuristics on a query to construct a logical query tree
 /// It performs logical optimizations while depending on [TablePlanner] to perform physical optimizations
 /// Both these optimizations happen in lockstep
-struct HeuristicQueryPlanner {
+pub struct HeuristicQueryPlanner {
     table_planners: Vec<TablePlanner>,
     metadata_manager: Arc<MetadataManager>,
 }
@@ -5206,6 +5239,7 @@ where
     S: Scan,
 {
     scan: S,
+    #[allow(dead_code)]
     field_list: Vec<String>,
 }
 
@@ -5218,6 +5252,7 @@ where
     }
 
     /// Returns the list of fields in this projection
+    #[allow(dead_code)]
     pub fn projected_fields(&self) -> &[String] {
         &self.field_list
     }
@@ -8218,6 +8253,7 @@ struct RecordPageIterator<'a> {
 }
 
 impl<'a> RecordPageIterator<'a> {
+    #[allow(dead_code)]
     pub fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
         Self {
             record_page,
@@ -8275,6 +8311,7 @@ struct RecordPage {
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
+    #[allow(dead_code)]
     pub fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         let handle = tx.pin(&block_id);
         Self { tx, handle, layout }
@@ -8313,6 +8350,7 @@ impl RecordPage {
     }
 
     /// Marks a slot as used and returns its slot number.
+    #[allow(dead_code)]
     fn insert(&self, slot: usize) -> usize {
         self.set_flag(slot, SlotPresence::Used);
         slot
@@ -8335,6 +8373,7 @@ impl RecordPage {
     }
 
     /// Returns the next [`SlotPresence::Used`] slot after the slot passed in
+    #[allow(dead_code)]
     fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
         let next_slot = self.iter_used_slots().find(|s| *s > slot).unwrap();
         Ok(next_slot)
@@ -8562,6 +8601,12 @@ pub struct FieldInfo {
 pub struct Schema {
     pub fields: Vec<String>,
     pub info: HashMap<String, FieldInfo>,
+}
+
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Schema {
@@ -10402,6 +10447,7 @@ impl BufferList {
     /// 1. BufferList count matches expected number of live handles for this transaction
     /// 2. BufferManager pin count >= BufferList count (other transactions may have pins too)
     #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
         let buffer_list_count = self
             .buffers
@@ -10487,6 +10533,8 @@ pub struct BufferFrame {
 impl BufferFrame {
     pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
         let size = file_manager.lock().unwrap().block_size();
+        #[cfg(feature = "replacement_clock")]
+        let _ = index; // Suppress unused warning when only clock is enabled
         Self {
             file_manager,
             log_manager,
@@ -10603,6 +10651,12 @@ impl IntrusiveNode for MutexGuard<'_, BufferFrame> {
 pub struct BufferStats {
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
+}
+
+impl Default for BufferStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BufferStats {

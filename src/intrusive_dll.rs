@@ -66,6 +66,7 @@ impl IntrusiveList {
     }
 
     /// Move the given node to the head of the list.
+    #[allow(dead_code)]
     pub fn move_to_head<T: IntrusiveNode>(
         &mut self,
         index: usize,
@@ -115,6 +116,7 @@ impl IntrusiveList {
     /// # Panics
     /// * If the list is empty or has only one element.
     /// * If the provided nodes do not reflect the list's current ordering.
+    #[allow(dead_code)]
     pub fn promote_successor_to_head<T: IntrusiveNode>(
         &mut self,
         head_node: &mut T,
@@ -156,6 +158,7 @@ impl IntrusiveList {
     }
 
     /// Remove the node at the tail and return the index so that the node can be reused
+    #[allow(dead_code)]
     pub fn evict_tail<T: IntrusiveNode>(
         &mut self,
         tail_node: &mut T,

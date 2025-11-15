@@ -117,6 +117,7 @@ impl<'a> Parser<'a> {
 
     /// Parses multiple terms connected by AND
     /// Returns: Vec<Term> containing all parsed terms
+    #[allow(dead_code)]
     fn terms(&mut self) -> Result<Vec<Term>, ParserError> {
         let mut terms = Vec::new();
         terms.push(self.term()?);

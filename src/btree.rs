@@ -1061,6 +1061,7 @@ impl BTreePage {
 
     /// Returns true if adding two more records would exceed the block size
     /// Used primarily for testing to detect splits before they occur
+    #[allow(dead_code)]
     fn is_one_off_full(&self) -> Result<bool, Box<dyn Error>> {
         let current_records = self.get_number_of_recs()?;
         Ok(self.slot_pos(current_records + 2) > self.txn.block_size())
