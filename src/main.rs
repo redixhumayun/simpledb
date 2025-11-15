@@ -3796,15 +3796,6 @@ impl TablePlanner {
         }
     }
 
-    #[allow(dead_code)]
-    fn build_base_plan(&self) -> Arc<dyn Plan> {
-        Arc::new(TablePlan::new(
-            &self.table_name,
-            Arc::clone(&self.txn),
-            Arc::clone(&self.metadata_manager),
-        ))
-    }
-
     /// Create a [SelectPlan] for this table using the available predicate. This applies heuristic 6
     /// First, try to apply indexes and create an [IndexSelectPlan]
     /// Next, push down predicates and create a [SelectPlan] with the sub-predicate
@@ -5246,8 +5237,7 @@ where
     S: Scan,
 {
     scan: S,
-    #[allow(dead_code)]
-    field_list: Vec<String>,
+    _field_list: Vec<String>,
 }
 
 impl<S> ProjectScan<S>
@@ -5255,13 +5245,10 @@ where
     S: Scan,
 {
     pub fn new(scan: S, field_list: Vec<String>) -> Self {
-        Self { scan, field_list }
-    }
-
-    /// Returns the list of fields in this projection
-    #[allow(dead_code)]
-    pub fn projected_fields(&self) -> &[String] {
-        &self.field_list
+        Self {
+            scan,
+            _field_list: field_list,
+        }
     }
 }
 
@@ -8232,7 +8219,6 @@ struct RecordPageIterator<'a> {
 }
 
 impl<'a> RecordPageIterator<'a> {
-    #[allow(dead_code)]
     pub fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
         Self {
             record_page,
@@ -8290,7 +8276,6 @@ struct RecordPage {
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
-    #[allow(dead_code)]
     pub fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         let handle = tx.pin(&block_id);
         Self { tx, handle, layout }
@@ -8329,7 +8314,7 @@ impl RecordPage {
     }
 
     /// Marks a slot as used and returns its slot number.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn insert(&self, slot: usize) -> usize {
         self.set_flag(slot, SlotPresence::Used);
         slot
@@ -8349,13 +8334,6 @@ impl RecordPage {
         };
         self.set_flag(new_slot, SlotPresence::Used);
         Ok(new_slot)
-    }
-
-    /// Returns the next [`SlotPresence::Used`] slot after the slot passed in
-    #[allow(dead_code)]
-    fn search_after(&self, slot: usize) -> Result<usize, Box<dyn Error>> {
-        let next_slot = self.iter_used_slots().find(|s| *s > slot).unwrap();
-        Ok(next_slot)
     }
 
     /// Sets the presence flag (EMPTY or USED) for a given slot.
@@ -8422,11 +8400,7 @@ impl RecordPage {
 
     /// Returns an iterator over used slots in the record page.
     fn iter_used_slots(&self) -> RecordPageIterator<'_> {
-        RecordPageIterator {
-            record_page: self,
-            current_slot: None,
-            presence: SlotPresence::Used,
-        }
+        RecordPageIterator::new(self, SlotPresence::Used)
     }
 }
 
@@ -9211,8 +9185,7 @@ mod transaction_tests {
                                 ))
                                 .unwrap();
                                 // Add deterministic jitter so retries don't re-enter lock queue in sync
-                                let jitter_ms =
-                                    25 + ((txn.tx_id + retry_count as u64) % 10) * 5;
+                                let jitter_ms = 25 + ((txn.tx_id + retry_count as u64) % 10) * 5;
                                 std::thread::sleep(Duration::from_millis(jitter_ms));
                                 continue;
                             }
@@ -10425,7 +10398,7 @@ impl BufferList {
     /// 1. BufferList count matches expected number of live handles for this transaction
     /// 2. BufferManager pin count >= BufferList count (other transactions may have pins too)
     #[cfg(debug_assertions)]
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
         let buffer_list_count = self
             .buffers
