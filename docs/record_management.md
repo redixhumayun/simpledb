@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document outlines the comprehensive redesign of SimpleDB's page format to integrate bitmap and ID table structures directly into the Page abstraction. The current implementation treats pages as raw byte arrays, requiring higher-level components to manually manage record organization. This redesign moves that knowledge into the Page itself, enabling more efficient record management and laying the groundwork for variable-length records.
+This document outlines the comprehensive redesign of SimpleDB's page format to use a line-pointer array plus heap layout. The current implementation treats pages as raw byte arrays, requiring higher-level components to manually manage record organization. The redesign moves that knowledge into the Page itself, enabling variable-length records, MVCC-friendly metadata, and deterministic on-disk images suitable for direct I/O.
 
 ## Motivation
 
@@ -151,51 +151,62 @@ Pinpoints exact record location for direct access and indexing.
 
 ## Proposed Architecture
 
-### New Page Structure
-
-The redesigned Page struct integrates record management metadata:
+### Page Structure
 
 ```rust
 pub struct Page {
-    header: PageHeader,           // Metadata about page state
-    bitmap: RecordBitmap,         // Track slot occupancy
-    id_table: IdTable,            // Map slots to record offsets
-    record_space: Vec<u8>,        // Actual record data
+    header: PageHeader,       // Metadata about page state
+    line_ptrs: Vec<LinePtr>,  // Slot array growing downward
+    record_space: Vec<u8>,    // Heap growing upward
+}
+
+#[repr(u8)]
+enum PageType {
+    Heap = 0,
+    IndexLeaf = 1,
+    IndexInternal = 2,
+    Overflow = 3,
+    Meta = 4,
+    Free = 255,
 }
 
 struct PageHeader {
-    slot_count: u32,      // Number of slots currently used
-    free_ptr: u32,        // Offset where free space begins
+    page_type: PageType,  // Heap, index leaf, etc.
+    slot_count: u16,      // Number of active slots
+    free_lower: u16,      // End of line-pointer array
+    free_upper: u16,      // Start of free heap space
+    free_ptr: u32,        // Next heap allocation offset (bump)
+    crc32: u32,           // Page checksum
+    latch_word: u64,      // Spin/seqlock metadata
+    free_head: u16,       // Head of free-slot freelist (slot id) or 0xFFFF if none
+    reserved: [u8; 6],    // Future (LSN, FSM hints, padding)
 }
 
-struct RecordBitmap {
-    bits: [u8; 32],       // 256 bits for slot presence
-}
+/// 4-byte packed line pointer: offset + length + state
+#[derive(Clone, Copy)]
+struct LinePtr(u32);
 
-struct IdTable {
-    offsets: [u16; 256],  // 2-byte offsets per slot
+impl LinePtr {
+    // bits 31..16: offset (u16, supports page sizes up to 64KB)
+    // bits 15..4 : length (12 bits, up to 4095 bytes)
+    // bits 3..0  : state  (4 bits: FREE, LIVE, DEAD, REDIRECT, COMPRESSED, etc.)
 }
 ```
 
-### Physical Layout
+### Physical Layout (4096 bytes)
 
 ```
-PROPOSED PAGE LAYOUT (4096 bytes)
-═══════════════════════════════════════════════════════════════════
-
 ┌───────────────────────────────────────────────────────────────┐
 │                         4096-byte Page                         │
-├────────┬────────┬─────────────────┬────────────────────────────┤
-│ Header │ Bitmap │    ID Table     │       Record Space         │
-│8 bytes │32 bytes│   512 bytes     │       3544 bytes           │
-├────────┼────────┼─────────────────┼────────────────────────────┤
-│        │        │                 │                            │
-│ - Slot │ - 1 bit│ - 2-byte offset │  - Records grow from here  │
-│  count │  per   │   per slot      │    toward the left         │
-│ - Free │  slot  │ - Points to     │  - Each record has a       │
-│  ptr   │ 256 max│   record start  │    4-byte header           │
-└────────┴────────┴─────────────────┴────────────────────────────┘
-   0        8          40                552              4096
+├──────────┬─────────────────────┬───────────────────────────────┤
+│ Header   │ Line Ptr Array      │         Record Heap           │
+│ 32 bytes │ grows downward      │         grows upward          │
+├──────────┼─────────────────────┼───────────────────────────────┤
+│ page_type│ lp[0] lp[1] ...     │  Tuples with MVCC + nullmap   │
+│ free_*   │ free_lower ►        │  free_upper/free_ptr ►        │
+│ crc32    │                     │                               │
+└──────────┴─────────────────────┴───────────────────────────────┘
+   0          32             free_lower            free_upper    4096
 ```
 
 ### Size Calculations
@@ -203,110 +214,124 @@ PROPOSED PAGE LAYOUT (4096 bytes)
 Starting from first principles:
 
 **1. Minimum record size:**
-- Record header: 4 bytes (2B length + 2B flags)
+- Tuple header: 24 bytes (`xmin` 8B + `xmax` 8B + `flags` 2B + `nullmap_ptr` 2B + `payload_len` 4B)
 - Minimum field: 4 bytes (one integer)
-- **Minimum record = 8 bytes**
+- **Minimum record = 28 bytes**
 
 **2. Theoretical maximum slots:**
 - Page size: 4096 bytes
-- Theoretical max: 4096 / 8 = 512 slots
+- Theoretical max: page bytes / min line pointer stride ≈ 4096 / 4 = 1024 line pointers (before they collide with heap)
 
-**3. Practical slot count: 256**
-- Use 256 instead of 512 for practical reasons
-- Still allows good space utilization
-- Keeps bitmap and ID table reasonably sized
+**3. Practical slot count: dynamic**
+- Line pointers grow until they meet the heap; no hard cap like the bitmap+ID table approach.
 
-**4. Bitmap size:**
-- 256 slots × 1 bit = 256 bits
-- **Bitmap = 32 bytes**
+**4. Line pointer size:**
+- 4 bytes per slot (u16 offset, 12-bit len, 4-bit state)
 
-**5. ID table size:**
-- Each entry: 2 bytes (can address up to 65,536 byte offsets >> 4,096)
-- 256 entries × 2 bytes = **ID table = 512 bytes**
+**5. Slot directory size:**
+- `4 * slot_count`; adjusts to workload (many small tuples → more pointers, few large tuples → fewer).
 
 **6. Header size:**
-- slot_count: 4 bytes (u32)
+- page_type + slot_count/free-lower/free-upper (6 bytes total)
 - free_ptr: 4 bytes (u32)
-- **Header = 8 bytes**
+- crc32: 4 bytes
+- latch_word: 8 bytes
+- free_head: 2 bytes
+- reserved bytes: 6 bytes
+- **Header = 32 bytes** (padded from 30 for alignment/power-of-two)
 
 **7. Record space:**
-- 4096 - 8 - 32 - 512 = **3544 bytes**
+- 4096 - 32 - 4*slot_count = **variable**, shared between line pointers and heap
 
 ### Component Details
 
-**Header (8 bytes):**
+**Header (32 bytes):**
 ```
-Offset 0-3: slot_count (u32)
-  • How many slots are currently in use
-  • Incremented when new slot allocated
-  • Used to find next available slot
-
-Offset 4-7: free_ptr (u32)
-  • Points to start of free space in record area
-  • Initially: 552 (right after ID table)
-  • Updated when records are inserted
+Offset 0:   page_type (u8)
+Offset 1:   reserved_type_flags (u8)
+Offset 2-3: slot_count (u16)
+Offset 4-5: free_lower (u16)   // end of line-pointer array
+Offset 6-7: free_upper (u16)   // start of free heap
+Offset 8-11: free_ptr (u32)    // bump cursor for heap inserts
+Offset 12-15: crc32 (u32)      // checksum of entire page
+Offset 16-23: latch_word (u64) // spin/seqlock metadata
+Offset 24-25: free_head (u16)  // freelist head slot id, 0xFFFF if none
+Offset 26-31: reserved bytes   // LSN, FSM hints, padding
 ```
+- Byte math: 2 (type+flags) + 2 + 2 + 4 + 4 + 8 + 2 + 6 = 30; padded to 32 for alignment and future growth.
+- `free_lower/free_upper`: contiguous free space is `free_upper - free_lower`; compaction slides these together.
+- `free_ptr`: bump allocator cursor; typically equals `free_upper` after compaction.
+- `free_head`: O(1) free-slot allocation via freelist threaded through FREE line pointers.
+- `crc32`: compute over the full 4KB image with the crc32 field zeroed; store little-endian; recompute after any change.
+- `latch_word`: reserved for per-page concurrency. Seqlock-style: writers set it odd, mutate page, recompute CRC, bump to next even; readers retry if they observe odd or changed value. Could alternatively encode a tiny spinlock owner id.
+- `reserved`: space for per-page LSN, FSM hints, and other recovery metadata.
 
-**Bitmap (32 bytes):**
+### Free Space Tracking & FSM Integration
+
+- `free_lower` and `free_upper` mirror PostgreSQL-style bounds; publish `(block_id, free_upper - free_lower)` into a free-space map.
+- Reserved bytes can later hold largest-hole/fragmentation hints if we measure them.
+- Reserved bytes are also the planned home for per-page LSN to coordinate WAL redo/undo; redo must rewrite line pointers and heap consistently before recomputing CRC.
+- Page latch protocol (future use of `latch_word`):
+  - Readers: check `latch_word`; if odd, retry; read page; recheck; retry on change/odd.
+  - Writers: spin/CAS to make `latch_word` odd (exclusive), mutate page, recompute CRC, bump to next even.
+  - Logical locks live in the lock table; latches are short critical-section guards only.
+- PageType-specific invariants:
+  - Heap: tuple header with xmin/xmax/flags/nullmap_ptr; line pointers reference heap tuples; REDIRECT allowed; compaction/vacuum apply.
+  - IndexLeaf / IndexInternal: line pointers reference index cells (key + child/row ref); MVCC semantics may differ; REDIRECT typically unused.
+  - Overflow: line pointers reference spill fragments; heap payload is raw continuation.
+  - Meta / Free: reserved for catalog/meta or reclaimed pages; interpretation defined by higher layers.
+- Visual (line pointers down, heap up):
 ```
-Offset 8-39: 256 bits for slot presence
-
-┌──────────────────────────────────────┐
-│ Byte 0 │ Byte 1 │ ... │ Byte 31     │
-│ 8 bits │ 8 bits │ ... │ 8 bits      │
-└──────────────────────────────────────┘
-
-Bit N = 1: Slot N is occupied
-Bit N = 0: Slot N is free
-
-Operations:
-  • is_set(slot): Check if slot occupied - O(1)
-  • set(slot): Mark slot as occupied - O(1)
-  • clear(slot): Mark slot as free - O(1)
-  • find_free(): Scan for first free slot - O(n)
-```
-
-**ID Table (512 bytes):**
-```
-Offset 40-551: 256 entries × 2 bytes
-
-┌──────────────────────────────────┐
-│ Slot 0 offset (u16)              │
-│ Slot 1 offset (u16)              │
-│ Slot 2 offset (u16)              │
-│ ...                              │
-│ Slot 255 offset (u16)            │
-└──────────────────────────────────┘
-
-Entry = 0: Slot is unused
-Entry > 0: Offset to record start (relative to page start)
-
-Benefits:
-  • Direct O(1) lookup of record location
-  • Enables variable-length records
-  • Can rearrange records without changing slot IDs
-  • Foundation for compaction
+| offset 0  --------------------------- Header (32B) --------------------------- |
+| 32      lp[0] lp[1] ... lp[n-1]  (4B each)   free_lower ►                     |
+|                <------------------------- free space ---------------------> <- free_upper/free_ptr |
+|                                  heap tuples grow upward                      |
+| 4096  ---------------------------------------------------------------------- |
 ```
 
-**Record Space (3544 bytes):**
+**Line Pointer Array (no bitmap/ID table):**
 ```
-Offset 552-4095: Variable-length record storage
+LinePtr (4 bytes):
+  bits 31..16: offset (u16) up to 64KB page
+  bits 15..4 : length (12 bits) up to 4095 bytes
+  bits 3..0  : state (FREE, LIVE, DEAD, REDIRECT, COMPRESSED, ...)
+```
+- When state=FREE, the length field stores `next_free` slot id (0xFFF sentinel for end of list); `free_head` points to the first free slot.
+- Slot-state encoding (4 bits, example):
+  - 0: FREE
+  - 1: LIVE
+  - 2: DEAD (tombstone, reclaimable)
+  - 3: REDIRECT (follow offset to replacement tuple)
+  - 4: COMPRESSED
+  - 15: RESERVED (future)
 
-Records are placed at offsets pointed to by ID table:
-┌────────────────────────────────────┐
-│ Record at offset 552 (slot 0)     │
-├────────────────────────────────────┤
-│ Record at offset 604 (slot 5)     │
-├────────────────────────────────────┤
-│ Record at offset 650 (slot 2)     │
-├────────────────────────────────────┤
-│           Free space...             │
-└────────────────────────────────────┘
+**Record Space (heap):**
+- Starts at `free_upper`; grows upward as tuples are appended/moved.
+
+**Tuple Header (per record, 24 bytes):**
 ```
+Offset +0..+3 : payload_len (u32)
+Offset +4..+11: xmin (u64)        // creator Txn id
+Offset +12..+19: xmax (u64)       // deleter/updater Txn id
+Offset +20..+21: flags (u16)      // tombstone, HOT redirect, compression bits
+Offset +22..+23: nullmap_ptr (u16)// offset within payload
+```
+- `flags` include tombstone/HOT/compression; `nullmap_ptr` is the column NULL bitmap anchor.
+- Recommendation: place the NULL bitmap immediately after the tuple header to keep payload parsing simple and compact.
 
 ---
 
 ## Design Details
+
+### Compaction Flow
+
+1. Scan line pointers for state=LIVE (or REDIRECT); gather slot ids and their offsets/lengths.
+2. Sort by current offset to walk heap tuples in physical order.
+3. Copy each live tuple to the top of the heap starting at `free_lower`; update that slot’s line pointer (offset/len/state).
+4. After the last copy, set `free_upper` and `free_ptr` to the next free byte; rebuild freelist (`free_head`) from slots in FREE/DEAD state; zero remaining heap for deterministic images.
+5. Recompute `crc32`; publish new free-space value to the FSM.
+
+Slot ids (RIDs) remain stable; only their offsets change.
 
 ### Page Operations
 
@@ -315,8 +340,10 @@ Records are placed at offsets pointed to by ID table:
 impl Page {
     fn init_as_record_page(&mut self) {
         // Clear header
-        self.set_u32(0, 0);    // slot_count = 0
-        self.set_u32(4, 552);  // free_ptr = start of record space
+        self.set_u16(2, 0);    // slot_count = 0
+        self.set_u16(4, 64);   // free_lower right after bitmap
+        self.set_u16(6, 576);  // free_upper start of heap
+        self.set_u32(8, 576);  // free_ptr = start of record space
 
         // Clear bitmap (all slots free)
         for i in 0..32 {
@@ -325,7 +352,7 @@ impl Page {
 
         // Clear ID table (all offsets = 0)
         for i in 0..512 {
-            self.contents[40 + i] = 0;
+            self.contents[64 + i] = 0;
         }
     }
 }
@@ -591,15 +618,15 @@ Record metadata        None             Header tracks state
 
 ### Fixed Overhead
 
-**Cost:** Every page pays 552 bytes (13.5%) for metadata
+**Cost:** Every page pays 576 bytes (14.1%) for metadata
 
 ```
 Overhead breakdown:
-  Header:    8 bytes (0.2%)
+  Header:   32 bytes (0.8%)
   Bitmap:   32 bytes (0.8%)
   ID table: 512 bytes (12.5%)
   ─────────────────────────
-  Total:    552 bytes (13.5% of 4096-byte page)
+  Total:    576 bytes (14.1% of 4096-byte page)
 ```
 
 **Is it worth it?**
@@ -660,45 +687,44 @@ Overhead breakdown:
 
 ---
 
-## Appendix: Example Page State
+## Appendix: Example Page State (Line Pointers)
 
 ```
 EXAMPLE: Page with 3 records inserted
 ═══════════════════════════════════════════════════════════════════
 
-Header (offset 0-7):
+Header (offset 0-31):
+  page_type = Heap
   slot_count = 3
-  free_ptr = 696
+  free_lower = 44      // 32B header + 3*4B line ptrs
+  free_upper = 720
+  free_ptr   = 720
+  free_head  = 0xFFFF  // no free slots
+  crc32      = 0xDEADBEEF
 
-Bitmap (offset 8-39):
-  [0x05, 0x00, ...] = 0b00000101
-  Meaning: Slots 0 and 2 are occupied, slot 1 is free
+Line Pointer Array (from offset 32):
+  lp[0] = offset 576, len 48, state=LIVE
+  lp[1] = offset   0, len any, state=FREE (unused)
+  lp[2] = offset 624, len 48, state=LIVE
+  lp[3] = offset 672, len 48, state=LIVE
+  free_lower = 32 + 4*3 = 44
 
-ID Table (offset 40-551):
-  [0] = 552  (slot 0 at offset 552)
-  [1] = 0    (slot 1 unused)
-  [2] = 600  (slot 2 at offset 600)
-  [3] = 648  (slot 3 at offset 648)
-  ...
-
-Record Space (offset 552-4095):
-  @ 552: Record for slot 0 (48 bytes)
-  @ 600: Record for slot 2 (48 bytes)
-  @ 648: Record for slot 3 (48 bytes)
-  @ 696: Free space begins
+Record Space (heap, offset 720-4095):
+  @ 576: Record for slot 0 (48 bytes)
+  @ 624: Record for slot 2 (48 bytes)
+  @ 672: Record for slot 3 (48 bytes)
+  @ 720: Free space begins
 
 Visual:
 ┌──────────────────────────────────────────────────────────────┐
-│ Header: count=3, free=696                                     │
+│ Header: type=Heap, count=3, free_ptr=720                      │
 ├──────────────────────────────────────────────────────────────┤
-│ Bitmap: [1,0,1,1,0,0,...]                                    │
+│ Line Ptrs: [ (576,LIVE), (FREE), (624,LIVE), (672,LIVE) ]     │
 ├──────────────────────────────────────────────────────────────┤
-│ ID Table: [552, 0, 600, 648, 0, ...]                         │
-├──────────────────────────────────────────────────────────────┤
-│ 552: [Rec 0] (slot 0)                                        │
-│ 600: [Rec 2] (slot 2)                                        │
-│ 648: [Rec 3] (slot 3)                                        │
-│ 696: ████████ Free Space ████████████████████████████         │
+│ 576: [Rec 0] (slot 0)                                         │
+│ 624: [Rec 2] (slot 2)                                         │
+│ 672: [Rec 3] (slot 3)                                         │
+│ 720: ████████ Free Space ████████████████████████████          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
