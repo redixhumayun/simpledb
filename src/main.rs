@@ -33,6 +33,7 @@ pub mod benchmark_framework;
 mod btree;
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 mod intrusive_dll;
+mod page;
 mod parser;
 mod replacement;
 
