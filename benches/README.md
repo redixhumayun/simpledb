@@ -73,31 +73,55 @@ All runs use `cargo bench --bench buffer_pool -- 100 12` (pool=12, block=4 KiB
 ### macOS (M1 Pro, macOS Sequoia)
 |Benchmark (Phase)|Replacement LRU (`--no-default-features --features replacement_lru`)|Replacement Clock (`--no-default-features --features replacement_clock`)|Replacement SIEVE (`--no-default-features --features replacement_sieve`)|
 |---|---|---|---|
-|Pin/Unpin hit|**0.264 µs**|1.275 µs|1.759 µs|
-|Cold pin|**2.325 µs**|11.442 µs|10.889 µs|
-|Sequential Scan|**0.226 M blocks/s (0 % hits)**|0.197 M blocks/s (0 % hits)|0.199 M blocks/s (0 % hits)|
-|Seq Scan MT x4|0.193 M blocks/s|0.141 M blocks/s|**0.195 M blocks/s**|
-|Seq Scan MT x16|**0.113 M blocks/s**|0.109 M blocks/s|0.111 M blocks/s|
-|Repeated Access|3.573 M ops/s (100 % hits)|3.761 M ops/s (100 % hits)|**3.840 M ops/s (100 % hits)**|
-|Repeated Access MT x4|0.915 M ops/s|**0.984 M ops/s**|0.963 M ops/s|
-|Repeated Access MT x16|0.309 M ops/s|**0.562 M ops/s**|0.549 M ops/s|
-|Random K=10|3.457 M ops/s (100 % hits)|3.802 M ops/s (100 % hits)|**3.876 M ops/s (100 % hits)**|
-|Random MT x4 K=10|0.890 M ops/s|**0.969 M ops/s**|0.933 M ops/s|
-|Random MT x16 K=10|0.292 M ops/s|**0.577 M ops/s**|0.569 M ops/s|
-|Random K=50|0.605 M ops/s (21 % hits)|**0.609 M ops/s (24 % hits)**|0.607 M ops/s (21 % hits)|
-|Random MT x4 K=50|**0.308 M ops/s**|0.222 M ops/s|0.305 M ops/s|
-|Random MT x16 K=50|0.137 M ops/s|**0.175 M ops/s**|0.161 M ops/s|
-|Random K=100|**0.530 M ops/s (13 % hits)**|0.526 M ops/s (11 % hits)|0.506 M ops/s (12 % hits)|
-|Random MT x4 K=100|**0.282 M ops/s**|0.206 M ops/s|0.261 M ops/s|
-|Random MT x16 K=100|0.125 M ops/s|**0.149 M ops/s**|0.136 M ops/s|
-|Zipfian|**1.684 M ops/s (80 % hits)**|1.179 M ops/s (74 % hits)|1.210 M ops/s (67 % hits)|
-|Zipfian MT x4|0.523 M ops/s|**0.563 M ops/s**|0.528 M ops/s|
-|Zipfian MT x16|0.226 M ops/s|**0.366 M ops/s**|0.314 M ops/s|
-|pin:t2|1.151 M ops/s|1.331 M ops/s|**1.365 M ops/s**|
-|pin:t8|**0.227 M ops/s**|0.158 M ops/s|0.206 M ops/s|
-|pin:t16|0.100 M ops/s|**0.140 M ops/s**|0.102 M ops/s|
-|hotset:t8_k4|0.509 M ops/s|**0.716 M ops/s**|0.689 M ops/s|
-|hotset:t16_k4|0.323 M ops/s|**0.529 M ops/s**|0.523 M ops/s|
+|Pin/Unpin hit|1.050 µs|0.483 µs|**0.291 µs**|
+|Cold pin|60.825 µs|**6.966 µs**|9.367 µs|
+|Sequential Scan|0.082 M blocks/s (0 % hits)|**0.161 M blocks/s (0 % hits)**|0.094 M blocks/s (0 % hits)|
+|Seq Scan MT x4|0.073 M blocks/s|0.071 M blocks/s|**0.174 M blocks/s**|
+|Seq Scan MT x16|0.051 M blocks/s|0.043 M blocks/s|**0.091 M blocks/s**|
+|Seq Scan MT x64|0.055 M blocks/s|0.051 M blocks/s|**0.067 M blocks/s**|
+|Seq Scan MT x128|0.034 M blocks/s|**0.050 M blocks/s**|0.038 M blocks/s|
+|Seq Scan MT x256|0.019 M blocks/s|0.027 M blocks/s|**0.027 M blocks/s**|
+|Repeated Access|3.425 M ops/s (100 % hits)|**3.749 M ops/s (100 % hits)**|3.237 M ops/s (100 % hits)|
+|Repeated Access MT x4|0.619 M ops/s|**0.985 M ops/s**|0.807 M ops/s|
+|Repeated Access MT x16|0.319 M ops/s|0.538 M ops/s|**0.566 M ops/s**|
+|Repeated Access MT x64|0.165 M ops/s|**0.856 M ops/s**|0.591 M ops/s|
+|Repeated Access MT x128|0.326 M ops/s|**0.520 M ops/s**|0.468 M ops/s|
+|Repeated Access MT x256|0.167 M ops/s|0.260 M ops/s|**0.261 M ops/s**|
+|Random K=10|3.363 M ops/s (100 % hits)|3.719 M ops/s (100 % hits)|**3.836 M ops/s (100 % hits)**|
+|Random MT x4 K=10|0.956 M ops/s|**1.058 M ops/s**|1.054 M ops/s|
+|Random MT x16 K=10|0.268 M ops/s|0.557 M ops/s|**0.567 M ops/s**|
+|Random MT x64 K=10|0.181 M ops/s|**0.575 M ops/s**|0.531 M ops/s|
+|Random MT x128 K=10|0.191 M ops/s|**0.267 M ops/s**|0.246 M ops/s|
+|Random MT x256 K=10|**0.127 M ops/s**|0.127 M ops/s|0.123 M ops/s|
+|Random K=50|**0.610 M ops/s (23 % hits)**|0.589 M ops/s (22 % hits)|0.608 M ops/s (25 % hits)|
+|Random MT x4 K=50|**0.298 M ops/s**|0.246 M ops/s|0.280 M ops/s|
+|Random MT x16 K=50|0.135 M ops/s|**0.176 M ops/s**|0.175 M ops/s|
+|Random MT x64 K=50|0.086 M ops/s|**0.184 M ops/s**|0.100 M ops/s|
+|Random MT x128 K=50|0.085 M ops/s|**0.176 M ops/s**|0.087 M ops/s|
+|Random MT x256 K=50|0.094 M ops/s|**0.115 M ops/s**|0.110 M ops/s|
+|Random K=100|**0.543 M ops/s (12 % hits)**|0.530 M ops/s (10 % hits)|0.501 M ops/s (11 % hits)|
+|Random MT x4 K=100|**0.274 M ops/s**|0.213 M ops/s|0.273 M ops/s|
+|Random MT x16 K=100|0.118 M ops/s|**0.153 M ops/s**|0.135 M ops/s|
+|Random MT x64 K=100|0.079 M ops/s|**0.158 M ops/s**|0.086 M ops/s|
+|Random MT x128 K=100|0.059 M ops/s|**0.152 M ops/s**|0.069 M ops/s|
+|Random MT x256 K=100|0.044 M ops/s|**0.111 M ops/s**|0.070 M ops/s|
+|Zipfian|1.482 M ops/s (78 % hits)|**1.615 M ops/s (78 % hits)**|1.342 M ops/s (68 % hits)|
+|Zipfian MT x4|0.513 M ops/s|**0.530 M ops/s**|0.500 M ops/s|
+|Zipfian MT x16|0.189 M ops/s|**0.343 M ops/s**|0.322 M ops/s|
+|Zipfian MT x64|0.145 M ops/s|**0.340 M ops/s**|0.283 M ops/s|
+|Zipfian MT x128|0.128 M ops/s|0.233 M ops/s|**0.236 M ops/s**|
+|Zipfian MT x256|0.111 M ops/s|**0.120 M ops/s**|0.116 M ops/s|
+|pin:t2|0.966 M ops/s|**1.369 M ops/s**|1.031 M ops/s|
+|pin:t8|**0.199 M ops/s**|0.151 M ops/s|0.182 M ops/s|
+|pin:t16|0.102 M ops/s|**0.137 M ops/s**|0.104 M ops/s|
+|pin:t64|0.054 M ops/s|**0.135 M ops/s**|0.051 M ops/s|
+|pin:t128|0.038 M ops/s|**0.134 M ops/s**|0.032 M ops/s|
+|pin:t256|0.025 M ops/s|**0.123 M ops/s**|0.021 M ops/s|
+|hotset:t8_k4|0.527 M ops/s|0.640 M ops/s|**0.721 M ops/s**|
+|hotset:t16_k4|0.329 M ops/s|0.535 M ops/s|**0.544 M ops/s**|
+|hotset:t64_k4|0.235 M ops/s|**0.433 M ops/s**|0.416 M ops/s|
+|hotset:t128_k4|0.216 M ops/s|**0.421 M ops/s**|0.398 M ops/s|
+|hotset:t256_k4|0.206 M ops/s|**0.423 M ops/s**|0.404 M ops/s|
 
 ### Linux (i7-8650U, Ubuntu 6.8.0-86)
 |Benchmark (Phase)|Replacement LRU (`--no-default-features --features replacement_lru`)|Replacement Clock (`--no-default-features --features replacement_clock`)|Replacement SIEVE (`--no-default-features --features replacement_sieve`)|
