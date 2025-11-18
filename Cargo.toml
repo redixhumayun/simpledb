@@ -27,9 +27,14 @@ name = "simpledb"
 path = "src/main.rs"
 
 [features]
-default = ["replacement_lru"]
+default = ["replacement_lru", "page-4k"]
 replacement_lru = []
 replacement_clock = []
 replacement_sieve = []
+
+# Compile-time page size selection. Exactly one of these should be enabled per binary.
+page-4k = []
+page-8k = []
+page-1m = []
 
 [dependencies]
