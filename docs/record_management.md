@@ -319,6 +319,100 @@ Offset +22..+23: nullmap_ptr (u16)// offset within payload
 - `flags` include tombstone/HOT/compression; `nullmap_ptr` is the column NULL bitmap anchor.
 - Recommendation: place the NULL bitmap immediately after the tuple header to keep payload parsing simple and compact.
 
+### RecordPage + Layout Integration
+
+Once the Page owns the physical concerns (line pointers, heap management, redirects), the existing `RecordPage` layer can shift to a thin logical wrapper:
+
+1. **RID → LinePtr:** Higher layers still identify tuples via `RID { block_num, slot }`. `RecordPage` pins the page, fetches the slot’s line pointer, follows any HOT redirects, and obtains `(offset, length)`.
+2. **LinePtr → HeapTuple:** Using the offset/length, `RecordPage` asks `Page::tuple(slot)` for a `HeapTuple` view (header + payload slice). Page never touches schema-specific details; it just vouches for the bytes.
+3. **HeapTuple → LogicalRow:** `Layout` (which already owns schema + per-column definitions) now interprets the tuple payload. It knows where the null bitmap sits (`nullmap_ptr`), which columns are fixed-width vs. varlen, and how to decode them. The result is a `LogicalRow` (or similarly named view) that exposes typed getters without exposing raw bytes.
+4. **Lazy decoding:** A `LogicalRow` can delay actual deserialization until a caller requests a column. It keeps references to the `HeapTuple` slice plus the `Layout`. When `row.get_string("name")` runs, the layout consults the null bitmap to see if column 1 is NULL, and only then reads the length prefix + string bytes. This keeps scans cheap when a plan only touches a subset of columns.
+
+**Responsibilities by layer:**
+
+- *Page:* slot allocation, freelist management, redirects, tuple byte access. No schema awareness.
+- *RecordPage:* wraps a page and current block id to expose CRUD + iteration in terms of `RID`s. Handles redirect chasing, delegating tuple decoding to Layout.
+- *Layout:* serializes/deserializes a tuple payload given a schema. Provides helpers like `encode_row(&RowValues) -> Vec<u8>` and `decode_field(HeapTuple, column_idx) -> Value` using the null bitmap + per-column offsets.
+
+### Buffer/Transaction Integration & Page Guards
+
+- **Coarse buffer lock stays (for now):** each `BufferFrame` continues to sit behind a single `Mutex`. That mutex protects frame metadata (pin count, replacement list links, dirty bits) *and* provides safety while the new APIs are wired up. We’ll refine later, but nothing else in the system needs to change yet.
+- **PageGuard abstraction:** introduce a guard object that:
+  1. Pins a block (RAII via the existing `BufferHandle`).
+  2. Acquires the per-page latch stored in `PageHeader::latch_word` (shared for readers, exclusive for writers).
+  3. Uses internal `unsafe` plumbing to reinterpret the frame’s bytes as `Page<HeapPage>` and exposes a safe wrapper (`PageView`) with the full tuple API.
+  4. Releases the latch and unpins on `Drop`.
+- **Concurrency semantics:** page latches enforce access: multiple `PageGuard`s can hold shared (read) latches simultaneously, but only one guard may hold the exclusive (write) latch. The borrow checker can then trust that any method returning `&mut PageView` really has exclusive access because it’s tied to the guard’s lifetime + latch token.
+- **RecordPage / Transaction usage:** higher layers stop calling `tx.get_int`/`set_string`. Instead they request `PageGuard`s (read or write) from the transaction, operate via the safe `PageView` API, and drop the guard when done.
+- **Why unsafe is contained:** All `unsafe` stays inside the guard implementation (where we pull raw pointers out of the frame). Consumers only see a safe API that mirrors Rust’s borrowing rules, with the latch providing the runtime guarantee that those rules aren’t violated.
+
+High-level sketch:
+
+```rust
+pub enum LatchMode {
+    Shared,
+    Exclusive,
+}
+
+pub struct PageGuard<'a, K: PageKind> {
+    handle: BufferHandle,     // pins/unpins via Drop
+    latch: PageLatchToken,    // releases latch on Drop
+    page: PageView<'a, K>,    // safe wrapper exposing Page API
+}
+
+impl<'a, K: PageKind> PageGuard<'a, K> {
+    pub fn pin(
+        txn: Arc<Transaction>,
+        block_id: BlockId,
+        mode: LatchMode,
+    ) -> Result<Self, Error> {
+        let handle = BufferHandle::new(block_id.clone(), txn.clone());
+        let frame = txn.buffer_manager.lookup(&block_id)?; // Arc<Mutex<BufferFrame>>
+        let bytes = frame.borrow_bytes()?;                 // grabs &mut [u8] under the mutex
+        drop(frame);                                       // release coarse lock immediately
+        let latch = latch_page(bytes, mode)?;              // CAS/spin on PageHeader::latch_word
+        let page = PageView::new(bytes);                   // wraps raw ptr with lifetime marker
+        Ok(PageGuard { handle, latch, page })
+    }
+
+    pub fn page(&mut self) -> &mut PageView<'_, K> {
+        &mut self.page
+    }
+}
+
+impl<'a, K: PageKind> Drop for PageGuard<'a, K> {
+    fn drop(&mut self) {
+        self.latch.release();
+        // BufferHandle’s Drop automatically unpins
+    }
+}
+```
+
+`PageView<'a, K>` is a thin wrapper that implements `Deref<Target = Page<K>>` / `DerefMut`, using `unsafe` inside to reinterpret the buffer bytes once the latch guarantees exclusivity.
+
+### Locking Strategy & Migration Plan
+
+#### Why both logical locks and page latches?
+- `LockTable` handles logical isolation (table/row). Once it moves to RID granularity, two writers on different rows of the same page must be allowed to proceed; otherwise throughput collapses.
+- We still need a short-lived physical latch on the buffer frame to prevent torn writes while multiple txns touch the same page. That’s what `PageGuard` and the page latch provide.
+- Issue #59 tracks refactoring `LockTable` to `{table, rid}` keys so logical locks only block real conflicts while page latches guard the bytes.
+
+#### Seqlock vs. RwLock
+- A latch word + seqlock allows optimistic readers: writer sets version odd → mutate → bump to even; readers sample `seq0`, read, then sample `seq1`. If `seq0` or `seq1` is odd or they differ, retry. The high bits of `latch_word` should be ≥32 bits to avoid frequent wraparound.
+- If we’re fine with classic shared/exclusive guards, we can wrap the page bytes in `RwLock<PageBytes>` and hand out `PageReadGuard`/`PageWriteGuard` without any seqlock logic. This keeps everything in safe Rust (no raw pointers) at the cost of a per-frame lock object.
+
+#### Phased rollout
+1. **Introduce helpers:** keep `Arc<Mutex<BufferFrame>>` but add `FrameMeta` + helper methods (`with_meta`, `with_page_access`) so callers stop poking fields directly.
+2. **Migrate users:** update BufferManager, replacement policy, and intrusive DLL code to use the helpers; behavior unchanged because the outer mutex still serializes everything.
+3. **Split locks:** replace the outer `Mutex<BufferFrame>` with `Arc<BufferFrame>` containing `meta: Mutex<FrameMeta>` plus `page: RwLock<PageBytes>`. Helpers now lock the specific primitive they need.
+4. **Add `PageReadGuard` / `PageWriteGuard`:** wrap the `RwLock` guards + pin token; expose new `Transaction::pin_read/pin_write` APIs that return these guards (legacy `get_*` delegate internally during the transition).
+5. **Refactor RecordPage/TableScan:** switch to guard-based access + Layout decoding; delete the old offset-based helpers.
+6. **Shrink `LockTable` scope:** once physical latching is in place, move logical locks to table/RID keys so concurrent readers on the same page can proceed when they touch distinct rows.
+
+This staging keeps the code compiling/testable at each step and makes it clear where unsafe code (if any) is isolated.
+
+With this split, TableScan / executor nodes only interact with `RecordPage` and `LogicalRow` abstractions. They never calculate offsets or manage line pointers; Page keeps physical invariants, Layout keeps schema semantics, and RecordPage stitches them together.
+
 ---
 
 ## Design Details
@@ -333,27 +427,20 @@ Offset +22..+23: nullmap_ptr (u16)// offset within payload
 
 Slot ids (RIDs) remain stable; only their offsets change.
 
+> **SlotId definition:** in code this is a thin type alias over the slot index (`type SlotId = u16` or `usize` depending on build). It’s the same value stored in `RID.slot`, i.e., the position in the line-pointer array.
+
 ### Page Operations
 
 **Initialize new page:**
 ```rust
 impl Page {
-    fn init_as_record_page(&mut self) {
-        // Clear header
-        self.set_u16(2, 0);    // slot_count = 0
-        self.set_u16(4, 64);   // free_lower right after bitmap
-        self.set_u16(6, 576);  // free_upper start of heap
-        self.set_u32(8, 576);  // free_ptr = start of record space
-
-        // Clear bitmap (all slots free)
-        for i in 0..32 {
-            self.contents[8 + i] = 0;
-        }
-
-        // Clear ID table (all offsets = 0)
-        for i in 0..512 {
-            self.contents[64 + i] = 0;
-        }
+    fn init_heap_page(&mut self) {
+        self.header = PageHeader::new(PageType::Heap);
+        self.line_ptrs.clear();
+        self.record_space.fill(0);
+        // free_lower already equals PAGE_HEADER_SIZE
+        // free_upper/free_ptr already point to end of page
+        // free_head = NO_FREE_SLOT (freelist empty)
     }
 }
 ```
@@ -361,34 +448,33 @@ impl Page {
 **Allocate new slot:**
 ```rust
 impl Page {
-    fn allocate_slot(&mut self, record_size: usize)
-        -> Result<(usize, usize), Error>
-    {
-        // 1. Find free slot in bitmap
-        let slot = self.bitmap.find_free()
-            .ok_or("No free slots available")?;
+    fn allocate_tuple(&mut self, tuple_bytes: &[u8]) -> Result<SlotId, Error> {
+        let len = tuple_bytes.len() as u16;
+        let (lower, upper) = self.header.free_bounds();
+        let needed = len;
 
-        // 2. Get current free pointer
-        let offset = self.header.free_ptr as usize;
-
-        // 3. Check if enough space
-        if offset + record_size > 4096 {
-            return Err("Insufficient space for record".into());
+        if lower + needed > upper {
+            return Err("insufficient free space".into());
         }
 
-        // 4. Update bitmap
-        self.bitmap.set(slot);
+        // Reuse a FREE slot if freelist populated, otherwise append.
+        let slot = self
+            .pop_free_slot()
+            .unwrap_or_else(|| self.push_line_ptr(LinePtr::new(0, 0, LineState::Free)));
 
-        // 5. Update ID table
-        self.id_table.set(slot, offset as u16);
+        // Carve space from the heap top (grows downward).
+        let new_upper = upper - needed;
+        self.record_space[new_upper as usize..(new_upper + needed) as usize]
+            .copy_from_slice(tuple_bytes);
 
-        // 6. Update free pointer
-        self.header.free_ptr += record_size as u32;
+        self.line_ptrs[slot as usize] =
+            LinePtr::new(new_upper, len, LineState::Live);
 
-        // 7. Increment slot count
-        self.header.slot_count += 1;
+        self.header.set_free_bounds(lower, new_upper);
+        self.header.set_free_ptr(new_upper as u32);
+        self.header.set_slot_count(self.header.slot_count() + 1);
 
-        Ok((slot, offset))
+        Ok(slot)
     }
 }
 ```
@@ -396,17 +482,14 @@ impl Page {
 **Get record location:**
 ```rust
 impl Page {
-    fn get_record_offset(&self, slot: usize) -> Option<usize> {
-        if !self.bitmap.is_set(slot) {
-            return None;  // Slot not used
+    fn tuple_bytes(&self, slot: SlotId) -> Option<&[u8]> {
+        let lp = self.line_ptrs.get(slot as usize)?;
+        if lp.state() != LineState::Live as u8 {
+            return None;
         }
-
-        let offset = self.id_table.get(slot);
-        if offset == 0 {
-            return None;  // Invalid offset
-        }
-
-        Some(offset as usize)
+        let offset = lp.offset() as usize;
+        let length = lp.length() as usize;
+        Some(&self.record_space[offset..offset + length])
     }
 }
 ```
@@ -415,20 +498,16 @@ impl Page {
 ```rust
 impl Page {
     fn delete_slot(&mut self, slot: usize) -> Result<(), Error> {
-        if !self.bitmap.is_set(slot) {
-            return Err("Slot not in use".into());
+        let lp = self.line_ptrs.get_mut(slot).ok_or("invalid slot")?;
+        if lp.state() != LineState::Live as u8 {
+            return Err("slot not live".into());
         }
 
-        // 1. Clear bitmap
-        self.bitmap.clear(slot);
-
-        // 2. Clear ID table entry
-        self.id_table.set(slot, 0);
-
-        // 3. Decrement slot count
-        self.header.slot_count -= 1;
-
-        // Note: Free space not reclaimed until compaction
+        lp.mark_dead();                 // visible to iterators/GC
+        self.push_free_slot(slot as u16); // add to freelist for reuse
+        self.header
+            .set_slot_count(self.header.slot_count().saturating_sub(1));
+        // Heap bytes reclaimed only during compaction.
 
         Ok(())
     }
@@ -444,28 +523,26 @@ impl RecordPage {
     fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
         let handle = tx.pin(&block_id);
 
-        // Initialize page structure if new
         if tx.block_size() == handle.page().header.free_ptr {
-            handle.page().init_as_record_page();
+            handle.page().init_heap_page();
         }
 
         Self { tx, handle, layout }
     }
 
     fn insert_after(&self, slot: Option<usize>) -> Result<usize, Error> {
-        // Use Page's allocation logic
-        let (new_slot, offset) = self.handle
+        let tuple_bytes = self.layout.build_tuple_buffer(/* fields */);
+        let new_slot = self
+            .handle
             .page()
-            .allocate_slot(self.layout.slot_size)?;
-
-        // Write record at offset
-        self.write_record_at(new_slot, offset);
+            .allocate_tuple(&tuple_bytes)?;
+        self.write_record_at(new_slot, tuple_bytes);
 
         Ok(new_slot)
     }
 
     fn is_slot_used(&self, slot: usize) -> bool {
-        self.handle.page().bitmap.is_set(slot)
+        self.handle.page().line_ptr_state(slot) == Some(LineState::Live)
     }
 }
 ```
@@ -478,24 +555,122 @@ FEATURE COMPARISON
 
 Operation              Current          Proposed
 ─────────────────────────────────────────────────────────────────
-Check slot used        O(1) read flag   O(1) bitmap check
-Find free slot         O(n) scan slots  O(n) scan bitmap*
-Get record offset      O(1) calculate   O(1) ID table lookup
-Variable-length        Not possible     Supported via ID table
+Check slot used        O(1) read flag   O(1) line ptr state check
+Find free slot         O(n) scan slots  O(1) freelist (fallback scan)
+Get record offset      O(1) calculate   O(1) line ptr lookup
+Variable-length        Not possible     Supported via heap indirection
 Space reclamation      Not possible     Possible with compaction
 Direct slot access     Yes              Yes
 Record metadata        None             Header tracks state
 
-* Future: Could maintain free list for O(1) allocation
+* Freelist threaded through FREE pointers; scan only when freelist empty.
 ```
 
 **Key Advantages:**
 
 1. **Structured metadata**: Page knows its own state
-2. **Variable-length ready**: ID table provides indirection
+2. **Variable-length ready**: Line pointers + heap indirection support arbitrary tuple sizes
 3. **Space efficiency**: Can compact and reclaim space
 4. **Recovery-friendly**: Structured format easier to log/recover
 5. **Pedagogically clear**: Explicitly shows record management concepts
+
+### Encoding Page Variants with the Type System
+
+Rather than handing every component a single `Page` struct plus a runtime `page_type` enum, treat the storage buffer as generic over a *page kind* that encodes its policies at compile time:
+
+```rust
+/// Shared storage: header + line pointers + heap bytes.
+pub struct Page<K: PageKind> {
+    header: PageHeader,
+    line_ptrs: Vec<LinePtr>,
+    record_space: Vec<u8>,
+    kind: PhantomData<K>,
+}
+
+pub trait PageKind {
+    const PAGE_TYPE: PageType;
+    type Alloc<'a>: PageAllocator<'a>;
+    type Iter<'a>: Iterator;
+
+    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>;
+    fn iter<'a>(page: &'a Page<Self>) -> Self::Iter<'a>;
+}
+
+pub trait PageAllocator<'a> {
+    type Output;
+    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Error>;
+}
+```
+
+**Heap pages** implement `PageKind` with freelist-driven allocation and a simple slot iterator:
+
+```rust
+pub struct HeapPage;
+
+impl PageKind for HeapPage {
+    const PAGE_TYPE: PageType = PageType::Heap;
+    type Alloc<'a> = HeapAllocator<'a>;
+    type Iter<'a> = HeapIter<'a>;
+
+    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a> {
+        HeapAllocator { page }
+    }
+
+    fn iter<'a>(page: &'a Page<Self>) -> Self::Iter<'a> {
+        HeapIter { page, next: 0 }
+    }
+}
+
+struct HeapAllocator<'a> {
+    page: &'a mut Page<HeapPage>,
+}
+
+impl<'a> PageAllocator<'a> for HeapAllocator<'a> {
+    type Output = SlotId;
+
+    fn insert(&mut self, bytes: &[u8]) -> Result<SlotId, Error> {
+        self.page.allocate_tuple(bytes)
+    }
+}
+```
+
+**B-tree leaf pages** use the same storage but expose an ordered allocator that keeps key slots sorted:
+
+```rust
+pub struct BTreeLeafPage;
+
+impl PageKind for BTreeLeafPage {
+    const PAGE_TYPE: PageType = PageType::IndexLeaf;
+    type Alloc<'a> = BTreeLeafAllocator<'a>;
+    type Iter<'a> = BTreeLeafIter<'a>;
+
+    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a> {
+        BTreeLeafAllocator { page }
+    }
+
+    fn iter<'a>(page: &'a Page<Self>) -> Self::Iter<'a> {
+        BTreeLeafIter { page, current: 0 }
+    }
+}
+
+struct BTreeLeafAllocator<'a> {
+    page: &'a mut Page<BTreeLeafPage>,
+}
+
+impl<'a> PageAllocator<'a> for BTreeLeafAllocator<'a> {
+    type Output = (SlotId, Option<SplitInfo>);
+
+    fn insert(&mut self, entry: &[u8]) -> Result<Self::Output, Error> {
+        // 1. binary-search existing line ptrs by key
+        // 2. shift line ptrs to open space
+        // 3. allocate tuple bytes + update LinePtr
+        // 4. optionally return split metadata
+        todo!()
+    }
+}
+```
+
+By splitting policies this way the compiler ensures heap-only APIs (freelist reuse) never run on B-tree pages, while B-tree-specific invariants (sorted keys, split metadata) remain encapsulated. Both variants still share the low-level line-pointer + heap layout, so WAL/CRC logic stays uniform.
 
 ---
 
@@ -506,16 +681,13 @@ Record metadata        None             Header tracks state
 **Goal:** Implement new Page structure without breaking existing code
 
 **Tasks:**
-- [ ] Define new Page struct with header, bitmap, ID table
-- [ ] Implement PageHeader with slot_count and free_ptr
-- [ ] Implement RecordBitmap with bit manipulation
-  - [ ] `is_set(slot) -> bool`
-  - [ ] `set(slot)`
-  - [ ] `clear(slot)`
-  - [ ] `find_free() -> Option<usize>`
-- [ ] Implement IdTable with offset tracking
-  - [ ] `get(slot) -> u16`
-  - [ ] `set(slot, offset)`
+- [ ] Define new Page struct with header, line-pointer array, and heap buffer
+- [ ] Implement PageHeader with slot_count, free_ptr, and free_lower/free_upper helpers
+- [ ] Implement LinePtr packing/unpacking helpers
+  - [ ] `offset()/length()/state()`
+  - [ ] mutation helpers + freelist threading
+- [ ] Implement freelist management (`push_free_slot` / `pop_free_slot`)
+- [ ] Implement tuple allocation/deallocation API described above
 - [ ] Add Page initialization method
 - [ ] Add unit tests for each component
 
@@ -523,8 +695,8 @@ Record metadata        None             Header tracks state
 
 **Acceptance Criteria:**
 - Page struct compiles with new fields
-- Bitmap operations work correctly
-- ID table stores and retrieves offsets
+- Line pointer packing/unpacking verified
+- Freelist logic reuses slots correctly
 - Tests verify all operations
 
 ---
@@ -534,10 +706,10 @@ Record metadata        None             Header tracks state
 **Goal:** Update RecordPage to use new Page structure
 
 **Tasks:**
-- [ ] Modify RecordPage to use Page bitmap for slot checking
-- [ ] Update slot allocation to use Page's allocate_slot()
-- [ ] Use ID table for record offset lookup
-- [ ] Update iteration to use bitmap for finding used slots
+- [ ] Modify RecordPage to inspect line pointer states for slot checking
+- [ ] Update slot allocation to call `allocate_tuple()`
+- [ ] Use line pointer offsets for tuple lookup
+- [ ] Update iteration to walk line pointers, skipping FREE/DEAD slots
 - [ ] Ensure slot flag compatibility (transition period)
 - [ ] Update all RecordPage tests
 
@@ -547,7 +719,7 @@ Record metadata        None             Header tracks state
 - RecordPage works with new Page structure
 - Existing RecordPage tests pass
 - Slot allocation uses new mechanism
-- Record access uses ID table
+- Record access uses `LinePtr` metadata
 
 ---
 
@@ -599,7 +771,7 @@ Record metadata        None             Header tracks state
 
 **Tasks:**
 - [ ] Implement Page compaction algorithm
-- [ ] Update ID table offsets after compaction
+- [ ] Update line pointer offsets after compaction
 - [ ] Decide compaction trigger policy
 - [ ] Add compaction tests
 - [ ] Measure space savings
@@ -608,7 +780,7 @@ Record metadata        None             Header tracks state
 
 **Acceptance Criteria:**
 - Compaction reclaims deleted space
-- ID table correctly updated
+- Line pointers correctly updated
 - No data corruption during compaction
 - Measurable space savings
 
@@ -616,23 +788,14 @@ Record metadata        None             Header tracks state
 
 ## Trade-offs and Considerations
 
-### Fixed Overhead
+### Metadata Footprint
 
-**Cost:** Every page pays 576 bytes (14.1%) for metadata
+**Cost:** Only the 32-byte header is fixed; the line-pointer array grows (4 bytes per slot) and shrinks with workload. Free space is simply `free_upper - free_lower`.
 
-```
-Overhead breakdown:
-  Header:   32 bytes (0.8%)
-  Bitmap:   32 bytes (0.8%)
-  ID table: 512 bytes (12.5%)
-  ─────────────────────────
-  Total:    576 bytes (14.1% of 4096-byte page)
-```
-
-**Is it worth it?**
-- ✓ For large records: Yes (small percentage of total)
-- ✗ For tiny records: Questionable (high relative overhead)
-- ✓ For variable-length: Absolutely (enables key feature)
+**Implications:**
+- Pages with many tiny tuples spend more bytes on line pointers, but still less than the old fixed bitmap + ID table tax.
+- Pages with a few large tuples pay almost nothing beyond the header.
+- Variable-length records are natural because heap bytes are contiguous and referenced indirectly.
 
 ### Complexity Increase
 
@@ -645,26 +808,18 @@ Overhead breakdown:
 - Necessary foundation for advanced features
 - Still simpler than production databases (e.g., PostgreSQL's page format)
 
-### Slot Limit: 256 vs 512
+### Slot Count Dynamics
 
-**Why 256?**
-- Bitmap fits in 32 bytes (power of 2)
-- ID table is 512 bytes (reasonable size)
-- Sufficient for most use cases
-- Simpler arithmetic
-
-**Could use 512:**
-- Would need 64-byte bitmap
-- Would need 1024-byte ID table
-- Less space for records (2972 bytes vs 3544)
-- Not worth the trade-off
+- No baked-in cap: slots exist as long as `free_lower + 4 * slot_count < free_upper`.
+- Maximum slots therefore depend on tuple size distribution; pathological case (28-byte tuples) still yields ≈1000 slots in 4 KB.
+- Freelist ensures we can recycle slot IDs without reshaping the array.
 
 ---
 
 ## Related Issues
 
-- **Supersedes:** Issue #7 (Store bitmap for presence checking) - now part of Page structure
-- **Supersedes:** Issue #8 (Implement ID table for variable length strings) - now part of Page structure
+- **Supersedes:** Issue #7 (Store bitmap for presence checking) - addressed by maintaining explicit line-pointer states + freelist
+- **Supersedes:** Issue #8 (Implement ID table for variable length strings) - addressed by heap indirection referenced through line pointers
 - **Enables:** Variable-length record support (future work)
 - **Enables:** Record compaction and space reclamation (future work)
 - **Prerequisite for:** Advanced type system with variable-length types
