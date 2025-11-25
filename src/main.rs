@@ -8118,7 +8118,6 @@ pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
 #[cfg(test)]
 mod table_scan_tests {
     use super::UpdateScan;
-    use std::sync::Arc;
 
     use crate::{test_utils::generate_random_number, Layout, Scan, Schema, SimpleDB, TableScan};
 
@@ -8403,7 +8402,6 @@ impl RecordPage {
 
 #[cfg(test)]
 mod record_page_tests {
-    use std::sync::Arc;
 
     use crate::{test_utils::generate_random_number, Layout, RecordPage, Schema, SimpleDB};
 
@@ -10627,11 +10625,6 @@ impl BufferFrame {
 
     pub(crate) fn lock_meta(&self) -> MutexGuard<'_, FrameMeta> {
         self.meta.lock().unwrap()
-    }
-
-    pub(crate) fn with_meta<R>(&self, f: impl FnOnce(&mut FrameMeta) -> R) -> R {
-        let mut guard = self.lock_meta();
-        f(&mut guard)
     }
 
     pub fn block_id_owned(&self) -> Option<BlockId> {
