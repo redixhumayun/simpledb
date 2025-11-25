@@ -10,6 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize},
@@ -8648,6 +8649,84 @@ impl Drop for BufferHandle {
     }
 }
 
+pub struct PageReadGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockReadGuard<'a, Page>,
+}
+
+impl<'a> PageReadGuard<'a> {
+    fn new(handle: BufferHandle, frame: Arc<BufferFrame>, page: RwLockReadGuard<'a, Page>) -> Self {
+        Self {
+            handle,
+            frame,
+            page,
+        }
+    }
+
+    pub fn block_id(&self) -> &BlockId {
+        self.handle.block_id()
+    }
+
+    pub fn frame(&self) -> &BufferFrame {
+        &self.frame
+    }
+}
+
+impl<'a> Deref for PageReadGuard<'a> {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+pub struct PageWriteGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockWriteGuard<'a, Page>,
+}
+
+impl<'a> PageWriteGuard<'a> {
+    fn new(
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+        page: RwLockWriteGuard<'a, Page>,
+    ) -> Self {
+        Self {
+            handle,
+            frame,
+            page,
+        }
+    }
+
+    pub fn block_id(&self) -> &BlockId {
+        self.handle.block_id()
+    }
+
+    pub fn frame(&self) -> &BufferFrame {
+        &self.frame
+    }
+
+    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
+        self.frame.set_modified(txn_id, lsn);
+    }
+}
+
+impl<'a> Deref for PageWriteGuard<'a> {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl<'a> DerefMut for PageWriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.page
+    }
+}
+
 trait TransactionOperations {
     fn pin(&self, block_id: &BlockId);
     fn unpin(&self, block_id: &BlockId);
@@ -8766,6 +8845,26 @@ impl Transaction {
     /// The public pin method which will return a [`BufferHandle`] for RAII semantics
     pub fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
+    }
+
+    pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> PageReadGuard<'_> {
+        let handle = self.pin(block_id);
+        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame_clone = Arc::clone(&frame);
+        let raw = Arc::into_raw(frame_clone);
+        let page = unsafe { (&*raw).read_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        PageReadGuard::new(handle, frame_for_guard, page)
+    }
+
+    pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> PageWriteGuard<'_> {
+        let handle = self.pin(block_id);
+        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame_clone = Arc::clone(&frame);
+        let raw = Arc::into_raw(frame_clone);
+        let page = unsafe { (&*raw).write_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        PageWriteGuard::new(handle, frame_for_guard, page)
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
