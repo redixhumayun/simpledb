@@ -34,7 +34,7 @@ impl PolicyState {
     ) -> Option<MutexGuard<'a, BufferFrame>> {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
         let mut frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+        if let Some(frame_block_id) = frame_guard.block_id() {
             if frame_block_id != block_id {
                 resident_table.lock().unwrap().remove(block_id);
                 return None;
@@ -42,7 +42,7 @@ impl PolicyState {
         }
         let current_head = intrusive_list_guard.peek_head();
         if let Some(head) = current_head {
-            if frame_guard.index == head {
+            if frame_guard.replacement_index() == head {
                 return Some(frame_guard);
             }
         }
@@ -73,7 +73,7 @@ impl PolicyState {
                 .next()
                 .map(|idx| buffer_pool[idx].lock().unwrap());
             intrusive_list_guard.move_to_head(
-                frame_guard.index,
+                frame_guard.replacement_index(),
                 &mut frame_guard,
                 current_head_guard.as_mut(),
                 prev_guard.as_mut(),
@@ -121,7 +121,7 @@ impl PolicyState {
             let mut current_guard = buffer_pool[current].lock().unwrap();
             if current_guard.is_pinned() {
                 if let Some(head) = intrusive_list_guard.peek_head() {
-                    if current_guard.index == head {
+                    if current_guard.replacement_index() == head {
                         return None;
                     } else {
                         current = current_guard

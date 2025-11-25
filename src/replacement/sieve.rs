@@ -44,13 +44,13 @@ impl PolicyState {
         resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
     ) -> Option<MutexGuard<'a, BufferFrame>> {
         let mut frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+        if let Some(frame_block_id) = frame_guard.block_id() {
             if frame_block_id != block_id {
                 resident_table.lock().unwrap().remove(block_id);
                 return None;
             }
         }
-        frame_guard.ref_bit = true;
+        frame_guard.set_ref_bit(true);
         Some(frame_guard)
     }
 
@@ -63,7 +63,7 @@ impl PolicyState {
                     return;
                 }
                 let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-                frame_guard.ref_bit = true;
+                frame_guard.set_ref_bit(true);
                 let mut current_head_guard = buffer_pool[head].lock().unwrap();
                 list_guard.intrusive_list.insert_at_head(
                     frame_idx,
@@ -73,7 +73,7 @@ impl PolicyState {
             }
             None => {
                 let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-                frame_guard.ref_bit = true;
+                frame_guard.set_ref_bit(true);
                 list_guard
                     .intrusive_list
                     .insert_at_head(frame_idx, &mut frame_guard, None);
@@ -93,7 +93,7 @@ impl PolicyState {
                     let mut current_guard = buffer_pool[hand].lock().unwrap();
                     if current_guard.is_pinned() {
                         if let Some(head) = list_guard.intrusive_list.peek_head() {
-                            if current_guard.index == head {
+                            if current_guard.replacement_index() == head {
                                 list_guard.hand = list_guard.intrusive_list.peek_tail();
                                 continue;
                             }
@@ -106,8 +106,8 @@ impl PolicyState {
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
-                    if current_guard.ref_bit {
-                        current_guard.ref_bit = false;
+                    if current_guard.ref_bit() {
+                        current_guard.set_ref_bit(false);
                         list_guard.hand = current_guard.prev();
                         continue;
                     }

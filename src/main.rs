@@ -9286,7 +9286,7 @@ mod transaction_tests {
 
             // Verify pin count = 1
             let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
-            assert_eq!(buffer.lock().unwrap().pins, 1);
+            assert_eq!(buffer.lock().unwrap().pin_count(), 1);
 
             #[cfg(debug_assertions)]
             txn.buffer_list.assert_pin_invariant(&block_id, 1);
@@ -9314,7 +9314,7 @@ mod transaction_tests {
 
         // Both handles should keep block pinned - pin count should be 2
         let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
-        assert_eq!(buffer.lock().unwrap().pins, 2);
+        assert_eq!(buffer.lock().unwrap().pin_count(), 2);
 
         #[cfg(debug_assertions)]
         txn.buffer_list.assert_pin_invariant(&block_id, 2);
@@ -9323,7 +9323,7 @@ mod transaction_tests {
 
         // After dropping one handle, pin count should be 1
         let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
-        assert_eq!(buffer.lock().unwrap().pins, 1);
+        assert_eq!(buffer.lock().unwrap().pin_count(), 1);
 
         #[cfg(debug_assertions)]
         txn.buffer_list.assert_pin_invariant(&block_id, 1);
@@ -9851,7 +9851,7 @@ impl RecoveryManager {
         _new_value: i32,
     ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_int(offset);
-        let block_id = buffer.block_id.clone().unwrap();
+        let block_id = buffer.block_id_owned().unwrap();
         let record = LogRecord::SetInt {
             txnum: self.tx_num,
             block_id,
@@ -9869,7 +9869,7 @@ impl RecoveryManager {
         _new_value: &str,
     ) -> Result<Lsn, Box<dyn Error>> {
         let old_value = buffer.contents.get_string(offset);
-        let block_id = buffer.block_id.clone().unwrap();
+        let block_id = buffer.block_id_owned().unwrap();
         let record = LogRecord::SetString {
             txnum: self.tx_num,
             block_id,
@@ -10417,7 +10417,7 @@ impl BufferList {
         // Invariant 2: BufferManager total pins >= this transaction's pins
         // (Other transactions may have pinned the same buffer)
         if let Some(buffer) = self.get_buffer(block_id) {
-            let buffer_manager_count = buffer.lock().unwrap().pins;
+            let buffer_manager_count = buffer.lock().unwrap().pin_count();
 
             assert!(
                 buffer_manager_count >= buffer_list_count,
@@ -10464,10 +10464,7 @@ mod buffer_list_tests {
 }
 
 #[derive(Debug)]
-pub struct BufferFrame {
-    file_manager: SharedFS,
-    log_manager: Arc<Mutex<LogManager>>,
-    contents: Page,
+struct FrameMeta {
     block_id: Option<BlockId>,
     pins: usize,
     txn: Option<usize>,
@@ -10482,15 +10479,9 @@ pub struct BufferFrame {
     ref_bit: bool,
 }
 
-impl BufferFrame {
-    pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
-        let size = file_manager.lock().unwrap().block_size();
-        #[cfg(feature = "replacement_clock")]
-        let _ = index; // Suppress unused warning when only clock is enabled
+impl FrameMeta {
+    fn new(index: usize) -> Self {
         Self {
-            file_manager,
-            log_manager,
-            contents: Page::new(size),
             block_id: None,
             pins: 0,
             txn: None,
@@ -10505,96 +10496,157 @@ impl BufferFrame {
             ref_bit: false,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct BufferFrame {
+    file_manager: SharedFS,
+    log_manager: Arc<Mutex<LogManager>>,
+    contents: Page,
+    meta: FrameMeta,
+}
+
+impl BufferFrame {
+    pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
+        let size = file_manager.lock().unwrap().block_size();
+        #[cfg(feature = "replacement_clock")]
+        let _ = index; // Suppress unused warning when only clock is enabled
+        Self {
+            file_manager,
+            log_manager,
+            contents: Page::new(size),
+            meta: FrameMeta::new(index),
+        }
+    }
+
+    pub fn block_id(&self) -> Option<&BlockId> {
+        self.meta.block_id.as_ref()
+    }
+
+    pub fn block_id_owned(&self) -> Option<BlockId> {
+        self.meta.block_id.clone()
+    }
+
+    fn set_block_id(&mut self, block_id: BlockId) {
+        self.meta.block_id = Some(block_id);
+    }
+
+    fn clear_block_id(&mut self) {
+        self.meta.block_id = None;
+    }
+
+    pub fn pin_count(&self) -> usize {
+        self.meta.pins
+    }
+
+    fn last_modified_by(&self) -> Option<usize> {
+        self.meta.txn
+    }
+
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+    pub fn replacement_index(&self) -> usize {
+        self.meta.index
+    }
+
+    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+    pub fn ref_bit(&self) -> bool {
+        self.meta.ref_bit
+    }
+
+    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+    pub fn set_ref_bit(&mut self, value: bool) {
+        self.meta.ref_bit = value;
+    }
 
     /// Mark that this buffer has been modified and set associated metadata for the modifying transaction
     fn set_modified(&mut self, txn_num: usize, lsn: usize) {
-        self.txn = Some(txn_num);
-        self.lsn = Some(lsn);
+        self.meta.txn = Some(txn_num);
+        self.meta.lsn = Some(lsn);
     }
 
     /// Check whether the buffer is pinned in memory
     fn is_pinned(&self) -> bool {
-        self.pins > 0
+        self.meta.pins > 0
     }
 
     /// Modify this buffer to hold the contents of a different block
     /// This requires flushing the existing page contents, if any, to disk if dirty
     fn assign_to_block(&mut self, block_id: &BlockId) {
         self.flush();
-        self.block_id = Some(block_id.clone());
+        self.set_block_id(block_id.clone());
         self.file_manager
             .lock()
             .unwrap()
-            .read(self.block_id.as_ref().unwrap(), &mut self.contents);
+            .read(block_id, &mut self.contents);
         self.reset_pins();
     }
 
     /// Write the current buffer contents to disk if dirty
     fn flush(&mut self) {
-        if self.txn.is_some() {
+        if self.meta.txn.is_some() {
             self.log_manager
                 .lock()
                 .unwrap()
-                .flush_lsn(self.lsn.unwrap());
+                .flush_lsn(self.meta.lsn.unwrap());
             self.file_manager
                 .lock()
                 .unwrap()
-                .write(self.block_id.as_ref().unwrap(), &mut self.contents);
+                .write(self.meta.block_id.as_ref().unwrap(), &mut self.contents);
         }
     }
 
     /// Increment the pin count for this buffer
     fn pin(&mut self) {
-        self.pins += 1;
+        self.meta.pins += 1;
     }
 
     /// Decrement the pin count for this buffer
     fn unpin(&mut self) {
-        assert!(self.pins > 0); //  sanity check to know that it will not become negative
-        self.pins -= 1;
+        assert!(self.meta.pins > 0); //  sanity check to know that it will not become negative
+        self.meta.pins -= 1;
     }
 
     /// Reset the pin count for this buffer
     fn reset_pins(&mut self) {
-        self.pins = 0;
+        self.meta.pins = 0;
     }
 }
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for BufferFrame {
     fn prev(&self) -> Option<usize> {
-        self.prev_idx
+        self.meta.prev_idx
     }
 
     fn set_prev(&mut self, prev: Option<usize>) {
-        self.prev_idx = prev
+        self.meta.prev_idx = prev
     }
 
     fn next(&self) -> Option<usize> {
-        self.next_idx
+        self.meta.next_idx
     }
 
     fn set_next(&mut self, next: Option<usize>) {
-        self.next_idx = next
+        self.meta.next_idx = next
     }
 }
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for MutexGuard<'_, BufferFrame> {
     fn prev(&self) -> Option<usize> {
-        self.prev_idx
+        self.meta.prev_idx
     }
 
     fn set_prev(&mut self, prev: Option<usize>) {
-        self.prev_idx = prev
+        self.meta.prev_idx = prev
     }
 
     fn next(&self) -> Option<usize> {
-        self.next_idx
+        self.meta.next_idx
     }
 
     fn set_next(&mut self, next: Option<usize>) {
-        self.next_idx = next
+        self.meta.next_idx = next
     }
 }
 
@@ -10775,7 +10827,7 @@ impl BufferManager {
     fn flush_all(&self, txn_num: usize) {
         for buffer in &self.buffer_pool {
             let mut buffer = buffer.lock().unwrap();
-            if buffer.txn.is_some() && *buffer.txn.as_ref().unwrap() == txn_num {
+            if matches!(buffer.last_modified_by(), Some(t) if t == txn_num) {
                 buffer.flush();
             }
         }
@@ -10883,7 +10935,7 @@ impl BufferManager {
             None => return None,
         };
 
-        if let Some(old) = frame_guard.block_id.as_ref() {
+        if let Some(old) = frame_guard.block_id() {
             self.resident_table.lock().unwrap().remove(old);
         }
         frame_guard.assign_to_block(block_id);
@@ -10905,10 +10957,10 @@ impl BufferManager {
     pub fn unpin(&self, frame: Arc<Mutex<BufferFrame>>) {
         let mut frame_guard = frame.lock().unwrap();
         assert!(
-            frame_guard.pins > 0,
+            frame_guard.pin_count() > 0,
             "While trying to unpin a block, the pins were already 0. This is incorrect"
         );
-        let was_one = frame_guard.pins == 1;
+        let was_one = frame_guard.pin_count() == 1;
         frame_guard.unpin();
         if was_one {
             *self.num_available.lock().unwrap() += 1;
@@ -10939,7 +10991,7 @@ impl BufferManager {
         let num_pinned_buffers: usize = self
             .buffer_pool
             .iter()
-            .filter(|buf| buf.lock().unwrap().pins > 0)
+            .filter(|buf| buf.lock().unwrap().is_pinned())
             .count();
 
         assert_eq!(
@@ -11047,7 +11099,7 @@ mod buffer_manager_tests {
                         // Verify we got the right block
                         {
                             let guard = buffer.lock().unwrap();
-                            assert_eq!(guard.block_id.as_ref().unwrap(), &block_id);
+                            assert_eq!(guard.block_id().unwrap(), &block_id);
                             let value = guard.contents.get_int(0);
                             assert_eq!(value, block_num as i32);
                         }
