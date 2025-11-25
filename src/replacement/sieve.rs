@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId, BufferFrame,
+    BlockId, BufferFrame, FrameMeta,
 };
 
 #[derive(Debug)]
@@ -21,11 +21,11 @@ pub struct PolicyState {
 }
 
 impl PolicyState {
-    pub fn new(buffer_pool: &[Arc<Mutex<BufferFrame>>]) -> Self {
+    pub fn new(buffer_pool: &[Arc<BufferFrame>]) -> Self {
         let mut guards = buffer_pool
             .iter()
-            .map(|frame| frame.lock().unwrap())
-            .collect::<Vec<MutexGuard<'_, BufferFrame>>>();
+            .map(|frame| frame.lock_meta())
+            .collect::<Vec<MutexGuard<'_, FrameMeta>>>();
         let intrusive_list = IntrusiveList::from_nodes(&mut guards);
         Self {
             list_state: Mutex::new(ListState {
@@ -38,23 +38,25 @@ impl PolicyState {
 
     pub fn record_hit<'a>(
         &self,
-        _buffer_pool: &[Arc<Mutex<BufferFrame>>],
-        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        _buffer_pool: &[Arc<BufferFrame>],
+        frame_ptr: &'a Arc<BufferFrame>,
         block_id: &BlockId,
-        resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
-    ) -> Option<MutexGuard<'a, BufferFrame>> {
-        let mut frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id() {
-            if frame_block_id != block_id {
-                resident_table.lock().unwrap().remove(block_id);
-                return None;
-            }
+        resident_table: &Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
+    ) -> Option<MutexGuard<'a, FrameMeta>> {
+        let mut frame_guard = frame_ptr.lock_meta();
+        if !frame_guard
+            .block_id
+            .as_ref()
+            .is_some_and(|current| current == block_id)
+        {
+            resident_table.lock().unwrap().remove(block_id);
+            return None;
         }
-        frame_guard.set_ref_bit(true);
+        frame_guard.ref_bit = true;
         Some(frame_guard)
     }
 
-    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {
+    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
         let mut list_guard = self.list_state.lock().unwrap();
         let current_head = list_guard.intrusive_list.peek_head();
         match current_head {
@@ -62,9 +64,9 @@ impl PolicyState {
                 if frame_idx == head {
                     return;
                 }
-                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-                frame_guard.set_ref_bit(true);
-                let mut current_head_guard = buffer_pool[head].lock().unwrap();
+                let mut frame_guard = buffer_pool[frame_idx].lock_meta();
+                frame_guard.ref_bit = true;
+                let mut current_head_guard = buffer_pool[head].lock_meta();
                 list_guard.intrusive_list.insert_at_head(
                     frame_idx,
                     &mut frame_guard,
@@ -72,8 +74,8 @@ impl PolicyState {
                 );
             }
             None => {
-                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-                frame_guard.set_ref_bit(true);
+                let mut frame_guard = buffer_pool[frame_idx].lock_meta();
+                frame_guard.ref_bit = true;
                 list_guard
                     .intrusive_list
                     .insert_at_head(frame_idx, &mut frame_guard, None);
@@ -83,17 +85,17 @@ impl PolicyState {
 
     pub fn evict_frame<'a>(
         &self,
-        buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
-    ) -> Option<(usize, MutexGuard<'a, BufferFrame>)> {
+        buffer_pool: &'a [Arc<BufferFrame>],
+    ) -> Option<(usize, MutexGuard<'a, FrameMeta>)> {
         let mut list_guard = self.list_state.lock().unwrap();
 
         for _ in 0..self.pool_len {
             match list_guard.hand {
                 Some(hand) => {
-                    let mut current_guard = buffer_pool[hand].lock().unwrap();
-                    if current_guard.is_pinned() {
+                    let mut current_guard = buffer_pool[hand].lock_meta();
+                    if current_guard.pins > 0 {
                         if let Some(head) = list_guard.intrusive_list.peek_head() {
-                            if current_guard.replacement_index() == head {
+                            if current_guard.index == head {
                                 list_guard.hand = list_guard.intrusive_list.peek_tail();
                                 continue;
                             }
@@ -106,17 +108,17 @@ impl PolicyState {
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
-                    if current_guard.ref_bit() {
-                        current_guard.set_ref_bit(false);
+                    if current_guard.ref_bit {
+                        current_guard.ref_bit = false;
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
                     let mut prev_node = current_guard
                         .prev()
-                        .map(|prev| buffer_pool[prev].lock().unwrap());
+                        .map(|prev| buffer_pool[prev].lock_meta());
                     let mut next_node = current_guard
                         .next()
-                        .map(|next| buffer_pool[next].lock().unwrap());
+                        .map(|next| buffer_pool[next].lock_meta());
                     list_guard.intrusive_list.remove_node(
                         hand,
                         &mut current_guard,
