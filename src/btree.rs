@@ -164,7 +164,7 @@ mod btree_index_tests {
     }
 
     fn setup_index(db: &SimpleDB) -> BTreeIndex {
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let layout = create_test_layout();
         let index_name = generate_filename();
         BTreeIndex::new(Arc::clone(&tx), &index_name, layout).unwrap()
@@ -428,7 +428,7 @@ mod btree_internal_tests {
     }
 
     fn setup_internal_node(db: &SimpleDB) -> (Arc<Transaction>, BTreeInternal) {
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
         let filename = generate_filename();
@@ -829,7 +829,7 @@ mod btree_leaf_tests {
     }
 
     fn setup_leaf(db: &SimpleDB, search_key: Constant) -> (Arc<Transaction>, BTreeLeaf) {
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1386,7 +1386,7 @@ mod btree_page_tests {
     #[test]
     fn test_btree_page_format() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1400,7 +1400,7 @@ mod btree_page_tests {
     #[test]
     fn test_leaf_insert_and_delete() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1424,7 +1424,7 @@ mod btree_page_tests {
     #[test]
     fn test_page_split() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1454,7 +1454,7 @@ mod btree_page_tests {
     #[test]
     fn test_type_safety() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1469,7 +1469,7 @@ mod btree_page_tests {
     #[test]
     fn test_internal_node_operations() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
@@ -1487,7 +1487,7 @@ mod btree_page_tests {
     #[test]
     fn test_find_slot_before() {
         let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
-        let tx = Arc::new(db.new_tx());
+        let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 

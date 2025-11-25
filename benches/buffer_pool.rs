@@ -576,7 +576,7 @@ fn dirty_eviction(
     precreate_blocks(db, &test_file, block_size, num_buffers * 2);
 
     // Fill buffer pool with dirty buffers using transactions
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
     for i in 0..num_buffers {
         let block_id = BlockId::new(test_file.clone(), i);
         // Pin the block first, then modify it
