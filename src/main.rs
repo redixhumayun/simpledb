@@ -8784,8 +8784,7 @@ impl Transaction {
     fn get_int(&self, block_id: &BlockId, offset: usize) -> Result<i32, Box<dyn Error>> {
         self.concurrency_manager.slock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
-        let page = buffer.read_page();
-        Ok(page.get_int(offset))
+        Ok(buffer.with_page(|page| page.get_int(offset)))
     }
 
     /// Set an integer value in a [`Buffer`] associated with this transaction
@@ -8809,10 +8808,7 @@ impl Transaction {
                 Lsn::MAX
             }
         };
-        {
-            let mut page = buffer.write_page();
-            page.set_int(offset, value);
-        }
+        buffer.with_page_mut(|page| page.set_int(offset, value));
         buffer.set_modified(self.tx_id as usize, lsn);
         Ok(())
     }
@@ -8821,8 +8817,7 @@ impl Transaction {
     fn get_string(&self, block_id: &BlockId, offset: usize) -> Result<String, Box<dyn Error>> {
         self.concurrency_manager.slock(block_id)?;
         let buffer = self.buffer_list.get_buffer(block_id).unwrap();
-        let page = buffer.read_page();
-        Ok(page.get_string(offset))
+        Ok(buffer.with_page(|page| page.get_string(offset)))
     }
 
     /// Set a string value in a [`Buffer`] associated with this transaction
@@ -8844,10 +8839,7 @@ impl Transaction {
                 Lsn::MAX
             }
         };
-        {
-            let mut page = buffer.write_page();
-            page.set_string(offset, value);
-        }
+        buffer.with_page_mut(|page| page.set_string(offset, value));
         buffer.set_modified(self.tx_id as usize, lsn);
         Ok(())
     }
@@ -9854,8 +9846,7 @@ impl RecoveryManager {
         _new_value: i32,
     ) -> Result<Lsn, Box<dyn Error>> {
         let block_id = buffer.block_id_owned().unwrap();
-        let page = buffer.read_page();
-        let old_value = page.get_int(offset);
+        let old_value = buffer.with_page(|page| page.get_int(offset));
         let record = LogRecord::SetInt {
             txnum: self.tx_num,
             block_id,
@@ -9873,8 +9864,7 @@ impl RecoveryManager {
         _new_value: &str,
     ) -> Result<Lsn, Box<dyn Error>> {
         let block_id = buffer.block_id_owned().unwrap();
-        let page = buffer.read_page();
-        let old_value = page.get_string(offset);
+        let old_value = buffer.with_page(|page| page.get_string(offset));
         let record = LogRecord::SetString {
             txnum: self.tx_num,
             block_id,
@@ -10486,6 +10476,8 @@ pub(crate) struct FrameMeta {
 
 impl FrameMeta {
     fn new(index: usize) -> Self {
+        #[cfg(not(any(feature = "replacement_lru", feature = "replacement_sieve")))]
+        let _ = index;
         Self {
             block_id: None,
             pins: 0,
@@ -10500,6 +10492,22 @@ impl FrameMeta {
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: false,
         }
+    }
+
+    fn pin(&mut self) -> bool {
+        let was_zero = self.pins == 0;
+        self.pins += 1;
+        was_zero
+    }
+
+    fn unpin(&mut self) -> bool {
+        assert!(self.pins > 0, "FrameMeta::unpin on zero pins");
+        self.pins -= 1;
+        self.pins == 0
+    }
+
+    fn reset_pins(&mut self) {
+        self.pins = 0;
     }
 }
 
@@ -10526,6 +10534,11 @@ impl BufferFrame {
 
     pub(crate) fn lock_meta(&self) -> MutexGuard<'_, FrameMeta> {
         self.meta.lock().unwrap()
+    }
+
+    pub(crate) fn with_meta<R>(&self, f: impl FnOnce(&mut FrameMeta) -> R) -> R {
+        let mut guard = self.lock_meta();
+        f(&mut guard)
     }
 
     pub fn block_id_owned(&self) -> Option<BlockId> {
@@ -10557,6 +10570,16 @@ impl BufferFrame {
 
     pub fn write_page(&self) -> RwLockWriteGuard<'_, Page> {
         self.page.write().unwrap()
+    }
+
+    pub fn with_page<R>(&self, f: impl FnOnce(&Page) -> R) -> R {
+        let page = self.page.read().unwrap();
+        f(&page)
+    }
+
+    pub fn with_page_mut<R>(&self, f: impl FnOnce(&mut Page) -> R) -> R {
+        let mut page = self.page.write().unwrap();
+        f(&mut page)
     }
 
     /// Mark that this buffer has been modified and set associated metadata for the modifying transaction
@@ -10594,7 +10617,7 @@ impl BufferFrame {
             .lock()
             .unwrap()
             .read(block_id, &mut *page_guard);
-        meta.pins = 0;
+        meta.reset_pins();
         meta.txn = None;
         meta.lsn = None;
     }
@@ -10897,8 +10920,7 @@ impl BufferManager {
         if let Some(frame_ptr) = frame_ptr {
             {
                 let mut meta_guard = self.record_hit(&frame_ptr, block_id)?;
-                let was_unpinned = meta_guard.pins == 0;
-                meta_guard.pins += 1;
+                let was_unpinned = meta_guard.pin();
                 if was_unpinned {
                     *self.num_available.lock().unwrap() -= 1;
                 }
@@ -10928,7 +10950,8 @@ impl BufferManager {
         }
         let frame = Arc::clone(&self.buffer_pool[tail_idx]);
         frame.assign_to_block_locked(&mut meta_guard, block_id);
-        meta_guard.pins = 1;
+        let became_pinned = meta_guard.pin();
+        debug_assert!(became_pinned, "newly assigned frame must have zero pins");
         drop(meta_guard);
 
         self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
@@ -10944,15 +10967,8 @@ impl BufferManager {
     /// Decrement the pin count for the provided buffer
     /// If all of the pins have been removed, managed metadata & notify waiting threads
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
-        let became_unpinned = {
-            let mut meta = frame.lock_meta();
-            assert!(
-                meta.pins > 0,
-                "While trying to unpin a block, the pins were already 0. This is incorrect"
-            );
-            meta.pins -= 1;
-            meta.pins == 0
-        };
+        let mut meta = frame.lock_meta();
+        let became_unpinned = meta.unpin();
         if became_unpinned {
             *self.num_available.lock().unwrap() += 1;
             self.cond.notify_all();
@@ -11093,11 +11109,10 @@ mod buffer_manager_tests {
                         let buffer = buffer_manager.pin(&block_id).unwrap();
 
                         // Verify we got the right block
-                        {
-                            assert_eq!(buffer.block_id_owned().unwrap(), block_id);
-                            let page = buffer.read_page();
+                        assert_eq!(buffer.block_id_owned().unwrap(), block_id);
+                        buffer.with_page(|page| {
                             assert_eq!(page.get_int(0), block_num as i32);
-                        }
+                        });
 
                         // Unpin immediately to maximize churn
                         buffer_manager.unpin(buffer);
