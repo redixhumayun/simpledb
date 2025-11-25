@@ -404,10 +404,13 @@ impl<'a, K: PageKind> Drop for PageGuard<'a, K> {
 #### Phased rollout
 1. **Introduce helpers:** keep `Arc<Mutex<BufferFrame>>` but add `FrameMeta` + helper methods (`with_meta`, `with_page_access`) so callers stop poking fields directly.
 2. **Migrate users:** update BufferManager, replacement policy, and intrusive DLL code to use the helpers; behavior unchanged because the outer mutex still serializes everything.
+   - 2a. Convert `buffer_pool` entries to `Arc<BufferFrame>` with internal `meta: Mutex<FrameMeta>` and `page: RwLock<PageBytes>`, keeping the public API shape intact during the swap.
+   - 2b. Update pin/unpin, eviction, and replacement-policy codepaths to lock only `meta` or `page` as needed, ensuring statistics and `BufferHandle` semantics remain unchanged.
+   - 2c. Teach transactional callers (`Transaction::get_int/set_*`, `RecordPage`, recovery) to acquire the appropriate read/write guard from the frame instead of taking a coarse mutex.
+   - 2d. Re-run the full AGENTS.md test + benchmark matrix (all feature-flag combinations) with explicit command-level timeouts to catch deadlocks introduced by the split before moving on.
 3. **Split locks:** replace the outer `Mutex<BufferFrame>` with `Arc<BufferFrame>` containing `meta: Mutex<FrameMeta>` plus `page: RwLock<PageBytes>`. Helpers now lock the specific primitive they need.
 4. **Add `PageReadGuard` / `PageWriteGuard`:** wrap the `RwLock` guards + pin token; expose new `Transaction::pin_read/pin_write` APIs that return these guards (legacy `get_*` delegate internally during the transition).
 5. **Refactor RecordPage/TableScan:** switch to guard-based access + Layout decoding; delete the old offset-based helpers.
-6. **Shrink `LockTable` scope:** once physical latching is in place, move logical locks to table/RID keys so concurrent readers on the same page can proceed when they touch distinct rows.
 
 This staging keeps the code compiling/testable at each step and makes it clear where unsafe code (if any) is isolated.
 
