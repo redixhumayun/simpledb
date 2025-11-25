@@ -31,19 +31,19 @@ impl PolicyState {
         resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
     ) -> Option<MutexGuard<'a, BufferFrame>> {
         let mut frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
+        if let Some(frame_block_id) = frame_guard.block_id() {
             if frame_block_id != block_id {
                 resident_table.lock().unwrap().remove(block_id);
                 return None;
             }
         }
-        frame_guard.ref_bit = true;
+        frame_guard.set_ref_bit(true);
         Some(frame_guard)
     }
 
     pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {
         let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-        frame_guard.ref_bit = true;
+        frame_guard.set_ref_bit(true);
     }
 
     pub fn evict_frame<'a>(
@@ -58,8 +58,8 @@ impl PolicyState {
                 *hand = (idx + 1) % self.pool_len;
                 continue;
             }
-            if frame_guard.ref_bit {
-                frame_guard.ref_bit = false;
+            if frame_guard.ref_bit() {
+                frame_guard.set_ref_bit(false);
                 *hand = (idx + 1) % self.pool_len;
                 continue;
             }
