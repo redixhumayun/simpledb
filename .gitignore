@@ -7,3 +7,4 @@ perf.*
 *.txt
 .DS_Store
 /output
+docs/local.md

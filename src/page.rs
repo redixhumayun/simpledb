@@ -477,9 +477,9 @@ pub struct Page<K: PageKind> {
 }
 
 impl<K: PageKind> Page<K> {
-    fn new_heap() -> Self {
+    fn new() -> Self {
         Self {
-            header: PageHeader::new(PageType::Heap),
+            header: PageHeader::new(K::PAGE_TYPE),
             line_pointers: Vec::new(),
             record_space: vec![0u8; PAGE_SIZE_BYTES as usize],
             kind: PhantomData,
@@ -633,7 +633,7 @@ mod page_tests {
 
     #[test]
     fn allocate_tuple_exposes_bytes_and_tuple_ref() {
-        let mut page = Page::<HeapPage>::new_heap();
+        let mut page = Page::<HeapPage>::new();
         let payload = vec![1u8, 2, 3, 4];
         let tuple = heap_tuple_bytes(&payload);
 
@@ -655,7 +655,7 @@ mod page_tests {
 
     #[test]
     fn delete_frees_slot_and_allocation_reuses_it() {
-        let mut page = Page::<HeapPage>::new_heap();
+        let mut page = Page::<HeapPage>::new();
         let tuple_a = heap_tuple_bytes(&[10]);
         let tuple_b = heap_tuple_bytes(&[20, 30]);
         let tuple_c_payload = vec![99, 100, 101];
@@ -681,7 +681,7 @@ mod page_tests {
 
     #[test]
     fn update_tuple_redirects_when_growing_and_overwrites_in_place_when_equal() {
-        let mut page = Page::<HeapPage>::new_heap();
+        let mut page = Page::<HeapPage>::new();
         let small_payload = vec![1u8, 2, 3];
         let large_payload = vec![5u8; 8];
         let replacement_payload = vec![7u8; 8];
@@ -714,7 +714,7 @@ mod page_tests {
 
     #[test]
     fn heap_iterator_filters_by_line_state() {
-        let mut page = Page::<HeapPage>::new_heap();
+        let mut page = Page::<HeapPage>::new();
         let payload_a = vec![1u8];
         let payload_b = vec![2u8];
         let payload_c = vec![3u8];
@@ -758,6 +758,38 @@ mod page_tests {
             }
             assert_eq!(states, vec!["live_a", "redirect", "free", "live_grown"]);
         }
+    }
+
+    #[test]
+    fn heap_allocator_and_iterator_round_trip() {
+        let mut page = Page::<HeapPage>::new();
+
+        // Use the high-level allocator API (via PageKind)
+        {
+            let mut alloc = HeapPage::allocator(&mut page);
+            let payload1 = vec![1u8, 2, 3];
+            let payload2 = vec![4u8, 5, 6];
+
+            let tuple1 = heap_tuple_bytes(&payload1);
+            let tuple2 = heap_tuple_bytes(&payload2);
+
+            let slot1 = alloc.insert(&tuple1).expect("first insert");
+            let slot2 = alloc.insert(&tuple2).expect("second insert");
+
+            assert_ne!(slot1, slot2, "slots should be distinct");
+        } // alloc drops; page keeps the tuples
+
+        // Use the high-level iterator API (via PageKind)
+        let mut iter = HeapPage::iterator(&mut page);
+        let mut seen = Vec::new();
+        while let Some(tref) = iter.next() {
+            if let TupleRef::Live(tuple) = tref {
+                seen.push(tuple.payload().to_vec());
+            }
+        }
+
+        // Order is insertion order for a fresh page
+        assert_eq!(seen, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
     }
 
     fn heap_tuple_bytes(payload: &[u8]) -> Vec<u8> {
