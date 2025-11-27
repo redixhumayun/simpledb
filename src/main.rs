@@ -10255,22 +10255,24 @@ impl TryFrom<Vec<u8>> for LogRecord {
             1 => Ok(LogRecord::Commit(read_usize(&value, &mut pos)?)),
             2 => Ok(LogRecord::Rollback(read_usize(&value, &mut pos)?)),
             3 => Ok(LogRecord::Checkpoint),
-            4 => {
-                Ok(LogRecord::SetInt {
-                    txnum: read_usize(&value, &mut pos)?,
-                    block_id: BlockId::new(read_string(&value, &mut pos)?, read_usize(&value, &mut pos)?),
-                    offset: read_usize(&value, &mut pos)?,
-                    old_val: read_i32(&value, &mut pos)?,
-                })
-            }
-            5 => {
-                Ok(LogRecord::SetString {
-                    txnum: read_usize(&value, &mut pos)?,
-                    block_id: BlockId::new(read_string(&value, &mut pos)?, read_usize(&value, &mut pos)?),
-                    offset: read_usize(&value, &mut pos)?,
-                    old_val: read_string(&value, &mut pos)?,
-                })
-            }
+            4 => Ok(LogRecord::SetInt {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                offset: read_usize(&value, &mut pos)?,
+                old_val: read_i32(&value, &mut pos)?,
+            }),
+            5 => Ok(LogRecord::SetString {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                offset: read_usize(&value, &mut pos)?,
+                old_val: read_string(&value, &mut pos)?,
+            }),
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -11321,7 +11323,11 @@ impl LogManager {
 
     /// Append a new block to the file maintained by the log manager
     /// This involves initializing a new block, writing a boundary pointer to it and writing the block to disk
-    fn append_new_block(file_manager: &SharedFS, log_file: &str, log_page: &mut WalPage) -> BlockId {
+    fn append_new_block(
+        file_manager: &SharedFS,
+        log_file: &str,
+        log_page: &mut WalPage,
+    ) -> BlockId {
         let block_id = file_manager.lock().unwrap().append(log_file.to_string());
         log_page.reset();
         file_manager
