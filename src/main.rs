@@ -36,6 +36,7 @@ mod intrusive_dll;
 mod page;
 mod parser;
 mod replacement;
+use crate::page::WalPage;
 
 use replacement::PolicyState;
 
@@ -8885,8 +8886,8 @@ impl Transaction {
     ) -> Result<(), Box<dyn Error>> {
         self.concurrency_manager.xlock(block_id)?;
         let mut page = self.pin_write_guard(block_id);
-        let old_value = page.get_int(offset);
         let lsn = if log {
+            let old_value = page.get_int(offset);
             self.recovery_manager.set_int(block_id, offset, old_value)?
         } else {
             Lsn::MAX
@@ -8905,8 +8906,8 @@ impl Transaction {
     ) -> Result<(), Box<dyn Error>> {
         self.concurrency_manager.xlock(block_id)?;
         let mut page = self.pin_write_guard(block_id);
-        let old_value = page.get_string(offset);
         let lsn = if log {
+            let old_value = page.get_string(offset);
             self.recovery_manager
                 .set_string(block_id, offset, old_value)?
         } else {
@@ -8954,10 +8955,11 @@ impl Transaction {
 
     /// Append a block to the file
     fn append(&self, file_name: &str) -> BlockId {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .append(file_name.to_string())
+        let mut file_manager = self.file_manager.lock().unwrap();
+        let block_id = file_manager.append(file_name.to_string());
+        let page = Page::new();
+        file_manager.write(&block_id, &page);
+        block_id
     }
 
     /// Get the block size
@@ -10168,21 +10170,21 @@ impl TryInto<Vec<u8>> for &LogRecord {
     type Error = Box<dyn Error>;
 
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        let int_value = self.discriminant();
-        let mut page = Page::new();
-        let mut pos = 0;
-        page.set_int(pos, int_value as i32);
-        pos += 4;
+        fn push_i32(buf: &mut Vec<u8>, value: i32) {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn push_string(buf: &mut Vec<u8>, value: &str) {
+            push_i32(buf, value.len() as i32);
+            buf.extend_from_slice(value.as_bytes());
+        }
+
+        let mut buf = Vec::with_capacity(self.calculate_size());
+        push_i32(&mut buf, self.discriminant() as i32);
         match self {
-            LogRecord::Start(txnum) => {
-                page.set_int(pos, *txnum as i32);
-            }
-            LogRecord::Commit(txnum) => {
-                page.set_int(pos, *txnum as i32);
-            }
-            LogRecord::Rollback(txnum) => {
-                page.set_int(pos, *txnum as i32);
-            }
+            LogRecord::Start(txnum) => push_i32(&mut buf, *txnum as i32),
+            LogRecord::Commit(txnum) => push_i32(&mut buf, *txnum as i32),
+            LogRecord::Rollback(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Checkpoint => {}
             LogRecord::SetInt {
                 txnum,
@@ -10190,15 +10192,11 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 offset,
                 old_val,
             } => {
-                page.set_int(pos, *txnum as i32);
-                pos += 4;
-                page.set_string(pos, &block_id.filename);
-                pos += 4 + block_id.filename.len();
-                page.set_int(pos, block_id.block_num as i32);
-                pos += 4;
-                page.set_int(pos, *offset as i32);
-                pos += 4;
-                page.set_int(pos, *old_val);
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_i32(&mut buf, *old_val);
             }
             LogRecord::SetString {
                 txnum,
@@ -10206,19 +10204,13 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 offset,
                 old_val,
             } => {
-                page.set_int(pos, *txnum as i32);
-                pos += 4;
-                page.set_string(pos, &block_id.filename);
-                pos += 4 + block_id.filename.len();
-                page.set_int(pos, block_id.block_num as i32);
-                pos += 4;
-                page.set_int(pos, *offset as i32);
-                pos += 4;
-                page.set_string(pos, old_val);
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_string(&mut buf, old_val);
             }
         }
-        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        page.write_bytes(&mut buf)?;
         Ok(buf)
     }
 }
@@ -10227,50 +10219,56 @@ impl TryFrom<Vec<u8>> for LogRecord {
     type Error = Box<dyn Error>;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        let page = Page::from_bytes(&value)?;
+        fn read_i32(bytes: &[u8], pos: &mut usize) -> Result<i32, Box<dyn Error>> {
+            if *pos + 4 > bytes.len() {
+                return Err("truncated log record".into());
+            }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&bytes[*pos..*pos + 4]);
+            *pos += 4;
+            Ok(i32::from_be_bytes(buf))
+        }
+
+        fn read_usize(bytes: &[u8], pos: &mut usize) -> Result<usize, Box<dyn Error>> {
+            let val = read_i32(bytes, pos)?;
+            if val < 0 {
+                return Err("negative value in log record".into());
+            }
+            Ok(val as usize)
+        }
+
+        fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, Box<dyn Error>> {
+            let len = read_usize(bytes, pos)?;
+            if *pos + len > bytes.len() {
+                return Err("truncated string in log record".into());
+            }
+            let slice = &bytes[*pos..*pos + len];
+            *pos += len;
+            Ok(std::str::from_utf8(slice)?.to_string())
+        }
+
         let mut pos = 0;
-        let discriminant = page.get_int(pos);
-        pos += 4;
+        let discriminant = read_i32(&value, &mut pos)?;
 
         match discriminant {
-            0 => Ok(LogRecord::Start(page.get_int(pos) as usize)),
-            1 => Ok(LogRecord::Commit(page.get_int(pos) as usize)),
-            2 => Ok(LogRecord::Rollback(page.get_int(pos) as usize)),
+            0 => Ok(LogRecord::Start(read_usize(&value, &mut pos)?)),
+            1 => Ok(LogRecord::Commit(read_usize(&value, &mut pos)?)),
+            2 => Ok(LogRecord::Rollback(read_usize(&value, &mut pos)?)),
             3 => Ok(LogRecord::Checkpoint),
             4 => {
-                let txnum = page.get_int(pos) as usize;
-                pos += 4;
-                let filename = page.get_string(pos);
-                pos += 4 + filename.len();
-                let block_num = page.get_int(pos) as usize;
-                pos += 4;
-                let offset = page.get_int(pos) as usize;
-                pos += 4;
-                let old_val = page.get_int(pos);
-
                 Ok(LogRecord::SetInt {
-                    txnum,
-                    block_id: BlockId::new(filename, block_num),
-                    offset,
-                    old_val,
+                    txnum: read_usize(&value, &mut pos)?,
+                    block_id: BlockId::new(read_string(&value, &mut pos)?, read_usize(&value, &mut pos)?),
+                    offset: read_usize(&value, &mut pos)?,
+                    old_val: read_i32(&value, &mut pos)?,
                 })
             }
             5 => {
-                let txnum = page.get_int(pos) as usize;
-                pos += 4;
-                let filename = page.get_string(pos);
-                pos += 4 + filename.len();
-                let block_num = page.get_int(pos) as usize;
-                pos += 4;
-                let offset = page.get_int(pos) as usize;
-                pos += 4;
-                let old_val = page.get_string(pos);
-
                 Ok(LogRecord::SetString {
-                    txnum,
-                    block_id: BlockId::new(filename, block_num),
-                    offset,
-                    old_val,
+                    txnum: read_usize(&value, &mut pos)?,
+                    block_id: BlockId::new(read_string(&value, &mut pos)?, read_usize(&value, &mut pos)?),
+                    offset: read_usize(&value, &mut pos)?,
+                    old_val: read_string(&value, &mut pos)?,
                 })
             }
             _ => Err("Invalid log record type".into()),
@@ -11236,7 +11234,7 @@ mod buffer_manager_tests {
 pub struct LogManager {
     file_manager: SharedFS,
     log_file: String,
-    log_page: Page,
+    log_page: WalPage,
     current_block: BlockId,
     latest_lsn: usize,
     last_saved_lsn: usize,
@@ -11244,8 +11242,7 @@ pub struct LogManager {
 
 impl LogManager {
     pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
-        let bytes = vec![0; file_manager.lock().unwrap().block_size()];
-        let mut log_page = Page::from_bytes(&bytes).unwrap();
+        let mut log_page = WalPage::new();
         let log_size = file_manager.lock().unwrap().length(log_file.to_string());
         let current_block = if log_size == 0 {
             LogManager::append_new_block(&file_manager, log_file, &mut log_page)
@@ -11254,7 +11251,10 @@ impl LogManager {
                 filename: log_file.to_string(),
                 block_num: log_size - 1,
             };
-            file_manager.lock().unwrap().read(&block, &mut log_page);
+            file_manager
+                .lock()
+                .unwrap()
+                .read_raw(&block, log_page.bytes_mut());
             block
         };
         Self {
@@ -11281,7 +11281,7 @@ impl LogManager {
         self.file_manager
             .lock()
             .unwrap()
-            .write(&self.current_block, &self.log_page);
+            .write_raw(&self.current_block, self.log_page.bytes());
 
         self.file_manager.lock().unwrap().sync(&self.log_file);
         self.file_manager.lock().unwrap().sync_directory();
@@ -11292,39 +11292,42 @@ impl LogManager {
     /// Write the log_record to the log page
     /// First, check if there is enough space
     pub fn append(&mut self, log_record: Vec<u8>) -> Lsn {
-        let mut boundary = self.log_page.get_int(0) as usize;
-        let bytes_needed = log_record.len() + Page::INT_BYTES;
-        if boundary.saturating_sub(bytes_needed) < Page::INT_BYTES {
+        let mut boundary = self.log_page.boundary();
+        let bytes_needed = log_record.len() + WalPage::HEADER_BYTES;
+        let page_capacity = self.log_page.capacity();
+        let max_payload = page_capacity.saturating_sub(WalPage::HEADER_BYTES);
+        assert!(
+            bytes_needed <= max_payload,
+            "log record of {} bytes exceeds WAL capacity {}",
+            bytes_needed,
+            max_payload
+        );
+        if boundary.saturating_sub(bytes_needed) < WalPage::HEADER_BYTES {
             self.flush_to_disk();
             self.current_block = LogManager::append_new_block(
                 &self.file_manager,
                 &self.log_file,
                 &mut self.log_page,
             );
-            boundary = self.log_page.get_int(0) as usize;
+            boundary = self.log_page.boundary();
         }
 
         let record_pos = boundary - bytes_needed;
-        self.log_page.set_bytes(record_pos, &log_record);
-        self.log_page.set_int(0, record_pos as i32);
+        self.log_page.write_record(record_pos, &log_record);
+        self.log_page.set_boundary(record_pos);
         self.latest_lsn += 1;
         self.latest_lsn
     }
 
     /// Append a new block to the file maintained by the log manager
     /// This involves initializing a new block, writing a boundary pointer to it and writing the block to disk
-    fn append_new_block(file_manager: &SharedFS, log_file: &str, log_page: &mut Page) -> BlockId {
+    fn append_new_block(file_manager: &SharedFS, log_file: &str, log_page: &mut WalPage) -> BlockId {
         let block_id = file_manager.lock().unwrap().append(log_file.to_string());
-        log_page.set_int(
-            0,
-            file_manager
-                .lock()
-                .unwrap()
-                .block_size()
-                .try_into()
-                .unwrap(),
-        );
-        file_manager.lock().unwrap().write(&block_id, log_page);
+        log_page.reset();
+        file_manager
+            .lock()
+            .unwrap()
+            .write_raw(&block_id, log_page.bytes());
         block_id
     }
 
@@ -11340,16 +11343,19 @@ impl LogManager {
 pub struct LogIterator {
     file_manager: SharedFS,
     current_block: BlockId,
-    page: Page,
+    page: WalPage,
     current_pos: usize,
     boundary: usize,
 }
 
 impl LogIterator {
     pub fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
-        let mut page = Page::new();
-        file_manager.lock().unwrap().read(&current_block, &mut page);
-        let boundary = page.get_int(0) as usize;
+        let mut page = WalPage::new();
+        file_manager
+            .lock()
+            .unwrap()
+            .read_raw(&current_block, page.bytes_mut());
+        let boundary = page.boundary();
 
         Self {
             file_manager,
@@ -11364,8 +11370,8 @@ impl LogIterator {
         self.file_manager
             .lock()
             .unwrap()
-            .read(&self.current_block, &mut self.page);
-        self.boundary = self.page.get_int(0) as usize;
+            .read_raw(&self.current_block, self.page.bytes_mut());
+        self.boundary = self.page.boundary();
         self.current_pos = self.boundary;
     }
 }
@@ -11374,20 +11380,22 @@ impl Iterator for LogIterator {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_pos >= self.file_manager.lock().unwrap().block_size() {
-            if self.current_block.block_num == 0 {
-                return None; //  no more blocks
+        loop {
+            if self.current_pos >= self.page.capacity() {
+                if self.current_block.block_num == 0 {
+                    return None; // no more blocks
+                }
+                self.current_block = BlockId {
+                    filename: self.current_block.filename.to_string(),
+                    block_num: self.current_block.block_num - 1,
+                };
+                self.move_to_block();
+                continue;
             }
-            self.current_block = BlockId {
-                filename: self.current_block.filename.to_string(),
-                block_num: self.current_block.block_num - 1,
-            };
-            self.move_to_block();
+            let (record, next_pos) = self.page.read_record(self.current_pos);
+            self.current_pos = next_pos;
+            return Some(record);
         }
-        //  Read the record
-        let record = self.page.get_bytes(self.current_pos);
-        self.current_pos += Page::INT_BYTES + record.len();
-        Some(record)
     }
 }
 
