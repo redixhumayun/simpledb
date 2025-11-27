@@ -9388,14 +9388,12 @@ mod transaction_tests {
             let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
             assert_eq!(buffer.pin_count(), 1);
 
-            #[cfg(debug_assertions)]
             txn.buffer_list.assert_pin_invariant(&block_id, 1);
         }
 
         // After handle is dropped, buffer should be unpinned
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
-        #[cfg(debug_assertions)]
         db.buffer_manager.assert_buffer_count_invariant();
     }
 
@@ -9450,7 +9448,6 @@ mod transaction_tests {
         // Even though handle still exists
         assert_eq!(db.buffer_manager.available(), 3);
 
-        #[cfg(debug_assertions)]
         db.buffer_manager.assert_buffer_count_invariant();
     }
 
