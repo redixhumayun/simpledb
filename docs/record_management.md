@@ -321,74 +321,84 @@ Offset +22..+23: nullmap_ptr (u16)// offset within payload
 
 ### RecordPage + Layout Integration
 
-Once the Page owns the physical concerns (line pointers, heap management, redirects), the existing `RecordPage` layer can shift to a thin logical wrapper:
+```
+┌─────────────────────┐
+│ TableScan / Executor│  (asks for “row i, column name”)
+└────────┬────────────┘
+         │ uses
+┌────────▼─────────┐
+│    RecordPage    │  (maps RID.slot → slot index, manages block iteration)
+└────────┬─────────┘
+         │ builds
+┌────────▼────────┐
+│ PageView / Page │  (wraps PageRead/WriteGuard, checks PageType)
+│ ViewMut         │
+└────────┬────────┘
+         │ hands out
+┌────────▼────────┐
+│  LogicalRow     │  (header + payload slice + Layout reference)
+└────────┬────────┘
+         │ consults
+┌────────▼────────┐
+│    Layout       │  (schema metadata → offsets/types)
+└────────┬────────┘
+         │ produces
+┌────────▼────────┐
+│ RowValues/      │  (Vec<Constant> lazily deserialized)
+│ Constant        │
+└─────────────────┘
+```
 
-1. **RID → LinePtr:** Higher layers still identify tuples via `RID { block_num, slot }`. `RecordPage` pins the page, fetches the slot’s line pointer, follows any HOT redirects, and obtains `(offset, length)`.
-2. **LinePtr → HeapTuple:** Using the offset/length, `RecordPage` asks `Page::tuple(slot)` for a `HeapTuple` view (header + payload slice). Page never touches schema-specific details; it just vouches for the bytes.
-3. **HeapTuple → LogicalRow:** `Layout` (which already owns schema + per-column definitions) now interprets the tuple payload. It knows where the null bitmap sits (`nullmap_ptr`), which columns are fixed-width vs. varlen, and how to decode them. The result is a `LogicalRow` (or similarly named view) that exposes typed getters without exposing raw bytes.
-4. **Lazy decoding:** A `LogicalRow` can delay actual deserialization until a caller requests a column. It keeps references to the `HeapTuple` slice plus the `Layout`. When `row.get_string("name")` runs, the layout consults the null bitmap to see if column 1 is NULL, and only then reads the length prefix + string bytes. This keeps scans cheap when a plan only touches a subset of columns.
+Once the new page layout from `src/page.rs` replaces the legacy `Page` type, each `BufferFrame` will store a single monomorphic `PageBytes = Page<RawPage>`, where `RawPage` is a zero-sized `PageKind` used only for storage (its allocator/iterator are no-ops). `PageView<'_, K>` then reinterprets those bytes as `Page<K>` after checking the on-disk `PageType`. With that in place, `RecordPage` becomes a thin logical shim:
 
-**Responsibilities by layer:**
+1. **RID.slot → slot index:** `RID { block_num, slot }` already stores the line-pointer index. `RecordPage` pins the block, hands the slot number to the page API, and never re-computes offsets manually.
+2. **Slot → `PageView`:** `Transaction::get_*`/`set_*` return `PageReadGuard`/`PageWriteGuard`, which own a `RwLock*Guard<PageBytes>`. `RecordPage` wraps those guards in `PageView<'_, HeapPage>` / `PageViewMut<'_, HeapPage>`. The constructor checks `PageBytes.header.page_type == PageType::Heap` and then (via a zero-cost cast—`Page<RawPage>` and `Page<HeapPage>` have identical layouts) exposes heap-specific helpers. Other page kinds (index leaf/internal, overflow) get their own `PageView<'_, K>` wrappers.
+3. **`PageView` → `LogicalRow`:** `PageView::tuple(slot)` walks the line pointer, follows any redirect, and returns a `LogicalRow<'_>` (header slice + payload slice + reference to the `Layout`). No schema knowledge lives inside `PageView`.
+4. **`LogicalRow` → typed value:** `LogicalRow::get("col")` consults `Layout` to find the field offset/type, checks the tuple’s null bitmap, and returns a `Constant` (`Int(i32)`, `String(String)`, …). Values are decoded lazily: nothing is deserialized until a caller asks for that column. For updates, `LogicalRowMut` produces a `RowValues` (alias for `Vec<Constant>`) which `Layout` re-encodes into bytes before writing back via `PageViewMut`.
 
-- *Page:* slot allocation, freelist management, redirects, tuple byte access. No schema awareness.
-- *RecordPage:* wraps a page and current block id to expose CRUD + iteration in terms of `RID`s. Handles redirect chasing, delegating tuple decoding to Layout.
-- *Layout:* serializes/deserializes a tuple payload given a schema. Provides helpers like `encode_row(&RowValues) -> Vec<u8>` and `decode_field(HeapTuple, column_idx) -> Value` using the null bitmap + per-column offsets.
+Migration steps for this layer:
 
-### Buffer/Transaction Integration & Page Guards
+1. **Typed views:** implement `PageView<'_, K>` / `PageViewMut<'_, K>` on top of the existing guards, including the header check + unsafe cast.
+2. **RecordPage/TableScan refactor:** rewrite `RecordPage::get_*`/`set_*`, TableScan, and recovery code to use `PageView` + `LogicalRow` instead of manual offsets.
+3. **Adopt new layout:** point `BufferFrame` at `Page<RawPage>` from `src/page.rs`, enabling tuple headers, freelists, and compaction.
+4. **Cleanup & tighten locks:** once everything flows through views, prune transitional helpers, revisit lock-table scope, and tighten the public surface of `BufferHandle` / `BufferFrame`.
 
-- **Coarse buffer lock stays (for now):** each `BufferFrame` continues to sit behind a single `Mutex`. That mutex protects frame metadata (pin count, replacement list links, dirty bits) *and* provides safety while the new APIs are wired up. We’ll refine later, but nothing else in the system needs to change yet.
-- **PageGuard abstraction:** introduce a guard object that:
-  1. Pins a block (RAII via the existing `BufferHandle`).
-  2. Acquires the per-page latch stored in `PageHeader::latch_word` (shared for readers, exclusive for writers).
-  3. Uses internal `unsafe` plumbing to reinterpret the frame’s bytes as `Page<HeapPage>` and exposes a safe wrapper (`PageView`) with the full tuple API.
-  4. Releases the latch and unpins on `Drop`.
-- **Concurrency semantics:** page latches enforce access: multiple `PageGuard`s can hold shared (read) latches simultaneously, but only one guard may hold the exclusive (write) latch. The borrow checker can then trust that any method returning `&mut PageView` really has exclusive access because it’s tied to the guard’s lifetime + latch token.
-- **RecordPage / Transaction usage:** higher layers stop calling `tx.get_int`/`set_string`. Instead they request `PageGuard`s (read or write) from the transaction, operate via the safe `PageView` API, and drop the guard when done.
-- **Why unsafe is contained:** All `unsafe` stays inside the guard implementation (where we pull raw pointers out of the frame). Consumers only see a safe API that mirrors Rust’s borrowing rules, with the latch providing the runtime guarantee that those rules aren’t violated.
+**Layer responsibilities:**
 
-High-level sketch:
+- *Page (physical):* slot allocation, freelist, redirects, heap compaction. Page is schema-agnostic.
+- *PageView/PageViewMut:* borrow a pinned, latched page and reinterpret the bytes as the requested page kind (heap, index leaf, …). Provide safe tuple/slot routines.
+- *RecordPage:* map `RID`s to slots, manage block iteration, coordinate locking by asking the transaction for read/write guards, and hand out `LogicalRow`s.
+- *Layout:* owns schema metadata (`FieldType`, lengths, nullability). Converts between `RowValues = Vec<Constant>` and the on-page tuple bytes, consulting the tuple header (payload length, nullmap pointer) provided by `LogicalRow`.
+
+Layout should expose a helper that returns both the column index (position in `schema.fields`) and its `FieldInfo`:
 
 ```rust
-pub enum LatchMode {
-    Shared,
-    Exclusive,
-}
-
-pub struct PageGuard<'a, K: PageKind> {
-    handle: BufferHandle,     // pins/unpins via Drop
-    latch: PageLatchToken,    // releases latch on Drop
-    page: PageView<'a, K>,    // safe wrapper exposing Page API
-}
-
-impl<'a, K: PageKind> PageGuard<'a, K> {
-    pub fn pin(
-        txn: Arc<Transaction>,
-        block_id: BlockId,
-        mode: LatchMode,
-    ) -> Result<Self, Error> {
-        let handle = BufferHandle::new(block_id.clone(), txn.clone());
-        let frame = txn.buffer_manager.lookup(&block_id)?; // Arc<Mutex<BufferFrame>>
-        let bytes = frame.borrow_bytes()?;                 // grabs &mut [u8] under the mutex
-        drop(frame);                                       // release coarse lock immediately
-        let latch = latch_page(bytes, mode)?;              // CAS/spin on PageHeader::latch_word
-        let page = PageView::new(bytes);                   // wraps raw ptr with lifetime marker
-        Ok(PageGuard { handle, latch, page })
-    }
-
-    pub fn page(&mut self) -> &mut PageView<'_, K> {
-        &mut self.page
-    }
-}
-
-impl<'a, K: PageKind> Drop for PageGuard<'a, K> {
-    fn drop(&mut self) {
-        self.latch.release();
-        // BufferHandle’s Drop automatically unpins
+impl Layout {
+    fn field_info(&self, field: &str) -> Option<(usize, &FieldInfo)> {
+        let idx = self.schema.fields.iter().position(|f| f == field)?;
+        let info = self.schema.info.get(field)?;
+        Some((idx, info))
     }
 }
 ```
 
-`PageView<'a, K>` is a thin wrapper that implements `Deref<Target = Page<K>>` / `DerefMut`, using `unsafe` inside to reinterpret the buffer bytes once the latch guarantees exclusivity.
+That index lets `LogicalRow` check the tuple’s null bitmap, whose bits follow schema order.
+
+See “Design Details → RecordPage + Layout Integration” for detailed `LogicalRow` / `LogicalRowMut` examples.
+
+### Buffer/Transaction Integration & Page Guards
+
+- **Current state:** `BufferFrame` stores `meta: Mutex<FrameMeta>` + `page: RwLock<PageBytes = Page<RawPage>>`. `Transaction::pin_*_guard` returns `PageReadGuard`/`PageWriteGuard` that own the handle, frame `Arc`, and `RwLock` guard; higher layers already use these guards exclusively.
+- **Typed view construction:** `PageView::for_heap(guard)` (and siblings for other page kinds) checks `guard.page.header.page_type`, then builds a newtype around the guard that exposes `Page<HeapPage>`’s helpers. Because `Page<RawPage>` and `Page<HeapPage>` differ only by `PhantomData`, the conversion is a zero-cost cast guarded by the runtime header check. All unsafe code lives inside these constructors.
+  See “Design Details → RecordPage + Layout Integration” for the concrete `PageReadGuard` / `PageView` implementation.
+- **Usage pattern:**
+  1. TableScan/RecordPage request a read or write guard from the transaction.
+  2. Wrap the guard in `PageView<'_, HeapPage>` / `PageViewMut<'_, HeapPage>`.
+  3. Call heap-specific APIs (`tuple`, `allocate_tuple`, `compact`) to obtain or update `LogicalRow`/`RowValues`.
+  4. `LogicalRow` exposes lazy `Constant` getters; `Layout` handles serialization/deserialization.
+- **Next milestones:** wire `BufferFrame` to the `Page<RawPage>` definition from `src/page.rs`, implement the `PageView` constructors + tuple iterators, and migrate RecordPage/TableScan onto the `LogicalRow` API. Once everything flows through views, we can revisit lock-table scope and shrink the public surface of `BufferHandle`.
+
+High-level sketch: see “Design Details → RecordPage + Layout Integration” for code snippets of `PageReadGuard`, `PageView`, `LogicalRow`, and `LogicalRowMut`.
 
 ### Locking Strategy & Migration Plan
 
@@ -402,19 +412,14 @@ impl<'a, K: PageKind> Drop for PageGuard<'a, K> {
 - If we’re fine with classic shared/exclusive guards, we can wrap the page bytes in `RwLock<PageBytes>` and hand out `PageReadGuard`/`PageWriteGuard` without any seqlock logic. This keeps everything in safe Rust (no raw pointers) at the cost of a per-frame lock object.
 
 #### Phased rollout
-1. **Introduce helpers:** keep `Arc<Mutex<BufferFrame>>` but add `FrameMeta` + helper methods (`with_meta`, `with_page_access`) so callers stop poking fields directly.
-2. **Migrate users:** update BufferManager, replacement policy, and intrusive DLL code to use the helpers; behavior unchanged because the outer mutex still serializes everything.
-   - 2a. Convert `buffer_pool` entries to `Arc<BufferFrame>` with internal `meta: Mutex<FrameMeta>` and `page: RwLock<PageBytes>`, keeping the public API shape intact during the swap.
-   - 2b. Update pin/unpin, eviction, and replacement-policy codepaths to lock only `meta` or `page` as needed, ensuring statistics and `BufferHandle` semantics remain unchanged.
-   - 2c. Teach transactional callers (`Transaction::get_int/set_*`, `RecordPage`, recovery) to acquire the appropriate read/write guard from the frame instead of taking a coarse mutex.
-   - 2d. Re-run the full AGENTS.md test + benchmark matrix (all feature-flag combinations) with explicit command-level timeouts to catch deadlocks introduced by the split before moving on.
-3. **Split locks:** replace the outer `Mutex<BufferFrame>` with `Arc<BufferFrame>` containing `meta: Mutex<FrameMeta>` plus `page: RwLock<PageBytes>`. Helpers now lock the specific primitive they need.
-4. **Add `PageReadGuard` / `PageWriteGuard`:** wrap the `RwLock` guards + pin token; expose new `Transaction::pin_read/pin_write` APIs that return these guards (legacy `get_*` delegate internally during the transition).
-5. **Refactor RecordPage/TableScan:** switch to guard-based access + Layout decoding; delete the old offset-based helpers.
+1. **Split locks (done):** `BufferFrame` already uses `meta: Mutex<FrameMeta>` + `page: RwLock<PageBytes>`; pin/unpin/replacement codepaths lock only what they mutate.
+2. **Guard-only access (done):** `Transaction::pin_read_guard` / `pin_write_guard` are the sole entry points to page bytes. Legacy helpers such as `with_page` have been removed.
+3. **Typed views (next):** layer `PageView<'_, K>` / `PageViewMut<'_, K>` on top of the guards. These check `PageHeader::page_type`, reinterpret `Page<RawPage>` as `Page<K>`, and expose heap/index helpers.
+4. **Record layer refactor:** migrate `RecordPage`, TableScan, recovery, and executor nodes to operate on `LogicalRow`/`RowValues` via `PageView`, eliminating manual offset math.
+5. **Adopt new layout everywhere:** replace the legacy `Page` used in `BufferFrame` with `Page<RawPage>` from `src/page.rs`, enabling tuple headers, freelists, and compaction.
+6. **Cleanup & tighten locks:** once everything flows through `PageView`, prune transitional code, revisit lock-table scope, and shrink the public surface of `BufferHandle`/`BufferFrame`.
 
-This staging keeps the code compiling/testable at each step and makes it clear where unsafe code (if any) is isolated.
-
-With this split, TableScan / executor nodes only interact with `RecordPage` and `LogicalRow` abstractions. They never calculate offsets or manage line pointers; Page keeps physical invariants, Layout keeps schema semantics, and RecordPage stitches them together.
+This keeps the code compiling/testable at each step while isolating unsafe logic inside the guard/view constructors.
 
 ---
 
@@ -517,35 +522,162 @@ impl Page {
 }
 ```
 
-### RecordPage Integration
-
-RecordPage will use the new Page API:
+### Buffer/Transaction Integration & Page Guards (Detailed)
 
 ```rust
-impl RecordPage {
-    fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
-        let handle = tx.pin(&block_id);
+struct RawPage;
 
-        if tx.block_size() == handle.page().header.free_ptr {
-            handle.page().init_heap_page();
+impl PageKind for RawPage {
+    const PAGE_TYPE: PageType = PageType::Heap; // unused placeholder
+    type Alloc<'a> = (); type Iter<'a> = std::iter::Empty<TupleRef<'a>>;
+    fn allocator<'a>(_: &'a mut Page<Self>) -> Self::Alloc<'a> { () }
+    fn iterator<'a>(_: &'a mut Page<Self>) -> Self::Iter<'a> { std::iter::empty() }
+}
+
+type PageBytes = Page<RawPage>;
+
+pub struct BufferFrame {
+    meta: Mutex<FrameMeta>,
+    page: RwLock<PageBytes>,
+    // ...
+}
+
+pub struct PageReadGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockReadGuard<'a, PageBytes>,
+}
+
+impl Drop for PageReadGuard<'_> {
+    fn drop(&mut self) {
+        // RwLock guard drops; BufferHandle’s Drop unpins
+    }
+}
+```
+
+`PageBytes = Page<RawPage>` is the type-erased page stored in every frame. It contains the header, line pointers, and record space; the only difference between `Page<RawPage>` and `Page<HeapPage>` is the `PhantomData<K>`, so we can reinterpret the bytes at runtime after checking `header.page_type`. The `PageView` / `PageViewMut` snippets above show how the guard is wrapped and cast to expose heap-specific APIs.
+
+### RecordPage + Layout Integration (Detailed)
+
+```rust
+pub struct PageReadGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockReadGuard<'a, PageBytes>,
+}
+
+impl Drop for PageReadGuard<'_> {
+    fn drop(&mut self) {
+        // RwLock guard drops first; BufferHandle’s Drop unpins automatically
+    }
+}
+
+pub struct PageView<'a, K: PageKind> {
+    guard: PageReadGuard<'a>,
+    page_ref: &'a Page<K>,
+}
+
+impl<'a> PageView<'a, HeapPage> {
+    pub fn new(guard: PageReadGuard<'a>) -> Result<Self, Error> {
+        if guard.page.header.page_type != PageType::Heap {
+            return Err(Error::WrongPageKind);
         }
-
-        Self { tx, handle, layout }
+        let raw_ptr = &*guard.page as *const Page<RawPage> as *const Page<HeapPage>;
+        let page_ref = unsafe { &*raw_ptr };
+        Ok(Self { guard, page_ref })
     }
 
-    fn insert_after(&self, slot: Option<usize>) -> Result<usize, Error> {
-        let tuple_bytes = self.layout.build_tuple_buffer(/* fields */);
-        let new_slot = self
-            .handle
-            .page()
-            .allocate_tuple(&tuple_bytes)?;
-        self.write_record_at(new_slot, tuple_bytes);
+    pub fn tuple(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
+        HeapPage::tuple(self.page_ref, slot, &self.layout)
+    }
+}
+```
 
-        Ok(new_slot)
+```rust
+pub struct PageWriteGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockWriteGuard<'a, PageBytes>,
+}
+
+pub struct PageViewMut<'a, K: PageKind> {
+    guard: PageWriteGuard<'a>,
+    page_mut: &'a mut Page<K>,
+}
+
+impl<'a> PageViewMut<'a, HeapPage> {
+    pub fn new(guard: PageWriteGuard<'a>) -> Result<Self, Error> {
+        if guard.page.header.page_type != PageType::Heap {
+            return Err(Error::WrongPageKind);
+        }
+        let raw_ptr = &mut *guard.page as *mut Page<RawPage> as *mut Page<HeapPage>;
+        let page_mut = unsafe { &mut *raw_ptr };
+        Ok(Self { guard, page_mut })
     }
 
-    fn is_slot_used(&self, slot: usize) -> bool {
-        self.handle.page().line_ptr_state(slot) == Some(LineState::Live)
+    pub fn tuple_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
+        HeapPage::tuple_mut(self.page_mut, slot, &self.layout)
+    }
+}
+```
+
+```rust
+pub struct LogicalRow<'a> {
+    header: &'a HeapTupleHeader,
+    payload: &'a [u8],
+    layout: &'a Layout,
+}
+
+impl<'a> LogicalRow<'a> {
+    pub fn new(tuple: TupleRef<'a>, layout: &'a Layout) -> Self {
+        Self {
+            header: tuple.header(),
+            payload: tuple.payload(),
+            layout,
+        }
+    }
+
+    pub fn get(&self, field: &str) -> Option<Constant> {
+        let (idx, field_info) = self.layout.field_info(field)?;
+        if self.header.is_null(idx) {
+            return Some(Constant::Null);
+        }
+        let offset = self.layout.offset(field)?;
+        match field_info.field_type {
+            FieldType::Int => Some(Constant::Int(self.payload[offset..].read_i32())),
+            FieldType::String => {
+                let len = self.payload[offset..].read_u16() as usize;
+                let bytes = &self.payload[offset + 2..offset + 2 + len];
+                Some(Constant::String(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        }
+    }
+}
+```
+
+```rust
+pub struct LogicalRowMut<'a> {
+    page: PageViewMut<'a, HeapPage>,
+    slot: SlotId,
+    layout: &'a Layout,
+}
+
+impl<'a> LogicalRowMut<'a> {
+    pub fn get(&self, field: &str) -> Option<Constant> {
+        let view = self.page.as_read_view();
+        let tuple = view.tuple(self.slot)?;
+        LogicalRow::new(tuple, self.layout).get(field)
+    }
+
+    pub fn set(&mut self, field: &str, value: Constant) -> Result<(), Error> {
+        let mut values = self.materialize()?;
+        values[self.layout.index(field)?] = value;
+        let bytes = self.layout.encode_row(&values)?;
+        self.page.overwrite_tuple(self.slot, &bytes)
+    }
+
+    fn materialize(&self) -> Result<RowValues, Error> {
+        // reuse LogicalRow + PageView to deserialize lazily
     }
 }
 ```
