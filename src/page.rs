@@ -558,6 +558,82 @@ impl PageKind for RawPage {
 /// Type alias for a page image whose kind is not yet known at the IO boundary.
 pub type PageBytes = Page<RawPage>;
 
+/// Write-ahead log pages use a simple "boundary pointer + payload" format that is
+/// unrelated to heap/index layouts. They only need to manage raw bytes.
+#[derive(Debug)]
+pub struct WalPage {
+    data: Vec<u8>,
+}
+
+impl WalPage {
+    pub const HEADER_BYTES: usize = 4;
+
+    pub fn new() -> Self {
+        let mut page = Self {
+            data: vec![0u8; PAGE_SIZE_BYTES as usize],
+        };
+        page.reset();
+        page
+    }
+
+    pub fn reset(&mut self) {
+        self.data.fill(0);
+        self.set_boundary(self.data.len());
+    }
+
+    pub fn boundary(&self) -> usize {
+        let mut buf = [0u8; Self::HEADER_BYTES];
+        buf.copy_from_slice(&self.data[..Self::HEADER_BYTES]);
+        i32::from_be_bytes(buf) as usize
+    }
+
+    pub fn set_boundary(&mut self, offset: usize) {
+        assert!(
+            offset <= self.data.len(),
+            "boundary cannot exceed page capacity"
+        );
+        let value = i32::try_from(offset).expect("boundary offset must fit in i32");
+        self.data[..Self::HEADER_BYTES].copy_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Record payloads are stored as `[len:u32][bytes...]`.
+    pub fn write_record(&mut self, dest: usize, bytes: &[u8]) {
+        let payload_len =
+            u32::try_from(bytes.len()).expect("record larger than u32::MAX is unsupported");
+        let start = dest;
+        let end = dest + Self::HEADER_BYTES + bytes.len();
+        assert!(
+            end <= self.data.len(),
+            "record does not fit in WAL page buffer"
+        );
+        self.data[start..start + Self::HEADER_BYTES].copy_from_slice(&payload_len.to_be_bytes());
+        self.data[start + Self::HEADER_BYTES..end].copy_from_slice(bytes);
+    }
+
+    pub fn read_record(&self, src: usize) -> (Vec<u8>, usize) {
+        let mut len_buf = [0u8; Self::HEADER_BYTES];
+        len_buf.copy_from_slice(&self.data[src..src + Self::HEADER_BYTES]);
+        let length = u32::from_be_bytes(len_buf) as usize;
+        let start = src + Self::HEADER_BYTES;
+        let end = start + length;
+        assert!(end <= self.data.len(), "record length exceeds WAL page");
+        let bytes = self.data[start..end].to_vec();
+        (bytes, end)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
 impl<'a> PageAllocator<'a> for () {
     type Output = SlotId;
     fn insert(&mut self, _bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
@@ -1047,6 +1123,20 @@ mod page_tests {
             TupleRef::Live(tuple) => assert_eq!(tuple.payload(), payload.as_slice()),
             _ => panic!("expected live tuple"),
         }
+    }
+
+    #[test]
+    fn wal_page_round_trip() {
+        let mut wal = WalPage::new();
+        let record = vec![1u8, 2, 3, 4, 5];
+
+        let start = wal.boundary() - (WalPage::HEADER_BYTES + record.len());
+        wal.write_record(start, &record);
+        wal.set_boundary(start);
+
+        let (loaded, next_pos) = wal.read_record(start);
+        assert_eq!(loaded, record);
+        assert_eq!(next_pos, start + WalPage::HEADER_BYTES + record.len());
     }
 
     fn heap_tuple_bytes(payload: &[u8]) -> Vec<u8> {
