@@ -8984,7 +8984,7 @@ mod transaction_tests {
 
         //  Start a transaction t1 that will set an int and a string
         let t1 = test_db.new_tx();
-        let block_id = BlockId::new(file.to_string(), 1);
+        let block_id = t1.append(&file);
         t1.pin_internal(&block_id);
         t1.set_int(&block_id, 80, 1, false).unwrap();
         t1.set_string(&block_id, 40, "one", false).unwrap();
@@ -9024,7 +9024,10 @@ mod transaction_tests {
         let file = generate_filename();
 
         let (test_db, _test_dir) = SimpleDB::new_for_test(10, 5000);
-        let block_id = BlockId::new(file.to_string(), 1);
+        let block_id = {
+            let txn = test_db.new_tx();
+            txn.append(&file)
+        };
 
         let fm1 = Arc::clone(&test_db.file_manager);
         let lm1 = Arc::clone(&test_db.log_manager);
@@ -9075,7 +9078,10 @@ mod transaction_tests {
         let file = generate_filename();
 
         let (test_db, _test_dir) = SimpleDB::new_for_test(10, 5000);
-        let block_id = BlockId::new(file.to_string(), 1);
+        let block_id = {
+            let txn = test_db.new_tx();
+            txn.append(&file)
+        };
 
         // Initialize data before spawning threads
         let init_txn = Arc::new(Transaction::new(
@@ -9151,7 +9157,10 @@ mod transaction_tests {
     fn test_transaction_rollback() {
         let file = generate_filename();
         let (test_db, _test_dir) = SimpleDB::new_for_test(3, 5000);
-        let block_id = BlockId::new(file.clone(), 1);
+        let block_id = {
+            let txn = test_db.new_tx();
+            txn.append(&file)
+        };
 
         // Setup initial state
         let t1 = Arc::new(Transaction::new(
@@ -9201,7 +9210,10 @@ mod transaction_tests {
     fn test_transaction_isolation_with_concurrent_writes() {
         let file = generate_filename();
         let (test_db, _test_dir) = SimpleDB::new_for_test(3, 500);
-        let block_id = BlockId::new(file.clone(), 1);
+        let block_id = {
+            let txn = test_db.new_tx();
+            txn.append(&file)
+        };
         let num_of_txns = 2;
         let max_retry_count = 150;
 
@@ -9330,8 +9342,8 @@ mod transaction_tests {
         let file = generate_filename();
         let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
 
-        //  Phase 1: Create and populate database and then drop it
-        {
+        let block_id = {
+            //  Phase 1: Create and populate database and then drop it
             let db = SimpleDB::new(&dir, 3, true, 100);
             let t1 = Arc::new(Transaction::new(
                 Arc::clone(&db.file_manager),
@@ -9339,12 +9351,14 @@ mod transaction_tests {
                 Arc::clone(&db.buffer_manager),
                 Arc::clone(&db.lock_table),
             ));
-            let block_id = BlockId::new(file.clone(), 1);
+            let block_id = t1.append(&file);
             t1.pin_internal(&block_id);
             t1.set_int(&block_id, 80, 100, true).unwrap();
             t1.commit().unwrap();
-        }
+            block_id
+        };
 
+        //  Phase 1: Create and populate database and then drop it
         //  Phase 2: Recover and verify
         {
             let db = SimpleDB::new(&dir, 3, false, 100);
@@ -9356,7 +9370,6 @@ mod transaction_tests {
             ));
             t2.recover().unwrap();
 
-            let block_id = BlockId::new(file.clone(), 1);
             t2.pin_internal(&block_id);
             assert_eq!(t2.get_int(&block_id, 80).unwrap(), 100);
         }
