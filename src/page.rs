@@ -1,9 +1,6 @@
-use std::{error::Error, marker::PhantomData, mem::size_of, ops::Deref, sync::Arc};
+use std::{error::Error, marker::PhantomData, mem::size_of};
 
-use crate::{
-    BlockId, BufferHandle, Constant, FieldInfo, FieldType, Layout, PageReadGuard, PageWriteGuard,
-    Schema, Transaction,
-};
+use crate::{Constant, FieldInfo, FieldType, Layout, PageReadGuard, PageWriteGuard};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -899,6 +896,18 @@ impl<K: PageKind> Page<K> {
     }
 }
 
+impl Page<HeapPage> {
+    fn heap_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
+        let bytes = self.tuple_bytes(slot)?;
+        Some(HeapTuple::from_bytes(bytes))
+    }
+
+    fn heap_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
+        let bytes = self.tuple_bytes_mut(slot)?;
+        Some(HeapTupleMut::from_bytes(bytes))
+    }
+}
+
 // Temporary compatibility helpers for legacy callers that treated a page as a raw byte buffer.
 // These operate directly on the backing record_space and use big-endian encoding to match the
 // previous `Page` in main.rs. Intended primarily for RawPage during migration.
@@ -1445,9 +1454,7 @@ impl<'a> PageView<'a, HeapPage> {
     }
 
     fn tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
-        let bytes = self.guard.tuple_bytes(slot)?;
-        let heap_tuple = HeapTuple::from_bytes(bytes);
-        Some(heap_tuple)
+        self.page_ref.heap_tuple(slot)
     }
 
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
@@ -1476,10 +1483,17 @@ impl<'a> PageViewMut<'a, HeapPage> {
         })
     }
 
+    fn tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
+        self.page_ref.heap_tuple(slot)
+    }
+
     fn tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
-        let bytes = self.guard.tuple_bytes_mut(slot)?;
-        let heap_tuple_mut = HeapTupleMut::from_bytes(bytes);
-        Some(heap_tuple_mut)
+        self.page_ref.heap_tuple_mut(slot)
+    }
+
+    pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
+        let heap_tuple = self.tuple(slot)?;
+        Some(LogicalRow::new(heap_tuple, self.layout))
     }
 
     pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
