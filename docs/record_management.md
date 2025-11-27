@@ -877,3 +877,10 @@ Visual:
 ```
 
 This structured format provides the foundation for efficient record management in SimpleDB.
+
+---
+
+**Status Note (2025-11-27): Remaining migration steps**
+- Add typed page guards (`PageView<'_, K>` / `PageViewMut<'_, K>`) so `Transaction` stops exposing raw `Page<RawPage>` and every caller goes through page-type checks.
+- Port `RecordPage`, TableScan, and executor nodes to the heap-page API (slot IDs, tuple headers, redirects) and introduce `LogicalRow`/`LogicalRowMut` so no one computes offsets manually.
+- Once runtime code uses the new layout, update `RecoveryManager`/`LogRecord` to log slot-level changes via the same page APIs, keeping WAL replay in sync with the physical format.
