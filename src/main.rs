@@ -7212,7 +7212,7 @@ impl IndexManager {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IndexInfo {
     index_name: String,
     field_name: String,
@@ -8759,7 +8759,6 @@ impl TxIdGenerator {
 
 static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
-#[derive(Debug)]
 pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
@@ -8978,7 +8977,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_single_threaded() {
         let file = generate_filename();
-        
+
         let (test_db, _test_dir) = SimpleDB::new_for_test(3, 5000);
 
         //  Start a transaction t1 that will set an int and a string
@@ -9021,7 +9020,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_multi_threaded_single_reader_single_writer() {
         let file = generate_filename();
-        
+
         let (test_db, _test_dir) = SimpleDB::new_for_test(10, 5000);
         let block_id = BlockId::new(file.to_string(), 1);
 
@@ -9072,7 +9071,7 @@ mod transaction_tests {
     #[test]
     fn test_transaction_multi_threaded_multiple_readers_single_writer() {
         let file = generate_filename();
-        
+
         let (test_db, _test_dir) = SimpleDB::new_for_test(10, 5000);
         let block_id = BlockId::new(file.to_string(), 1);
 
@@ -9840,7 +9839,6 @@ impl ConcurrencyManager {
 
 /// The container for the recovery manager - a [`Transaction`] uses a unique instance of this to
 /// manage writing records to WAL and handling recovery & rollback
-#[derive(Debug)]
 struct RecoveryManager {
     tx_num: usize,
     log_manager: Arc<Mutex<LogManager>>,
@@ -10170,9 +10168,8 @@ impl TryInto<Vec<u8>> for &LogRecord {
     type Error = Box<dyn Error>;
 
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        let size = self.calculate_size();
         let int_value = self.discriminant();
-        let mut page = Page::new(size);
+        let mut page = Page::new();
         let mut pos = 0;
         page.set_int(pos, int_value as i32);
         pos += 4;
@@ -10220,7 +10217,9 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 page.set_string(pos, old_val);
             }
         }
-        Ok(page.contents)
+        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -10228,7 +10227,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
     type Error = Box<dyn Error>;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        let page = Page::from_bytes(value);
+        let page = Page::from_bytes(&value)?;
         let mut pos = 0;
         let discriminant = page.get_int(pos);
         pos += 4;
@@ -10518,9 +10517,8 @@ mod buffer_list_tests {
     #[test]
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
-        let file_manager: super::SharedFS = Arc::new(Mutex::new(Box::new(
-            FileManager::new(&dir, true).unwrap(),
-        )));
+        let file_manager: super::SharedFS =
+            Arc::new(Mutex::new(Box::new(FileManager::new(&dir, true).unwrap())));
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -10608,13 +10606,12 @@ pub struct BufferFrame {
 
 impl BufferFrame {
     pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
-        let size = file_manager.lock().unwrap().block_size();
         #[cfg(feature = "replacement_clock")]
         let _ = index; // Suppress unused warning when only clock is enabled
         Self {
             file_manager,
             log_manager,
-            page: RwLock::new(Page::new(size)),
+            page: RwLock::new(Page::new()),
             meta: Mutex::new(FrameMeta::new(index)),
         }
     }
@@ -11097,7 +11094,7 @@ mod buffer_manager_tests {
 
         //  Initialize the file with enough data
         let block_id = BlockId::new("testfile".to_string(), 1);
-        let mut page = Page::new(400);
+        let mut page = Page::new();
         page.set_int(80, 1);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
 
@@ -11160,7 +11157,7 @@ mod buffer_manager_tests {
         // Pre-create blocks on disk
         for i in 0..num_blocks {
             let block_id = BlockId::new("stressfile".to_string(), i);
-            let mut page = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+            let mut page = Page::new();
             page.set_int(0, i as i32);
             db.file_manager.lock().unwrap().write(&block_id, &mut page);
         }
@@ -11248,7 +11245,7 @@ pub struct LogManager {
 impl LogManager {
     pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
         let bytes = vec![0; file_manager.lock().unwrap().block_size()];
-        let mut log_page = Page::from_bytes(bytes);
+        let mut log_page = Page::from_bytes(&bytes).unwrap();
         let log_size = file_manager.lock().unwrap().length(log_file.to_string());
         let current_block = if log_size == 0 {
             LogManager::append_new_block(&file_manager, log_file, &mut log_page)
@@ -11284,7 +11281,7 @@ impl LogManager {
         self.file_manager
             .lock()
             .unwrap()
-            .write(&self.current_block, &mut self.log_page);
+            .write(&self.current_block, &self.log_page);
 
         self.file_manager.lock().unwrap().sync(&self.log_file);
         self.file_manager.lock().unwrap().sync_directory();
@@ -11350,8 +11347,7 @@ pub struct LogIterator {
 
 impl LogIterator {
     pub fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
-        let block_size = file_manager.lock().unwrap().block_size();
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         file_manager.lock().unwrap().read(&current_block, &mut page);
         let boundary = page.get_int(0) as usize;
 
@@ -11489,77 +11485,15 @@ impl BlockId {
     }
 }
 
-/// The page struct that contains the contents of a page
-#[derive(Debug)]
-pub struct Page {
-    pub contents: Vec<u8>,
-}
-
-impl Page {
-    const INT_BYTES: usize = 4;
-
-    pub fn new(blocksize: usize) -> Self {
-        Self {
-            contents: vec![0; blocksize],
-        }
-    }
-
-    /// Create a new page from the given bytes
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self { contents: bytes }
-    }
-
-    /// Get an integer from the page at the given offset
-    fn get_int(&self, offset: usize) -> i32 {
-        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
-            .try_into()
-            .unwrap();
-        i32::from_be_bytes(bytes)
-    }
-
-    /// Set an integer at the given offset
-    pub fn set_int(&mut self, offset: usize, n: i32) {
-        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
-    }
-
-    /// Get a slice of bytes from the page at the given offset. Read the length and then the bytes
-    fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
-        let _length_bytes = &self.contents[offset..offset + Self::INT_BYTES];
-        let bytes: [u8; Self::INT_BYTES] = self.contents[offset..offset + Self::INT_BYTES]
-            .try_into()
-            .unwrap();
-        let length = u32::from_be_bytes(bytes) as usize;
-        offset += Self::INT_BYTES;
-        self.contents[offset..offset + length].to_vec()
-    }
-
-    /// Set a slice of bytes at the given offset. Write the length and then the bytes
-    fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
-        let length = bytes.len() as u32;
-        let _length_bytes = length.to_be_bytes();
-        self.contents[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
-        offset += Self::INT_BYTES;
-        self.contents[offset..offset + bytes.len()].copy_from_slice(bytes);
-    }
-
-    /// Get a string from the page at the given offset
-    fn get_string(&self, offset: usize) -> String {
-        let bytes = self.get_bytes(offset);
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// Set a string at the given offset
-    fn set_string(&mut self, offset: usize, string: &str) {
-        self.set_bytes(offset, string.as_bytes());
-    }
-}
+/// Page backed by the new layout; alias to the RawPage bytes type.
+pub type Page = crate::page::PageBytes;
 
 #[cfg(test)]
 mod page_tests {
     use super::*;
     #[test]
     fn test_page_int_operations() {
-        let mut page = Page::new(4096);
+        let mut page = Page::new();
         page.set_int(100, 4000);
         assert_eq!(page.get_int(100), 4000);
 
@@ -11572,7 +11506,7 @@ mod page_tests {
 
     #[test]
     fn test_page_string_operations() {
-        let mut page = Page::new(4096);
+        let mut page = Page::new();
         page.set_string(100, "Hello");
         assert_eq!(page.get_string(100), "Hello");
 
@@ -11586,7 +11520,7 @@ pub trait FileSystemInterface: std::fmt::Debug {
     fn block_size(&self) -> usize;
     fn length(&mut self, filename: String) -> usize;
     fn read(&mut self, block_id: &BlockId, page: &mut Page);
-    fn write(&mut self, block_id: &BlockId, page: &mut Page);
+    fn write(&mut self, block_id: &BlockId, page: &Page);
     fn append(&mut self, filename: String) -> BlockId;
     fn sync(&mut self, filename: &str);
     fn sync_directory(&mut self);
@@ -11662,35 +11596,41 @@ impl FileSystemInterface for FileManager {
             (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
         ))
         .unwrap();
-        match file.read_exact(&mut page.contents) {
+        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+        match file.read_exact(&mut buf) {
             Ok(_) => (),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                page.contents = vec![0; crate::page::PAGE_SIZE_BYTES as usize];
+                buf.fill(0);
             }
             Err(e) => panic!("Failed to read from file {e}"),
         }
+        *page = Page::from_bytes(&buf).expect("deserialize page");
     }
 
-    fn write(&mut self, block_id: &BlockId, page: &mut Page) {
+    fn write(&mut self, block_id: &BlockId, page: &Page) {
         let mut file = self.get_file(&block_id.filename);
         file.seek(io::SeekFrom::Start(
             (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
         ))
         .unwrap();
-        file.write_all(&page.contents).unwrap();
+        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut buf).expect("serialize page");
+        file.write_all(&buf).unwrap();
     }
 
     /// Append a new empty block to the file
     fn append(&mut self, filename: String) -> BlockId {
         let new_blk_num = self.length(filename.clone());
         let block_id = BlockId::new(filename.clone(), new_blk_num);
-        let buffer = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+        let buffer = Page::new();
         let mut file = self.get_file(&filename);
         file.seek(io::SeekFrom::Start(
             (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
         ))
-            .unwrap();
-        file.write_all(&buffer.contents).unwrap();
+        .unwrap();
+        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+        buffer.write_bytes(&mut buf).expect("serialize page");
+        file.write_all(&buf).unwrap();
         block_id
     }
 
@@ -11801,7 +11741,8 @@ mod mock_file_manager {
             }
 
             if !self.files.contains_key(&block_id.filename) {
-                page.contents.fill(0);
+                *page =
+                    Page::from_bytes(&vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]).unwrap();
                 return;
             }
 
@@ -11810,22 +11751,25 @@ mod mock_file_manager {
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
-                page.contents.copy_from_slice(&block.data);
+                *page = Page::from_bytes(&block.data).unwrap();
             } else {
-                page.contents.fill(0);
+                *page =
+                    Page::from_bytes(&vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]).unwrap();
             }
         }
 
-        fn write(&mut self, block_id: &BlockId, page: &mut Page) {
+        fn write(&mut self, block_id: &BlockId, page: &Page) {
             if self.crashed {
                 panic!("Cannot write to crashed file system");
             }
 
             self.ensure_block_exists(&block_id.filename, block_id.block_num);
             let file = self.files.get_mut(&block_id.filename).unwrap();
+            let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+            page.write_bytes(&mut buf).expect("serialize page");
 
             file.blocks[block_id.block_num] = MockBlock {
-                data: page.contents.clone(),
+                data: buf,
                 synced: false, // Write only goes to buffer, not synced
             };
         }
@@ -11924,7 +11868,7 @@ mod durability_tests {
     fn test_mock_filesystem_demonstrates_durability_flaw() {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
-        let mut page = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+        let mut page = Page::new();
         page.set_int(0, 42);
         page.set_string(4, "durability");
 
@@ -11935,7 +11879,7 @@ mod durability_tests {
         mock_fs.restore_from_crash();
 
         // Phase 2: Try to read data after crash. Data cannot be recovered.
-        let mut read_page = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+        let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
         let recovered_int = read_page.get_int(0);
@@ -11955,7 +11899,7 @@ mod durability_tests {
     fn test_mock_filesystem_with_sync_preserves_data() {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
-        let mut page = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+        let mut page = Page::new();
         page.set_int(0, 42);
         page.set_string(4, "durability");
 
@@ -11968,7 +11912,7 @@ mod durability_tests {
         mock_fs.restore_from_crash();
 
         // Phase 2: Read data after crash
-        let mut read_page = Page::new(crate::page::PAGE_SIZE_BYTES as usize);
+        let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
         let recovered_int = read_page.get_int(0);
@@ -11997,7 +11941,8 @@ mod offset_smoke_tests {
         let bm = Arc::clone(&db.buffer_manager);
 
         println!(
-            "num_available offset: 0x{:X}", core::mem::offset_of!(BufferManager, num_available)
+            "num_available offset: 0x{:X}",
+            core::mem::offset_of!(BufferManager, num_available)
         );
 
         // Get pointer to the actual BufferManager inside the Arc

@@ -583,7 +583,7 @@ pub struct Page<K: PageKind> {
 }
 
 impl<K: PageKind> Page<K> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             header: PageHeader::new(K::PAGE_TYPE),
             line_pointers: Vec::new(),
@@ -746,7 +746,8 @@ impl<K: PageKind> Page<K> {
         out.copy_from_slice(&self.record_space);
 
         // Header.
-        self.header.write_to_bytes(&mut out[..PAGE_HEADER_SIZE_BYTES as usize]);
+        self.header
+            .write_to_bytes(&mut out[..PAGE_HEADER_SIZE_BYTES as usize]);
 
         // Line pointers.
         let lp_bytes = self.line_pointers.len() * size_of::<u32>();
@@ -796,8 +797,7 @@ impl<K: PageKind> Page<K> {
 
         let mut header = header;
         let (_, upper) = header.free_bounds();
-        let computed_lower =
-            (PAGE_HEADER_SIZE_BYTES as usize + lp_count * 4) as u16;
+        let computed_lower = (PAGE_HEADER_SIZE_BYTES as usize + lp_count * 4) as u16;
         header.set_free_bounds(computed_lower, upper);
         header.set_slot_count(line_pointers.len() as u16);
 
@@ -813,8 +813,18 @@ impl<K: PageKind> Page<K> {
 // Temporary compatibility helpers for legacy callers that treated a page as a raw byte buffer.
 // These operate directly on the backing record_space and use big-endian encoding to match the
 // previous `Page` in main.rs. Intended primarily for RawPage during migration.
+impl std::fmt::Debug for Page<RawPage> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Page<RawPage>")
+            .field("header", &"PageHeader{...}")
+            .field("line_pointers_len", &self.line_pointers.len())
+            .field("record_space_len", &self.record_space.len())
+            .finish()
+    }
+}
+
 impl Page<RawPage> {
-    const INT_BYTES: usize = 4;
+    pub const INT_BYTES: usize = 4;
 
     pub fn get_int(&self, offset: usize) -> i32 {
         let bytes: [u8; Self::INT_BYTES] = self.record_space[offset..offset + Self::INT_BYTES]
@@ -839,8 +849,7 @@ impl Page<RawPage> {
 
     pub fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
         let length = bytes.len() as u32;
-        self.record_space[offset..offset + Self::INT_BYTES]
-            .copy_from_slice(&length.to_be_bytes());
+        self.record_space[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
         offset += Self::INT_BYTES;
         self.record_space[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
