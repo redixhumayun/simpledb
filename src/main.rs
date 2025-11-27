@@ -11521,6 +11521,8 @@ pub trait FileSystemInterface: std::fmt::Debug {
     fn length(&mut self, filename: String) -> usize;
     fn read(&mut self, block_id: &BlockId, page: &mut Page);
     fn write(&mut self, block_id: &BlockId, page: &Page);
+    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]);
+    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]);
     fn append(&mut self, filename: String) -> BlockId;
     fn sync(&mut self, filename: &str);
     fn sync_directory(&mut self);
@@ -11618,18 +11620,50 @@ impl FileSystemInterface for FileManager {
         file.write_all(&buf).unwrap();
     }
 
+    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
+        assert_eq!(
+            buf.len(),
+            crate::page::PAGE_SIZE_BYTES as usize,
+            "raw read buffer must be PAGE_SIZE_BYTES"
+        );
+        let mut file = self.get_file(&block_id.filename);
+        file.seek(io::SeekFrom::Start(
+            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
+        ))
+        .unwrap();
+        match file.read_exact(buf) {
+            Ok(_) => (),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                buf.fill(0);
+            }
+            Err(e) => panic!("Failed to read from file {e}"),
+        }
+    }
+
+    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
+        assert_eq!(
+            buf.len(),
+            crate::page::PAGE_SIZE_BYTES as usize,
+            "raw write buffer must be PAGE_SIZE_BYTES"
+        );
+        let mut file = self.get_file(&block_id.filename);
+        file.seek(io::SeekFrom::Start(
+            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
+        ))
+        .unwrap();
+        file.write_all(buf).unwrap();
+    }
+
     /// Append a new empty block to the file
     fn append(&mut self, filename: String) -> BlockId {
         let new_blk_num = self.length(filename.clone());
         let block_id = BlockId::new(filename.clone(), new_blk_num);
-        let buffer = Page::new();
         let mut file = self.get_file(&filename);
         file.seek(io::SeekFrom::Start(
             (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
         ))
         .unwrap();
-        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        buffer.write_bytes(&mut buf).expect("serialize page");
+        let buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
         file.write_all(&buf).unwrap();
         block_id
     }
@@ -11771,6 +11805,51 @@ mod mock_file_manager {
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf,
                 synced: false, // Write only goes to buffer, not synced
+            };
+        }
+
+        fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
+            if self.crashed {
+                panic!("Cannot read from crashed file system");
+            }
+            assert_eq!(
+                buf.len(),
+                crate::page::PAGE_SIZE_BYTES as usize,
+                "raw read buffer must be PAGE_SIZE_BYTES"
+            );
+
+            if !self.files.contains_key(&block_id.filename) {
+                buf.fill(0);
+                return;
+            }
+
+            self.ensure_block_exists(&block_id.filename, block_id.block_num);
+            let file = self.files.get(&block_id.filename).unwrap();
+
+            if block_id.block_num < file.blocks.len() {
+                let block = &file.blocks[block_id.block_num];
+                buf.copy_from_slice(&block.data);
+            } else {
+                buf.fill(0);
+            }
+        }
+
+        fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
+            if self.crashed {
+                panic!("Cannot write to crashed file system");
+            }
+            assert_eq!(
+                buf.len(),
+                crate::page::PAGE_SIZE_BYTES as usize,
+                "raw write buffer must be PAGE_SIZE_BYTES"
+            );
+
+            self.ensure_block_exists(&block_id.filename, block_id.block_num);
+            let file = self.files.get_mut(&block_id.filename).unwrap();
+
+            file.blocks[block_id.block_num] = MockBlock {
+                data: buf.to_vec(),
+                synced: false,
             };
         }
 
