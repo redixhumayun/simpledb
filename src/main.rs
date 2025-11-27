@@ -9366,7 +9366,7 @@ mod transaction_tests {
     fn test_buffer_handle_raii_basic_pin_unpin() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
-        let block_id = BlockId::new("test".to_string(), 0);
+        let block_id = txn.append("test");
 
         {
             let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
@@ -9392,9 +9392,11 @@ mod transaction_tests {
         let txn = db.new_tx();
         let block_id = BlockId::new("test".to_string(), 0);
 
+        //  append a correctly formatted page to the file
+        txn.append("test");
+
         let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
 
-        #[cfg(debug_assertions)]
         txn.buffer_list.assert_pin_invariant(&block_id, 1);
 
         let handle2 = handle1.clone();
@@ -9403,7 +9405,6 @@ mod transaction_tests {
         let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 2);
 
-        #[cfg(debug_assertions)]
         txn.buffer_list.assert_pin_invariant(&block_id, 2);
 
         drop(handle1);
@@ -9412,7 +9413,6 @@ mod transaction_tests {
         let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 1);
 
-        #[cfg(debug_assertions)]
         txn.buffer_list.assert_pin_invariant(&block_id, 1);
 
         drop(handle2);
@@ -9420,7 +9420,6 @@ mod transaction_tests {
         // After dropping both handles, buffer should be unpinned
         assert!(txn.buffer_list.get_buffer(&block_id).is_none());
 
-        #[cfg(debug_assertions)]
         db.buffer_manager.assert_buffer_count_invariant();
     }
 
@@ -9428,7 +9427,7 @@ mod transaction_tests {
     fn test_no_buffer_leaks_after_commit() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
-        let block_id = BlockId::new("test".to_string(), 0);
+        let block_id = txn.append("test");
 
         let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
 
@@ -9446,7 +9445,7 @@ mod transaction_tests {
     fn test_handle_drop_after_commit_is_safe() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
-        let block_id = BlockId::new("test".to_string(), 0);
+        let block_id = txn.append("test");
         let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
 
         // Commit unpins everything and sets committed flag
@@ -9467,7 +9466,7 @@ mod transaction_tests {
         let initial_available = db.buffer_manager.available();
 
         let txn = db.new_tx();
-        let block_id = BlockId::new("test".to_string(), 0);
+        let block_id = txn.append("test");
 
         let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
         let handle2 = handle1.clone();
@@ -10479,7 +10478,6 @@ impl BufferList {
     /// Verifies:
     /// 1. BufferList count matches expected number of live handles for this transaction
     /// 2. BufferManager pin count >= BufferList count (other transactions may have pins too)
-    #[cfg(debug_assertions)]
     #[cfg(test)]
     fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
         let buffer_list_count = self
@@ -11059,7 +11057,7 @@ impl BufferManager {
 
     /// Debug assertion to verify buffer count invariants
     /// Checks that available + pinned buffers = pool size
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     pub fn assert_buffer_count_invariant(&self) {
         let available = *self.num_available.lock().unwrap();
 
