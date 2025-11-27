@@ -172,13 +172,12 @@ mod btree_index_tests {
 
     #[test]
     fn test_btree_index_construction() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let index = setup_index(&db);
 
         // Verify internal node file exists with minimum value entry
         let root = BTreeInternal::new(
-            Arc::clone(&index.txn),
-            index.root_block.clone(),
+            Arc::clone(&index.txn), index.root_block.clone(),
             index.internal_layout.clone(),
             index.root_block.filename.clone(),
         );
@@ -191,7 +190,7 @@ mod btree_index_tests {
 
     #[test]
     fn test_simple_insert_and_search() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
         // Insert some values
@@ -211,7 +210,7 @@ mod btree_index_tests {
 
     #[test]
     fn test_duplicate_keys() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
         // Insert duplicate keys
@@ -235,7 +234,7 @@ mod btree_index_tests {
 
     #[test]
     fn test_delete() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
         // Insert and then delete a value
@@ -260,7 +259,7 @@ mod btree_index_tests {
 
     #[test]
     fn test_btree_split() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
         // Insert enough values to force splits
@@ -443,7 +442,7 @@ mod btree_internal_tests {
 
     #[test]
     fn test_search_simple_path() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, internal) = setup_internal_node(&db);
 
         // Insert some entries to create a simple path
@@ -470,7 +469,7 @@ mod btree_internal_tests {
 
     #[test]
     fn test_insert_with_split() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, internal) = setup_internal_node(&db);
 
         // Fill the node until just before splitting
@@ -503,7 +502,7 @@ mod btree_internal_tests {
 
     #[test]
     fn test_make_new_root() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, internal) = setup_internal_node(&db);
 
         // Setup initial entries
@@ -540,7 +539,7 @@ mod btree_internal_tests {
 
     #[test]
     fn test_insert_recursive_split() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut internal) = setup_internal_node(&db);
 
         // Create a multi-level tree by filling and splitting nodes
@@ -570,7 +569,7 @@ mod btree_internal_tests {
 
     #[test]
     fn test_edge_cases() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, internal) = setup_internal_node(&db);
 
         // Test inserting duplicate keys
@@ -851,7 +850,7 @@ mod btree_leaf_tests {
 
     #[test]
     fn test_insert_no_split() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Insert should succeed without splitting
@@ -864,7 +863,7 @@ mod btree_leaf_tests {
 
     #[test]
     fn test_insert_with_split_different_keys() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Fill the page with different keys
@@ -887,7 +886,7 @@ mod btree_leaf_tests {
 
     #[test]
     fn test_insert_with_overflow_same_keys() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Fill the page with same key
@@ -912,7 +911,7 @@ mod btree_leaf_tests {
 
     #[test]
     fn test_insert_with_existing_overflow() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(5));
 
         // Create a page with overflow block containing key 10
@@ -936,7 +935,7 @@ mod btree_leaf_tests {
 
     #[test]
     fn test_insert_edge_cases() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
 
         // Test case 1: Insert when split point equals first key
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
@@ -1385,7 +1384,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_btree_page_format() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
@@ -1399,7 +1398,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_leaf_insert_and_delete() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
@@ -1423,7 +1422,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_page_split() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
@@ -1453,7 +1452,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_type_safety() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
@@ -1468,7 +1467,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_internal_node_operations() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
@@ -1486,7 +1485,7 @@ mod btree_page_tests {
 
     #[test]
     fn test_find_slot_before() {
-        let (db, _dir) = SimpleDB::new_for_test(400, 8, 5000);
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();

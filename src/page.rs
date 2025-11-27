@@ -34,6 +34,7 @@ pub const NO_FREE_SLOT: u16 = 0xFFFF;
 
 struct PageHeader {
     page_type: PageType,
+    reserved_flags: u8,
     slot_count: u16,
     free_lower: u16,
     free_upper: u16,
@@ -55,6 +56,7 @@ impl PageHeader {
     fn new(page_type: PageType) -> Self {
         PageHeader {
             page_type,
+            reserved_flags: 0,
             slot_count: 0,
             free_lower: PAGE_HEADER_SIZE_BYTES,
             free_upper: PAGE_SIZE_BYTES,
@@ -143,6 +145,75 @@ impl PageHeader {
 
     fn set_reserved(&mut self, reserved: [u8; 6]) {
         self.reserved = reserved;
+    }
+
+    fn reserved_flags(&self) -> u8 {
+        self.reserved_flags
+    }
+
+    fn set_reserved_flags(&mut self, flags: u8) {
+        self.reserved_flags = flags;
+    }
+
+    /// Serialize the header into the provided 32-byte buffer using the documented layout.
+    fn write_to_bytes(&self, dst: &mut [u8]) {
+        assert_eq!(
+            dst.len(),
+            PAGE_HEADER_SIZE_BYTES as usize,
+            "header buffer must be 32 bytes"
+        );
+
+        dst.fill(0);
+        dst[0] = self.page_type as u8;
+        dst[1] = self.reserved_flags;
+        dst[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
+        dst[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
+        dst[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
+        dst[8..12].copy_from_slice(&self.free_ptr.to_le_bytes());
+        dst[12..16].copy_from_slice(&self.crc32.to_le_bytes());
+        dst[16..24].copy_from_slice(&self.latch_word.to_le_bytes());
+        dst[24..26].copy_from_slice(&self.free_head.to_le_bytes());
+        dst[26..32].copy_from_slice(&self.reserved);
+    }
+
+    /// Parse a header from a 32-byte buffer.
+    fn read_from_bytes(src: &[u8]) -> Result<Self, Box<dyn Error>> {
+        if src.len() != PAGE_HEADER_SIZE_BYTES as usize {
+            return Err("header buffer must be 32 bytes".into());
+        }
+
+        let page_type = match src[0] {
+            0 => PageType::Heap,
+            1 => PageType::IndexLeaf,
+            2 => PageType::IndexInternal,
+            3 => PageType::Overflow,
+            4 => PageType::Meta,
+            255 => PageType::Free,
+            _ => return Err("invalid page type byte".into()),
+        };
+
+        let slot_count = u16::from_le_bytes(src[2..4].try_into().unwrap());
+        let free_lower = u16::from_le_bytes(src[4..6].try_into().unwrap());
+        let free_upper = u16::from_le_bytes(src[6..8].try_into().unwrap());
+        let free_ptr = u32::from_le_bytes(src[8..12].try_into().unwrap());
+        let crc32 = u32::from_le_bytes(src[12..16].try_into().unwrap());
+        let latch_word = u64::from_le_bytes(src[16..24].try_into().unwrap());
+        let free_head = u16::from_le_bytes(src[24..26].try_into().unwrap());
+        let mut reserved = [0u8; 6];
+        reserved.copy_from_slice(&src[26..32]);
+
+        Ok(PageHeader {
+            page_type,
+            reserved_flags: src[1],
+            slot_count,
+            free_lower,
+            free_upper,
+            free_ptr,
+            crc32,
+            latch_word,
+            free_head,
+            reserved,
+        })
     }
 }
 
@@ -393,6 +464,9 @@ pub trait PageKind {
 type SlotId = usize;
 
 struct HeapPage;
+/// Raw page kind used to hold an on-disk image without enforcing a specific PageType.
+/// Useful at the IO boundary (FileManager/LogManager) where the page kind is not yet known.
+pub struct RawPage;
 
 struct HeapAllocator<'a> {
     page: &'a mut Page<HeapPage>,
@@ -456,6 +530,38 @@ impl PageKind for HeapPage {
             current_slot: 0,
             match_state: None,
         }
+    }
+}
+
+impl PageKind for RawPage {
+    const PAGE_TYPE: PageType = PageType::Free;
+
+    type Alloc<'a> = ();
+
+    type Iter<'a> = std::iter::Empty<()>;
+
+    fn allocator<'a>(_page: &'a mut Page<Self>) -> Self::Alloc<'a>
+    where
+        Self: Sized,
+    {
+        ()
+    }
+
+    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
+    where
+        Self: Sized,
+    {
+        std::iter::empty()
+    }
+}
+
+/// Type alias for a page image whose kind is not yet known at the IO boundary.
+pub type PageBytes = Page<RawPage>;
+
+impl<'a> PageAllocator<'a> for () {
+    type Output = SlotId;
+    fn insert(&mut self, _bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
+        Err("RawPage allocator is not supported".into())
     }
 }
 
@@ -624,6 +730,129 @@ impl<K: PageKind> Page<K> {
     fn slot_count(&self) -> usize {
         self.line_pointers.len()
     }
+
+    /// Serialize the page into a contiguous `PAGE_SIZE_BYTES` buffer.
+    ///
+    /// Layout matches `docs/record_management.md`:
+    /// header (32B) + line pointer array (4B each, downward) + heap (upward).
+    pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
+        if out.len() != PAGE_SIZE_BYTES as usize {
+            return Err("output buffer must equal PAGE_SIZE_BYTES".into());
+        }
+
+        // Start with heap copy (holds tuple bytes). This is safe because header/LPs are
+        // overwritten below.
+        out.fill(0);
+        out.copy_from_slice(&self.record_space);
+
+        // Header.
+        self.header.write_to_bytes(&mut out[..PAGE_HEADER_SIZE_BYTES as usize]);
+
+        // Line pointers.
+        let lp_bytes = self.line_pointers.len() * size_of::<u32>();
+        let lp_region_end = PAGE_HEADER_SIZE_BYTES as usize + lp_bytes;
+        if lp_region_end > out.len() {
+            return Err("line pointer array exceeds page size".into());
+        }
+        for (i, lp) in self.line_pointers.iter().enumerate() {
+            let start = PAGE_HEADER_SIZE_BYTES as usize + i * 4;
+            out[start..start + 4].copy_from_slice(&lp.0.to_le_bytes());
+        }
+
+        Ok(())
+    }
+
+    /// Construct a page from a contiguous `PAGE_SIZE_BYTES` buffer.
+    ///
+    /// Validates the page type matches `K::PAGE_TYPE` and rebuilds line pointers and heap.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
+        if bytes.len() != PAGE_SIZE_BYTES as usize {
+            return Err("input buffer must equal PAGE_SIZE_BYTES".into());
+        }
+
+        let header = PageHeader::read_from_bytes(&bytes[..PAGE_HEADER_SIZE_BYTES as usize])?;
+        // RawPage is allowed to wrap any on-disk page type; other kinds must match.
+        if K::PAGE_TYPE != PageType::Free && header.page_type() != K::PAGE_TYPE {
+            return Err("page type does not match requested PageKind".into());
+        }
+
+        let free_lower = header.free_bounds().0 as usize;
+        if free_lower < PAGE_HEADER_SIZE_BYTES as usize || free_lower > bytes.len() {
+            return Err("corrupt free_lower in header".into());
+        }
+        let lp_bytes = free_lower - PAGE_HEADER_SIZE_BYTES as usize;
+        if lp_bytes % 4 != 0 {
+            return Err("line pointer region not aligned to 4 bytes".into());
+        }
+        let lp_count = lp_bytes / 4;
+        let mut line_pointers = Vec::with_capacity(lp_count);
+        for i in 0..lp_count {
+            let start = PAGE_HEADER_SIZE_BYTES as usize + i * 4;
+            let raw = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+            line_pointers.push(LinePtr(raw));
+        }
+
+        let record_space = bytes.to_vec();
+
+        let mut header = header;
+        let (_, upper) = header.free_bounds();
+        let computed_lower =
+            (PAGE_HEADER_SIZE_BYTES as usize + lp_count * 4) as u16;
+        header.set_free_bounds(computed_lower, upper);
+        header.set_slot_count(line_pointers.len() as u16);
+
+        Ok(Self {
+            header,
+            line_pointers,
+            record_space,
+            kind: PhantomData,
+        })
+    }
+}
+
+// Temporary compatibility helpers for legacy callers that treated a page as a raw byte buffer.
+// These operate directly on the backing record_space and use big-endian encoding to match the
+// previous `Page` in main.rs. Intended primarily for RawPage during migration.
+impl Page<RawPage> {
+    const INT_BYTES: usize = 4;
+
+    pub fn get_int(&self, offset: usize) -> i32 {
+        let bytes: [u8; Self::INT_BYTES] = self.record_space[offset..offset + Self::INT_BYTES]
+            .try_into()
+            .unwrap();
+        i32::from_be_bytes(bytes)
+    }
+
+    pub fn set_int(&mut self, offset: usize, n: i32) {
+        self.record_space[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
+    }
+
+    pub fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
+        let length_bytes: [u8; Self::INT_BYTES] = self.record_space
+            [offset..offset + Self::INT_BYTES]
+            .try_into()
+            .unwrap();
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        offset += Self::INT_BYTES;
+        self.record_space[offset..offset + length].to_vec()
+    }
+
+    pub fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
+        let length = bytes.len() as u32;
+        self.record_space[offset..offset + Self::INT_BYTES]
+            .copy_from_slice(&length.to_be_bytes());
+        offset += Self::INT_BYTES;
+        self.record_space[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    pub fn get_string(&self, offset: usize) -> String {
+        let bytes = self.get_bytes(offset);
+        String::from_utf8(bytes).unwrap()
+    }
+
+    pub fn set_string(&mut self, offset: usize, string: &str) {
+        self.set_bytes(offset, string.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -790,6 +1019,25 @@ mod page_tests {
 
         // Order is insertion order for a fresh page
         assert_eq!(seen, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
+    }
+
+    #[test]
+    fn pack_and_unpack_preserves_tuples() {
+        let mut page = Page::<HeapPage>::new();
+        let payload = vec![42u8, 43, 44, 45];
+        let slot = page
+            .allocate_tuple(&heap_tuple_bytes(&payload))
+            .expect("allocation succeeds");
+
+        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut buf).expect("pack succeeds");
+
+        let reconstructed = Page::<HeapPage>::from_bytes(&buf).expect("unpack succeeds");
+
+        match reconstructed.tuple(slot).unwrap() {
+            TupleRef::Live(tuple) => assert_eq!(tuple.payload(), payload.as_slice()),
+            _ => panic!("expected live tuple"),
+        }
     }
 
     fn heap_tuple_bytes(payload: &[u8]) -> Vec<u8> {
