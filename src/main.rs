@@ -8467,25 +8467,29 @@ mod record_page_tests {
 pub struct Layout {
     pub schema: Schema,
     offsets: HashMap<String, usize>, //  map the field name to the offset
+    column_index: HashMap<String, usize>, //  map the field name to the column index
     pub slot_size: usize,
 }
 
 impl Layout {
     pub fn new(schema: Schema) -> Self {
         let mut offsets = HashMap::new();
+        let mut column_index = HashMap::new();
         let mut offset = Page::INT_BYTES;
-        for field in schema.fields.iter() {
+        for (idx, field) in schema.fields.iter().enumerate() {
             let field_info = schema.info.get(field).unwrap();
+            column_index.insert(field.clone(), idx);
             offsets.insert(field.clone(), offset);
-
             match field_info.field_type {
                 FieldType::Int => offset += field_info.length,
                 FieldType::String => offset += Page::INT_BYTES + field_info.length,
             }
         }
+
         Self {
             schema,
             offsets,
+            column_index,
             slot_size: offset,
         }
     }
@@ -8493,6 +8497,28 @@ impl Layout {
     /// Get the offset of a field in a record
     fn offset(&self, field: &str) -> Option<usize> {
         self.offsets.get(field).copied()
+    }
+
+    /// Get the offset along with the column index for a field
+    fn offset_with_index(&self, field: &str) -> Option<(usize, usize)> {
+        Some((*self.offsets.get(field)?, *self.column_index.get(field)?))
+    }
+
+    /// Get the number of columns stored in this layout
+    fn num_of_columns(&self) -> usize {
+        self.schema.fields.len()
+    }
+
+    fn field_info(&self, field: &str) -> Option<&FieldInfo> {
+        self.schema.info.get(field)
+    }
+
+    fn field_length(&self, field: &str) -> Option<usize> {
+        let info = self.field_info(field)?;
+        match info.field_type {
+            FieldType::Int => Some(info.length),
+            FieldType::String => Some(4 + info.length),
+        }
     }
 }
 

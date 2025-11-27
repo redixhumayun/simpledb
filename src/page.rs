@@ -1,6 +1,9 @@
-use std::{error::Error, marker::PhantomData, mem::size_of, sync::Arc};
+use std::{error::Error, marker::PhantomData, mem::size_of, ops::Deref, sync::Arc};
 
-use crate::{BlockId, BufferHandle, Schema, Transaction};
+use crate::{
+    BlockId, BufferHandle, Constant, FieldInfo, FieldType, Layout, PageReadGuard, PageWriteGuard,
+    Schema, Transaction,
+};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -743,6 +746,16 @@ impl<K: PageKind> Page<K> {
         self.record_space.get(offset..offset + length)
     }
 
+    fn tuple_bytes_mut(&mut self, slot: SlotId) -> Option<&mut [u8]> {
+        let line_pointer = self.line_pointers.get(slot)?;
+        if !line_pointer.is_live() {
+            return None;
+        }
+        let offset = line_pointer.offset() as usize;
+        let length = line_pointer.length() as usize;
+        self.record_space.get_mut(offset..offset + length)
+    }
+
     fn update_tuple(&mut self, slot: SlotId, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let line_pointer = self
             .line_pointers
@@ -1178,6 +1191,47 @@ impl<'a> TupleRef<'a> {
     }
 }
 
+struct NullBitmap<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> NullBitmap<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn is_null(&self, col_idx: usize) -> bool {
+        let byte = col_idx / 8;
+        let bit = col_idx % 8;
+        let mask = 1u8 << bit;
+        (self.bytes[byte] & mask) != 0
+    }
+}
+
+struct NullBitmapMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> NullBitmapMut<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn set_null(&mut self, col_idx: usize) {
+        let byte = col_idx / 8;
+        let bit = col_idx % 8;
+        let mask = 1u8 << bit;
+        self.bytes[byte] = self.bytes[byte] | mask;
+    }
+
+    fn clear(&mut self, col_idx: usize) {
+        let byte = col_idx / 8;
+        let bit = col_idx % 8;
+        let mask = 1u8 << bit;
+        self.bytes[byte] = self.bytes[byte] & !mask;
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct HeapTupleHeader {
@@ -1203,6 +1257,10 @@ impl<'a> HeapTuple<'a> {
         }
     }
 
+    fn from_parts(header: &'a HeapTupleHeader, payload: &'a [u8]) -> Self {
+        Self { header, payload }
+    }
+
     fn xmin(&self) -> u64 {
         self.header.xmin
     }
@@ -1226,25 +1284,208 @@ impl<'a> HeapTuple<'a> {
     fn payload(&self) -> &'a [u8] {
         self.payload
     }
+
+    fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
+        let offset = self.header.nullmap_ptr as usize;
+        let bytes_needed = (num_columns + 7) / 8;
+        let bytes = &self.payload[offset..offset + bytes_needed];
+        NullBitmap::new(bytes)
+    }
+
+    fn payload_slice(&self, offset: usize, len: usize) -> &'a [u8] {
+        &self.payload[offset..offset + len]
+    }
+
+    fn read_i32(&self, offset: usize) -> i32 {
+        let bytes = self.payload_slice(offset, 4);
+        i32::from_be_bytes(bytes.try_into().unwrap())
+    }
+
+    fn read_varlen(&self, offset: usize) -> &'a [u8] {
+        let length_bytes = self.payload_slice(offset, 4);
+        let length = u32::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+        &self.payload[offset + 4..offset + 4 + length]
+    }
 }
 
-struct RecordPage {
-    txn: Arc<Transaction>,
-    handle: BufferHandle,
-    layout: Layout,
+struct HeapTupleMut<'a> {
+    header: &'a mut HeapTupleHeader,
+    payload: &'a mut [u8],
 }
 
-impl RecordPage {
-    fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
-        let handle = txn.pin(&block_id);
+impl<'a> HeapTupleMut<'a> {
+    fn from_bytes(bytes: &'a mut [u8]) -> Self {
+        let (header_bytes, payload_bytes) = bytes.split_at_mut(size_of::<HeapTupleHeader>());
+        let header = unsafe { &mut *(header_bytes.as_ptr() as *mut HeapTupleHeader) };
         Self {
-            txn,
-            handle,
-            layout,
+            header,
+            payload: payload_bytes,
+        }
+    }
+
+    fn payload_slice_mut(&mut self, offset: usize, len: usize) -> &'_ mut [u8] {
+        &mut self.payload[offset..offset + len]
+    }
+
+    fn null_bitmap_mut(&mut self, num_columns: usize) -> NullBitmapMut<'_> {
+        let offset = self.header.nullmap_ptr as usize;
+        let bytes_needed = (num_columns + 7) / 8;
+        let bytes = &mut self.payload[offset..offset + bytes_needed];
+        NullBitmapMut::new(bytes)
+    }
+
+    fn as_tuple(&self) -> HeapTuple<'_> {
+        HeapTuple::from_parts(&self.header, &self.payload)
+    }
+}
+
+struct LogicalRow<'a> {
+    tuple: HeapTuple<'a>,
+    layout: &'a Layout,
+}
+
+impl<'a> LogicalRow<'a> {
+    fn new(tuple: HeapTuple<'a>, layout: &'a Layout) -> Self {
+        Self { tuple, layout }
+    }
+
+    fn get_column(&self, column_name: &str) -> Option<Constant> {
+        let (offset, index) = self.layout.offset_with_index(column_name)?;
+        let null_bitmap = self.tuple.null_bitmap(self.layout.num_of_columns());
+        if null_bitmap.is_null(index) {
+            return None;
+        }
+        let field_info = self.layout.field_info(column_name)?;
+        let field_length = self.layout.field_length(column_name)?;
+        let bytes = self.tuple.payload_slice(offset, field_length);
+        Some(self.decode(bytes, field_info, field_length))
+    }
+
+    fn decode(&self, bytes: &'a [u8], field_info: &FieldInfo, field_length: usize) -> Constant {
+        match field_info.field_type {
+            FieldType::Int => Constant::Int(i32::from_le_bytes(
+                bytes[..field_length].try_into().unwrap(),
+            )),
+            FieldType::String => {
+                let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                Constant::String(String::from_utf8(bytes[4..4 + len].to_vec()).unwrap())
+            }
         }
     }
 }
 
-struct Layout {
-    schema: Schema,
+struct LogicalRowMut<'a> {
+    tuple: HeapTupleMut<'a>,
+    layout: Layout,
+}
+
+impl<'a> LogicalRowMut<'a> {
+    fn new(tuple: HeapTupleMut<'a>, layout: Layout) -> Self {
+        Self { tuple, layout }
+    }
+
+    fn as_row(&self) -> LogicalRow<'_> {
+        LogicalRow::new(self.tuple.as_tuple(), &self.layout)
+    }
+
+    fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
+        let (offset, index) = self.layout.offset_with_index(column_name)?;
+        let field_info = self.layout.field_info(column_name)?;
+        let field_length = self.layout.field_length(column_name)?;
+        self.tuple
+            .null_bitmap_mut(self.layout.num_of_columns())
+            .clear(index);
+        let dest = self.tuple.payload_slice_mut(offset, field_length);
+        LogicalRowMut::encode(dest, field_info, value);
+        Some(())
+    }
+
+    fn set_null(&mut self, column_name: &str) -> Option<()> {
+        let (_, index) = self.layout.offset_with_index(column_name)?;
+        self.tuple
+            .null_bitmap_mut(self.layout.num_of_columns())
+            .set_null(index);
+        Some(())
+    }
+
+    fn encode(bytes: &'_ mut [u8], field_info: &FieldInfo, value: &Constant) {
+        match field_info.field_type {
+            FieldType::Int => {
+                let value = value.as_int();
+                bytes[..4].copy_from_slice(&value.to_le_bytes());
+            }
+            FieldType::String => {
+                let value = value.as_str();
+                let len = value.len();
+                bytes[..4].copy_from_slice(&len.to_le_bytes());
+                bytes[4..4 + len].copy_from_slice(value.as_bytes());
+            }
+        }
+    }
+}
+
+struct PageView<'a, K: PageKind> {
+    guard: PageReadGuard<'a>,
+    page_ref: &'a Page<K>,
+    layout: &'a Layout,
+}
+
+impl<'a> PageView<'a, HeapPage> {
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::Heap {
+            return Err("cannot initialize PageView<'a, HeapPage> with a non-heap page".into());
+        }
+        let page = &*guard.page as *const Page<RawPage> as *const Page<HeapPage>;
+        let page_ref = unsafe { &*page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    fn tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
+        let bytes = self.guard.tuple_bytes(slot)?;
+        let heap_tuple = HeapTuple::from_bytes(bytes);
+        Some(heap_tuple)
+    }
+
+    pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
+        let heap_tuple = self.tuple(slot)?;
+        Some(LogicalRow::new(heap_tuple, self.layout))
+    }
+}
+
+struct PageViewMut<'a, K: PageKind> {
+    guard: PageWriteGuard<'a>,
+    page_ref: &'a mut Page<K>,
+    layout: &'a Layout,
+}
+
+impl<'a> PageViewMut<'a, HeapPage> {
+    fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::Heap {
+            return Err("cannot initialize PageViewMut<'a, HeapPage> with a non-heap page".into());
+        }
+        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<HeapPage>;
+        let page_ref = unsafe { &mut *page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    fn tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
+        let bytes = self.guard.tuple_bytes_mut(slot)?;
+        let heap_tuple_mut = HeapTupleMut::from_bytes(bytes);
+        Some(heap_tuple_mut)
+    }
+
+    pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
+        //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
+        let layout_clone = self.layout.clone();
+        let heap_tuple_mut = self.tuple_mut(slot)?;
+        Some(LogicalRowMut::new(heap_tuple_mut, layout_clone))
+    }
 }
