@@ -906,6 +906,23 @@ impl Page<HeapPage> {
         let bytes = self.tuple_bytes_mut(slot)?;
         Some(HeapTupleMut::from_bytes(bytes))
     }
+
+    fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+        self.allocate_tuple(bytes)
+    }
+
+    fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.delete_tuple(slot)
+    }
+
+    fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
+        let line_pointer = self
+            .line_pointers
+            .get_mut(slot)
+            .ok_or("invalid slot provided during redirect")?;
+        line_pointer.mark_redirect(target as u16);
+        Ok(())
+    }
 }
 
 // Temporary compatibility helpers for legacy callers that treated a page as a raw byte buffer.
@@ -1743,6 +1760,45 @@ impl<'a> PageViewMut<'a, HeapPage> {
         let heap_tuple_mut = self.tuple_mut(slot)?;
         Some(LogicalRowMut::new(heap_tuple_mut, layout_clone))
     }
+
+    pub fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+        self.page_ref.insert_tuple(bytes)
+    }
+
+    pub fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.page_ref.delete_slot(slot)
+    }
+
+    pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
+        self.page_ref.redirect_slot(slot, target)
+    }
+
+    pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
+        let payload_len = self.layout.slot_size;
+        let mut buf = vec![0u8; size_of::<HeapTupleHeader>() + payload_len];
+        {
+            let header = HeapTupleHeader {
+                payload_len: payload_len as u32,
+                xmin: 0,
+                xmax: 0,
+                flags: 0,
+                nullmap_ptr: 0,
+            };
+            let header_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &header as *const HeapTupleHeader as *const u8,
+                    size_of::<HeapTupleHeader>(),
+                )
+            };
+            buf[..header_bytes.len()].copy_from_slice(header_bytes);
+        }
+        let slot = self.page_ref.insert_tuple(&buf)?;
+        let tuple_mut = self
+            .page_ref
+            .heap_tuple_mut(slot)
+            .expect("tuple must exist after allocation");
+        Ok((slot, LogicalRowMut::new(tuple_mut, self.layout.clone())))
+    }
 }
 
 #[cfg(test)]
@@ -1758,51 +1814,13 @@ mod page_view_tests {
         Layout::new(schema)
     }
 
-    fn tuple_bytes(layout: &Layout, id: i32, name: &str, score: Option<i32>) -> Vec<u8> {
-        let mut payload = vec![0u8; layout.slot_size];
-        let nullmap_bytes = (layout.num_of_columns() + 7) / 8;
-        payload[..nullmap_bytes].fill(0);
-
-        if let Some(offset) = layout.offset("id") {
-            payload[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
-        }
-
-        if let Some(offset) = layout.offset("name") {
-            let bytes = name.as_bytes();
-            assert!(
-                bytes.len() <= layout.field_info("name").unwrap().length,
-                "name exceeds declared length"
-            );
-            payload[offset..offset + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-            payload[offset + 4..offset + 4 + bytes.len()].copy_from_slice(bytes);
-        }
-
-        if let Some(score_value) = score {
-            if let Some(offset) = layout.offset("score") {
-                payload[offset..offset + 4].copy_from_slice(&score_value.to_le_bytes());
-            }
-        } else {
-            let (_, idx) = layout.offset_with_index("score").unwrap();
-            let byte = idx / 8;
-            let bit = idx % 8;
-            payload[byte] |= 1 << bit;
-        }
-
-        build_tuple_bytes(&payload, 0)
-    }
-
-    fn write_heap_page(guard: &mut PageWriteGuard<'_>, tuples: &[Vec<u8>]) {
-        let mut heap_page = Page::<HeapPage>::new();
-        for tuple in tuples {
-            heap_page
-                .allocate_tuple(tuple)
-                .expect("tuple should fit on heap page");
-        }
+    fn format_heap_page(guard: &mut PageWriteGuard<'_>) {
+        let heap_page = Page::<HeapPage>::new();
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
         heap_page
             .write_bytes(&mut buf)
-            .expect("serialize heap page to bytes");
-        **guard = Page::<RawPage>::from_bytes(&buf).expect("materialize raw page from bytes");
+            .expect("serialize empty heap page");
+        **guard = Page::<RawPage>::from_bytes(&buf).expect("materialize heap page backing bytes");
     }
 
     #[test]
@@ -1813,15 +1831,27 @@ mod page_view_tests {
         let block_id = txn.append(&filename);
         let layout = sample_layout();
 
-        let tuples = vec![
-            tuple_bytes(&layout, 42, "alpha", Some(9)),
-            tuple_bytes(&layout, 7, "beta", None),
-        ];
-
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            write_heap_page(&mut guard, &tuples);
-        }
+            format_heap_page(&mut guard);
+            let mut view_mut =
+                PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            let (slot0, mut row0) = view_mut.insert_row_mut().expect("insert row 0");
+            assert_eq!(slot0, 0);
+            row0.set_column("id", &Constant::Int(42)).unwrap();
+            row0
+                .set_column("name", &Constant::String("alpha".into()))
+                .unwrap();
+            row0.set_column("score", &Constant::Int(9)).unwrap();
+
+            let (slot1, mut row1) = view_mut.insert_row_mut().expect("insert row 1");
+            assert_eq!(slot1, 1);
+            row1.set_column("id", &Constant::Int(7)).unwrap();
+            row1
+                .set_column("name", &Constant::String("beta".into()))
+                .unwrap();
+            row1.set_null("score").unwrap();
+        } // drop guard
 
         let read_guard = txn.pin_read_guard(&block_id);
         let view = PageView::new(read_guard, &layout).expect("heap page view");
@@ -1851,38 +1881,149 @@ mod page_view_tests {
         let block_id = txn.append(&filename);
         let layout = sample_layout();
 
-        let tuples = vec![tuple_bytes(&layout, 5, "seed", Some(10))];
-
         let mut guard = txn.pin_write_guard(&block_id);
-        write_heap_page(&mut guard, &tuples);
-
+        format_heap_page(&mut guard);
+        let mut view =
+            PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+        let (slot, mut row_initial) = view.insert_row_mut().expect("insert new row");
+        assert_eq!(slot, 0);
+        row_initial.set_column("id", &Constant::Int(5)).unwrap();
+        row_initial
+            .set_column("name", &Constant::String("seed".into()))
+            .unwrap();
+        row_initial
+            .set_column("score", &Constant::Int(10))
+            .unwrap();
         {
-            let mut view =
-                PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
-            {
-                let mut row_mut = view.row_mut(0).expect("mutable access to slot 0");
-                row_mut
-                    .set_column("id", &Constant::Int(777))
-                    .expect("update int column");
-                row_mut
-                    .set_column("name", &Constant::String("toast".to_string()))
-                    .expect("update string column");
-                row_mut.set_null("score").expect("mark score as NULL");
-            }
-
-            let row = view.row(0).expect("read updated slot 0");
-            assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
-            assert_eq!(
-                row.get_column("name"),
-                Some(Constant::String("toast".to_string()))
-            );
-            assert!(row.get_column("score").is_none());
+            let mut row_mut = view.row_mut(slot).expect("mutable access to slot 0");
+            row_mut
+                .set_column("id", &Constant::Int(777))
+                .expect("update int column");
+            row_mut
+                .set_column("name", &Constant::String("toast".to_string()))
+                .expect("update string column");
+            row_mut.set_null("score").expect("mark score as NULL");
         }
+
+        let row = view.row(slot).expect("read updated slot 0");
+        assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
+        assert_eq!(
+            row.get_column("name"),
+            Some(Constant::String("toast".to_string()))
+        );
+        assert!(row.get_column("score").is_none());
+        drop(view); // drop write guard before acquiring read guard
 
         let read_guard = txn.pin_read_guard(&block_id);
         let view = PageView::new(read_guard, &layout).expect("reopen heap view");
-        let row = view.row(0).expect("slot 0 after write guard drop");
+        let row = view.row(slot).expect("slot 0 after write guard drop");
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
         assert!(row.get_column("score").is_none());
+    }
+
+    #[test]
+    fn page_view_mut_reuses_slots_and_serializes() {
+        use super::TupleRef;
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = sample_layout();
+
+        let mut guard = txn.pin_write_guard(&block_id);
+        format_heap_page(&mut guard);
+        let mut view =
+            PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+
+        let slot_a = {
+            let (slot, mut row) = view.insert_row_mut().expect("insert row a");
+            row.set_column("id", &Constant::Int(10)).unwrap();
+            row.set_column("name", &Constant::String("alpha".into()))
+                .unwrap();
+            row.set_column("score", &Constant::Int(1)).unwrap();
+            slot
+        };
+        let slot_b = {
+            let (slot, mut row) = view.insert_row_mut().expect("insert row b");
+            row.set_column("id", &Constant::Int(20)).unwrap();
+            row.set_column("name", &Constant::String("beta".into()))
+                .unwrap();
+            row.set_column("score", &Constant::Int(2)).unwrap();
+            slot
+        };
+        assert_eq!((slot_a, slot_b), (0, 1));
+
+        view.delete_slot(slot_a).expect("delete slot_a");
+        let slot_c = {
+            let (slot, mut row) = view.insert_row_mut().expect("insert row c");
+            row.set_column("id", &Constant::Int(30)).unwrap();
+            row.set_column("name", &Constant::String("gamma".into()))
+                .unwrap();
+            row.set_column("score", &Constant::Int(3)).unwrap();
+            slot
+        };
+        assert_eq!(
+            slot_c, slot_a,
+            "freed slot should be reused for next allocation"
+        );
+
+        let slot_d = {
+            let (slot, mut row) = view.insert_row_mut().expect("insert row d");
+            row.set_column("id", &Constant::Int(40)).unwrap();
+            row.set_column("name", &Constant::String("delta".into()))
+                .unwrap();
+            row.set_column("score", &Constant::Int(4)).unwrap();
+            slot
+        };
+        assert_eq!(slot_d, 2);
+
+        view.redirect_slot(slot_b, slot_d)
+            .expect("redirect slot_b to slot_d");
+
+        // slot_b should now report redirect state (rows returns None)
+        assert!(view.row(slot_b).is_none());
+        let redirected = view.page_ref.tuple(slot_b).expect("slot_b exists");
+        match redirected {
+            TupleRef::Redirect(target) => assert_eq!(target as usize, slot_d),
+            _ => panic!("slot_b should be redirect after redirect_slot"),
+        }
+
+        // slot_c and slot_d remain live
+        let row_c = view.row(slot_c).expect("row at slot_c");
+        assert_eq!(row_c.get_column("id"), Some(Constant::Int(30)));
+        let row_d = view.row(slot_d).expect("row at slot_d");
+        assert_eq!(row_d.get_column("id"), Some(Constant::Int(40)));
+
+        // Serialize to bytes and drop the guard
+        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
+        view.guard
+            .write_bytes(&mut buf)
+            .expect("serialize heap page state");
+        drop(view);
+
+        let rebuilt =
+            Page::<HeapPage>::from_bytes(&buf).expect("deserialize heap page after serialization");
+
+        match rebuilt.tuple(slot_c).expect("slot_c tuple") {
+            TupleRef::Live(tuple) => {
+                let row = LogicalRow::new(tuple, &layout);
+                assert_eq!(row.get_column("id"), Some(Constant::Int(30)));
+            }
+            _ => panic!("slot_c should remain live after serialization"),
+        }
+
+        match rebuilt.tuple(slot_d).expect("slot_d tuple") {
+            TupleRef::Live(tuple) => {
+                let row = LogicalRow::new(tuple, &layout);
+                assert_eq!(row.get_column("id"), Some(Constant::Int(40)));
+            }
+            _ => panic!("slot_d should remain live after serialization"),
+        }
+
+        match rebuilt.tuple(slot_b).expect("slot_b tuple") {
+            TupleRef::Redirect(target) => assert_eq!(target as usize, slot_d),
+            _ => panic!("slot_b redirect state not preserved across serialization"),
+        }
     }
 }
