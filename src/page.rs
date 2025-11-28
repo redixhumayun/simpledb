@@ -916,6 +916,23 @@ impl<K: PageKind> Page<K> {
     }
 }
 
+impl From<Page<HeapPage>> for PageBytes {
+    fn from(page: Page<HeapPage>) -> Self {
+        let Page {
+            header,
+            line_pointers,
+            record_space,
+            ..
+        } = page;
+        Page::<RawPage> {
+            header,
+            line_pointers,
+            record_space,
+            kind: PhantomData,
+        }
+    }
+}
+
 impl Page<HeapPage> {
     fn heap_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
         let bytes = self.tuple_bytes(slot)?;
@@ -1365,12 +1382,8 @@ mod heap_tuple_tests {
         {
             let mut tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
             let new_val = 0x0A0B0C0Du32.to_be_bytes();
-            tuple_mut
-                .payload_slice_mut(1, 4)
-                .copy_from_slice(&new_val);
-            tuple_mut
-                .null_bitmap_mut(8)
-                .set_null(6);
+            tuple_mut.payload_slice_mut(1, 4).copy_from_slice(&new_val);
+            tuple_mut.null_bitmap_mut(8).set_null(6);
         }
 
         let tuple = HeapTuple::from_bytes(&bytes);
@@ -1793,6 +1806,11 @@ impl<'a> PageViewMut<'a, HeapPage> {
         self.page_ref.redirect_slot(slot, target)
     }
 
+    pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
+        let page_ref = &*self.page_ref;
+        page_ref.write_bytes(out)
+    }
+
     pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
         let payload_len = self.layout.slot_size;
         let mut buf = vec![0u8; size_of::<HeapTupleHeader>() + payload_len];
@@ -1835,12 +1853,7 @@ mod page_view_tests {
     }
 
     fn format_heap_page(guard: &mut PageWriteGuard<'_>) {
-        let heap_page = Page::<HeapPage>::new();
-        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
-        heap_page
-            .write_bytes(&mut buf)
-            .expect("serialize empty heap page");
-        **guard = Page::<RawPage>::from_bytes(&buf).expect("materialize heap page backing bytes");
+        **guard = Page::<HeapPage>::new().into();
     }
 
     #[test]
@@ -1859,16 +1872,14 @@ mod page_view_tests {
             let (slot0, mut row0) = view_mut.insert_row_mut().expect("insert row 0");
             assert_eq!(slot0, 0);
             row0.set_column("id", &Constant::Int(42)).unwrap();
-            row0
-                .set_column("name", &Constant::String("alpha".into()))
+            row0.set_column("name", &Constant::String("alpha".into()))
                 .unwrap();
             row0.set_column("score", &Constant::Int(9)).unwrap();
 
             let (slot1, mut row1) = view_mut.insert_row_mut().expect("insert row 1");
             assert_eq!(slot1, 1);
             row1.set_column("id", &Constant::Int(7)).unwrap();
-            row1
-                .set_column("name", &Constant::String("beta".into()))
+            row1.set_column("name", &Constant::String("beta".into()))
                 .unwrap();
             row1.set_null("score").unwrap();
         } // drop guard
@@ -1911,9 +1922,7 @@ mod page_view_tests {
         row_initial
             .set_column("name", &Constant::String("seed".into()))
             .unwrap();
-        row_initial
-            .set_column("score", &Constant::Int(10))
-            .unwrap();
+        row_initial.set_column("score", &Constant::Int(10)).unwrap();
         {
             let mut row_mut = view.row_mut(slot).expect("mutable access to slot 0");
             row_mut
@@ -2017,8 +2026,7 @@ mod page_view_tests {
 
         // Serialize to bytes and drop the guard
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
-        view.guard
-            .write_bytes(&mut buf)
+        view.write_bytes(&mut buf)
             .expect("serialize heap page state");
         drop(view);
 
