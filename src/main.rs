@@ -11145,6 +11145,17 @@ mod buffer_manager_tests {
         buffer_1.set_modified(1, 0);
         buffer_manager_guard.unpin(buffer_1);
 
+        //  materialize blocks 2-4 before pinning so they have valid heap headers
+        // TODO: once RecordPage/TableScan use PageView, rewrite this test to insert via logical rows
+        for blk in 2..=4 {
+            let block_id = BlockId::new("testfile".to_string(), blk);
+            let mut empty_page = Page::new();
+            db.file_manager
+                .lock()
+                .unwrap()
+                .write(&block_id, &mut empty_page);
+        }
+
         //  force buffer replacement by pinning 3 new blocks
         let buffer_2 = buffer_manager_guard
             .pin(&BlockId::new("testfile".to_string(), 2))
@@ -11189,10 +11200,12 @@ mod buffer_manager_tests {
         let ops_per_thread = 100;
 
         // Pre-create blocks on disk
+        let seed_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
+        // TODO: remove this offset hack and write via LogicalRow once the buffer layer uses PageView
         for i in 0..num_blocks {
             let block_id = BlockId::new("stressfile".to_string(), i);
             let mut page = Page::new();
-            page.set_int(0, i as i32);
+            page.set_int(seed_offset, i as i32);
             db.file_manager.lock().unwrap().write(&block_id, &mut page);
         }
 
@@ -11214,7 +11227,7 @@ mod buffer_manager_tests {
                         assert_eq!(buffer.block_id_owned().unwrap(), block_id);
                         {
                             let page = buffer.read_page();
-                            assert_eq!(page.get_int(0), block_num as i32);
+                            assert_eq!(page.get_int(seed_offset), block_num as i32);
                         }
 
                         // Unpin immediately to maximize churn
