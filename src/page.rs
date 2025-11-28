@@ -1428,6 +1428,58 @@ mod logical_row_tests {
 
         assert!(row.get_column("c").is_none());
     }
+
+    fn serialization_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("num");
+        schema.add_string_field("text", 8);
+        Layout::new(schema)
+    }
+
+    #[test]
+    fn logical_row_round_trip_serialization_cases() {
+        let layout = serialization_layout();
+        let cases: Vec<(i32, Option<&str>)> = vec![
+            (123, Some("")),
+            (-77, Some("abc")),
+            (42, Some("abcdefgh")),
+            (0, None),
+        ];
+
+        for (int_val, str_val) in cases {
+            let payload = vec![0u8; layout.slot_size];
+            let mut bytes = build_tuple_bytes(&payload, 0);
+
+            {
+                let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
+                let mut row_mut = LogicalRowMut::new(tuple_mut, layout.clone());
+                row_mut
+                    .set_column("num", &Constant::Int(int_val))
+                    .expect("set int column");
+                match str_val {
+                    Some(s) => {
+                        row_mut
+                            .set_column("text", &Constant::String(s.to_string()))
+                            .expect("set string column");
+                    }
+                    None => {
+                        row_mut.set_null("text").expect("set string column null");
+                    }
+                }
+            }
+
+            let tuple = HeapTuple::from_bytes(&bytes);
+            let row = LogicalRow::new(tuple, &layout);
+            assert_eq!(row.get_column("num"), Some(Constant::Int(int_val)));
+            match str_val {
+                Some(s) => assert_eq!(
+                    row.get_column("text"),
+                    Some(Constant::String(s.to_string()))
+                ),
+                None => assert!(row.get_column("text").is_none()),
+            }
+        }
+    }
 }
 
 #[repr(C)]
