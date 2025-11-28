@@ -1241,6 +1241,195 @@ impl<'a> NullBitmapMut<'a> {
     }
 }
 
+#[cfg(test)]
+fn build_tuple_bytes(payload: &[u8], nullmap_ptr: u16) -> Vec<u8> {
+    let mut buf = vec![0u8; size_of::<HeapTupleHeader>() + payload.len()];
+    unsafe {
+        let header = &mut *(buf.as_mut_ptr() as *mut HeapTupleHeader);
+        header.payload_len = payload.len() as u32;
+        header.xmin = 1;
+        header.xmax = 0;
+        header.flags = 0;
+        header.nullmap_ptr = nullmap_ptr;
+    }
+    buf[size_of::<HeapTupleHeader>()..].copy_from_slice(payload);
+    buf
+}
+
+#[cfg(test)]
+mod bitmap_tests {
+    use super::*;
+
+    #[test]
+    fn null_bitmap_reads_bits_across_bytes() {
+        let bytes = [0b1010_1010u8, 0b0000_0011u8];
+        let bitmap = NullBitmap::new(&bytes);
+        // byte 0 bits
+        assert!(bitmap.is_null(1)); // bit 1 set
+        assert!(bitmap.is_null(3));
+        assert!(bitmap.is_null(5));
+        assert!(bitmap.is_null(7));
+        assert!(!bitmap.is_null(0));
+        assert!(!bitmap.is_null(6));
+        // byte 1 bits (columns 8,9)
+        assert!(bitmap.is_null(8));
+        assert!(bitmap.is_null(9));
+        assert!(!bitmap.is_null(10));
+    }
+
+    #[test]
+    fn null_bitmap_mut_sets_and_clears_bits() {
+        let mut bytes = [0u8; 2];
+        {
+            let mut bitmap = NullBitmapMut::new(&mut bytes);
+            bitmap.set_null(0);
+            bitmap.set_null(9);
+            bitmap.set_null(7);
+            bitmap.clear(7);
+        }
+        let bitmap = NullBitmap::new(&bytes);
+        assert!(bitmap.is_null(0));
+        assert!(!bitmap.is_null(7));
+        assert!(bitmap.is_null(9));
+        assert!(!bitmap.is_null(5));
+    }
+}
+
+#[cfg(test)]
+mod heap_tuple_tests {
+    use super::*;
+
+    #[test]
+    fn heap_tuple_reads_int_and_varlen_payload() {
+        // Layout: [bitmap byte][i32 big endian][len:u32][payload bytes]
+        let mut payload = Vec::new();
+        payload.push(0b0000_1000u8); // only column 3 is null
+        payload.extend_from_slice(&0x01020304u32.to_be_bytes());
+        payload.extend_from_slice(&3u32.to_be_bytes());
+        payload.extend_from_slice(b"abc");
+        let bytes = build_tuple_bytes(&payload, 0);
+        let tuple = HeapTuple::from_bytes(&bytes);
+
+        assert_eq!(tuple.payload_len(), payload.len() as u32);
+        assert_eq!(tuple.read_i32(1), 0x01020304);
+        assert_eq!(tuple.read_varlen(1 + 4), b"abc");
+        let bitmap = tuple.null_bitmap(8);
+        assert!(bitmap.is_null(3));
+        assert!(!bitmap.is_null(2));
+    }
+
+    #[test]
+    fn heap_tuple_mut_updates_payload_and_bitmap() {
+        let mut payload = Vec::new();
+        payload.push(0u8); // bitmap
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        let mut bytes = build_tuple_bytes(&payload, 0);
+
+        {
+            let mut tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
+            let new_val = 0x0A0B0C0Du32.to_be_bytes();
+            tuple_mut
+                .payload_slice_mut(1, 4)
+                .copy_from_slice(&new_val);
+            tuple_mut
+                .null_bitmap_mut(8)
+                .set_null(6);
+        }
+
+        let tuple = HeapTuple::from_bytes(&bytes);
+        assert_eq!(tuple.read_i32(1), 0x0A0B0C0D);
+        let bitmap = tuple.null_bitmap(8);
+        assert!(bitmap.is_null(6));
+        assert!(!bitmap.is_null(0));
+    }
+}
+
+#[cfg(test)]
+mod logical_row_tests {
+    use super::*;
+    use crate::Schema;
+
+    fn sample_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("a");
+        schema.add_string_field("b", 5);
+        schema.add_int_field("c");
+        Layout::new(schema)
+    }
+
+    fn base_payload(layout: &Layout, a: i32, b: &str, c: i32, null_bitmap: u8) -> Vec<u8> {
+        let mut payload = vec![0u8; layout.slot_size];
+        payload[0] = null_bitmap;
+
+        let offset_a = layout.offset("a").unwrap();
+        payload[offset_a..offset_a + 4].copy_from_slice(&a.to_le_bytes());
+
+        let offset_b = layout.offset("b").unwrap();
+        payload[offset_b..offset_b + 4].copy_from_slice(&(b.len() as u32).to_le_bytes());
+        payload[offset_b + 4..offset_b + 4 + b.len()].copy_from_slice(b.as_bytes());
+
+        let offset_c = layout.offset("c").unwrap();
+        payload[offset_c..offset_c + 4].copy_from_slice(&c.to_le_bytes());
+
+        payload
+    }
+
+    #[test]
+    fn logical_row_reads_typed_columns_and_nulls() {
+        let layout = sample_layout();
+        let payload = base_payload(&layout, 10, "xy", 0, 0b0000_0100);
+        let bytes = build_tuple_bytes(&payload, 0);
+        let tuple = HeapTuple::from_bytes(&bytes);
+        let row = LogicalRow::new(tuple, &layout);
+
+        match row.get_column("a") {
+            Some(Constant::Int(v)) => assert_eq!(v, 10),
+            _ => panic!("expected int value for column a"),
+        }
+
+        match row.get_column("b") {
+            Some(Constant::String(s)) => assert_eq!(s, "xy"),
+            _ => panic!("expected string value for column b"),
+        }
+
+        assert!(row.get_column("c").is_none());
+    }
+
+    #[test]
+    fn logical_row_mut_updates_and_nulls_columns() {
+        let layout = sample_layout();
+        let payload = base_payload(&layout, 1, "hi", 5, 0);
+        let mut bytes = build_tuple_bytes(&payload, 0);
+
+        {
+            let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
+            let mut row_mut = LogicalRowMut::new(tuple_mut, layout.clone());
+            row_mut
+                .set_column("a", &Constant::Int(99))
+                .expect("set int");
+            row_mut
+                .set_column("b", &Constant::String("hey".to_string()))
+                .expect("set string");
+            row_mut.set_null("c").expect("set null");
+        }
+
+        let tuple = HeapTuple::from_bytes(&bytes);
+        let row = LogicalRow::new(tuple, &layout);
+
+        match row.get_column("a") {
+            Some(Constant::Int(v)) => assert_eq!(v, 99),
+            _ => panic!("expected updated int"),
+        }
+
+        match row.get_column("b") {
+            Some(Constant::String(s)) => assert_eq!(s, "hey"),
+            _ => panic!("expected updated string"),
+        }
+
+        assert!(row.get_column("c").is_none());
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct HeapTupleHeader {
@@ -1425,9 +1614,9 @@ impl<'a> LogicalRowMut<'a> {
             }
             FieldType::String => {
                 let value = value.as_str();
-                let len = value.len();
+                let len = value.len() as u32;
                 bytes[..4].copy_from_slice(&len.to_le_bytes());
-                bytes[4..4 + len].copy_from_slice(value.as_bytes());
+                bytes[4..4 + len as usize].copy_from_slice(value.as_bytes());
             }
         }
     }
@@ -1501,5 +1690,147 @@ impl<'a> PageViewMut<'a, HeapPage> {
         let layout_clone = self.layout.clone();
         let heap_tuple_mut = self.tuple_mut(slot)?;
         Some(LogicalRowMut::new(heap_tuple_mut, layout_clone))
+    }
+}
+
+#[cfg(test)]
+mod page_view_tests {
+    use super::*;
+    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+
+    fn sample_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        schema.add_string_field("name", 16);
+        schema.add_int_field("score");
+        Layout::new(schema)
+    }
+
+    fn tuple_bytes(layout: &Layout, id: i32, name: &str, score: Option<i32>) -> Vec<u8> {
+        let mut payload = vec![0u8; layout.slot_size];
+        let nullmap_bytes = (layout.num_of_columns() + 7) / 8;
+        payload[..nullmap_bytes].fill(0);
+
+        if let Some(offset) = layout.offset("id") {
+            payload[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
+        }
+
+        if let Some(offset) = layout.offset("name") {
+            let bytes = name.as_bytes();
+            assert!(
+                bytes.len() <= layout.field_info("name").unwrap().length,
+                "name exceeds declared length"
+            );
+            payload[offset..offset + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            payload[offset + 4..offset + 4 + bytes.len()].copy_from_slice(bytes);
+        }
+
+        if let Some(score_value) = score {
+            if let Some(offset) = layout.offset("score") {
+                payload[offset..offset + 4].copy_from_slice(&score_value.to_le_bytes());
+            }
+        } else {
+            let (_, idx) = layout.offset_with_index("score").unwrap();
+            let byte = idx / 8;
+            let bit = idx % 8;
+            payload[byte] |= 1 << bit;
+        }
+
+        build_tuple_bytes(&payload, 0)
+    }
+
+    fn write_heap_page(guard: &mut PageWriteGuard<'_>, tuples: &[Vec<u8>]) {
+        let mut heap_page = Page::<HeapPage>::new();
+        for tuple in tuples {
+            heap_page
+                .allocate_tuple(tuple)
+                .expect("tuple should fit on heap page");
+        }
+        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
+        heap_page
+            .write_bytes(&mut buf)
+            .expect("serialize heap page to bytes");
+        **guard = Page::<RawPage>::from_bytes(&buf).expect("materialize raw page from bytes");
+    }
+
+    #[test]
+    fn page_view_reads_rows_from_heap_page() {
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = sample_layout();
+
+        let tuples = vec![
+            tuple_bytes(&layout, 42, "alpha", Some(9)),
+            tuple_bytes(&layout, 7, "beta", None),
+        ];
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            write_heap_page(&mut guard, &tuples);
+        }
+
+        let read_guard = txn.pin_read_guard(&block_id);
+        let view = PageView::new(read_guard, &layout).expect("heap page view");
+
+        let row0 = view.row(0).expect("slot 0 row");
+        assert_eq!(row0.get_column("id"), Some(Constant::Int(42)));
+        assert_eq!(
+            row0.get_column("name"),
+            Some(Constant::String("alpha".to_string()))
+        );
+        assert_eq!(row0.get_column("score"), Some(Constant::Int(9)));
+
+        let row1 = view.row(1).expect("slot 1 row");
+        assert_eq!(row1.get_column("id"), Some(Constant::Int(7)));
+        assert_eq!(
+            row1.get_column("name"),
+            Some(Constant::String("beta".to_string()))
+        );
+        assert!(row1.get_column("score").is_none());
+    }
+
+    #[test]
+    fn page_view_mut_updates_rows() {
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = sample_layout();
+
+        let tuples = vec![tuple_bytes(&layout, 5, "seed", Some(10))];
+
+        let mut guard = txn.pin_write_guard(&block_id);
+        write_heap_page(&mut guard, &tuples);
+
+        {
+            let mut view =
+                PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            {
+                let mut row_mut = view.row_mut(0).expect("mutable access to slot 0");
+                row_mut
+                    .set_column("id", &Constant::Int(777))
+                    .expect("update int column");
+                row_mut
+                    .set_column("name", &Constant::String("toast".to_string()))
+                    .expect("update string column");
+                row_mut.set_null("score").expect("mark score as NULL");
+            }
+
+            let row = view.row(0).expect("read updated slot 0");
+            assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
+            assert_eq!(
+                row.get_column("name"),
+                Some(Constant::String("toast".to_string()))
+            );
+            assert!(row.get_column("score").is_none());
+        }
+
+        let read_guard = txn.pin_read_guard(&block_id);
+        let view = PageView::new(read_guard, &layout).expect("reopen heap view");
+        let row = view.row(0).expect("slot 0 after write guard drop");
+        assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
+        assert!(row.get_column("score").is_none());
     }
 }
