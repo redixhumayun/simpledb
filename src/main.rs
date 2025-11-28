@@ -10546,7 +10546,9 @@ impl BufferList {
 mod buffer_list_tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::{test_utils::TestDir, BlockId, BufferList, BufferManager, FileManager, LogManager};
+    use crate::{
+        test_utils::TestDir, BlockId, BufferList, BufferManager, FileManager, LogManager, Page,
+    };
 
     #[test]
     fn test_buffer_list_functionality() {
@@ -10558,13 +10560,22 @@ mod buffer_list_tests {
             "buffer_list_tests_log_file",
         )));
         let buffer_manager = Arc::new(BufferManager::new(file_manager, log_manager, 4));
-        let buffer_list = BufferList::new(buffer_manager);
+        let buffer_list = BufferList::new(Arc::clone(&buffer_manager));
 
         //  check that there are no buffers in the buffer list initially
         let block_id = BlockId {
             filename: "testfile".to_string(),
             block_num: 1,
         };
+        // TODO: rework this test to go through RecordPage/PageView once higher layers migrate
+        {
+            let mut page = Page::new();
+            buffer_manager
+                .file_manager()
+                .lock()
+                .unwrap()
+                .write(&block_id, &mut page);
+        }
         assert!(buffer_list.get_buffer(&block_id).is_none());
 
         //  pinning a buffer and then attempting to fetch it should return the correct one
@@ -11655,10 +11666,8 @@ impl FileSystemInterface for FileManager {
 
     fn read(&mut self, block_id: &BlockId, page: &mut Page) {
         let mut file = self.get_file(&block_id.filename);
-        file.seek(io::SeekFrom::Start(
-            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-        ))
-        .unwrap();
+        let offset = block_offset(block_id.block_num);
+        file.seek(io::SeekFrom::Start(offset)).unwrap();
         let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
         match file.read_exact(&mut buf) {
             Ok(_) => (),
@@ -11672,10 +11681,8 @@ impl FileSystemInterface for FileManager {
 
     fn write(&mut self, block_id: &BlockId, page: &Page) {
         let mut file = self.get_file(&block_id.filename);
-        file.seek(io::SeekFrom::Start(
-            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-        ))
-        .unwrap();
+        let offset = block_offset(block_id.block_num);
+        file.seek(io::SeekFrom::Start(offset)).unwrap();
         let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
         page.write_bytes(&mut buf).expect("serialize page");
         file.write_all(&buf).unwrap();
@@ -11688,10 +11695,8 @@ impl FileSystemInterface for FileManager {
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
         let mut file = self.get_file(&block_id.filename);
-        file.seek(io::SeekFrom::Start(
-            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-        ))
-        .unwrap();
+        let offset = block_offset(block_id.block_num);
+        file.seek(io::SeekFrom::Start(offset)).unwrap();
         match file.read_exact(buf) {
             Ok(_) => (),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -11708,10 +11713,8 @@ impl FileSystemInterface for FileManager {
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
         let mut file = self.get_file(&block_id.filename);
-        file.seek(io::SeekFrom::Start(
-            (block_id.block_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-        ))
-        .unwrap();
+        let offset = block_offset(block_id.block_num);
+        file.seek(io::SeekFrom::Start(offset)).unwrap();
         file.write_all(buf).unwrap();
     }
 
@@ -11739,6 +11742,23 @@ impl FileSystemInterface for FileManager {
     fn sync_directory(&mut self) {
         self.directory_fd.sync_all().unwrap();
     }
+}
+
+fn block_offset(block_num: usize) -> u64 {
+    let bytes_per_block = crate::page::PAGE_SIZE_BYTES as u128;
+    let block = block_num as u128;
+    let offset = block
+        .checked_mul(bytes_per_block)
+        .expect(&format!(
+            "block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"
+        ));
+    if offset > i64::MAX as u128 {
+        panic!(
+            "block offset exceeds i64 range: block_num={}, bytes_per_block={}, offset={}",
+            block_num, bytes_per_block, offset
+        );
+    }
+    offset as u64
 }
 
 #[cfg(test)]
@@ -11772,6 +11792,14 @@ mod mock_file_manager {
                 directory_synced: false,
                 crashed: false,
             }
+        }
+
+        fn fresh_page_bytes() -> Vec<u8> {
+            let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+            Page::new()
+                .write_bytes(&mut buf)
+                .expect("serialize empty page");
+            buf
         }
 
         /// Simulate a system crash - discards all unsynced data
@@ -11812,7 +11840,7 @@ mod mock_file_manager {
 
             while file.blocks.len() <= block_num {
                 file.blocks.push(MockBlock {
-                    data: vec![0; crate::page::PAGE_SIZE_BYTES as usize],
+                    data: Self::fresh_page_bytes(),
                     synced: false,
                 });
             }
@@ -11836,8 +11864,7 @@ mod mock_file_manager {
             }
 
             if !self.files.contains_key(&block_id.filename) {
-                *page =
-                    Page::from_bytes(&vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]).unwrap();
+                *page = Page::new();
                 return;
             }
 
@@ -11848,8 +11875,7 @@ mod mock_file_manager {
                 let block = &file.blocks[block_id.block_num];
                 *page = Page::from_bytes(&block.data).unwrap();
             } else {
-                *page =
-                    Page::from_bytes(&vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]).unwrap();
+                *page = Page::new();
             }
         }
 
@@ -11880,7 +11906,7 @@ mod mock_file_manager {
             );
 
             if !self.files.contains_key(&block_id.filename) {
-                buf.fill(0);
+                buf.copy_from_slice(&Self::fresh_page_bytes());
                 return;
             }
 
@@ -11891,7 +11917,7 @@ mod mock_file_manager {
                 let block = &file.blocks[block_id.block_num];
                 buf.copy_from_slice(&block.data);
             } else {
-                buf.fill(0);
+                buf.copy_from_slice(&Self::fresh_page_bytes());
             }
         }
 
@@ -11924,7 +11950,7 @@ mod mock_file_manager {
             let block_num = file.blocks.len();
 
             file.blocks.push(MockBlock {
-                data: vec![0; crate::page::PAGE_SIZE_BYTES as usize],
+                data: Self::fresh_page_bytes(),
                 synced: false,
             });
 
@@ -12009,8 +12035,10 @@ mod durability_tests {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        page.set_int(0, 42);
-        page.set_string(4, "durability");
+        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
+        // TODO: once logical rows are wired up in durability tests, use the real tuple API instead of fixed offsets
+        page.set_int(base, 42);
+        page.set_string(base + Page::INT_BYTES, "durability");
 
         // Phase 1: Write data without sync and simulate a crash which will discard all unsynced data
         mock_fs.write(&block_id, &mut page);
@@ -12022,8 +12050,8 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(0);
-        let recovered_string = read_page.get_string(4);
+        let recovered_int = read_page.get_int(base);
+        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
 
         assert_eq!(
             recovered_int, 0,
@@ -12040,8 +12068,9 @@ mod durability_tests {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        page.set_int(0, 42);
-        page.set_string(4, "durability");
+        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
+        page.set_int(base, 42);
+        page.set_string(base + Page::INT_BYTES, "durability");
 
         // Phase 1: Write data AND sync
         mock_fs.write(&block_id, &mut page);
@@ -12055,8 +12084,8 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(0);
-        let recovered_string = read_page.get_string(4);
+        let recovered_int = read_page.get_int(base);
+        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
 
         assert_eq!(
             recovered_int, 42,

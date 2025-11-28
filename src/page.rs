@@ -445,6 +445,11 @@ pub trait PageAllocator<'a> {
 
 pub trait PageKind {
     const PAGE_TYPE: PageType;
+    /// Whether this page kind uses the structured header/line-pointer layout.
+    /// RawPage keeps the legacy “flat byte array” semantics for legacy callers like B-tree
+    /// while they’re still being migrated to the new page API.
+    /// TODO: Once B-tree pages have typed views, remove this escape hatch.
+    const HAS_HEADER: bool = true;
     type Alloc<'a>: PageAllocator<'a>
     where
         Self: 'a;
@@ -535,6 +540,7 @@ impl PageKind for HeapPage {
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
+    const HAS_HEADER: bool = false;
 
     type Alloc<'a> = ();
 
@@ -826,6 +832,11 @@ impl<K: PageKind> Page<K> {
             return Err("output buffer must equal PAGE_SIZE_BYTES".into());
         }
 
+        if !K::HAS_HEADER {
+            out.copy_from_slice(&self.record_space);
+            return Ok(());
+        }
+
         // Start with heap copy (holds tuple bytes). This is safe because header/LPs are
         // overwritten below.
         out.fill(0);
@@ -855,6 +866,15 @@ impl<K: PageKind> Page<K> {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
         if bytes.len() != PAGE_SIZE_BYTES as usize {
             return Err("input buffer must equal PAGE_SIZE_BYTES".into());
+        }
+
+        if !K::HAS_HEADER {
+            return Ok(Self {
+                header: PageHeader::new(K::PAGE_TYPE),
+                line_pointers: Vec::new(),
+                record_space: bytes.to_vec(),
+                kind: PhantomData,
+            });
         }
 
         let header = PageHeader::read_from_bytes(&bytes[..PAGE_HEADER_SIZE_BYTES as usize])?;
