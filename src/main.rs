@@ -750,17 +750,34 @@ impl ChunkScan {
             first_block_num <= last_block_num,
             "{first_block_num} is not less than or equal to {last_block_num}"
         );
-        debug!(
-            "Creating chunk scan for {}.tbl for blocks from {} to {}",
-            table_name, first_block_num, last_block_num
-        );
+
         let file_name = format!("{table_name}.tbl");
+        let file_size = txn.size(&file_name);
+
+        // Clamp the block range to only include blocks that actually exist
+        let actual_last_block = if file_size == 0 {
+            // No blocks exist yet, create empty ChunkScan
+            first_block_num.saturating_sub(1) // This will make the range empty
+        } else {
+            last_block_num.min(file_size - 1)
+        };
+
+        debug!(
+            "Creating chunk scan for {}.tbl for blocks from {} to {} (file has {} blocks)",
+            table_name, first_block_num, actual_last_block, file_size
+        );
+
         let mut buffer_list = Vec::new();
-        for block_num in first_block_num..=last_block_num {
-            let block_id = BlockId::new(file_name.to_string(), block_num);
-            let record_page = RecordPage::new(Arc::clone(&txn), block_id, layout.clone());
-            buffer_list.push(record_page);
+        // Only create RecordPages for blocks that exist
+        if file_size > 0 && first_block_num < file_size {
+            for block_num in first_block_num..=actual_last_block {
+                let block_id = BlockId::new(file_name.to_string(), block_num);
+                let record_page = RecordPage::new(Arc::clone(&txn), block_id, layout.clone());
+                buffer_list.push(record_page);
+            }
         }
+
+        let has_blocks = !buffer_list.is_empty();
 
         let mut scan = Self {
             txn,
@@ -768,13 +785,16 @@ impl ChunkScan {
             file_name: file_name.to_string(),
             table_name: table_name.to_string(),
             first_block_num,
-            last_block_num,
+            last_block_num: actual_last_block,
             current_block_num: first_block_num,
             current_record_page: None,
             current_slot: None,
             buffer_list,
         };
-        scan.move_to_block(first_block_num);
+
+        if has_blocks {
+            scan.move_to_block(first_block_num);
+        }
         scan
     }
 
@@ -847,7 +867,9 @@ impl Iterator for ChunkScan {
 
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on ChunkScan for {}", self.table_name);
-        assert!(!self.buffer_list.is_empty());
+        if self.buffer_list.is_empty() {
+            return None;
+        }
         loop {
             if let Some(record_page_idx) = &self.current_record_page {
                 let record_page = &self.buffer_list[*record_page_idx];
