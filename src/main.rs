@@ -8284,6 +8284,21 @@ impl RecordPage {
         Ok(None)
     }
 
+    /// Returns a Vec of all live (non-deleted) slot IDs on this page.
+    pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
+        let view = self
+            .txn
+            .pin_read_guard(&self.block_id)
+            .into_heap_view(&self.layout)?;
+
+        let slot_count = view.slot_count();
+        let live: Vec<usize> = (0..slot_count)
+            .filter(|&slot| view.row(slot).is_some())
+            .collect();
+
+        Ok(live)
+    }
+
     /// Allocates an empty slot for a new record and returns its slot ID.
     /// Used by TableScan which populates fields separately via set_int/set_string.
     pub fn insert(&self) -> Result<usize, Box<dyn Error>> {
@@ -8364,18 +8379,16 @@ mod record_page_tests {
         let mut deleted_count = 0;
         for slot in &inserted_slots {
             let a = record_page.get_int(*slot, "A");
-            println!("value of a {}", a);
             if a < 25 {
                 deleted_count += 1;
                 record_page.delete(*slot).ok();
             }
         }
-        println!("{deleted_count} values were deleted");
 
         //  Check that the correct number of records are left
         let mut remaining_count = 0;
-        for slot in &inserted_slots {
-            let a = record_page.get_int(*slot, "A");
+        for slot in record_page.live_slots().unwrap() {
+            let a = record_page.get_int(slot, "A");
             if a >= 25 {
                 remaining_count += 1;
             }
