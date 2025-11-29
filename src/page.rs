@@ -1,6 +1,12 @@
-use std::{error::Error, marker::PhantomData, mem::size_of};
+use std::{
+    error::Error,
+    marker::PhantomData,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
+};
 
-use crate::{Constant, FieldInfo, FieldType, Layout, PageReadGuard, PageWriteGuard};
+use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,12 +474,12 @@ pub trait PageKind {
 
 type SlotId = usize;
 
-struct HeapPage;
+pub struct HeapPage;
 /// Raw page kind used to hold an on-disk image without enforcing a specific PageType.
 /// Useful at the IO boundary (FileManager/LogManager) where the page kind is not yet known.
 pub struct RawPage;
 
-struct HeapAllocator<'a> {
+pub struct HeapAllocator<'a> {
     page: &'a mut Page<HeapPage>,
 }
 
@@ -485,7 +491,7 @@ impl<'a> PageAllocator<'a> for HeapAllocator<'a> {
     }
 }
 
-struct HeapIterator<'a> {
+pub struct HeapIterator<'a> {
     page: &'a Page<HeapPage>,
     current_slot: SlotId,
     match_state: Option<LineState>,
@@ -1016,6 +1022,106 @@ impl Page<RawPage> {
     }
 }
 
+pub struct PageReadGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockReadGuard<'a, Page<RawPage>>,
+}
+
+impl<'a> PageReadGuard<'a> {
+    pub fn new(
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+        page: RwLockReadGuard<'a, Page<RawPage>>,
+    ) -> Self {
+        Self {
+            handle,
+            frame,
+            page,
+        }
+    }
+
+    pub fn block_id(&self) -> &BlockId {
+        self.handle.block_id()
+    }
+
+    pub fn frame(&self) -> &BufferFrame {
+        &self.frame
+    }
+
+    pub fn into_heap_view(
+        self,
+        layout: &'a Layout,
+    ) -> Result<PageView<'a, HeapPage>, Box<dyn Error>> {
+        PageView::new(self, layout)
+    }
+}
+
+impl<'a> Deref for PageReadGuard<'a> {
+    type Target = Page<RawPage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+pub struct PageWriteGuard<'a> {
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    page: RwLockWriteGuard<'a, Page<RawPage>>,
+}
+
+impl<'a> PageWriteGuard<'a> {
+    pub fn new(
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+        page: RwLockWriteGuard<'a, Page<RawPage>>,
+    ) -> Self {
+        Self {
+            handle,
+            frame,
+            page,
+        }
+    }
+
+    pub fn block_id(&self) -> &BlockId {
+        self.handle.block_id()
+    }
+
+    pub fn frame(&self) -> &BufferFrame {
+        &self.frame
+    }
+
+    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
+        self.frame.set_modified(txn_id, lsn);
+    }
+
+    pub fn format_as_heap(&mut self) {
+        **self = Page::<HeapPage>::new().into()
+    }
+
+    pub fn into_heap_view_mut(
+        self,
+        layout: &'a Layout,
+    ) -> Result<PageViewMut<'a, HeapPage>, Box<dyn Error>> {
+        PageViewMut::new(self, &layout)
+    }
+}
+
+impl<'a> Deref for PageWriteGuard<'a> {
+    type Target = Page<RawPage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl<'a> DerefMut for PageWriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.page
+    }
+}
+
 #[cfg(test)]
 mod page_tests {
     use super::*;
@@ -1236,7 +1342,7 @@ mod page_tests {
     }
 }
 
-enum TupleRef<'a> {
+pub enum TupleRef<'a> {
     Live(HeapTuple<'a>),
     Redirect(SlotId),
     Free,
@@ -1639,7 +1745,7 @@ impl<'a> HeapTupleMut<'a> {
     }
 }
 
-struct LogicalRow<'a> {
+pub struct LogicalRow<'a> {
     tuple: HeapTuple<'a>,
     layout: &'a Layout,
 }
@@ -1649,7 +1755,7 @@ impl<'a> LogicalRow<'a> {
         Self { tuple, layout }
     }
 
-    fn get_column(&self, column_name: &str) -> Option<Constant> {
+    pub fn get_column(&self, column_name: &str) -> Option<Constant> {
         let (offset, index) = self.layout.offset_with_index(column_name)?;
         let null_bitmap = self.tuple.null_bitmap(self.layout.num_of_columns());
         if null_bitmap.is_null(index) {
@@ -1674,7 +1780,7 @@ impl<'a> LogicalRow<'a> {
     }
 }
 
-struct LogicalRowMut<'a> {
+pub struct LogicalRowMut<'a> {
     tuple: HeapTupleMut<'a>,
     layout: Layout,
 }
@@ -1688,7 +1794,7 @@ impl<'a> LogicalRowMut<'a> {
         LogicalRow::new(self.tuple.as_tuple(), &self.layout)
     }
 
-    fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
+    pub fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
         let (offset, index) = self.layout.offset_with_index(column_name)?;
         let field_info = self.layout.field_info(column_name)?;
         let field_length = self.layout.field_length(column_name)?;
@@ -1724,7 +1830,7 @@ impl<'a> LogicalRowMut<'a> {
     }
 }
 
-struct PageView<'a, K: PageKind> {
+pub struct PageView<'a, K: PageKind> {
     guard: PageReadGuard<'a>,
     page_ref: &'a Page<K>,
     layout: &'a Layout,
@@ -1752,9 +1858,13 @@ impl<'a> PageView<'a, HeapPage> {
         let heap_tuple = self.tuple(slot)?;
         Some(LogicalRow::new(heap_tuple, self.layout))
     }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
+    }
 }
 
-struct PageViewMut<'a, K: PageKind> {
+pub struct PageViewMut<'a, K: PageKind> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<K>,
     layout: &'a Layout,
@@ -1836,6 +1946,10 @@ impl<'a> PageViewMut<'a, HeapPage> {
             .heap_tuple_mut(slot)
             .expect("tuple must exist after allocation");
         Ok((slot, LogicalRowMut::new(tuple_mut, self.layout.clone())))
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
     }
 }
 

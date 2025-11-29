@@ -36,7 +36,7 @@ mod intrusive_dll;
 mod page;
 mod parser;
 mod replacement;
-use crate::page::WalPage;
+use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
 
 use replacement::PolicyState;
 
@@ -8666,84 +8666,6 @@ impl Drop for BufferHandle {
     }
 }
 
-pub struct PageReadGuard<'a> {
-    handle: BufferHandle,
-    frame: Arc<BufferFrame>,
-    page: RwLockReadGuard<'a, Page>,
-}
-
-impl<'a> PageReadGuard<'a> {
-    fn new(handle: BufferHandle, frame: Arc<BufferFrame>, page: RwLockReadGuard<'a, Page>) -> Self {
-        Self {
-            handle,
-            frame,
-            page,
-        }
-    }
-
-    pub fn block_id(&self) -> &BlockId {
-        self.handle.block_id()
-    }
-
-    pub fn frame(&self) -> &BufferFrame {
-        &self.frame
-    }
-}
-
-impl<'a> Deref for PageReadGuard<'a> {
-    type Target = Page;
-
-    fn deref(&self) -> &Self::Target {
-        &self.page
-    }
-}
-
-pub struct PageWriteGuard<'a> {
-    handle: BufferHandle,
-    frame: Arc<BufferFrame>,
-    page: RwLockWriteGuard<'a, Page>,
-}
-
-impl<'a> PageWriteGuard<'a> {
-    fn new(
-        handle: BufferHandle,
-        frame: Arc<BufferFrame>,
-        page: RwLockWriteGuard<'a, Page>,
-    ) -> Self {
-        Self {
-            handle,
-            frame,
-            page,
-        }
-    }
-
-    pub fn block_id(&self) -> &BlockId {
-        self.handle.block_id()
-    }
-
-    pub fn frame(&self) -> &BufferFrame {
-        &self.frame
-    }
-
-    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
-        self.frame.set_modified(txn_id, lsn);
-    }
-}
-
-impl<'a> Deref for PageWriteGuard<'a> {
-    type Target = Page;
-
-    fn deref(&self) -> &Self::Target {
-        &self.page
-    }
-}
-
-impl<'a> DerefMut for PageWriteGuard<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.page
-    }
-}
-
 trait TransactionOperations {
     fn pin(&self, block_id: &BlockId);
     fn unpin(&self, block_id: &BlockId);
@@ -11747,11 +11669,9 @@ impl FileSystemInterface for FileManager {
 fn block_offset(block_num: usize) -> u64 {
     let bytes_per_block = crate::page::PAGE_SIZE_BYTES as u128;
     let block = block_num as u128;
-    let offset = block
-        .checked_mul(bytes_per_block)
-        .expect(&format!(
-            "block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"
-        ));
+    let offset = block.checked_mul(bytes_per_block).expect(&format!(
+        "block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"
+    ));
     if offset > i64::MAX as u128 {
         panic!(
             "block offset exceeds i64 range: block_num={}, bytes_per_block={}, offset={}",
