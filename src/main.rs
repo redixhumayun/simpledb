@@ -10,7 +10,6 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, Write},
-    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize},
@@ -852,15 +851,17 @@ impl Iterator for ChunkScan {
         loop {
             if let Some(record_page_idx) = &self.current_record_page {
                 let record_page = &self.buffer_list[*record_page_idx];
-                let next_slot = match self.current_slot {
-                    None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
-                };
-
-                //  There are still slots to iterate in the current record page
-                if let Some(slot) = next_slot {
-                    self.current_slot = Some(slot);
-                    return Some(Ok(()));
+                match record_page.next_valid_slot(self.current_slot) {
+                    Ok(Some(slot)) => {
+                        self.current_slot = Some(slot);
+                        return Some(Ok(()));
+                    }
+                    Ok(None) => {
+                        // No more slots in this page, continue to next page
+                    }
+                    Err(e) => {
+                        return Some(Err(e));
+                    }
                 }
 
                 //  There are no more slots in the current record page. Check if there are more record pages
@@ -7501,14 +7502,7 @@ impl StatManager {
         let mut num_blocks = 0;
         while table_scan.next().is_some() {
             num_rec += 1;
-            num_blocks = table_scan
-                .record_page
-                .as_ref()
-                .unwrap()
-                .handle
-                .block_id()
-                .block_num
-                + 1;
+            num_blocks = table_scan.record_page.as_ref().unwrap().block_id.block_num + 1;
         }
         StatInfo {
             num_blocks,
@@ -7872,13 +7866,7 @@ impl TableScan {
 
     /// Checks if the [`TableScan`] is at the last block in the file
     fn at_last_block(&self) -> bool {
-        self.record_page
-            .as_ref()
-            .unwrap()
-            .handle
-            .block_id()
-            .block_num
-            == self.txn.size(&self.file_name) - 1
+        self.record_page.as_ref().unwrap().block_id.block_num == self.txn.size(&self.file_name) - 1
     }
 
     /// Moves the [`RecordPage`] to the start of the file
@@ -7906,29 +7894,24 @@ impl Iterator for TableScan {
         loop {
             //  Check if there is a record page currently
             if let Some(record_page) = &self.record_page {
-                let next_slot = match self.current_slot {
-                    None => record_page.iter_used_slots().next(),
-                    Some(slot) => record_page.iter_used_slots().find(|s| *s > slot),
-                };
-
-                if let Some(slot) = next_slot {
-                    self.current_slot = Some(slot);
-                    return Some(Ok(()));
+                match record_page.next_valid_slot(self.current_slot) {
+                    Ok(Some(slot)) => {
+                        self.current_slot = Some(slot);
+                        return Some(Ok(()));
+                    }
+                    Ok(None) => {
+                        // No more slots in this page, continue to next page
+                    }
+                    Err(e) => {
+                        return Some(Err(e));
+                    }
                 }
             }
 
             if self.at_last_block() {
                 return None;
             }
-            self.move_to_block(
-                self.record_page
-                    .as_ref()
-                    .unwrap()
-                    .handle
-                    .block_id()
-                    .block_num
-                    + 1,
-            );
+            self.move_to_block(self.record_page.as_ref().unwrap().block_id.block_num + 1);
         }
     }
 }
@@ -8031,12 +8014,7 @@ impl UpdateScan for TableScan {
                 iterations <= 10000,
                 "Table scan insert failed for {iterations} iterations"
             );
-            match self
-                .record_page
-                .as_ref()
-                .unwrap()
-                .insert_after(self.current_slot)
-            {
+            match self.record_page.as_ref().unwrap().insert() {
                 Ok(slot) => {
                     self.current_slot = Some(slot);
                     break;
@@ -8046,13 +8024,7 @@ impl UpdateScan for TableScan {
                         self.move_to_new_block();
                     } else {
                         self.move_to_block(
-                            self.record_page
-                                .as_ref()
-                                .unwrap()
-                                .handle
-                                .block_id()
-                                .block_num
-                                + 1,
+                            self.record_page.as_ref().unwrap().block_id.block_num + 1,
                         );
                     }
                     continue;
@@ -8066,18 +8038,13 @@ impl UpdateScan for TableScan {
         self.record_page
             .as_ref()
             .unwrap()
-            .delete(*self.current_slot.as_ref().unwrap());
+            .delete(*self.current_slot.as_ref().unwrap())?;
         Ok(())
     }
 
     fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
         Ok(RID::new(
-            self.record_page
-                .as_ref()
-                .unwrap()
-                .handle
-                .block_id()
-                .block_num,
+            self.record_page.as_ref().unwrap().block_id.block_num,
             *self.current_slot.as_ref().unwrap(),
         ))
     }
@@ -8144,7 +8111,7 @@ mod table_scan_tests {
         dbg!("Deleting a bunch of records");
         dbg!(format!(
             "The table scan is at {:?}",
-            table_scan.record_page.as_ref().unwrap().handle.block_id()
+            table_scan.record_page.as_ref().unwrap().block_id
         ));
         let mut deleted_count = 0;
         table_scan.move_to_start();
@@ -8193,6 +8160,8 @@ impl Constant {
     }
 }
 
+pub type RowValues = Vec<Constant>;
+
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct RID {
     block_num: usize,
@@ -8205,54 +8174,6 @@ impl RID {
     }
 }
 
-struct RecordPageIterator<'a> {
-    record_page: &'a RecordPage,
-    current_slot: Option<usize>,
-    presence: SlotPresence,
-}
-
-impl<'a> RecordPageIterator<'a> {
-    pub fn new(record_page: &'a RecordPage, presence: SlotPresence) -> Self {
-        Self {
-            record_page,
-            current_slot: None,
-            presence,
-        }
-    }
-}
-
-impl Iterator for RecordPageIterator<'_> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let slot = match self.current_slot {
-                None => 0,
-                Some(slot) => slot + 1,
-            };
-            if !self.record_page.is_valid_slot(slot) {
-                break;
-            }
-
-            self.current_slot = Some(slot);
-
-            let slot_value = self
-                .record_page
-                .tx
-                .get_int(
-                    self.record_page.handle.block_id(),
-                    self.record_page.offset(slot),
-                )
-                .unwrap();
-
-            if slot_value == self.presence as i32 {
-                return Some(slot);
-            }
-        }
-        None
-    }
-}
-
 #[derive(Clone, Copy)]
 enum SlotPresence {
     Empty,
@@ -8261,146 +8182,144 @@ enum SlotPresence {
 
 #[derive(Clone)]
 struct RecordPage {
-    tx: Arc<Transaction>,
-    handle: BufferHandle,
+    txn: Arc<Transaction>,
+    block_id: BlockId,
     layout: Layout,
 }
 
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
-    pub fn new(tx: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
-        let handle = tx.pin(&block_id);
-        Self { tx, handle, layout }
+    pub fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
+        Self {
+            txn,
+            block_id,
+            layout,
+        }
     }
 
     /// Retrieves an integer value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn get_int(&self, slot: usize, field_name: &str) -> i32 {
-        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
-        self.tx.get_int(self.handle.block_id(), offset).unwrap()
+        self.txn
+            .pin_read_guard(&self.block_id)
+            .into_heap_view(&self.layout)
+            .unwrap()
+            .row(slot)
+            .unwrap()
+            .get_column(field_name)
+            .unwrap()
+            .as_int()
     }
 
     /// Retrieves a string value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn get_string(&self, slot: usize, field_name: &str) -> String {
-        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
-        self.tx.get_string(self.handle.block_id(), offset).unwrap()
+        self.txn
+            .pin_read_guard(&self.block_id)
+            .into_heap_view(&self.layout)
+            .unwrap()
+            .row(slot)
+            .unwrap()
+            .get_column(field_name)
+            .unwrap()
+            .as_str()
+            .to_string()
     }
 
     /// Sets an integer value in the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) {
-        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
-        self.tx
-            .set_int(self.handle.block_id(), offset, value, true)
-            .unwrap();
+        self.txn
+            .pin_write_guard(&self.block_id)
+            .into_heap_view_mut(&self.layout)
+            .unwrap()
+            .row_mut(slot)
+            .unwrap()
+            .set_column(field_name, &Constant::Int(value));
     }
 
     /// Sets a string value in the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) {
-        let offset = self.offset(slot) + self.layout.offset(field_name).unwrap();
-        self.tx
-            .set_string(self.handle.block_id(), offset, value, true)
-            .unwrap();
+        self.txn
+            .pin_write_guard(&self.block_id)
+            .into_heap_view_mut(&self.layout)
+            .unwrap()
+            .row_mut(slot)
+            .unwrap()
+            .set_column(field_name, &Constant::String(value.to_string()));
     }
 
-    /// Marks a slot as used and returns its slot number.
-    #[cfg(test)]
-    fn insert(&self, slot: usize) -> usize {
-        self.set_flag(slot, SlotPresence::Used);
-        slot
+    /// Deletes the record at the specified slot.
+    pub fn delete(&self, slot: usize) -> Result<(), Box<dyn Error>> {
+        let guard = self.txn.pin_write_guard(&self.block_id);
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        view.delete_slot(slot)
     }
 
-    /// Finds the next empty slot after the given slot, marks it as used, and returns its number.
-    fn insert_after(&self, slot: Option<usize>) -> Result<usize, Box<dyn Error>> {
-        let new_slot = match slot {
-            None => self
-                .iter_empty_slots()
-                .next()
-                .ok_or("no empty slots available in this record page")?,
-            Some(current_slot) => self
-                .iter_empty_slots()
-                .find(|s| *s > current_slot)
-                .ok_or("no empty slots available in this record page")?,
-        };
-        self.set_flag(new_slot, SlotPresence::Used);
-        Ok(new_slot)
+    /// Format the underlying page as a HeapPage
+    pub fn format(&self) {
+        let mut guard = self.txn.pin_write_guard(&self.block_id);
+        guard.format_as_heap();
     }
 
-    /// Sets the presence flag (EMPTY or USED) for a given slot.
-    fn set_flag(&self, slot: usize, flag: SlotPresence) {
-        self.tx
-            .set_int(self.handle.block_id(), self.offset(slot), flag as i32, true)
-            .unwrap();
-    }
+    /// Finds the next valid slot after the given slot.
+    /// If `after` is None, returns the first valid slot.
+    /// Returns None if no more valid slots exist.
+    pub fn next_valid_slot(&self, after: Option<usize>) -> Result<Option<usize>, Box<dyn Error>> {
+        let view = self
+            .txn
+            .pin_read_guard(&self.block_id)
+            .into_heap_view(&self.layout)?;
 
-    /// Marks a slot as empty, effectively deleting its record.
-    fn delete(&self, slot: usize) {
-        self.set_flag(slot, SlotPresence::Empty);
-    }
+        let start_slot = after.map(|s| s + 1).unwrap_or(0);
+        let slot_count = view.slot_count();
 
-    /// Calculates the byte offset for a given slot based on the layout's slot size.
-    fn offset(&self, slot: usize) -> usize {
-        slot * self.layout.slot_size
-    }
-
-    /// Checks if a slot number is valid within the block's size.
-    fn is_valid_slot(&self, slot: usize) -> bool {
-        self.offset(slot + 1) <= self.tx.block_size()
-    }
-
-    /// Initializes all slots in the block with empty flags and default values.
-    /// For each field in the schema, sets integers to 0 and strings to empty.
-    fn format(&self) {
-        let mut current_slot = 0;
-        while self.is_valid_slot(current_slot) {
-            self.tx
-                .set_int(
-                    self.handle.block_id(),
-                    self.offset(current_slot),
-                    SlotPresence::Empty as i32,
-                    false,
-                )
-                .unwrap();
-            let schema = &self.layout.schema;
-            for field in &schema.fields {
-                let field_pos = self.offset(current_slot) + self.layout.offset(field).unwrap();
-                match schema.info.get(field).unwrap().field_type {
-                    FieldType::Int => self
-                        .tx
-                        .set_int(self.handle.block_id(), field_pos, 0, false)
-                        .unwrap(),
-                    FieldType::String => self
-                        .tx
-                        .set_string(self.handle.block_id(), field_pos, "", false)
-                        .unwrap(),
-                }
+        for slot in start_slot..slot_count {
+            if view.row(slot).is_some() {
+                return Ok(Some(slot));
             }
-            current_slot += 1;
         }
+        Ok(None)
     }
 
-    /// Returns an iterator over empty slots in the record page.
-    fn iter_empty_slots(&self) -> RecordPageIterator<'_> {
-        RecordPageIterator {
-            record_page: self,
-            current_slot: None,
-            presence: SlotPresence::Empty,
-        }
+    /// Allocates an empty slot for a new record and returns its slot ID.
+    /// Used by TableScan which populates fields separately via set_int/set_string.
+    pub fn insert(&self) -> Result<usize, Box<dyn Error>> {
+        let guard = self.txn.pin_write_guard(&self.block_id);
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let (slot_id, _row_mut) = view.insert_row_mut()?;
+        Ok(slot_id)
     }
 
-    /// Returns an iterator over used slots in the record page.
-    fn iter_used_slots(&self) -> RecordPageIterator<'_> {
-        RecordPageIterator::new(self, SlotPresence::Used)
+    /// Inserts a new record with the given values and returns its slot ID.
+    /// Values must match the schema field order.
+    pub fn insert_with_values(&self, values: &RowValues) -> Result<usize, Box<dyn Error>> {
+        if values.len() != self.layout.schema.fields.len() {
+            return Err("value count must match schema field count".into());
+        }
+
+        let guard = self.txn.pin_write_guard(&self.block_id);
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let (slot_id, mut row_mut) = view.insert_row_mut()?;
+
+        for (field_name, value) in self.layout.schema.fields.iter().zip(values) {
+            row_mut
+                .set_column(field_name, value)
+                .ok_or_else(|| format!("failed to set column {} during insert", field_name))?;
+        }
+
+        Ok(slot_id)
     }
 }
 
 #[cfg(test)]
 mod record_page_tests {
 
-    use crate::{test_utils::generate_random_number, Layout, RecordPage, Schema, SimpleDB};
+    use crate::{
+        test_utils::generate_random_number, Constant, Layout, RecordPage, Schema, SimpleDB,
+    };
 
     #[test]
     fn record_page_test() {
@@ -8425,38 +8344,41 @@ mod record_page_tests {
         let record_page = RecordPage::new(txn, block_id, layout);
         record_page.format();
 
-        //  Create a bunch of records
-        let record_iter = record_page.iter_empty_slots();
-        let mut inserted_count = 0;
-        for slot in record_iter {
+        //  Create a bunch of records using insert_with_values
+        let mut inserted_slots = Vec::new();
+        loop {
             let number = (generate_random_number() % 100) + 1;
+            let values = vec![
+                Constant::Int(number as i32),
+                Constant::String(format!("rec{number}")),
+            ];
 
-            record_page.set_int(slot, "A", number as i32);
-            record_page.set_string(slot, "B", &format!("rec{number}"));
-            inserted_count += 1;
-            record_page.insert(slot);
+            match record_page.insert_with_values(&values) {
+                Ok(slot) => inserted_slots.push(slot),
+                Err(_) => break, // page full
+            }
         }
+        let inserted_count = inserted_slots.len();
 
         //  Delete all records with a value less than 25
-        let record_iter = record_page.iter_used_slots();
         let mut deleted_count = 0;
-        for slot in record_iter {
-            let a = record_page.get_int(slot, "A");
+        for slot in &inserted_slots {
+            let a = record_page.get_int(*slot, "A");
             println!("value of a {}", a);
             if a < 25 {
                 deleted_count += 1;
-                record_page.delete(slot);
+                record_page.delete(*slot).ok();
             }
         }
         println!("{deleted_count} values were deleted");
 
         //  Check that the correct number of records are left
-        let record_iter = record_page.iter_used_slots();
         let mut remaining_count = 0;
-        for slot in record_iter {
-            let a = record_page.get_int(slot, "A");
-            assert!(a >= 25);
-            remaining_count += 1;
+        for slot in &inserted_slots {
+            let a = record_page.get_int(*slot, "A");
+            if a >= 25 {
+                remaining_count += 1;
+            }
         }
 
         assert_eq!(remaining_count + deleted_count, inserted_count);
@@ -9290,8 +9212,8 @@ mod transaction_tests {
         let file = generate_filename();
         let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
 
+        //  Phase 1: Create and populate database and then drop it
         let block_id = {
-            //  Phase 1: Create and populate database and then drop it
             let db = SimpleDB::new(&dir, 3, true, 100);
             let t1 = Arc::new(Transaction::new(
                 Arc::clone(&db.file_manager),
@@ -9306,7 +9228,6 @@ mod transaction_tests {
             block_id
         };
 
-        //  Phase 1: Create and populate database and then drop it
         //  Phase 2: Recover and verify
         {
             let db = SimpleDB::new(&dir, 3, false, 100);
