@@ -6,7 +6,8 @@ use crate::{
         BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeLeafPageView,
         BTreeLeafPageViewMut,
     },
-    BlockId, BufferHandle, Constant, FieldType, Index, IndexInfo, Layout, Schema, Transaction, RID,
+    BlockId, BufferHandle, Constant, FieldType, Index, IndexInfo, Layout, Lsn, Schema, Transaction,
+    RID,
 };
 
 pub struct BTreeIndex {
@@ -310,12 +311,14 @@ impl BTreeInternal {
 
     /// Helper method to split an internal page by moving entries from [split_slot..] onwards
     fn split_page(&self, split_slot: usize) -> Result<BlockId, Box<dyn Error>> {
+        let txn_id = self.txn.id();
         let orig_guard = self.txn.pin_write_guard(&self.block_id);
         let mut orig_view = BTreeInternalPageViewMut::new(orig_guard, &self.layout)?;
 
         let new_block_id = self.txn.append(&self.file_name);
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         new_guard.format_as_btree_internal(orig_view.btree_level());
+        new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
 
         while split_slot < orig_view.slot_count() {
@@ -324,6 +327,8 @@ impl BTreeInternal {
             orig_view.delete_entry(split_slot)?;
         }
 
+        orig_view.mark_modified(txn_id, Lsn::MAX);
+        new_view.mark_modified(txn_id, Lsn::MAX);
         Ok(new_block_id)
     }
 
@@ -364,6 +369,7 @@ impl BTreeInternal {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
         view.set_btree_level(level + 1);
+        view.mark_modified(self.txn.id(), Lsn::MAX);
         Ok(())
     }
 
@@ -403,10 +409,12 @@ impl BTreeInternal {
         &self,
         entry: BTreeInternalEntry,
     ) -> Result<Option<BTreeInternalEntry>, Box<dyn Error>> {
+        let txn_id = self.txn.id();
         let (split_point, split_key) = {
             let guard = self.txn.pin_write_guard(&self.block_id);
             let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
             view.insert_entry(entry.key, entry.child_block)?;
+            view.mark_modified(txn_id, Lsn::MAX);
             if !view.is_full() {
                 return Ok(None);
             }
@@ -475,6 +483,7 @@ mod btree_internal_tests {
             view.insert_entry(Constant::Int(10), 2).unwrap();
             view.insert_entry(Constant::Int(20), 3).unwrap();
             view.insert_entry(Constant::Int(30), 4).unwrap();
+            view.mark_modified(txn.id(), Lsn::MAX);
         }
 
         // Search for a value - should return correct child block
@@ -521,6 +530,7 @@ mod btree_internal_tests {
             let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
             view.insert_entry(Constant::Int(10), 2).unwrap();
             view.insert_entry(Constant::Int(20), 3).unwrap();
+            view.mark_modified(txn.id(), Lsn::MAX);
         }
 
         // Create a new entry that will be part of new root
@@ -577,6 +587,7 @@ mod btree_internal_tests {
         let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
         view.insert_entry(Constant::Int(10), 1).unwrap();
         view.insert_entry(Constant::Int(10), 2).unwrap();
+        view.mark_modified(txn.id(), Lsn::MAX);
 
         //  NOTE: It looks like the numbers are reversed here in the sense that the block numbers asserted are backwards
         //  but they are correct because the insertion into the node results in a page that looks like this where block 2
@@ -636,12 +647,14 @@ impl BTreeLeaf {
         split_slot: usize,
         overflow_block: Option<usize>,
     ) -> Result<BlockId, Box<dyn Error>> {
+        let txn_id = self.txn.id();
         let orig_guard = self.txn.pin_write_guard(&self.current_block_id);
         let mut orig_view = BTreeLeafPageViewMut::new(orig_guard, &self.layout)?;
 
         let new_block_id = self.txn.append(&self.file_name);
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         new_guard.format_as_btree_leaf(overflow_block);
+        new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = BTreeLeafPageViewMut::new(new_guard, &self.layout)?;
 
         while split_slot < orig_view.slot_count() {
@@ -650,6 +663,8 @@ impl BTreeLeaf {
             orig_view.delete_entry(split_slot)?;
         }
 
+        orig_view.mark_modified(txn_id, Lsn::MAX);
+        new_view.mark_modified(txn_id, Lsn::MAX);
         Ok(new_block_id)
     }
 
@@ -723,6 +738,7 @@ impl BTreeLeaf {
 
             if view.get_entry(slot)?.rid == rid {
                 view.delete_entry(slot)?;
+                view.mark_modified(self.txn.id(), Lsn::MAX);
                 return Ok(());
             }
         }
@@ -736,6 +752,7 @@ impl BTreeLeaf {
         //  If this page has an overflow page, and the key being inserted is less than the first key force a split
         //  This is done to ensure that overflow pages are linked to a page with the first key the same as entries in overflow pages
         debug!("Inserting rid {:?} into BTreeLeaf", rid);
+        let txn_id = self.txn.id();
 
         // Check for overflow + smaller key case
         {
@@ -756,6 +773,7 @@ impl BTreeLeaf {
                     let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
                     view.set_overflow_block(None);
                     view.insert_entry(self.search_key.clone(), rid)?;
+                    view.mark_modified(txn_id, Lsn::MAX);
 
                     self.current_slot = Some(0);
 
@@ -779,6 +797,7 @@ impl BTreeLeaf {
             let guard = self.txn.pin_write_guard(&self.current_block_id);
             let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
             view.insert_entry(self.search_key.clone(), rid)?;
+            view.mark_modified(txn_id, Lsn::MAX);
 
             if !view.is_full() {
                 debug!("Done inserting rid {:?} into BTreeLeaf", rid);
@@ -817,6 +836,7 @@ impl BTreeLeaf {
             let guard = self.txn.pin_write_guard(&self.current_block_id);
             let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
             view.set_overflow_block(Some(new_block_id.block_num));
+            view.mark_modified(txn_id, Lsn::MAX);
 
             debug!("Done splitting BTreeLeaf");
             return Ok(None);
@@ -937,6 +957,7 @@ mod btree_leaf_tests {
         {
             let mut guard = tx.pin_write_guard(&block);
             guard.format_as_btree_leaf(None);
+            guard.mark_modified(tx.id(), Lsn::MAX);
         }
 
         let leaf = BTreeLeaf::new(
