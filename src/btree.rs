@@ -1,8 +1,9 @@
 use std::{error::Error, sync::Arc};
 
 use crate::{
-    debug, BlockId, BufferHandle, Constant, FieldType, Index, IndexInfo, Layout, Schema,
-    Transaction, RID,
+    debug,
+    page::{BTreeLeafPageView, BTreeLeafPageViewMut},
+    BlockId, BufferHandle, Constant, FieldType, Index, IndexInfo, Layout, Schema, Transaction, RID,
 };
 
 pub struct BTreeIndex {
@@ -32,7 +33,7 @@ impl BTreeIndex {
         if txn.size(&leaf_table_name) == 0 {
             let block_id = txn.append(&leaf_table_name);
             let btree_page = BTreePage::new(Arc::clone(&txn), block_id, leaf_layout.clone());
-            btree_page.format(PageType::Leaf(None))?;
+            btree_page.format(BTreePageFlags::Leaf(None))?;
         }
 
         //  Create the internal file with the schema required if it does not exist
@@ -44,7 +45,7 @@ impl BTreeIndex {
         if txn.size(&internal_table_name) == 0 {
             let block_id = txn.append(&internal_table_name);
             let internal_page = BTreePage::new(Arc::clone(&txn), block_id, internal_layout.clone());
-            internal_page.format(PageType::Internal(None))?;
+            internal_page.format(BTreePageFlags::Internal(None))?;
             //  insert initial entry
             let field_type = internal_schema
                 .info
@@ -177,7 +178,8 @@ mod btree_index_tests {
 
         // Verify internal node file exists with minimum value entry
         let root = BTreeInternal::new(
-            Arc::clone(&index.txn), index.root_block.clone(),
+            Arc::clone(&index.txn),
+            index.root_block.clone(),
             index.internal_layout.clone(),
             index.root_block.filename.clone(),
         );
@@ -312,7 +314,7 @@ impl BTreeInternal {
     /// It will return the block ID of the child block
     fn search(&mut self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
         let mut child_block = self.find_child_block(search_key)?;
-        while !matches!(self.contents.get_flag()?, PageType::Internal(None)) {
+        while !matches!(self.contents.get_flag()?, BTreePageFlags::Internal(None)) {
             self.contents = BTreePage::new(
                 Arc::clone(&self.txn),
                 child_block.clone(),
@@ -331,8 +333,8 @@ impl BTreeInternal {
         let first_value = self.contents.get_data_value(0)?;
         let page_type = self.contents.get_flag()?;
         let level = match page_type {
-            PageType::Internal(None) => 0,
-            PageType::Internal(Some(n)) => n,
+            BTreePageFlags::Internal(None) => 0,
+            BTreePageFlags::Internal(Some(n)) => n,
             _ => panic!("Invalid page type for new root"),
         };
         let new_block_id = self.contents.split(0, page_type)?;
@@ -343,7 +345,7 @@ impl BTreeInternal {
         self.insert_entry(new_block_entry)?;
         self.insert_entry(entry)?;
         self.contents
-            .set_flag(PageType::Internal(Some(level + 1)))?;
+            .set_flag(BTreePageFlags::Internal(Some(level + 1)))?;
         Ok(())
     }
 
@@ -355,7 +357,7 @@ impl BTreeInternal {
         &self,
         entry: InternalNodeEntry,
     ) -> Result<Option<InternalNodeEntry>, Box<dyn Error>> {
-        if matches!(self.contents.get_flag()?, PageType::Internal(None)) {
+        if matches!(self.contents.get_flag()?, BTreePageFlags::Internal(None)) {
             return self.insert_internal_node_entry(entry);
         }
         let child_block = self.find_child_block(&entry.dataval)?;
@@ -434,7 +436,7 @@ mod btree_internal_tests {
 
         // Format the page as internal node
         let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
-        page.format(PageType::Internal(None)).unwrap();
+        page.format(BTreePageFlags::Internal(None)).unwrap();
 
         let internal = BTreeInternal::new(Arc::clone(&tx), block, layout, filename);
         (tx, internal)
@@ -527,7 +529,7 @@ mod btree_internal_tests {
         // Verify root structure
         assert!(matches!(
             internal.contents.get_flag().unwrap(),
-            PageType::Internal(Some(1))
+            BTreePageFlags::Internal(Some(1))
         ));
         assert_eq!(internal.contents.get_number_of_recs().unwrap(), 2);
 
@@ -622,7 +624,7 @@ struct BTreeLeaf {
     txn: Arc<Transaction>,
     layout: Layout,
     search_key: Constant,
-    contents: BTreePage,
+    current_block_id: BlockId,
     current_slot: Option<usize>,
     file_name: String,
 }
@@ -633,13 +635,58 @@ impl std::fmt::Display for BTreeLeaf {
         writeln!(f, "Search Key: {:?}", self.search_key)?;
         writeln!(f, "Current Slot: {:?}", self.current_slot)?;
         writeln!(f, "File Name: {}", self.file_name)?;
-        writeln!(f, "\nContents:")?;
-        write!(f, "{}", self.contents)?;
+        writeln!(f, "Current Block: {:?}", self.current_block_id)?;
         Ok(())
     }
 }
 
 impl BTreeLeaf {
+    /// Helper method to split a leaf page by moving entries from split_slot onwards to a new page
+    /// Returns the BlockId of the newly created page
+    fn split_page(
+        &self,
+        split_slot: usize,
+        overflow_block: Option<usize>,
+    ) -> Result<BlockId, Box<dyn Error>> {
+        // Create and format new leaf block
+        let new_block_id = self.txn.append(&self.file_name);
+        {
+            let new_guard = self.txn.pin_write_guard(&new_block_id);
+            let mut formatted_guard = new_guard;
+            formatted_guard.format_as_btree_leaf(overflow_block);
+        }
+
+        // Interleave copy and delete operations (like legacy split)
+        // Keep deleting from split_slot as entries shift down
+        loop {
+            // Check if there are more entries to move
+            let entry_to_move = {
+                let guard = self.txn.pin_read_guard(&self.current_block_id);
+                let view = BTreeLeafPageView::new(guard, &self.layout)?;
+                if split_slot >= view.slot_count() {
+                    break; // No more entries to move
+                }
+                view.get_entry(split_slot)?.clone()
+            };
+
+            // Insert into new page
+            {
+                let guard = self.txn.pin_write_guard(&new_block_id);
+                let mut new_view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+                new_view.insert_entry(entry_to_move.key, entry_to_move.rid)?;
+            }
+
+            // Delete from original page (entry shifts down, so keep deleting same slot)
+            {
+                let guard = self.txn.pin_write_guard(&self.current_block_id);
+                let mut orig_view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+                orig_view.delete_entry(split_slot)?;
+            }
+        }
+
+        Ok(new_block_id)
+    }
+
     /// Creates a new [BTreeLeaf] with the given transaction, block ID, layout, search key and filename
     /// The page is initialized with an appropriate slot based on the search key position
     fn new(
@@ -649,13 +696,18 @@ impl BTreeLeaf {
         search_key: Constant,
         file_name: String,
     ) -> Result<Self, Box<dyn Error>> {
-        let contents = BTreePage::new(Arc::clone(&txn), block_id, layout.clone());
-        let current_slot = contents.find_slot_before(&search_key)?;
+        // Calculate initial slot using a temporary guard
+        let current_slot = {
+            let guard = txn.pin_read_guard(&block_id);
+            let view = BTreeLeafPageView::new(guard, &layout)?;
+            view.find_slot_before(&search_key)
+        };
+
         Ok(Self {
             txn,
             layout,
             search_key,
-            contents,
+            current_block_id: block_id,
             current_slot,
             file_name,
         })
@@ -671,9 +723,23 @@ impl BTreeLeaf {
                 None => Some(0),
             }
         };
-        if self.current_slot.unwrap() >= self.contents.get_number_of_recs()? {
+
+        let (at_end, key_matches) = {
+            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let view = BTreeLeafPageView::new(guard, &self.layout)?;
+
+            let at_end = self.current_slot.unwrap() >= view.slot_count();
+            let key_matches = if !at_end {
+                view.get_entry(self.current_slot.unwrap())?.key == self.search_key
+            } else {
+                false
+            };
+            (at_end, key_matches)
+        }; // Guard dropped here
+
+        if at_end {
             self.try_overflow()
-        } else if self.contents.get_data_value(self.current_slot.unwrap())? == self.search_key {
+        } else if key_matches {
             Ok(Some(()))
         } else {
             self.try_overflow()
@@ -685,8 +751,12 @@ impl BTreeLeaf {
     /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
         while (self.next()?).is_some() {
-            if self.contents.get_rid(self.current_slot.unwrap())? == rid {
-                self.contents.delete(self.current_slot.unwrap())?;
+            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            let slot = self.current_slot.unwrap();
+
+            if view.get_entry(slot)?.rid == rid {
+                view.delete_entry(slot)?;
                 return Ok(());
             }
         }
@@ -700,32 +770,54 @@ impl BTreeLeaf {
         //  If this page has an overflow page, and the key being inserted is less than the first key force a split
         //  This is done to ensure that overflow pages are linked to a page with the first key the same as entries in overflow pages
         debug!("Inserting rid {:?} into BTreeLeaf", rid);
-        if matches!(self.contents.get_flag()?, PageType::Leaf(Some(_)))
-            && self.contents.get_data_value(0)? > self.search_key
+
+        // Check for overflow + smaller key case
         {
-            debug!("Inserting a record smaller than the first record into a page full of identical records");
-            let first_entry = self.contents.get_data_value(0)?;
-            let new_block_id = self.contents.split(0, self.contents.get_flag()?)?;
-            self.current_slot = Some(0);
-            self.contents.set_flag(PageType::Leaf(None))?;
-            self.contents.insert_leaf(0, self.search_key.clone(), rid)?;
-            return Ok(Some(InternalNodeEntry {
-                dataval: first_entry,
-                block_num: new_block_id.block_num,
-            }));
+            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let view = BTreeLeafPageView::new(guard, &self.layout)?;
+
+            if let Some(overflow_block) = view.overflow_block() {
+                let first_key = view.get_entry(0)?.key;
+                if first_key > self.search_key {
+                    debug!("Inserting a record smaller than the first record into a page full of identical records");
+                    drop(view); // Drops view and guard
+
+                    // Split at 0, preserving current overflow
+                    let new_block_id = self.split_page(0, Some(overflow_block))?;
+
+                    // Clear overflow on current page and insert new entry
+                    let guard = self.txn.pin_write_guard(&self.current_block_id);
+                    let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+                    view.set_overflow_block(None);
+                    view.insert_entry(self.search_key.clone(), rid)?;
+
+                    self.current_slot = Some(0);
+
+                    return Ok(Some(InternalNodeEntry {
+                        dataval: first_key,
+                        block_num: new_block_id.block_num,
+                    }));
+                }
+            }
         }
 
+        // Normal insert
         self.current_slot = {
             match self.current_slot {
                 Some(slot) => Some(slot + 1),
                 None => Some(0),
             }
         };
-        self.contents
-            .insert_leaf(self.current_slot.unwrap(), self.search_key.clone(), rid)?;
-        if !self.contents.is_full()? {
-            debug!("Done inserting rid {:?} into BTreeLeaf", rid);
-            return Ok(None);
+
+        {
+            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            view.insert_entry(self.search_key.clone(), rid)?;
+
+            if !view.is_full() {
+                debug!("Done inserting rid {:?} into BTreeLeaf", rid);
+                return Ok(None);
+            }
         }
 
         //  The leaf needs to be split. There are two cases to handle here
@@ -742,38 +834,50 @@ impl BTreeLeaf {
         //  If the split key is identical to the first key, move it right because all identical keys need to stay together
         //  If the split key is not identical to the first key, move it left until the the first instance of the split key is found
         debug!("Splitting BTreeLeaf");
-        debug!("State of BTreeLeaf before split {}", self.contents);
-        let first_key = self.contents.get_data_value(0)?;
-        let last_key = self
-            .contents
-            .get_data_value(self.contents.get_number_of_recs()? - 1)?;
+
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+
+        let first_key = view.get_entry(0)?.key;
+        let last_key = view.get_entry(view.slot_count() - 1)?.key;
+
         if first_key == last_key {
             debug!("The first key and last key are identical, so moving everything except first record into overflow page");
-            let new_block_id = self.contents.split(1, self.contents.get_flag()?)?;
-            self.contents
-                .set_flag(PageType::Leaf(Some(new_block_id.block_num)))?;
+            drop(view); // Drops view and guard
+
+            let new_block_id = self.split_page(1, None)?;
+
+            // Set overflow on current page
+            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            view.set_overflow_block(Some(new_block_id.block_num));
+
             debug!("Done splitting BTreeLeaf");
             return Ok(None);
         }
 
         debug!("Finding the split point");
-        let mut split_point = self.contents.get_number_of_recs()? / 2;
+        let mut split_point = view.slot_count() / 2;
         debug!("The split point {}", split_point);
-        let mut split_record = self.contents.get_data_value(split_point)?;
+        let mut split_record = view.get_entry(split_point)?.key;
+
         if split_record == first_key {
             debug!("Moving split point to the right");
-            while self.contents.get_data_value(split_point)? == first_key {
+            while view.get_entry(split_point)?.key == first_key {
                 split_point += 1;
             }
-            split_record = self.contents.get_data_value(split_point)?;
+            split_record = view.get_entry(split_point)?.key;
         } else {
             debug!("Moving split point to the left");
-            while self.contents.get_data_value(split_point - 1)? == split_record {
+            while view.get_entry(split_point - 1)?.key == split_record {
                 split_point -= 1;
             }
         }
+
         debug!("Splitting at {}", split_point);
-        let new_block_id = self.contents.split(split_point, PageType::Leaf(None))?;
+        drop(view); // Drops view and guard
+
+        let new_block_id = self.split_page(split_point, None)?;
 
         Ok(Some(InternalNodeEntry {
             dataval: split_record,
@@ -785,32 +889,63 @@ impl BTreeLeaf {
     /// An overflow page for a specific page will contain entries that are the same as the first key of the current page
     /// If no overflow page can be found, just return. Otherwise swap out the current contents for the overflow contents
     fn try_overflow(&mut self) -> Result<Option<()>, Box<dyn Error>> {
-        let first_key = self.contents.get_data_value(0)?;
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
 
-        if first_key != self.search_key
-            || !matches!(self.contents.get_flag()?, PageType::Leaf(Some(_)))
-        {
+        let first_key = view.get_entry(0)?.key;
+
+        if first_key != self.search_key {
             return Ok(None);
         }
 
-        let PageType::Leaf(Some(overflow_block_num)) = self.contents.get_flag()? else {
+        let Some(overflow_block_num) = view.overflow_block() else {
             return Ok(None);
         };
 
-        let overflow_contents = BTreePage::new(
-            Arc::clone(&self.txn),
-            BlockId::new(self.file_name.clone(), overflow_block_num),
-            self.layout.clone(),
-        );
-        self.contents = overflow_contents;
+        // Switch to overflow page
+        self.current_block_id = BlockId::new(self.file_name.clone(), overflow_block_num);
+        self.current_slot = None;
         Ok(Some(()))
     }
 
     fn get_data_rid(&self) -> Result<RID, Box<dyn Error>> {
-        self.contents.get_rid(
-            self.current_slot
-                .expect("Current slot not set in BTreeLeaf::get_data_rid"),
-        )
+        let slot = self
+            .current_slot
+            .expect("Current slot not set in BTreeLeaf::get_data_rid");
+
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        let entry = view.get_entry(slot)?;
+        Ok(entry.rid)
+    }
+
+    #[cfg(test)]
+    fn is_one_off_full(&self) -> Result<bool, Box<dyn Error>> {
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        // Check if we can fit one more entry
+        Ok(view.is_full())
+    }
+
+    #[cfg(test)]
+    fn get_slot_count(&self) -> Result<usize, Box<dyn Error>> {
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        Ok(view.slot_count())
+    }
+
+    #[cfg(test)]
+    fn get_entry_key(&self, slot: usize) -> Result<Constant, Box<dyn Error>> {
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        Ok(view.get_entry(slot)?.key)
+    }
+
+    #[cfg(test)]
+    fn has_overflow(&self) -> Result<bool, Box<dyn Error>> {
+        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        Ok(view.overflow_block().is_some())
     }
 }
 
@@ -832,9 +967,11 @@ mod btree_leaf_tests {
         let block = tx.append(&generate_filename());
         let layout = create_test_layout();
 
-        // Format the page as a leaf
-        let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
-        page.format(PageType::Leaf(None)).unwrap();
+        // Format the page as a leaf using new page format
+        {
+            let mut guard = tx.pin_write_guard(&block);
+            guard.format_as_btree_leaf(None);
+        }
 
         let leaf = BTreeLeaf::new(
             Arc::clone(&tx),
@@ -857,8 +994,8 @@ mod btree_leaf_tests {
         assert!(leaf.insert(RID::new(1, 1)).unwrap().is_none());
 
         // Verify the record was inserted
-        assert_eq!(leaf.contents.get_number_of_recs().unwrap(), 1);
-        assert_eq!(leaf.contents.get_data_value(0).unwrap(), Constant::Int(10));
+        assert_eq!(leaf.get_slot_count().unwrap(), 1);
+        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
     }
 
     #[test]
@@ -869,7 +1006,7 @@ mod btree_leaf_tests {
         // Fill the page with different keys
         let mut slot = 0;
         // let mut split_result = None;
-        while !leaf.contents.is_one_off_full().unwrap() {
+        while !leaf.is_one_off_full().unwrap() {
             leaf.search_key = Constant::Int(slot);
             leaf.insert(RID::new(1, slot as usize)).unwrap();
             slot += 1;
@@ -891,7 +1028,7 @@ mod btree_leaf_tests {
 
         // Fill the page with same key
         let mut slot = 0;
-        while !leaf.contents.is_one_off_full().unwrap() {
+        while !leaf.is_one_off_full().unwrap() {
             leaf.insert(RID::new(1, slot)).unwrap();
             slot += 1;
         }
@@ -901,12 +1038,10 @@ mod btree_leaf_tests {
 
         // Verify overflow block was created
         assert!(split_result.is_none()); //  overflow block returns None
-        let PageType::Leaf(Some(_)) = leaf.contents.get_flag().unwrap() else {
-            panic!("Expected overflow block");
-        };
+        assert!(leaf.has_overflow().unwrap(), "Expected overflow block");
 
         // Verify first key matches in both pages
-        assert_eq!(leaf.contents.get_data_value(0).unwrap(), Constant::Int(10));
+        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
     }
 
     #[test]
@@ -917,7 +1052,7 @@ mod btree_leaf_tests {
         // Create a page with overflow block containing key 10
         leaf.search_key = Constant::Int(10);
         let mut slot = 0;
-        while !leaf.contents.is_one_off_full().unwrap() {
+        while !leaf.is_one_off_full().unwrap() {
             leaf.insert(RID::new(1, slot)).unwrap();
             slot += 1;
         }
@@ -941,7 +1076,7 @@ mod btree_leaf_tests {
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
         // Fill page with alternating 10s and 20s
         let mut counter = 0;
-        while !leaf.contents.is_one_off_full().unwrap() {
+        while !leaf.is_one_off_full().unwrap() {
             leaf.search_key = Constant::Int(if counter % 2 == 0 { 10 } else { 20 });
             leaf.insert(RID::new(1, counter)).unwrap();
             counter += 1;
@@ -978,41 +1113,41 @@ struct InternalNodeEntry {
 /// +-------------+------------------+
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PageType {
+enum BTreePageFlags {
     Internal(Option<usize>),
     Leaf(Option<usize>),
 }
 
-impl From<i32> for PageType {
+impl From<i32> for BTreePageFlags {
     fn from(value: i32) -> Self {
         const TYPE_MASK: i32 = 1 << 31;
         const VALUE_MASK: i32 = !(1 << 31);
         let is_internal = value & TYPE_MASK == 0;
         if is_internal {
             if value == 0 {
-                PageType::Internal(None)
+                BTreePageFlags::Internal(None)
             } else {
-                PageType::Internal(Some((value & VALUE_MASK) as usize))
+                BTreePageFlags::Internal(Some((value & VALUE_MASK) as usize))
             }
         } else {
             let val = value & VALUE_MASK;
             if val == 0 {
-                PageType::Leaf(None)
+                BTreePageFlags::Leaf(None)
             } else {
-                PageType::Leaf(Some(val as usize))
+                BTreePageFlags::Leaf(Some(val as usize))
             }
         }
     }
 }
 
-impl From<PageType> for i32 {
-    fn from(value: PageType) -> Self {
+impl From<BTreePageFlags> for i32 {
+    fn from(value: BTreePageFlags) -> Self {
         const TYPE_MASK: i32 = 1 << 31;
         match value {
-            PageType::Internal(None) => 0,
-            PageType::Internal(Some(n)) => n as i32,
-            PageType::Leaf(None) => TYPE_MASK,
-            PageType::Leaf(Some(n)) => TYPE_MASK | (n as i32),
+            BTreePageFlags::Internal(None) => 0,
+            BTreePageFlags::Internal(Some(n)) => n as i32,
+            BTreePageFlags::Leaf(None) => TYPE_MASK,
+            BTreePageFlags::Leaf(Some(n)) => TYPE_MASK | (n as i32),
         }
     }
 }
@@ -1075,7 +1210,7 @@ impl BTreePage {
     /// This method splits the existing [BTreePage] and moves the records from [slot..]
     /// into a new page and then returns the [BlockId] of the new page
     /// The current page continues to be the same, but with fewer records
-    fn split(&self, slot: usize, page_type: PageType) -> Result<BlockId, Box<dyn Error>> {
+    fn split(&self, slot: usize, page_type: BTreePageFlags) -> Result<BlockId, Box<dyn Error>> {
         //  construct a new block, a new btree page and then pin the buffer
         debug!(
             "Splitting the btree page for block num {} at slot {}",
@@ -1106,14 +1241,23 @@ impl BTreePage {
 
     /// Formats a new page by initializing its flag and record count
     /// Sets all record slots to their zero values based on field types
-    fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
+    fn format(&self, page_type: BTreePageFlags) -> Result<(), Box<dyn Error>> {
         let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        self.txn
-            .set_int(self.handle.block_id(), header_offset, page_type.into(), true)?;
-        self.txn
-            .set_int(self.handle.block_id(), header_offset + Self::INT_BYTES, 0, true)?;
+        self.txn.set_int(
+            self.handle.block_id(),
+            header_offset,
+            page_type.into(),
+            true,
+        )?;
+        self.txn.set_int(
+            self.handle.block_id(),
+            header_offset + Self::INT_BYTES,
+            0,
+            true,
+        )?;
         let record_size = self.layout.slot_size;
-        for i in ((header_offset + 2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size) {
+        for i in ((header_offset + 2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size)
+        {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
@@ -1130,15 +1274,15 @@ impl BTreePage {
     }
 
     /// Retrieves the page type flag from the header
-    fn get_flag(&self) -> Result<PageType, Box<dyn Error>> {
+    fn get_flag(&self) -> Result<BTreePageFlags, Box<dyn Error>> {
         let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
             .get_int(self.handle.block_id(), header_offset)
-            .map(PageType::from)
+            .map(BTreePageFlags::from)
     }
 
     /// Updates the page type flag in the header
-    fn set_flag(&self, value: PageType) -> Result<(), Box<dyn Error>> {
+    fn set_flag(&self, value: BTreePageFlags) -> Result<(), Box<dyn Error>> {
         let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
             .set_int(self.handle.block_id(), header_offset, value.into(), true)
@@ -1179,6 +1323,7 @@ impl BTreePage {
 
     /// Inserts a leaf entry at the specified slot
     /// Leaf entries contain a data value and RID pointing to the actual record
+    #[cfg(test)]
     fn insert_leaf(&self, slot: usize, value: Constant, rid: RID) -> Result<(), Box<dyn Error>> {
         self.insert(slot)?;
         self.set_value(slot, IndexInfo::DATA_FIELD, value)?;
@@ -1229,8 +1374,12 @@ impl BTreePage {
     /// Updates the number of records stored in the page
     fn set_number_of_recs(&self, num: usize) -> Result<(), Box<dyn Error>> {
         let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        self.txn
-            .set_int(self.handle.block_id(), header_offset + Self::INT_BYTES, num as i32, true)
+        self.txn.set_int(
+            self.handle.block_id(),
+            header_offset + Self::INT_BYTES,
+            num as i32,
+            true,
+        )
     }
 
     fn get_int(&self, slot: usize, field_name: &str) -> Result<i32, Box<dyn Error>> {
@@ -1344,7 +1493,7 @@ impl std::fmt::Display for BTreePage {
                 writeln!(f, "Record Count: {count}")?;
                 writeln!(f, "Entries:")?;
                 match self.get_flag() {
-                    Ok(PageType::Internal(_)) => {
+                    Ok(BTreePageFlags::Internal(_)) => {
                         for slot in 0..count {
                             if let (Ok(key), Ok(child)) =
                                 (self.get_data_value(slot), self.get_child_block_num(slot))
@@ -1353,7 +1502,7 @@ impl std::fmt::Display for BTreePage {
                             }
                         }
                     }
-                    Ok(PageType::Leaf(_)) => {
+                    Ok(BTreePageFlags::Leaf(_)) => {
                         for slot in 0..count {
                             if let (Ok(key), Ok(rid)) =
                                 (self.get_data_value(slot), self.get_rid(slot))
@@ -1396,9 +1545,9 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf(None)).unwrap();
+        page.format(BTreePageFlags::Leaf(None)).unwrap();
 
-        assert_eq!(page.get_flag().unwrap(), PageType::Leaf(None));
+        assert_eq!(page.get_flag().unwrap(), BTreePageFlags::Leaf(None));
         assert_eq!(page.get_number_of_recs().unwrap(), 0);
     }
 
@@ -1410,7 +1559,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf(None)).unwrap();
+        page.format(BTreePageFlags::Leaf(None)).unwrap();
 
         // Insert a record
         let rid = RID::new(1, 1);
@@ -1434,7 +1583,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block.clone(), layout.clone());
-        page.format(PageType::Leaf(None)).unwrap();
+        page.format(BTreePageFlags::Leaf(None)).unwrap();
 
         // Insert records until full
         let mut slot = 0;
@@ -1446,7 +1595,7 @@ mod btree_page_tests {
 
         // Split the page
         let split_point = slot / 2;
-        let new_block = page.split(split_point, PageType::Leaf(None)).unwrap();
+        let new_block = page.split(split_point, BTreePageFlags::Leaf(None)).unwrap();
 
         // Verify original page
         assert_eq!(page.get_number_of_recs().unwrap(), split_point);
@@ -1464,7 +1613,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf(None)).unwrap();
+        page.format(BTreePageFlags::Leaf(None)).unwrap();
 
         // Try to insert wrong type
         let result = page.set_value(0, "dataval", Constant::String("wrong type".to_string()));
@@ -1479,7 +1628,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Internal(None)).unwrap();
+        page.format(BTreePageFlags::Internal(None)).unwrap();
 
         // Insert internal entry
         page.insert_internal(0, Constant::Int(10), 2).unwrap();
@@ -1497,7 +1646,7 @@ mod btree_page_tests {
         let layout = create_test_layout();
 
         let page = BTreePage::new(Arc::clone(&tx), block, layout);
-        page.format(PageType::Leaf(None)).unwrap();
+        page.format(BTreePageFlags::Leaf(None)).unwrap();
 
         page.insert_leaf(0, Constant::Int(10), RID::new(1, 1))
             .unwrap();
