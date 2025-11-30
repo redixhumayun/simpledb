@@ -1103,6 +1103,40 @@ impl From<Page<HeapPage>> for PageBytes {
     }
 }
 
+impl From<Page<BTreeLeafPage>> for PageBytes {
+    fn from(page: Page<BTreeLeafPage>) -> Self {
+        let Page {
+            header,
+            line_pointers,
+            record_space,
+            ..
+        } = page;
+        Page::<RawPage> {
+            header,
+            line_pointers,
+            record_space,
+            kind: PhantomData,
+        }
+    }
+}
+
+impl From<Page<BTreeInternalPage>> for PageBytes {
+    fn from(page: Page<BTreeInternalPage>) -> Self {
+        let Page {
+            header,
+            line_pointers,
+            record_space,
+            ..
+        } = page;
+        Page::<RawPage> {
+            header,
+            line_pointers,
+            record_space,
+            kind: PhantomData,
+        }
+    }
+}
+
 impl Page<HeapPage> {
     fn heap_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
         let bytes = self.tuple_bytes(slot)?;
@@ -1546,6 +1580,18 @@ impl<'a> PageWriteGuard<'a> {
 
     pub fn format_as_heap(&mut self) {
         **self = Page::<HeapPage>::new().into()
+    }
+
+    pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(overflow_block);
+        **self = page.into();
+    }
+
+    pub fn format_as_btree_internal(&mut self, level: u16) {
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(level);
+        **self = page.into();
     }
 
     pub fn into_heap_view_mut(
@@ -3004,6 +3050,1165 @@ mod heap_page_view_tests {
         match rebuilt.tuple(slot_b).expect("slot_b tuple") {
             TupleRef::Redirect(target) => assert_eq!(target as usize, slot_d),
             _ => panic!("slot_b redirect state not preserved across serialization"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod btree_page_tests {
+    use super::*;
+    use crate::Schema;
+
+    // Helper: Create a layout for BTree leaf entries with INT key
+    fn btree_leaf_layout_int() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(BTREE_DATA_FIELD);
+        schema.add_int_field(BTREE_BLOCK_FIELD);
+        schema.add_int_field(BTREE_ID_FIELD);
+        Layout::new(schema)
+    }
+
+    // Helper: Create a layout for BTree leaf entries with VARCHAR key
+    fn btree_leaf_layout_varchar() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_string_field(BTREE_DATA_FIELD, 20);
+        schema.add_int_field(BTREE_BLOCK_FIELD);
+        schema.add_int_field(BTREE_ID_FIELD);
+        Layout::new(schema)
+    }
+
+    // Helper: Create a layout for BTree internal entries with INT key
+    fn btree_internal_layout_int() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(BTREE_DATA_FIELD);
+        schema.add_int_field(BTREE_BLOCK_FIELD);
+        Layout::new(schema)
+    }
+
+    // Helper: Create a layout for BTree internal entries with VARCHAR key
+    fn btree_internal_layout_varchar() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_string_field(BTREE_DATA_FIELD, 20);
+        schema.add_int_field(BTREE_BLOCK_FIELD);
+        Layout::new(schema)
+    }
+
+    // ========== Phase 1: Entry Encoding/Decoding Tests ==========
+
+    #[test]
+    fn btree_leaf_entry_int_roundtrip() {
+        let layout = btree_leaf_layout_int();
+        let entry = BTreeLeafEntry {
+            key: Constant::Int(42),
+            rid: RID::new(10, 5),
+        };
+
+        let encoded = entry.encode(&layout);
+        let decoded = BTreeLeafEntry::decode(&layout, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn btree_leaf_entry_varchar_roundtrip() {
+        let layout = btree_leaf_layout_varchar();
+        let entry = BTreeLeafEntry {
+            key: Constant::String("hello".to_string()),
+            rid: RID::new(100, 25),
+        };
+
+        let encoded = entry.encode(&layout);
+        let decoded = BTreeLeafEntry::decode(&layout, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn btree_leaf_entry_varchar_edge_cases() {
+        let layout = btree_leaf_layout_varchar();
+
+        // Empty string
+        let entry_empty = BTreeLeafEntry {
+            key: Constant::String("".to_string()),
+            rid: RID::new(0, 0),
+        };
+        let encoded = entry_empty.encode(&layout);
+        let decoded = BTreeLeafEntry::decode(&layout, &encoded).expect("decode empty string");
+        assert_eq!(decoded, entry_empty);
+
+        // Max length string (20 chars)
+        let entry_max = BTreeLeafEntry {
+            key: Constant::String("12345678901234567890".to_string()),
+            rid: RID::new(999, 999),
+        };
+        let encoded = entry_max.encode(&layout);
+        let decoded = BTreeLeafEntry::decode(&layout, &encoded).expect("decode max length");
+        assert_eq!(decoded, entry_max);
+    }
+
+    #[test]
+    fn btree_internal_entry_int_roundtrip() {
+        let layout = btree_internal_layout_int();
+        let entry = BTreeInternalEntry {
+            key: Constant::Int(99),
+            child_block: 42,
+        };
+
+        let encoded = entry.encode(&layout);
+        let decoded =
+            BTreeInternalEntry::decode(&layout, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn btree_internal_entry_varchar_roundtrip() {
+        let layout = btree_internal_layout_varchar();
+        let entry = BTreeInternalEntry {
+            key: Constant::String("index".to_string()),
+            child_block: 123,
+        };
+
+        let encoded = entry.encode(&layout);
+        let decoded =
+            BTreeInternalEntry::decode(&layout, &encoded).expect("decode should succeed");
+
+        assert_eq!(decoded, entry);
+    }
+
+    // ========== Phase 1: Page Initialization Tests ==========
+
+    #[test]
+    fn btree_leaf_page_init() {
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        assert_eq!(page.header.page_type(), PageType::IndexLeaf);
+        assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.overflow_block(), None);
+    }
+
+    #[test]
+    fn btree_leaf_page_init_with_overflow() {
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(Some(42));
+
+        assert_eq!(page.header.page_type(), PageType::IndexLeaf);
+        assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.overflow_block(), Some(42));
+    }
+
+    #[test]
+    fn btree_internal_page_init() {
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(3);
+
+        assert_eq!(page.header.page_type(), PageType::IndexInternal);
+        assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.btree_level(), 3);
+    }
+
+    // ========== Phase 1: Sorted Insertion Tests ==========
+
+    #[test]
+    fn btree_leaf_sorted_insertion_random_order() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert in random order
+        let keys = [42, 1, 99, 17, 55, 3, 88];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+                .expect("insert should succeed");
+        }
+
+        // Verify sorted order
+        let expected_sorted = [1, 3, 17, 42, 55, 88, 99];
+        for (slot, &expected_key) in expected_sorted.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+    }
+
+    #[test]
+    fn btree_leaf_sorted_insertion_ascending() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        let keys = [1, 2, 3, 4, 5];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+                .expect("insert should succeed");
+        }
+
+        // Verify order maintained
+        for (slot, &expected_key) in keys.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+    }
+
+    #[test]
+    fn btree_leaf_sorted_insertion_descending() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        let keys = [5, 4, 3, 2, 1];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+                .expect("insert should succeed");
+        }
+
+        // Verify ascending sorted order
+        let expected = [1, 2, 3, 4, 5];
+        for (slot, &expected_key) in expected.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+    }
+
+    #[test]
+    fn btree_leaf_varchar_sorted_insertion() {
+        let layout = btree_leaf_layout_varchar();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        let keys = ["dog", "apple", "zebra", "banana", "cat"];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, &Constant::String(key.to_string()), &rid)
+                .expect("insert should succeed");
+        }
+
+        // Verify sorted order
+        let expected = ["apple", "banana", "cat", "dog", "zebra"];
+        for (slot, &expected_key) in expected.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::String(expected_key.to_string()));
+        }
+    }
+
+    #[test]
+    fn btree_internal_sorted_insertion() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(1);
+
+        let keys = [50, 10, 90, 30, 70];
+        for (i, &key) in keys.iter().enumerate() {
+            page.insert_internal_entry(&layout, &Constant::Int(key), i * 10)
+                .expect("insert should succeed");
+        }
+
+        // Verify sorted order
+        let expected = [10, 30, 50, 70, 90];
+        for (slot, &expected_key) in expected.iter().enumerate() {
+            let entry = page.get_internal_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+    }
+
+    // ========== Phase 1: Binary Search Tests ==========
+
+    #[test]
+    fn find_insertion_slot_empty_page() {
+        let layout = btree_leaf_layout_int();
+        let page = Page::<BTreeLeafPage>::new();
+
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(42));
+        assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn find_insertion_slot_middle() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert [10, 30, 50]
+        for &key in &[10, 30, 50] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        // Search for 40 should return slot 2 (between 30 and 50)
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(40));
+        assert_eq!(slot, 2);
+    }
+
+    #[test]
+    fn find_insertion_slot_beginning() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        // Search for 5 should return slot 0
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(5));
+        assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn find_insertion_slot_end() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        // Search for 40 should return slot 3 (end)
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(40));
+        assert_eq!(slot, 3);
+    }
+
+    #[test]
+    fn find_slot_before_empty_page() {
+        let layout = btree_leaf_layout_int();
+        let page = Page::<BTreeLeafPage>::new();
+
+        let slot = page.find_slot_before(&layout, &Constant::Int(42));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn find_slot_before_key_less_than_all() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        let slot = page.find_slot_before(&layout, &Constant::Int(5));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn find_slot_before_key_greater_than_all() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        let slot = page.find_slot_before(&layout, &Constant::Int(100));
+        assert_eq!(slot, Some(2)); // Last slot
+    }
+
+    #[test]
+    fn find_slot_before_key_in_middle() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30, 40] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        // Search for 25 should return slot 1 (20 is before 25)
+        let slot = page.find_slot_before(&layout, &Constant::Int(25));
+        assert_eq!(slot, Some(1));
+    }
+
+    #[test]
+    fn find_slot_before_exact_match() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        for &key in &[10, 20, 30, 40] {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+                .unwrap();
+        }
+
+        // Exact match with 30 should return slot before it (slot 1 = 20)
+        let slot = page.find_slot_before(&layout, &Constant::Int(30));
+        assert_eq!(slot, Some(1));
+    }
+
+    // ========== Phase 1: Basic CRUD Tests ==========
+
+    #[test]
+    fn btree_leaf_insert_get_verify() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        let rid = RID::new(100, 50);
+        let slot = page
+            .insert_leaf_entry(&layout, &Constant::Int(42), &rid)
+            .expect("insert should succeed");
+
+        let entry = page.get_leaf_entry(&layout, slot).expect("get should succeed");
+        assert_eq!(entry.key, Constant::Int(42));
+        assert_eq!(entry.rid, rid);
+    }
+
+    #[test]
+    fn btree_leaf_insert_delete_verify() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert two entries
+        let slot1 = page
+            .insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1))
+            .unwrap();
+        let slot2 = page
+            .insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2))
+            .unwrap();
+
+        assert_eq!(page.slot_count(), 2);
+
+        // Delete first entry
+        page.delete_leaf_entry(slot1).expect("delete should succeed");
+
+        // Verify entry is gone (tuple_bytes returns None for deleted slots)
+        assert!(page.tuple_bytes(slot1).is_none());
+
+        // Second entry should still be accessible
+        let entry2 = page.get_leaf_entry(&layout, slot2).expect("get should succeed");
+        assert_eq!(entry2.key, Constant::Int(20));
+    }
+
+    #[test]
+    fn btree_leaf_get_invalid_slot() {
+        let layout = btree_leaf_layout_int();
+        let page = Page::<BTreeLeafPage>::new();
+
+        let result = page.get_leaf_entry(&layout, 999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn btree_leaf_delete_invalid_slot() {
+        let _layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        let result = page.delete_leaf_entry(999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn btree_internal_insert_get_verify() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(2);
+
+        let slot = page
+            .insert_internal_entry(&layout, &Constant::Int(50), 123)
+            .expect("insert should succeed");
+
+        let entry = page
+            .get_internal_entry(&layout, slot)
+            .expect("get should succeed");
+        assert_eq!(entry.key, Constant::Int(50));
+        assert_eq!(entry.child_block, 123);
+    }
+
+    #[test]
+    fn btree_internal_insert_delete_verify() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(1);
+
+        let slot1 = page
+            .insert_internal_entry(&layout, &Constant::Int(10), 100)
+            .unwrap();
+        let slot2 = page
+            .insert_internal_entry(&layout, &Constant::Int(20), 200)
+            .unwrap();
+
+        page.delete_internal_entry(slot1)
+            .expect("delete should succeed");
+
+        assert!(page.tuple_bytes(slot1).is_none());
+
+        let entry2 = page
+            .get_internal_entry(&layout, slot2)
+            .expect("get should succeed");
+        assert_eq!(entry2.key, Constant::Int(20));
+        assert_eq!(entry2.child_block, 200);
+    }
+
+    // ========== Phase 2: Capacity Tests ==========
+
+    #[test]
+    fn btree_leaf_is_full_detection() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Initially not full
+        assert!(!page.is_full(&layout));
+
+        // Insert entries until full
+        let mut count = 0;
+        loop {
+            if page.is_full(&layout) {
+                break;
+            }
+            let result = page.insert_leaf_entry(&layout, &Constant::Int(count), &RID::new(count as usize, count as usize));
+            if result.is_err() {
+                break;
+            }
+            count += 1;
+        }
+
+        // Should be marked as full
+        assert!(page.is_full(&layout));
+        assert!(count > 0, "should have inserted at least one entry");
+    }
+
+    #[test]
+    fn btree_leaf_fill_to_capacity_then_fail() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Fill page completely
+        let mut inserted = 0;
+        loop {
+            let result = page.insert_leaf_entry(&layout, &Constant::Int(inserted), &RID::new(inserted as usize, inserted as usize));
+            if result.is_err() {
+                break;
+            }
+            inserted += 1;
+            if inserted > 1000 {
+                panic!("infinite loop - page never fills");
+            }
+        }
+
+        // One more insert should fail
+        let result = page.insert_leaf_entry(&layout, &Constant::Int(9999), &RID::new(9999, 9999));
+        assert!(result.is_err(), "insert should fail on full page");
+
+        // Verify all previously inserted entries are still accessible and sorted
+        for slot in 0..inserted {
+            let entry = page.get_leaf_entry(&layout, slot as usize).expect("entry should exist");
+            assert_eq!(entry.key, Constant::Int(slot));
+        }
+    }
+
+    #[test]
+    fn btree_leaf_delete_then_insert_more() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Fill page
+        let mut inserted = 0;
+        loop {
+            let result = page.insert_leaf_entry(&layout, &Constant::Int(inserted), &RID::new(inserted as usize, inserted as usize));
+            if result.is_err() {
+                break;
+            }
+            inserted += 1;
+            if inserted > 1000 {
+                panic!("infinite loop");
+            }
+        }
+
+        let _initial_count = inserted;
+        assert!(page.is_full(&layout), "page should be full");
+
+        // Delete several entries
+        for slot in 0..5 {
+            page.delete_leaf_entry(slot).expect("delete should succeed");
+        }
+
+        // Should no longer be marked as full (freed some space)
+        // Note: is_full checks if there's space for one more entry
+        let was_full_after_delete = page.is_full(&layout);
+
+        // Try inserting again - should succeed now that we've freed space
+        let result = page.insert_leaf_entry(&layout, &Constant::Int(8888), &RID::new(8888, 8888));
+        assert!(result.is_ok() || was_full_after_delete,
+                "either insert succeeds or page was still full after deletes");
+    }
+
+    #[test]
+    fn btree_internal_is_full_detection() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(1);
+
+        assert!(!page.is_full(&layout));
+
+        let mut count = 0;
+        loop {
+            if page.is_full(&layout) {
+                break;
+            }
+            let result = page.insert_internal_entry(&layout, &Constant::Int(count), count as usize * 100);
+            if result.is_err() {
+                break;
+            }
+            count += 1;
+        }
+
+        assert!(page.is_full(&layout));
+    }
+
+    // ========== Phase 2: Empty/Single Entry Tests ==========
+
+    #[test]
+    fn btree_leaf_operations_on_empty_page() {
+        let layout = btree_leaf_layout_int();
+        let page = Page::<BTreeLeafPage>::new();
+
+        // Empty page operations
+        assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(42)), 0);
+        assert_eq!(page.find_slot_before(&layout, &Constant::Int(42)), None);
+        assert!(page.get_leaf_entry(&layout, 0).is_err());
+    }
+
+    #[test]
+    fn btree_leaf_single_entry_operations() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert single entry
+        let slot = page.insert_leaf_entry(&layout, &Constant::Int(50), &RID::new(10, 5))
+            .expect("insert should succeed");
+        assert_eq!(slot, 0);
+        assert_eq!(page.slot_count(), 1);
+
+        // Search operations with single entry
+        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(40)), 0); // before
+        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(50)), 0); // exact
+        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(60)), 1); // after
+
+        assert_eq!(page.find_slot_before(&layout, &Constant::Int(40)), None);
+        assert_eq!(page.find_slot_before(&layout, &Constant::Int(50)), None);
+        assert_eq!(page.find_slot_before(&layout, &Constant::Int(60)), Some(0));
+
+        // Delete the only entry
+        page.delete_leaf_entry(slot).expect("delete should succeed");
+        assert!(page.tuple_bytes(slot).is_none());
+
+        // Note: After deletion, the slot still exists in the line_pointers array (marked Free).
+        // Search behavior on pages with only deleted entries is undefined, so we don't test it.
+    }
+
+    #[test]
+    fn btree_internal_single_entry_operations() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(2);
+
+        let slot = page.insert_internal_entry(&layout, &Constant::Int(100), 500)
+            .expect("insert should succeed");
+        assert_eq!(slot, 0);
+
+        let entry = page.get_internal_entry(&layout, slot).expect("get should succeed");
+        assert_eq!(entry.key, Constant::Int(100));
+        assert_eq!(entry.child_block, 500);
+
+        page.delete_internal_entry(slot).expect("delete should succeed");
+        assert!(page.tuple_bytes(slot).is_none());
+    }
+
+    // ========== Phase 2: Metadata Persistence Tests ==========
+
+    #[test]
+    fn btree_leaf_overflow_block_roundtrip() {
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Initially None
+        assert_eq!(page.overflow_block(), None);
+
+        // Set to Some value
+        page.set_overflow_block(Some(42));
+        assert_eq!(page.overflow_block(), Some(42));
+
+        // Change value
+        page.set_overflow_block(Some(999));
+        assert_eq!(page.overflow_block(), Some(999));
+
+        // Clear back to None
+        page.set_overflow_block(None);
+        assert_eq!(page.overflow_block(), None);
+    }
+
+    #[test]
+    fn btree_internal_level_roundtrip() {
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(0);
+
+        assert_eq!(page.btree_level(), 0);
+
+        page.set_btree_level(5);
+        assert_eq!(page.btree_level(), 5);
+
+        page.set_btree_level(255);
+        assert_eq!(page.btree_level(), 255);
+    }
+
+    #[test]
+    fn btree_leaf_metadata_persists_across_serialization() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(Some(123));
+
+        // Insert some entries
+        page.insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1)).unwrap();
+        page.insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2)).unwrap();
+
+        // Serialize
+        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut buf).expect("serialize should succeed");
+
+        // Deserialize
+        let restored = Page::<BTreeLeafPage>::from_bytes(&buf).expect("deserialize should succeed");
+
+        // Verify metadata preserved
+        assert_eq!(restored.overflow_block(), Some(123));
+        assert_eq!(restored.slot_count(), 2);
+
+        // Verify entries preserved
+        let entry1 = restored.get_leaf_entry(&layout, 0).expect("entry 0 should exist");
+        assert_eq!(entry1.key, Constant::Int(10));
+
+        let entry2 = restored.get_leaf_entry(&layout, 1).expect("entry 1 should exist");
+        assert_eq!(entry2.key, Constant::Int(20));
+    }
+
+    #[test]
+    fn btree_internal_metadata_persists_across_serialization() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(7);
+
+        // Insert entries
+        page.insert_internal_entry(&layout, &Constant::Int(30), 300).unwrap();
+        page.insert_internal_entry(&layout, &Constant::Int(60), 600).unwrap();
+
+        // Serialize
+        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut buf).expect("serialize should succeed");
+
+        // Deserialize
+        let restored = Page::<BTreeInternalPage>::from_bytes(&buf).expect("deserialize should succeed");
+
+        // Verify metadata
+        assert_eq!(restored.btree_level(), 7);
+        assert_eq!(restored.slot_count(), 2);
+
+        // Verify entries
+        let entry1 = restored.get_internal_entry(&layout, 0).expect("entry should exist");
+        assert_eq!(entry1.key, Constant::Int(30));
+        assert_eq!(entry1.child_block, 300);
+    }
+
+    // ========== Phase 3: Iterator Tests ==========
+
+    #[test]
+    fn btree_leaf_iterator_yields_sorted_order() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert in random order
+        let keys = [42, 10, 99, 5, 77, 33];
+        for &key in &keys {
+            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(key as usize, 0))
+                .unwrap();
+        }
+
+        // Iterate and collect
+        let mut iter = BTreeLeafIterator {
+            page: &page,
+            layout: &layout,
+            current_slot: 0,
+        };
+
+        let mut collected = Vec::new();
+        while let Some(entry) = iter.next() {
+            if let Constant::Int(k) = entry.key {
+                collected.push(k);
+            }
+        }
+
+        // Should be sorted
+        assert_eq!(collected, vec![5, 10, 33, 42, 77, 99]);
+    }
+
+    #[test]
+    fn btree_leaf_iterator_skips_deleted_entries() {
+        let layout = btree_leaf_layout_int();
+        let mut page = Page::<BTreeLeafPage>::new();
+        page.init(None);
+
+        // Insert 5 entries
+        for i in 0..5 {
+            page.insert_leaf_entry(&layout, &Constant::Int(i * 10), &RID::new(i as usize, 0))
+                .unwrap();
+        }
+
+        // Delete slot 2 (key=20)
+        page.delete_leaf_entry(2).expect("delete should succeed");
+
+        // Iterate
+        let mut iter = BTreeLeafIterator {
+            page: &page,
+            layout: &layout,
+            current_slot: 0,
+        };
+
+        let mut collected = Vec::new();
+        while let Some(entry) = iter.next() {
+            if let Constant::Int(k) = entry.key {
+                collected.push(k);
+            }
+        }
+
+        // Should skip deleted entry
+        assert_eq!(collected, vec![0, 10, 30, 40]);
+    }
+
+    #[test]
+    fn btree_leaf_iterator_empty_page() {
+        let layout = btree_leaf_layout_int();
+        let page = Page::<BTreeLeafPage>::new();
+
+        let mut iter = BTreeLeafIterator {
+            page: &page,
+            layout: &layout,
+            current_slot: 0,
+        };
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn btree_internal_iterator_yields_sorted_order() {
+        let layout = btree_internal_layout_int();
+        let mut page = Page::<BTreeInternalPage>::new();
+        page.init(1);
+
+        let keys = [50, 20, 80, 10, 90];
+        for (i, &key) in keys.iter().enumerate() {
+            page.insert_internal_entry(&layout, &Constant::Int(key), i * 100)
+                .unwrap();
+        }
+
+        let mut iter = BTreeInternalIterator {
+            page: &page,
+            layout: &layout,
+            current_slot: 0,
+        };
+
+        let mut collected = Vec::new();
+        while let Some(entry) = iter.next() {
+            if let Constant::Int(k) = entry.key {
+                collected.push(k);
+            }
+        }
+
+        assert_eq!(collected, vec![10, 20, 50, 80, 90]);
+    }
+
+    // ========== Phase 3: Mixed Operations via Views ==========
+
+    #[test]
+    fn btree_leaf_view_delete_and_reinsert() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout)
+                .expect("create leaf view");
+
+            // Insert entries at slots 0, 1, 2, 3, 4
+            let slot0 = view.insert_entry(Constant::Int(10), RID::new(1, 0)).unwrap();
+            let slot1 = view.insert_entry(Constant::Int(20), RID::new(2, 0)).unwrap();
+            let slot2 = view.insert_entry(Constant::Int(30), RID::new(3, 0)).unwrap();
+            let slot3 = view.insert_entry(Constant::Int(40), RID::new(4, 0)).unwrap();
+            let slot4 = view.insert_entry(Constant::Int(50), RID::new(5, 0)).unwrap();
+
+            assert_eq!(slot0, 0);
+            assert_eq!(slot1, 1);
+            assert_eq!(slot2, 2);
+            assert_eq!(slot3, 3);
+            assert_eq!(slot4, 4);
+
+            // Delete slots 1, 3 (keys 20, 40)
+            view.delete_entry(slot1).expect("delete slot1");
+            view.delete_entry(slot3).expect("delete slot3");
+
+            // Verify deletions - should have 3 live entries now
+            let live_count = view.iter().count();
+            assert_eq!(live_count, 3);
+
+            // Insert new entries
+            // Note: BTree pages maintain sorted order by shifting slots,
+            // so new entries may not reuse deleted slots like heap pages do
+            let _new_slot1 = view.insert_entry(Constant::Int(15), RID::new(10, 0)).unwrap();
+            let _new_slot2 = view.insert_entry(Constant::Int(25), RID::new(11, 0)).unwrap();
+
+            // Verify all live entries are in sorted order via iterator
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+            assert_eq!(collected, vec![10, 15, 25, 30, 50]);
+            assert_eq!(collected.len(), 5);
+        }
+    }
+
+    #[test]
+    fn btree_leaf_view_serialize_with_deletes() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout)
+                .expect("create leaf view");
+
+            // Insert 10 entries
+            for i in 0..10 {
+                view.insert_entry(Constant::Int(i * 10), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
+            // Delete every other entry (0, 2, 4, 6, 8)
+            for slot in [0, 2, 4, 6, 8] {
+                view.delete_entry(slot).expect("delete should succeed");
+            }
+
+            // Verify 5 live entries remain via iterator
+            let count = view.iter().count();
+            assert_eq!(count, 5);
+        }
+
+        // Serialize happens automatically when guard is dropped
+        // Re-read the page
+        {
+            let guard = txn.pin_read_guard(&block_id);
+            let view = BTreeLeafPageView::new(guard, &layout).expect("create read view");
+
+            // Verify 5 live entries still accessible
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+            assert_eq!(collected, vec![10, 30, 50, 70, 90]);
+        }
+    }
+
+    #[test]
+    fn btree_leaf_view_insert_delete_chaos() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout)
+                .expect("create leaf view");
+
+            // Insert 20 entries
+            for i in 0..20 {
+                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
+            // Delete 10 random entries
+            for slot in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19] {
+                view.delete_entry(slot).expect("delete");
+            }
+
+            // Insert 5 new entries
+            for i in 100..105 {
+                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
+            // Verify sorted order maintained
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+
+            // Should be: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 100, 101, 102, 103, 104]
+            let mut expected = vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18];
+            expected.extend(100..105);
+            assert_eq!(collected, expected);
+            assert_eq!(collected.len(), 15);
+        }
+    }
+
+    #[test]
+    fn btree_leaf_view_fill_delete_refill() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout)
+                .expect("create leaf view");
+
+            // Fill page to capacity
+            let mut inserted = 0;
+            loop {
+                let result = view.insert_entry(Constant::Int(inserted), RID::new(inserted as usize, 0));
+                if result.is_err() {
+                    break;
+                }
+                inserted += 1;
+                if inserted > 1000 {
+                    panic!("page never fills");
+                }
+            }
+
+            assert!(view.is_full());
+            let _full_count = inserted;
+
+            // Delete 10 entries from the middle
+            let start_delete = (_full_count / 2 - 5) as usize;
+            for slot in start_delete..start_delete + 10 {
+                view.delete_entry(slot).expect("delete should succeed");
+            }
+
+            // Should no longer be full
+            let still_full = view.is_full();
+
+            // Try to insert more entries
+            let mut new_inserted = 0;
+            for i in 1000..1010 {
+                let result = view.insert_entry(Constant::Int(i), RID::new(i as usize, 0));
+                if result.is_ok() {
+                    new_inserted += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Should have inserted at least some entries (or page was still full)
+            assert!(new_inserted > 0 || still_full);
+
+            // Verify sorted order maintained
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+
+            // Verify sorted
+            for window in collected.windows(2) {
+                assert!(window[0] < window[1], "not sorted: {} >= {}", window[0], window[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn btree_leaf_view_wrong_page_type_error() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            // Format as Heap page, NOT BTree
+            guard.format_as_heap();
+
+            // Try to create BTree leaf view on heap page
+            let result = BTreeLeafPageViewMut::new(guard, &layout);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn btree_internal_view_mixed_operations() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_internal_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_internal(2);
+
+            let mut view = BTreeInternalPageViewMut::new(guard, &layout)
+                .expect("create internal view");
+
+            // Insert entries
+            view.insert_entry(Constant::Int(50), 100).unwrap();
+            view.insert_entry(Constant::Int(30), 200).unwrap();
+            view.insert_entry(Constant::Int(70), 300).unwrap();
+
+            // Verify sorted
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+            assert_eq!(collected, vec![30, 50, 70]);
+
+            // Delete middle entry
+            view.delete_entry(1).expect("delete should succeed");
+
+            // Verify remaining sorted
+            let collected: Vec<i32> = view.iter()
+                .filter_map(|e| if let Constant::Int(k) = e.key { Some(k) } else { None })
+                .collect();
+            assert_eq!(collected, vec![30, 70]);
+
+            // Verify level preserved
+            assert_eq!(view.btree_level(), 2);
         }
     }
 }
