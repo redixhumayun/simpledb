@@ -600,11 +600,13 @@ mod btree_internal_tests {
         let (txn, internal) = setup_internal_node(&db);
 
         // Test inserting duplicate keys
-        let guard = txn.pin_write_guard(&internal.block_id);
-        let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
-        view.insert_entry(Constant::Int(10), 1).unwrap();
-        view.insert_entry(Constant::Int(10), 2).unwrap();
-        view.mark_modified(txn.id(), Lsn::MAX);
+        {
+            let guard = txn.pin_write_guard(&internal.block_id);
+            let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
+            view.insert_entry(Constant::Int(10), 1).unwrap();
+            view.insert_entry(Constant::Int(10), 2).unwrap();
+            view.mark_modified(txn.id(), Lsn::MAX);
+        }
 
         //  NOTE: It looks like the numbers are reversed here in the sense that the block numbers asserted are backwards
         //  but they are correct because the insertion into the node results in a page that looks like this where block 2
