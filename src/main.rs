@@ -7732,7 +7732,8 @@ impl TableManager {
                 Self::FIELD_CAT_TABLE_NAME,
             );
             let mut schema = Schema::new();
-            while let Some(_) = table_scan.next() {
+            while let Some(result) = table_scan.next() {
+                result.expect("failed to advance table scan in get_layout");
                 if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
                     let field_name = table_scan.get_string(Self::FIELD_NAME_COL).unwrap();
                     let field_type: FieldType =
@@ -7754,7 +7755,8 @@ impl TableManager {
             Self::TABLE_CAT_TABLE_NAME,
         );
         let mut tables = Vec::new();
-        while let Some(_) = table_scan.next() {
+        while let Some(result) = table_scan.next() {
+            result?;
             let table_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
             // Skip internal catalog tables
             if table_name != Self::TABLE_CAT_TABLE_NAME && table_name != Self::FIELD_CAT_TABLE_NAME
@@ -7933,7 +7935,16 @@ impl Iterator for TableScan {
             if self.at_last_block() {
                 return None;
             }
-            self.move_to_block(self.record_page.as_ref().unwrap().block_id.block_num + 1);
+
+            let next_block = self.record_page.as_ref().unwrap().block_id.block_num + 1;
+            let file_size = self.txn.size(&self.file_name);
+
+            // Don't move to a block that doesn't exist
+            if next_block >= file_size {
+                return None;
+            }
+
+            self.move_to_block(next_block);
         }
     }
 }
@@ -8284,6 +8295,7 @@ impl RecordPage {
     pub fn format(&self) {
         let mut guard = self.txn.pin_write_guard(&self.block_id);
         guard.format_as_heap();
+        guard.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
     }
 
     /// Finds the next valid slot after the given slot.

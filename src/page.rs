@@ -546,7 +546,7 @@ impl PageKind for HeapPage {
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
-    const HAS_HEADER: bool = false;
+    const HAS_HEADER: bool = true;
 
     type Alloc<'a> = ();
 
