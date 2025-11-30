@@ -286,6 +286,18 @@ mod btree_index_tests {
     }
 }
 
+/// The general format of the BTreePage
+///
+/// The format of the record slot for the leaf page
+/// +-------------+---------------+--------------+
+/// | key         | block number  | slot number  |
+/// +-------------+---------------+--------------+
+///
+/// The format of the record slot for the internal page
+/// +-------------+------------------+
+/// | key         | child block num  |
+/// +-------------+------------------+
+
 struct BTreeInternal {
     txn: Arc<Transaction>,
     block_id: BlockId,
@@ -1080,61 +1092,5 @@ mod btree_leaf_tests {
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
         assert_eq!(entry.key, Constant::Int(20)); // First non-10 value
-    }
-}
-
-/// The general format of the BTreePage
-/// +--------------------+----------------------+----------------------+
-/// | flag (4 bytes)     | record count (4B)    | record slots [...]   |
-/// +--------------------+----------------------+----------------------+
-///     ^ offset 0            ^ offset 4              ^ offset 8
-///
-/// The format of the record slot for the leaf page
-/// +-------------+---------------+--------------+
-/// | dataval     | block number  | slot number  |
-/// +-------------+---------------+--------------+
-///
-/// The format of the record slot for the internal page
-/// +-------------+------------------+
-/// | dataval     | child block num  |
-/// +-------------+------------------+
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BTreePageFlags {
-    Internal(Option<usize>),
-    Leaf(Option<usize>),
-}
-
-impl From<i32> for BTreePageFlags {
-    fn from(value: i32) -> Self {
-        const TYPE_MASK: i32 = 1 << 31;
-        const VALUE_MASK: i32 = !(1 << 31);
-        let is_internal = value & TYPE_MASK == 0;
-        if is_internal {
-            if value == 0 {
-                BTreePageFlags::Internal(None)
-            } else {
-                BTreePageFlags::Internal(Some((value & VALUE_MASK) as usize))
-            }
-        } else {
-            let val = value & VALUE_MASK;
-            if val == 0 {
-                BTreePageFlags::Leaf(None)
-            } else {
-                BTreePageFlags::Leaf(Some(val as usize))
-            }
-        }
-    }
-}
-
-impl From<BTreePageFlags> for i32 {
-    fn from(value: BTreePageFlags) -> Self {
-        const TYPE_MASK: i32 = 1 << 31;
-        match value {
-            BTreePageFlags::Internal(None) => 0,
-            BTreePageFlags::Internal(Some(n)) => n as i32,
-            BTreePageFlags::Leaf(None) => TYPE_MASK,
-            BTreePageFlags::Leaf(Some(n)) => TYPE_MASK | (n as i32),
-        }
     }
 }
