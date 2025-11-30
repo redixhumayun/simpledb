@@ -8207,12 +8207,6 @@ impl RID {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SlotPresence {
-    Empty,
-    Used,
-}
-
 #[derive(Clone)]
 struct RecordPage {
     txn: Arc<Transaction>,
@@ -8319,6 +8313,7 @@ impl RecordPage {
     }
 
     /// Returns a Vec of all live (non-deleted) slot IDs on this page.
+    #[cfg(test)]
     pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
         let view = self
             .txn
@@ -8344,6 +8339,7 @@ impl RecordPage {
 
     /// Inserts a new record with the given values and returns its slot ID.
     /// Values must match the schema field order.
+    #[cfg(test)]
     pub fn insert_with_values(&self, values: &RowValues) -> Result<usize, Box<dyn Error>> {
         if values.len() != self.layout.schema.fields.len() {
             return Err("value count must match schema field count".into());
@@ -10594,6 +10590,7 @@ impl BufferFrame {
     }
 
     /// Check whether the buffer is pinned in memory
+    #[cfg(test)]
     fn is_pinned(&self) -> bool {
         self.lock_meta().pins > 0
     }
