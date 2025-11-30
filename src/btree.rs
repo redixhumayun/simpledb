@@ -1107,12 +1107,13 @@ impl BTreePage {
     /// Formats a new page by initializing its flag and record count
     /// Sets all record slots to their zero values based on field types
     fn format(&self, page_type: PageType) -> Result<(), Box<dyn Error>> {
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
-            .set_int(self.handle.block_id(), 0, page_type.into(), true)?;
+            .set_int(self.handle.block_id(), header_offset, page_type.into(), true)?;
         self.txn
-            .set_int(self.handle.block_id(), Self::INT_BYTES, 0, true)?;
+            .set_int(self.handle.block_id(), header_offset + Self::INT_BYTES, 0, true)?;
         let record_size = self.layout.slot_size;
-        for i in ((2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size) {
+        for i in ((header_offset + 2 * Self::INT_BYTES)..self.txn.block_size()).step_by(record_size) {
             for field in &self.layout.schema.fields {
                 let field_type = self.layout.schema.info.get(field).unwrap().field_type;
                 match field_type {
@@ -1130,15 +1131,17 @@ impl BTreePage {
 
     /// Retrieves the page type flag from the header
     fn get_flag(&self) -> Result<PageType, Box<dyn Error>> {
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
-            .get_int(self.handle.block_id(), 0)
+            .get_int(self.handle.block_id(), header_offset)
             .map(PageType::from)
     }
 
     /// Updates the page type flag in the header
     fn set_flag(&self, value: PageType) -> Result<(), Box<dyn Error>> {
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
-            .set_int(self.handle.block_id(), 0, value.into(), true)
+            .set_int(self.handle.block_id(), header_offset, value.into(), true)
     }
 
     /// Gets the data value at the specified slot
@@ -1217,15 +1220,17 @@ impl BTreePage {
 
     /// Gets the number of records currently stored in the page
     fn get_number_of_recs(&self) -> Result<usize, Box<dyn Error>> {
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
-            .get_int(self.handle.block_id(), Self::INT_BYTES)
+            .get_int(self.handle.block_id(), header_offset + Self::INT_BYTES)
             .map(|v| v as usize)
     }
 
     /// Updates the number of records stored in the page
     fn set_number_of_recs(&self, num: usize) -> Result<(), Box<dyn Error>> {
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
         self.txn
-            .set_int(self.handle.block_id(), Self::INT_BYTES, num as i32, true)
+            .set_int(self.handle.block_id(), header_offset + Self::INT_BYTES, num as i32, true)
     }
 
     fn get_int(&self, slot: usize, field_name: &str) -> Result<i32, Box<dyn Error>> {
@@ -1320,7 +1325,8 @@ impl BTreePage {
 
     /// Calculates the starting byte position of a record slot
     fn slot_pos(&self, slot: usize) -> usize {
-        Self::INT_BYTES + Self::INT_BYTES + slot * self.layout.slot_size
+        let header_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
+        header_offset + Self::INT_BYTES + Self::INT_BYTES + slot * self.layout.slot_size
     }
 }
 

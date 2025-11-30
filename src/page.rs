@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout};
+use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, RID};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +159,42 @@ impl PageHeader {
 
     fn set_reserved_flags(&mut self, flags: u8) {
         self.reserved_flags = flags;
+    }
+
+    /// Get the B-tree level for internal nodes (uses reserved bytes 0-1)
+    fn btree_level(&self) -> u16 {
+        u16::from_le_bytes([self.reserved[0], self.reserved[1]])
+    }
+
+    /// Set the B-tree level for internal nodes (uses reserved bytes 0-1)
+    fn set_btree_level(&mut self, level: u16) {
+        let bytes = level.to_le_bytes();
+        self.reserved[0] = bytes[0];
+        self.reserved[1] = bytes[1];
+    }
+
+    /// Get the overflow block number for leaf nodes (uses reserved bytes 2-5)
+    /// Returns None if no overflow block (0xFFFFFFFF sentinel)
+    fn overflow_block(&self) -> Option<usize> {
+        let val = u32::from_le_bytes([
+            self.reserved[2],
+            self.reserved[3],
+            self.reserved[4],
+            self.reserved[5],
+        ]);
+        if val == 0xFFFFFFFF {
+            None
+        } else {
+            Some(val as usize)
+        }
+    }
+
+    /// Set the overflow block number for leaf nodes (uses reserved bytes 2-5)
+    /// Use None to clear (sets to 0xFFFFFFFF sentinel)
+    fn set_overflow_block(&mut self, block: Option<usize>) {
+        let val = block.map(|b| b as u32).unwrap_or(0xFFFFFFFF);
+        let bytes = val.to_le_bytes();
+        self.reserved[2..6].copy_from_slice(&bytes);
     }
 
     /// Serialize the header into the provided 32-byte buffer using the documented layout.
@@ -567,6 +603,134 @@ impl PageKind for RawPage {
     }
 }
 
+// BTree page types
+pub struct BTreeLeafPage;
+pub struct BTreeInternalPage;
+
+pub struct BTreeLeafAllocator<'a> {
+    page: &'a mut Page<BTreeLeafPage>,
+}
+
+pub struct BTreeInternalAllocator<'a> {
+    page: &'a mut Page<BTreeInternalPage>,
+}
+
+pub struct BTreeLeafIterator<'a> {
+    page: &'a Page<BTreeLeafPage>,
+    layout: &'a Layout,
+    current_slot: SlotId,
+}
+
+pub struct BTreeInternalIterator<'a> {
+    page: &'a Page<BTreeInternalPage>,
+    layout: &'a Layout,
+    current_slot: SlotId,
+}
+
+impl<'a> PageAllocator<'a> for BTreeLeafAllocator<'a> {
+    type Output = SlotId;
+
+    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
+        // (TODO) BTree leaf pages need sorted insertion
+        self.page.allocate_tuple(bytes)
+    }
+}
+
+impl<'a> PageAllocator<'a> for BTreeInternalAllocator<'a> {
+    type Output = SlotId;
+
+    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
+        // (TODO) BTree internal pages need sorted insertion
+        self.page.allocate_tuple(bytes)
+    }
+}
+
+impl<'a> Iterator for BTreeLeafIterator<'a> {
+    type Item = BTreeLeafEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_slot < self.page.slot_count() {
+            let slot = self.current_slot;
+            self.current_slot += 1;
+
+            if let Some(bytes) = self.page.tuple_bytes(slot) {
+                if let Ok(entry) = BTreeLeafEntry::decode(self.layout, bytes) {
+                    return Some(entry);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl<'a> Iterator for BTreeInternalIterator<'a> {
+    type Item = BTreeInternalEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_slot < self.page.slot_count() {
+            let slot = self.current_slot;
+            self.current_slot += 1;
+
+            if let Some(bytes) = self.page.tuple_bytes(slot) {
+                if let Ok(entry) = BTreeInternalEntry::decode(self.layout, bytes) {
+                    return Some(entry);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl PageKind for BTreeLeafPage {
+    const PAGE_TYPE: PageType = PageType::IndexLeaf;
+    const HAS_HEADER: bool = true;
+
+    type Alloc<'a> = BTreeLeafAllocator<'a>;
+    type Iter<'a> = BTreeLeafIterator<'a>;
+
+    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
+    where
+        Self: Sized,
+    {
+        BTreeLeafAllocator { page }
+    }
+
+    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
+    where
+        Self: Sized,
+    {
+        // BTree iteration requires Layout and should be done through views
+        // Use BTreeLeafPageView::iter() instead
+        panic!(
+            "BTree iteration not supported through PageKind trait; use BTreeLeafPageView::iter()"
+        )
+    }
+}
+
+impl PageKind for BTreeInternalPage {
+    const PAGE_TYPE: PageType = PageType::IndexInternal;
+    const HAS_HEADER: bool = true;
+
+    type Alloc<'a> = BTreeInternalAllocator<'a>;
+    type Iter<'a> = BTreeInternalIterator<'a>;
+
+    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
+    where
+        Self: Sized,
+    {
+        BTreeInternalAllocator { page }
+    }
+
+    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
+    where
+        Self: Sized,
+    {
+        // BTree iteration requires Layout and should be done through views
+        // Use BTreeInternalPageView::iter() instead
+        panic!("BTree iteration not supported through PageKind trait; use BTreeInternalPageView::iter()")
+    }
+}
+
 /// Type alias for a page image whose kind is not yet known at the IO boundary.
 pub type PageBytes = Page<RawPage>;
 
@@ -965,6 +1129,150 @@ impl Page<HeapPage> {
             .ok_or("invalid slot provided during redirect")?;
         line_pointer.mark_redirect(target as u16);
         Ok(())
+    }
+}
+
+impl Page<BTreeLeafPage> {
+    /// Insert a B-tree leaf entry
+    pub fn insert_leaf_entry(
+        &mut self,
+        layout: &Layout,
+        key: &Constant,
+        rid: &RID,
+    ) -> Result<SlotId, Box<dyn Error>> {
+        let entry = BTreeLeafEntry {
+            key: key.clone(),
+            rid: rid.clone(),
+        };
+        let bytes = entry.encode(layout);
+        self.allocate_tuple(&bytes)
+    }
+
+    /// Get a B-tree leaf entry at the given slot
+    pub fn get_leaf_entry(
+        &self,
+        layout: &Layout,
+        slot: SlotId,
+    ) -> Result<BTreeLeafEntry, Box<dyn Error>> {
+        let bytes = self.tuple_bytes(slot).ok_or("slot not found")?;
+        BTreeLeafEntry::decode(layout, bytes)
+    }
+
+    /// Delete a B-tree leaf entry at the given slot
+    pub fn delete_leaf_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.delete_tuple(slot)
+    }
+
+    /// Find the rightmost slot before the search key
+    pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
+        let mut slot = 0;
+        while slot < self.slot_count() {
+            if let Ok(entry) = self.get_leaf_entry(layout, slot) {
+                if entry.key >= *search_key {
+                    return if slot == 0 { None } else { Some(slot - 1) };
+                }
+            }
+            slot += 1;
+        }
+        if slot == 0 {
+            None
+        } else {
+            Some(slot - 1)
+        }
+    }
+
+    /// Check if the page is full
+    pub fn is_full(&self, layout: &Layout) -> bool {
+        let (lower, upper) = self.header.free_bounds();
+        let needed = layout.slot_size as u16 + 4;
+        lower + needed > upper
+    }
+
+    /// Get the B-tree level from the header (for leaf pages, usually 0)
+    pub fn btree_level(&self) -> u16 {
+        self.header.btree_level()
+    }
+
+    /// Set the B-tree level in the header
+    pub fn set_btree_level(&mut self, level: u16) {
+        self.header.set_btree_level(level);
+    }
+
+    /// Get the overflow block number (if any)
+    pub fn overflow_block(&self) -> Option<usize> {
+        self.header.overflow_block()
+    }
+
+    /// Set the overflow block number
+    pub fn set_overflow_block(&mut self, block: Option<usize>) {
+        self.header.set_overflow_block(block);
+    }
+}
+
+impl Page<BTreeInternalPage> {
+    /// Insert a B-tree internal entry
+    pub fn insert_internal_entry(
+        &mut self,
+        layout: &Layout,
+        key: &Constant,
+        child_block: usize,
+    ) -> Result<SlotId, Box<dyn Error>> {
+        let entry = BTreeInternalEntry {
+            key: key.clone(),
+            child_block,
+        };
+        let bytes = entry.encode(layout);
+        self.allocate_tuple(&bytes)
+    }
+
+    /// Get a B-tree internal entry at the given slot
+    pub fn get_internal_entry(
+        &self,
+        layout: &Layout,
+        slot: SlotId,
+    ) -> Result<BTreeInternalEntry, Box<dyn Error>> {
+        let bytes = self.tuple_bytes(slot).ok_or("slot not found")?;
+        BTreeInternalEntry::decode(layout, bytes)
+    }
+
+    /// Delete a B-tree internal entry at the given slot
+    pub fn delete_internal_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.delete_tuple(slot)
+    }
+
+    /// Find the rightmost slot before the search key
+    pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
+        let mut slot = 0;
+        while slot < self.slot_count() {
+            if let Ok(entry) = self.get_internal_entry(layout, slot) {
+                if entry.key >= *search_key {
+                    return if slot == 0 { None } else { Some(slot - 1) };
+                }
+            }
+            slot += 1;
+        }
+        if slot == 0 {
+            None
+        } else {
+            Some(slot - 1)
+        }
+    }
+
+    /// Check if the page is full
+    pub fn is_full(&self, layout: &Layout) -> bool {
+        let (lower, upper) = self.header.free_bounds();
+        let needed = layout.slot_size as u16 + 4;
+        lower + needed > upper
+    }
+
+    /// Get the B-tree level from the header
+    pub fn btree_level(&self) -> u16 {
+        self.header.btree_level()
+    }
+
+    /// Set the B-tree level in the header
+    pub fn set_btree_level(&mut self, level: u16) {
+        self.header.set_btree_level(level);
     }
 }
 
@@ -1950,6 +2258,396 @@ impl<'a> PageViewMut<'a, HeapPage> {
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
+    }
+}
+
+// BTree entry types
+#[derive(Debug, Clone, PartialEq)]
+pub struct BTreeLeafEntry {
+    pub key: Constant,
+    pub rid: RID,
+}
+
+impl BTreeLeafEntry {
+    pub fn encode(&self, layout: &Layout) -> Vec<u8> {
+        let mut bytes = vec![0u8; layout.slot_size];
+
+        // Encode key at "dataval" offset
+        let key_offset = layout
+            .offset(BTREE_DATA_FIELD)
+            .expect("dataval field required");
+        match &self.key {
+            Constant::Int(v) => {
+                bytes[key_offset..key_offset + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            Constant::String(s) => {
+                let len = s.len() as u32;
+                bytes[key_offset..key_offset + 4].copy_from_slice(&len.to_le_bytes());
+                bytes[key_offset + 4..key_offset + 4 + s.len()].copy_from_slice(s.as_bytes());
+            }
+        }
+
+        // Encode block number at "block" offset
+        let block_offset = layout
+            .offset(BTREE_BLOCK_FIELD)
+            .expect("block field required");
+        bytes[block_offset..block_offset + 4]
+            .copy_from_slice(&(self.rid.block_num as i32).to_le_bytes());
+
+        // Encode slot number at "id" offset
+        let id_offset = layout.offset(BTREE_ID_FIELD).expect("id field required");
+        bytes[id_offset..id_offset + 4].copy_from_slice(&(self.rid.slot as i32).to_le_bytes());
+
+        bytes
+    }
+
+    pub fn decode(layout: &Layout, bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
+        // Decode key from "dataval" offset
+        let key_offset = layout
+            .offset(BTREE_DATA_FIELD)
+            .ok_or("dataval field not found")?;
+        let field_info = layout
+            .field_info(BTREE_DATA_FIELD)
+            .ok_or("dataval field info not found")?;
+        let key = match field_info.field_type {
+            FieldType::Int => {
+                let val = i32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?);
+                Constant::Int(val)
+            }
+            FieldType::String => {
+                let len =
+                    u32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?) as usize;
+                let str_bytes = &bytes[key_offset + 4..key_offset + 4 + len];
+                Constant::String(String::from_utf8(str_bytes.to_vec())?)
+            }
+        };
+
+        // Decode block number from "block" offset
+        let block_offset = layout
+            .offset(BTREE_BLOCK_FIELD)
+            .ok_or("block field not found")?;
+        let block_num =
+            i32::from_le_bytes(bytes[block_offset..block_offset + 4].try_into()?) as usize;
+
+        // Decode slot number from "id" offset
+        let id_offset = layout.offset(BTREE_ID_FIELD).ok_or("id field not found")?;
+        let slot = i32::from_le_bytes(bytes[id_offset..id_offset + 4].try_into()?) as usize;
+
+        Ok(BTreeLeafEntry {
+            key,
+            rid: RID::new(block_num, slot),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BTreeInternalEntry {
+    pub key: Constant,
+    pub child_block: usize,
+}
+
+impl BTreeInternalEntry {
+    pub fn encode(&self, layout: &Layout) -> Vec<u8> {
+        let mut bytes = vec![0u8; layout.slot_size];
+
+        // Encode key at "dataval" offset
+        let key_offset = layout
+            .offset(BTREE_DATA_FIELD)
+            .expect("dataval field required");
+        match &self.key {
+            Constant::Int(v) => {
+                bytes[key_offset..key_offset + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            Constant::String(s) => {
+                let len = s.len() as u32;
+                bytes[key_offset..key_offset + 4].copy_from_slice(&len.to_le_bytes());
+                bytes[key_offset + 4..key_offset + 4 + s.len()].copy_from_slice(s.as_bytes());
+            }
+        }
+
+        // Encode child block number at "block" offset
+        let block_offset = layout
+            .offset(BTREE_BLOCK_FIELD)
+            .expect("block field required");
+        bytes[block_offset..block_offset + 4]
+            .copy_from_slice(&(self.child_block as i32).to_le_bytes());
+
+        bytes
+    }
+
+    pub fn decode(layout: &Layout, bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
+        // Decode key from "dataval" offset
+        let key_offset = layout
+            .offset(BTREE_DATA_FIELD)
+            .ok_or("dataval field not found")?;
+        let field_info = layout
+            .field_info(BTREE_DATA_FIELD)
+            .ok_or("dataval field info not found")?;
+        let key = match field_info.field_type {
+            FieldType::Int => {
+                let val = i32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?);
+                Constant::Int(val)
+            }
+            FieldType::String => {
+                let len =
+                    u32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?) as usize;
+                let str_bytes = &bytes[key_offset + 4..key_offset + 4 + len];
+                Constant::String(String::from_utf8(str_bytes.to_vec())?)
+            }
+        };
+
+        // Decode child block number from "block" offset
+        let block_offset = layout
+            .offset(BTREE_BLOCK_FIELD)
+            .ok_or("block field not found")?;
+        let child_block =
+            i32::from_le_bytes(bytes[block_offset..block_offset + 4].try_into()?) as usize;
+
+        Ok(BTreeInternalEntry { key, child_block })
+    }
+}
+
+// Field names used in BTree layouts (matching IndexInfo constants in btree.rs)
+const BTREE_DATA_FIELD: &str = "dataval";
+const BTREE_BLOCK_FIELD: &str = "block";
+const BTREE_ID_FIELD: &str = "id";
+
+// BTree Leaf Page Views
+pub struct BTreeLeafPageView<'a> {
+    guard: PageReadGuard<'a>,
+    page_ref: &'a Page<BTreeLeafPage>,
+    layout: &'a Layout,
+}
+
+impl<'a> BTreeLeafPageView<'a> {
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::IndexLeaf {
+            return Err("cannot initialize BTreeLeafPageView with non-leaf page".into());
+        }
+        let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
+        let page_ref = unsafe { &*page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
+        self.page_ref.get_leaf_entry(self.layout, slot)
+    }
+
+    pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
+        self.page_ref.find_slot_before(self.layout, search_key)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.page_ref.is_full(self.layout)
+    }
+
+    pub fn overflow_block(&self) -> Option<usize> {
+        self.page_ref.overflow_block()
+    }
+
+    pub fn iter(&self) -> BTreeLeafIterator<'_> {
+        BTreeLeafIterator {
+            page: self.page_ref,
+            layout: self.layout,
+            current_slot: 0,
+        }
+    }
+}
+
+pub struct BTreeLeafPageViewMut<'a> {
+    guard: PageWriteGuard<'a>,
+    page_ref: &'a mut Page<BTreeLeafPage>,
+    layout: &'a Layout,
+}
+
+impl<'a> BTreeLeafPageViewMut<'a> {
+    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::IndexLeaf {
+            return Err("cannot initialize BTreeLeafPageViewMut with non-leaf page".into());
+        }
+        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<BTreeLeafPage>;
+        let page_ref = unsafe { &mut *page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    // Read operations
+    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
+        self.page_ref.get_leaf_entry(self.layout, slot)
+    }
+
+    pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
+        self.page_ref.find_slot_before(self.layout, search_key)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.page_ref.is_full(self.layout)
+    }
+
+    pub fn overflow_block(&self) -> Option<usize> {
+        self.page_ref.overflow_block()
+    }
+
+    pub fn iter(&self) -> BTreeLeafIterator<'_> {
+        BTreeLeafIterator {
+            page: self.page_ref,
+            layout: self.layout,
+            current_slot: 0,
+        }
+    }
+
+    // Write operations
+    pub fn insert_entry(&mut self, key: Constant, rid: RID) -> Result<SlotId, Box<dyn Error>> {
+        self.page_ref.insert_leaf_entry(self.layout, &key, &rid)
+    }
+
+    pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.page_ref.delete_leaf_entry(slot)
+    }
+
+    pub fn set_overflow_block(&mut self, block: Option<usize>) {
+        self.page_ref.set_overflow_block(block);
+    }
+
+    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
+        self.guard.mark_modified(txn_id, lsn);
+    }
+}
+
+// BTree Internal Page Views
+pub struct BTreeInternalPageView<'a> {
+    guard: PageReadGuard<'a>,
+    page_ref: &'a Page<BTreeInternalPage>,
+    layout: &'a Layout,
+}
+
+impl<'a> BTreeInternalPageView<'a> {
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::IndexInternal {
+            return Err("cannot initialize BTreeInternalPageView with non-internal page".into());
+        }
+        let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
+        let page_ref = unsafe { &*page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
+        self.page_ref.get_internal_entry(self.layout, slot)
+    }
+
+    pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
+        self.page_ref.find_slot_before(self.layout, search_key)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.page_ref.is_full(self.layout)
+    }
+
+    pub fn btree_level(&self) -> u16 {
+        self.page_ref.btree_level()
+    }
+
+    pub fn iter(&self) -> BTreeInternalIterator<'_> {
+        BTreeInternalIterator {
+            page: self.page_ref,
+            layout: self.layout,
+            current_slot: 0,
+        }
+    }
+}
+
+pub struct BTreeInternalPageViewMut<'a> {
+    guard: PageWriteGuard<'a>,
+    page_ref: &'a mut Page<BTreeInternalPage>,
+    layout: &'a Layout,
+}
+
+impl<'a> BTreeInternalPageViewMut<'a> {
+    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+        if guard.page.header.page_type() != PageType::IndexInternal {
+            return Err("cannot initialize BTreeInternalPageViewMut with non-internal page".into());
+        }
+        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<BTreeInternalPage>;
+        let page_ref = unsafe { &mut *page };
+        Ok(Self {
+            guard,
+            page_ref,
+            layout,
+        })
+    }
+
+    // Read operations
+    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
+        self.page_ref.get_internal_entry(self.layout, slot)
+    }
+
+    pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
+        self.page_ref.find_slot_before(self.layout, search_key)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.page_ref.slot_count()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.page_ref.is_full(self.layout)
+    }
+
+    pub fn btree_level(&self) -> u16 {
+        self.page_ref.btree_level()
+    }
+
+    pub fn iter(&self) -> BTreeInternalIterator<'_> {
+        BTreeInternalIterator {
+            page: self.page_ref,
+            layout: self.layout,
+            current_slot: 0,
+        }
+    }
+
+    // Write operations
+    pub fn insert_entry(
+        &mut self,
+        key: Constant,
+        child_block: usize,
+    ) -> Result<SlotId, Box<dyn Error>> {
+        self.page_ref
+            .insert_internal_entry(self.layout, &key, child_block)
+    }
+
+    pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+        self.page_ref.delete_internal_entry(slot)
+    }
+
+    pub fn set_btree_level(&mut self, level: u16) {
+        self.page_ref.set_btree_level(level);
+    }
+
+    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
+        self.guard.mark_modified(txn_id, lsn);
     }
 }
 
