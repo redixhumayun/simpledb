@@ -8755,6 +8755,7 @@ impl Transaction {
     }
 
     pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> PageReadGuard<'_> {
+        self.concurrency_manager.slock(block_id).unwrap();
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
@@ -8765,6 +8766,7 @@ impl Transaction {
     }
 
     pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> PageWriteGuard<'_> {
+        self.concurrency_manager.xlock(block_id).unwrap();
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
