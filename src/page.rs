@@ -1175,6 +1175,7 @@ impl Page<BTreeLeafPage> {
     }
 
     /// Find the slot where a key should be inserted to maintain sorted order (binary search)
+    /// For duplicate keys, finds the rightmost position (after all existing duplicates)
     fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
         let mut left = 0;
         let mut right = self.slot_count();
@@ -1184,7 +1185,7 @@ impl Page<BTreeLeafPage> {
 
             // Deserialize entry at mid to compare keys
             if let Ok(entry) = self.get_leaf_entry(layout, mid) {
-                if entry.key < *search_key {
+                if entry.key <= *search_key {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -1322,6 +1323,7 @@ impl Page<BTreeInternalPage> {
     }
 
     /// Find the slot where a key should be inserted to maintain sorted order (binary search)
+    /// For duplicate keys, finds the rightmost position (after all existing duplicates)
     fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
         let mut left = 0;
         let mut right = self.slot_count();
@@ -1331,7 +1333,7 @@ impl Page<BTreeInternalPage> {
 
             // Deserialize entry at mid to compare keys
             if let Ok(entry) = self.get_internal_entry(layout, mid) {
-                if entry.key < *search_key {
+                if entry.key <= *search_key {
                     left = mid + 1;
                 } else {
                     right = mid;

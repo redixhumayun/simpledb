@@ -445,14 +445,13 @@ impl BTreeInternal {
     }
 
     /// This method will find the child block for a given search key in a [BTreeInternal] node
-    /// It will search for the rightmost slot before the search key
-    /// If the search key is found in the slot, it will return the next slot
+    /// It will find the rightmost slot where key <= search_key and return that slot's child
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.block_id);
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
         let slot = match view.find_slot_before(search_key) {
-            Some(slot) => slot + 1, //  move to the insertion point
-            None => 0,              //  the insertion point is at the first slot
+            Some(slot) => slot, // Use the rightmost slot where key <= search_key
+            None => 0,          // No entries <= search_key, use first slot
         };
         let block_num = view.get_entry(slot)?.child_block;
         Ok(BlockId::new(self.file_name.clone(), block_num))
@@ -608,28 +607,26 @@ mod btree_internal_tests {
             view.mark_modified(txn.id(), Lsn::MAX);
         }
 
-        //  NOTE: It looks like the numbers are reversed here in the sense that the block numbers asserted are backwards
-        //  but they are correct because the insertion into the node results in a page that looks like this where block 2
-        //  is in slot 0
+        //  With rightmost insertion, duplicates are inserted after existing entries
         //  === BTreePage Debug ===
-        //  Block: BlockId { filename: "test_file_1746190249550660000_ThreadId(2)", block_num: 0 }
+        //  Block: BlockId { filename: "test_file_...", block_num: 0 }
         //  Page Type: Internal(None)
         //  Record Count: 2
         //  Entries:
-        //  Slot 0: Key=Int(10), Child Block=2
-        //  Slot 1: Key=Int(10), Child Block=1
+        //  Slot 0: Key=Int(10), Child Block=1  (inserted first)
+        //  Slot 1: Key=Int(10), Child Block=2  (inserted second, rightmost)
         //  ====================
         // Search should return the rightmost child for duplicate key
         let result = internal.find_child_block(&Constant::Int(10)).unwrap();
-        assert_eq!(result.block_num, 1);
+        assert_eq!(result.block_num, 2);
 
         // Test searching for key less than all entries
         let result = internal.find_child_block(&Constant::Int(5)).unwrap();
-        assert_eq!(result.block_num, 2);
+        assert_eq!(result.block_num, 1); // First entry
 
         // Test searching for key greater than all entries
         let result = internal.find_child_block(&Constant::Int(15)).unwrap();
-        assert_eq!(result.block_num, 1);
+        assert_eq!(result.block_num, 2); // Rightmost entry
     }
 }
 
