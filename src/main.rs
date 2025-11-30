@@ -8691,6 +8691,10 @@ impl Transaction {
         Self::TXN_SLEEP_TIMEOUT
     }
 
+    pub fn id(&self) -> usize {
+        self.tx_id as usize
+    }
+
     pub fn new(
         file_manager: SharedFS,
         log_manager: Arc<Mutex<LogManager>>,
