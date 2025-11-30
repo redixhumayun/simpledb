@@ -1164,7 +1164,11 @@ impl Page<BTreeLeafPage> {
     }
 
     /// Insert a tuple at a specific slot, shifting later slots to the right
-    fn insert_tuple_at_slot(&mut self, slot: SlotId, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+    fn insert_tuple_at_slot(
+        &mut self,
+        slot: SlotId,
+        bytes: &[u8],
+    ) -> Result<SlotId, Box<dyn Error>> {
         let needed: u16 = bytes
             .len()
             .try_into()
@@ -1307,7 +1311,11 @@ impl Page<BTreeInternalPage> {
     }
 
     /// Insert a tuple at a specific slot, shifting later slots to the right
-    fn insert_tuple_at_slot(&mut self, slot: SlotId, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+    fn insert_tuple_at_slot(
+        &mut self,
+        slot: SlotId,
+        bytes: &[u8],
+    ) -> Result<SlotId, Box<dyn Error>> {
         let needed: u16 = bytes
             .len()
             .try_into()
@@ -1492,8 +1500,8 @@ impl<'a> PageReadGuard<'a> {
     pub fn into_heap_view(
         self,
         layout: &'a Layout,
-    ) -> Result<PageView<'a, HeapPage>, Box<dyn Error>> {
-        PageView::new(self, layout)
+    ) -> Result<HeapPageView<'a, HeapPage>, Box<dyn Error>> {
+        HeapPageView::new(self, layout)
     }
 }
 
@@ -1543,8 +1551,8 @@ impl<'a> PageWriteGuard<'a> {
     pub fn into_heap_view_mut(
         self,
         layout: &'a Layout,
-    ) -> Result<PageViewMut<'a, HeapPage>, Box<dyn Error>> {
-        PageViewMut::new(self, &layout)
+    ) -> Result<HeapPageViewMut<'a, HeapPage>, Box<dyn Error>> {
+        HeapPageViewMut::new(self, &layout)
     }
 }
 
@@ -2270,13 +2278,13 @@ impl<'a> LogicalRowMut<'a> {
     }
 }
 
-pub struct PageView<'a, K: PageKind> {
+pub struct HeapPageView<'a, K: PageKind> {
     guard: PageReadGuard<'a>,
     page_ref: &'a Page<K>,
     layout: &'a Layout,
 }
 
-impl<'a> PageView<'a, HeapPage> {
+impl<'a> HeapPageView<'a, HeapPage> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::Heap {
             return Err("cannot initialize PageView<'a, HeapPage> with a non-heap page".into());
@@ -2304,13 +2312,13 @@ impl<'a> PageView<'a, HeapPage> {
     }
 }
 
-pub struct PageViewMut<'a, K: PageKind> {
+pub struct HeapPageViewMut<'a, K: PageKind> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<K>,
     layout: &'a Layout,
 }
 
-impl<'a> PageViewMut<'a, HeapPage> {
+impl<'a> HeapPageViewMut<'a, HeapPage> {
     fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::Heap {
             return Err("cannot initialize PageViewMut<'a, HeapPage> with a non-heap page".into());
@@ -2784,7 +2792,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
 }
 
 #[cfg(test)]
-mod page_view_tests {
+mod heap_page_view_tests {
     use super::*;
     use crate::{test_utils::generate_filename, Schema, SimpleDB};
 
@@ -2801,7 +2809,7 @@ mod page_view_tests {
     }
 
     #[test]
-    fn page_view_reads_rows_from_heap_page() {
+    fn heap_page_view_reads_rows_from_heap_page() {
         let (db, _dir) = SimpleDB::new_for_test(2, 1000);
         let txn = db.new_tx();
         let filename = generate_filename();
@@ -2811,8 +2819,8 @@ mod page_view_tests {
         {
             let mut guard = txn.pin_write_guard(&block_id);
             format_heap_page(&mut guard);
-            let mut view_mut =
-                PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            let mut view_mut = HeapPageViewMut::new(guard, &layout)
+                .expect("heap page mutable view initialization");
             let (slot0, mut row0) = view_mut.insert_row_mut().expect("insert row 0");
             assert_eq!(slot0, 0);
             row0.set_column("id", &Constant::Int(42)).unwrap();
@@ -2829,7 +2837,7 @@ mod page_view_tests {
         } // drop guard
 
         let read_guard = txn.pin_read_guard(&block_id);
-        let view = PageView::new(read_guard, &layout).expect("heap page view");
+        let view = HeapPageView::new(read_guard, &layout).expect("heap page view");
 
         let row0 = view.row(0).expect("slot 0 row");
         assert_eq!(row0.get_column("id"), Some(Constant::Int(42)));
@@ -2849,7 +2857,7 @@ mod page_view_tests {
     }
 
     #[test]
-    fn page_view_mut_updates_rows() {
+    fn heap_page_view_mut_updates_rows() {
         let (db, _dir) = SimpleDB::new_for_test(2, 1000);
         let txn = db.new_tx();
         let filename = generate_filename();
@@ -2859,7 +2867,7 @@ mod page_view_tests {
         let mut guard = txn.pin_write_guard(&block_id);
         format_heap_page(&mut guard);
         let mut view =
-            PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
         let (slot, mut row_initial) = view.insert_row_mut().expect("insert new row");
         assert_eq!(slot, 0);
         row_initial.set_column("id", &Constant::Int(5)).unwrap();
@@ -2888,14 +2896,14 @@ mod page_view_tests {
         drop(view); // drop write guard before acquiring read guard
 
         let read_guard = txn.pin_read_guard(&block_id);
-        let view = PageView::new(read_guard, &layout).expect("reopen heap view");
+        let view = HeapPageView::new(read_guard, &layout).expect("reopen heap view");
         let row = view.row(slot).expect("slot 0 after write guard drop");
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
         assert!(row.get_column("score").is_none());
     }
 
     #[test]
-    fn page_view_mut_reuses_slots_and_serializes() {
+    fn heap_page_view_mut_reuses_slots_and_serializes() {
         use super::TupleRef;
 
         let (db, _dir) = SimpleDB::new_for_test(2, 1000);
@@ -2907,7 +2915,7 @@ mod page_view_tests {
         let mut guard = txn.pin_write_guard(&block_id);
         format_heap_page(&mut guard);
         let mut view =
-            PageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
 
         let slot_a = {
             let (slot, mut row) = view.insert_row_mut().expect("insert row a");
