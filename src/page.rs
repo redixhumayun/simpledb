@@ -1133,19 +1133,93 @@ impl Page<HeapPage> {
 }
 
 impl Page<BTreeLeafPage> {
-    /// Insert a B-tree leaf entry
+    /// Initialize a new B-tree leaf page
+    pub fn init(&mut self, overflow_block: Option<usize>) {
+        self.header.set_page_type(PageType::IndexLeaf);
+        self.header.set_overflow_block(overflow_block);
+        self.header.set_slot_count(0);
+    }
+
+    /// Find the slot where a key should be inserted to maintain sorted order (binary search)
+    fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+
+            // Deserialize entry at mid to compare keys
+            if let Ok(entry) = self.get_leaf_entry(layout, mid) {
+                if entry.key < *search_key {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            } else {
+                // If we can't read the entry, treat it as less than search key
+                left = mid + 1;
+            }
+        }
+        left
+    }
+
+    /// Insert a tuple at a specific slot, shifting later slots to the right
+    fn insert_tuple_at_slot(&mut self, slot: SlotId, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+        let needed: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size".to_string())?;
+
+        let (lower, upper) = self.header.free_bounds();
+
+        // Check if we have space for the line pointer and the data
+        let line_ptr_space = 4u16; // LinePtr is 4 bytes (u32)
+        if lower + line_ptr_space + needed > upper {
+            return Err("page full".into());
+        }
+
+        // Allocate space in record_space from upper end
+        let new_upper = upper - needed;
+        self.record_space[new_upper as usize..(new_upper + needed) as usize].copy_from_slice(bytes);
+
+        // Create new line pointer
+        let line_ptr = LinePtr::new(new_upper, needed, LineState::Live);
+
+        // Insert line pointer at the specified slot, shifting later ones right
+        if slot <= self.line_pointers.len() {
+            self.line_pointers.insert(slot, line_ptr);
+        } else {
+            return Err("invalid slot index".into());
+        }
+
+        // Update header
+        let new_lower = lower + line_ptr_space;
+        self.header.set_free_bounds(new_lower, new_upper);
+        self.header.set_free_ptr(new_upper as u32);
+        self.header.set_slot_count(self.line_pointers.len() as u16);
+
+        Ok(slot)
+    }
+
+    /// Insert a B-tree leaf entry in sorted order by key
     pub fn insert_leaf_entry(
         &mut self,
         layout: &Layout,
         key: &Constant,
         rid: &RID,
     ) -> Result<SlotId, Box<dyn Error>> {
+        // Find insertion position using binary search
+        let slot = self.find_insertion_slot(layout, key);
+
+        // Encode entry
         let entry = BTreeLeafEntry {
             key: key.clone(),
             rid: rid.clone(),
         };
         let bytes = entry.encode(layout);
-        self.allocate_tuple(&bytes)
+
+        // Insert at the correct position
+        self.insert_tuple_at_slot(slot, &bytes)
     }
 
     /// Get a B-tree leaf entry at the given slot
@@ -1165,19 +1239,11 @@ impl Page<BTreeLeafPage> {
 
     /// Find the rightmost slot before the search key
     pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
-        let mut slot = 0;
-        while slot < self.slot_count() {
-            if let Ok(entry) = self.get_leaf_entry(layout, slot) {
-                if entry.key >= *search_key {
-                    return if slot == 0 { None } else { Some(slot - 1) };
-                }
-            }
-            slot += 1;
-        }
-        if slot == 0 {
+        let insertion_slot = self.find_insertion_slot(layout, search_key);
+        if insertion_slot == 0 {
             None
         } else {
-            Some(slot - 1)
+            Some(insertion_slot - 1)
         }
     }
 
@@ -1210,19 +1276,93 @@ impl Page<BTreeLeafPage> {
 }
 
 impl Page<BTreeInternalPage> {
-    /// Insert a B-tree internal entry
+    /// Initialize a new B-tree internal page
+    pub fn init(&mut self, level: u16) {
+        self.header.set_page_type(PageType::IndexInternal);
+        self.header.set_btree_level(level);
+        self.header.set_slot_count(0);
+    }
+
+    /// Find the slot where a key should be inserted to maintain sorted order (binary search)
+    fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+
+            // Deserialize entry at mid to compare keys
+            if let Ok(entry) = self.get_internal_entry(layout, mid) {
+                if entry.key < *search_key {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            } else {
+                // If we can't read the entry, treat it as less than search key
+                left = mid + 1;
+            }
+        }
+        left
+    }
+
+    /// Insert a tuple at a specific slot, shifting later slots to the right
+    fn insert_tuple_at_slot(&mut self, slot: SlotId, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+        let needed: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size".to_string())?;
+
+        let (lower, upper) = self.header.free_bounds();
+
+        // Check if we have space for the line pointer and the data
+        let line_ptr_space = 4u16; // LinePtr is 4 bytes (u32)
+        if lower + line_ptr_space + needed > upper {
+            return Err("page full".into());
+        }
+
+        // Allocate space in record_space from upper end
+        let new_upper = upper - needed;
+        self.record_space[new_upper as usize..(new_upper + needed) as usize].copy_from_slice(bytes);
+
+        // Create new line pointer
+        let line_ptr = LinePtr::new(new_upper, needed, LineState::Live);
+
+        // Insert line pointer at the specified slot, shifting later ones right
+        if slot <= self.line_pointers.len() {
+            self.line_pointers.insert(slot, line_ptr);
+        } else {
+            return Err("invalid slot index".into());
+        }
+
+        // Update header
+        let new_lower = lower + line_ptr_space;
+        self.header.set_free_bounds(new_lower, new_upper);
+        self.header.set_free_ptr(new_upper as u32);
+        self.header.set_slot_count(self.line_pointers.len() as u16);
+
+        Ok(slot)
+    }
+
+    /// Insert a B-tree internal entry in sorted order by key
     pub fn insert_internal_entry(
         &mut self,
         layout: &Layout,
         key: &Constant,
         child_block: usize,
     ) -> Result<SlotId, Box<dyn Error>> {
+        // Find insertion position using binary search
+        let slot = self.find_insertion_slot(layout, key);
+
+        // Encode entry
         let entry = BTreeInternalEntry {
             key: key.clone(),
             child_block,
         };
         let bytes = entry.encode(layout);
-        self.allocate_tuple(&bytes)
+
+        // Insert at the correct position
+        self.insert_tuple_at_slot(slot, &bytes)
     }
 
     /// Get a B-tree internal entry at the given slot
@@ -1242,19 +1382,11 @@ impl Page<BTreeInternalPage> {
 
     /// Find the rightmost slot before the search key
     pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
-        let mut slot = 0;
-        while slot < self.slot_count() {
-            if let Ok(entry) = self.get_internal_entry(layout, slot) {
-                if entry.key >= *search_key {
-                    return if slot == 0 { None } else { Some(slot - 1) };
-                }
-            }
-            slot += 1;
-        }
-        if slot == 0 {
+        let insertion_slot = self.find_insertion_slot(layout, search_key);
+        if insertion_slot == 0 {
             None
         } else {
-            Some(slot - 1)
+            Some(insertion_slot - 1)
         }
     }
 
