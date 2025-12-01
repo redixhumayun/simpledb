@@ -3574,28 +3574,35 @@ mod btree_page_tests {
         let mut page = Page::<BTreeLeafPage>::new();
         page.init(None);
 
-        // Insert two entries
-        let slot1 = page
-            .insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1))
+        // Insert two entries - they will be sorted by key (10, 20)
+        page.insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1))
             .unwrap();
-        let slot2 = page
-            .insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2))
+        page.insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2))
             .unwrap();
 
+        // Verify both entries exist at expected positions
         assert_eq!(page.slot_count(), 2);
+        let entry0 = page.get_leaf_entry(&layout, 0).unwrap();
+        assert_eq!(entry0.key, Constant::Int(10));
+        assert_eq!(entry0.rid, RID::new(1, 1));
 
-        // Delete first entry
-        page.delete_leaf_entry(slot1)
-            .expect("delete should succeed");
+        let entry1 = page.get_leaf_entry(&layout, 1).unwrap();
+        assert_eq!(entry1.key, Constant::Int(20));
+        assert_eq!(entry1.rid, RID::new(2, 2));
 
-        // Verify entry is gone (tuple_bytes returns None for deleted slots)
-        assert!(page.tuple_bytes(slot1).is_none());
+        // Delete first entry (slot 0, key=10)
+        page.delete_leaf_entry(0).expect("delete should succeed");
 
-        // Second entry should still be accessible
-        let entry2 = page
-            .get_leaf_entry(&layout, slot2)
-            .expect("get should succeed");
-        assert_eq!(entry2.key, Constant::Int(20));
+        // After physical deletion, only one entry remains
+        assert_eq!(page.slot_count(), 1);
+
+        // The entry that was at slot 1 is now at slot 0 due to dense array maintenance
+        let remaining = page.get_leaf_entry(&layout, 0).unwrap();
+        assert_eq!(remaining.key, Constant::Int(20));
+        assert_eq!(remaining.rid, RID::new(2, 2));
+
+        // Verify slot 1 no longer exists (out of bounds)
+        assert!(page.get_leaf_entry(&layout, 1).is_err());
     }
 
     #[test]
@@ -3640,23 +3647,36 @@ mod btree_page_tests {
         let mut page = Page::<BTreeInternalPage>::new();
         page.init(1);
 
-        let slot1 = page
-            .insert_internal_entry(&layout, &Constant::Int(10), 100)
+        // Insert two entries - they will be sorted by key (10, 20)
+        page.insert_internal_entry(&layout, &Constant::Int(10), 100)
             .unwrap();
-        let slot2 = page
-            .insert_internal_entry(&layout, &Constant::Int(20), 200)
+        page.insert_internal_entry(&layout, &Constant::Int(20), 200)
             .unwrap();
 
-        page.delete_internal_entry(slot1)
+        // Verify both entries exist at expected positions
+        assert_eq!(page.slot_count(), 2);
+        let entry0 = page.get_internal_entry(&layout, 0).unwrap();
+        assert_eq!(entry0.key, Constant::Int(10));
+        assert_eq!(entry0.child_block, 100);
+
+        let entry1 = page.get_internal_entry(&layout, 1).unwrap();
+        assert_eq!(entry1.key, Constant::Int(20));
+        assert_eq!(entry1.child_block, 200);
+
+        // Delete the first entry (slot 0, key=10)
+        page.delete_internal_entry(0)
             .expect("delete should succeed");
 
-        assert!(page.tuple_bytes(slot1).is_none());
+        // After physical deletion, only one entry remains
+        assert_eq!(page.slot_count(), 1);
 
-        let entry2 = page
-            .get_internal_entry(&layout, slot2)
-            .expect("get should succeed");
-        assert_eq!(entry2.key, Constant::Int(20));
-        assert_eq!(entry2.child_block, 200);
+        // The entry that was at slot 1 is now at slot 0 due to dense array maintenance
+        let remaining = page.get_internal_entry(&layout, 0).unwrap();
+        assert_eq!(remaining.key, Constant::Int(20));
+        assert_eq!(remaining.child_block, 200);
+
+        // Verify slot 1 no longer exists (out of bounds)
+        assert!(page.get_internal_entry(&layout, 1).is_err());
     }
 
     // ========== Phase 2: Capacity Tests ==========
@@ -3824,19 +3844,20 @@ mod btree_page_tests {
 
         // Search operations with single entry
         assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(40)), 0); // before
-        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(50)), 0); // exact
+        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(50)), 1); // exact (rightmost for duplicates)
         assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(60)), 1); // after
 
         assert_eq!(page.find_slot_before(&layout, &Constant::Int(40)), None);
         assert_eq!(page.find_slot_before(&layout, &Constant::Int(50)), None);
         assert_eq!(page.find_slot_before(&layout, &Constant::Int(60)), Some(0));
 
-        // Delete the only entry
-        page.delete_leaf_entry(slot).expect("delete should succeed");
-        assert!(page.tuple_bytes(slot).is_none());
+        // Delete the only entry - physical deletion removes it from the line_pointers array
+        page.delete_leaf_entry(0).expect("delete should succeed");
 
-        // Note: After deletion, the slot still exists in the line_pointers array (marked Free).
-        // Search behavior on pages with only deleted entries is undefined, so we don't test it.
+        // After deletion, slot count should be 0 and accessing slot 0 should fail
+        assert_eq!(page.slot_count(), 0);
+        assert!(page.tuple_bytes(0).is_none());
+        assert!(page.get_leaf_entry(&layout, 0).is_err());
     }
 
     #[test]
@@ -4093,45 +4114,35 @@ mod btree_page_tests {
 
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
-            // Insert entries at slots 0, 1, 2, 3, 4
-            let slot0 = view
-                .insert_entry(Constant::Int(10), RID::new(1, 0))
+            // Insert 5 entries - keys will be sorted: [10, 20, 30, 40, 50]
+            view.insert_entry(Constant::Int(10), RID::new(1, 0))
                 .unwrap();
-            let slot1 = view
-                .insert_entry(Constant::Int(20), RID::new(2, 0))
+            view.insert_entry(Constant::Int(20), RID::new(2, 0))
                 .unwrap();
-            let slot2 = view
-                .insert_entry(Constant::Int(30), RID::new(3, 0))
+            view.insert_entry(Constant::Int(30), RID::new(3, 0))
                 .unwrap();
-            let slot3 = view
-                .insert_entry(Constant::Int(40), RID::new(4, 0))
+            view.insert_entry(Constant::Int(40), RID::new(4, 0))
                 .unwrap();
-            let slot4 = view
-                .insert_entry(Constant::Int(50), RID::new(5, 0))
+            view.insert_entry(Constant::Int(50), RID::new(5, 0))
                 .unwrap();
 
-            assert_eq!(slot0, 0);
-            assert_eq!(slot1, 1);
-            assert_eq!(slot2, 2);
-            assert_eq!(slot3, 3);
-            assert_eq!(slot4, 4);
+            assert_eq!(view.slot_count(), 5);
 
-            // Delete slots 1, 3 (keys 20, 40)
-            view.delete_entry(slot1).expect("delete slot1");
-            view.delete_entry(slot3).expect("delete slot3");
+            // Delete entries with keys 20 and 40
+            // Must delete in reverse order to avoid slot shifting issues
+            // After sorting: slot 0=10, 1=20, 2=30, 3=40, 4=50
+            view.delete_entry(3).expect("delete key 40 at slot 3");
+            view.delete_entry(1).expect("delete key 20 at slot 1");
 
-            // Verify deletions - should have 3 live entries now
+            // After deletions: [10, 30, 50] remain
+            assert_eq!(view.slot_count(), 3);
             let live_count = view.iter().count();
             assert_eq!(live_count, 3);
 
-            // Insert new entries
-            // Note: BTree pages maintain sorted order by shifting slots,
-            // so new entries may not reuse deleted slots like heap pages do
-            let _new_slot1 = view
-                .insert_entry(Constant::Int(15), RID::new(10, 0))
+            // Insert new entries - they will be inserted in sorted order
+            view.insert_entry(Constant::Int(15), RID::new(10, 0))
                 .unwrap();
-            let _new_slot2 = view
-                .insert_entry(Constant::Int(25), RID::new(11, 0))
+            view.insert_entry(Constant::Int(25), RID::new(11, 0))
                 .unwrap();
 
             // Verify all live entries are in sorted order via iterator
@@ -4166,16 +4177,21 @@ mod btree_page_tests {
 
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
-            // Insert 10 entries
+            // Insert 10 entries with keys [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
             for i in 0..10 {
                 view.insert_entry(Constant::Int(i * 10), RID::new(i as usize, 0))
                     .unwrap();
             }
 
-            // Delete every other entry (0, 2, 4, 6, 8)
-            for slot in [0, 2, 4, 6, 8] {
-                view.delete_entry(slot).expect("delete should succeed");
-            }
+            // Delete entries with keys 0, 20, 40, 60, 80 (every other entry)
+            // Must delete in reverse order to avoid slot shifting issues
+            // Initial: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+            // Slots:    0   1   2   3   4   5   6   7   8   9
+            view.delete_entry(8).expect("delete key 80 at slot 8");
+            view.delete_entry(6).expect("delete key 60 at slot 6");
+            view.delete_entry(4).expect("delete key 40 at slot 4");
+            view.delete_entry(2).expect("delete key 20 at slot 2");
+            view.delete_entry(0).expect("delete key 0 at slot 0");
 
             // Verify 5 live entries remain via iterator
             let count = view.iter().count();
@@ -4188,7 +4204,7 @@ mod btree_page_tests {
             let guard = txn.pin_read_guard(&block_id);
             let view = BTreeLeafPageView::new(guard, &layout).expect("create read view");
 
-            // Verify 5 live entries still accessible
+            // Verify 5 live entries still accessible: [10, 30, 50, 70, 90]
             let collected: Vec<i32> = view
                 .iter()
                 .filter_map(|e| {
@@ -4219,18 +4235,30 @@ mod btree_page_tests {
 
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
-            // Insert 20 entries
+            // Insert 20 entries with keys [0, 1, 2, ..., 19]
             for i in 0..20 {
                 view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
                     .unwrap();
             }
 
-            // Delete 10 random entries
-            for slot in [1, 3, 5, 7, 9, 11, 13, 15, 17, 19] {
-                view.delete_entry(slot).expect("delete");
-            }
+            // Delete entries with odd keys: 1, 3, 5, 7, 9, 11, 13, 15, 17, 19
+            // Must delete in reverse order to avoid slot shifting issues
+            // After insertion, keys are at their corresponding slots
+            view.delete_entry(19).expect("delete key 19");
+            view.delete_entry(17).expect("delete key 17");
+            view.delete_entry(15).expect("delete key 15");
+            view.delete_entry(13).expect("delete key 13");
+            view.delete_entry(11).expect("delete key 11");
+            view.delete_entry(9).expect("delete key 9");
+            view.delete_entry(7).expect("delete key 7");
+            view.delete_entry(5).expect("delete key 5");
+            view.delete_entry(3).expect("delete key 3");
+            view.delete_entry(1).expect("delete key 1");
 
-            // Insert 5 new entries
+            // After deletions, should have 10 entries with even keys: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+            assert_eq!(view.slot_count(), 10);
+
+            // Insert 5 new entries with keys [100, 101, 102, 103, 104]
             for i in 100..105 {
                 view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
                     .unwrap();
