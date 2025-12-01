@@ -7734,7 +7734,8 @@ impl TableManager {
             let mut schema = Schema::new();
             while let Some(result) = table_scan.next() {
                 result.expect("failed to advance table scan in get_layout");
-                if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
+                let scanned_table = table_scan.get_string(Self::TABLE_NAME_COL).unwrap();
+                if table_name == scanned_table {
                     let field_name = table_scan.get_string(Self::FIELD_NAME_COL).unwrap();
                     let field_type: FieldType =
                         table_scan.get_int(Self::FIELD_TYPE_COL).unwrap().into();
@@ -8257,32 +8258,32 @@ impl RecordPage {
     /// Sets an integer value in the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) {
-        self.txn
-            .pin_write_guard(&self.block_id)
-            .into_heap_view_mut(&self.layout)
-            .unwrap()
-            .row_mut(slot)
+        let guard = self.txn.pin_write_guard(&self.block_id);
+        let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
+        view.row_mut(slot)
             .unwrap()
             .set_column(field_name, &Constant::Int(value));
+        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
     }
 
     /// Sets a string value in the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) {
-        self.txn
-            .pin_write_guard(&self.block_id)
-            .into_heap_view_mut(&self.layout)
-            .unwrap()
-            .row_mut(slot)
+        let guard = self.txn.pin_write_guard(&self.block_id);
+        let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
+        view.row_mut(slot)
             .unwrap()
             .set_column(field_name, &Constant::String(value.to_string()));
+        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
     }
 
     /// Deletes the record at the specified slot.
     pub fn delete(&self, slot: usize) -> Result<(), Box<dyn Error>> {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
-        view.delete_slot(slot)
+        view.delete_slot(slot)?;
+        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
+        Ok(())
     }
 
     /// Format the underlying page as a HeapPage
@@ -8334,6 +8335,7 @@ impl RecordPage {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let (slot_id, _row_mut) = view.insert_row_mut()?;
+        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
         Ok(slot_id)
     }
 
@@ -8355,6 +8357,7 @@ impl RecordPage {
                 .ok_or_else(|| format!("failed to set column {} during insert", field_name))?;
         }
 
+        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
         Ok(slot_id)
     }
 }

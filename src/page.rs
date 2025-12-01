@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, RID};
+use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, Lsn, RID};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1029,6 +1029,7 @@ impl<K: PageKind> Page<K> {
         if lp_region_end > out.len() {
             return Err("line pointer array exceeds page size".into());
         }
+
         for (i, lp) in self.line_pointers.iter().enumerate() {
             let start = PAGE_HEADER_SIZE_BYTES as usize + i * 4;
             out[start..start + 4].copy_from_slice(&lp.0.to_le_bytes());
@@ -1069,6 +1070,7 @@ impl<K: PageKind> Page<K> {
             return Err("line pointer region not aligned to 4 bytes".into());
         }
         let lp_count = lp_bytes / 4;
+
         let mut line_pointers = Vec::with_capacity(lp_count);
         for i in 0..lp_count {
             let start = PAGE_HEADER_SIZE_BYTES as usize + i * 4;
@@ -1319,6 +1321,14 @@ impl Page<BTreeLeafPage> {
         let deleted_offset = self.line_pointers[slot].offset() as usize;
         let deleted_len = self.line_pointers[slot].length() as usize;
 
+        // CRITICAL: Verify this is actually a B-tree leaf page
+        assert_eq!(
+            self.header.page_type(),
+            PageType::IndexLeaf,
+            "delete_leaf_entry called on wrong page type: {:?} (should be IndexLeaf)",
+            self.header.page_type()
+        );
+
         // Physical deletion: remove line pointer from Vec (shifts remaining left)
         self.line_pointers.remove(slot);
 
@@ -1534,6 +1544,14 @@ impl Page<BTreeInternalPage> {
         // Capture deleted tuple info BEFORE removing pointer
         let deleted_offset = self.line_pointers[slot].offset() as usize;
         let deleted_len = self.line_pointers[slot].length() as usize;
+
+        // CRITICAL: Verify this is actually a B-tree internal page
+        assert_eq!(
+            self.header.page_type(),
+            PageType::IndexInternal,
+            "delete_internal_entry called on wrong page type: {:?} (should be IndexInternal)",
+            self.header.page_type()
+        );
 
         // Physical deletion: remove line pointer from Vec (shifts remaining left)
         self.line_pointers.remove(slot);
@@ -2614,6 +2632,12 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
+    }
+
+    /// Mark this page as modified by a transaction.
+    /// This ensures the page will be flushed to disk during eviction or commit.
+    pub fn mark_modified(&mut self, txn_id: usize, lsn: Lsn) {
+        self.guard.mark_modified(txn_id, lsn);
     }
 }
 
