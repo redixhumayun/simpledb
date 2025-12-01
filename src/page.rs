@@ -1278,22 +1278,58 @@ impl Page<BTreeLeafPage> {
         BTreeLeafEntry::decode(layout, bytes)
     }
 
+    /// Compact payload space after deletion by sliding tuples upward to close gaps
+    /// Tuples with offset < deleted_offset move up by deleted_len bytes
+    fn compact_payload_after_delete(&mut self, deleted_offset: usize, deleted_len: usize) {
+        let mut moves: Vec<(usize, usize, usize)> = vec![];
+
+        for (i, lp) in self.line_pointers.iter().enumerate() {
+            let offset = lp.offset() as usize;
+            if offset < deleted_offset {
+                moves.push((i, offset, lp.length() as usize));
+            }
+        }
+
+        // Sort by offset DESCENDING - move highest offsets first to avoid overwriting
+        moves.sort_by_key(|(_, off, _)| std::cmp::Reverse(*off));
+
+        // Move each tuple up and update its pointer
+        for (lp_idx, old_offset, length) in moves {
+            let new_offset = old_offset + deleted_len;
+            self.record_space
+                .copy_within(old_offset..old_offset + length, new_offset);
+            self.line_pointers[lp_idx].set_offset(new_offset as u16);
+        }
+
+        // Update free_upper to reflect reclaimed space
+        let (lower, upper) = self.header.free_bounds();
+        self.header
+            .set_free_bounds(lower, upper + deleted_len as u16);
+    }
+
     /// Delete a B-tree leaf entry at the given slot
     /// Uses physical deletion (Vec::remove) to maintain dense sorted array
+    /// Compacts payload space to reclaim deleted tuple bytes
     pub fn delete_leaf_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
         if slot >= self.line_pointers.len() {
             return Err("invalid slot".into());
         }
 
+        // Capture deleted tuple info BEFORE removing pointer
+        let deleted_offset = self.line_pointers[slot].offset() as usize;
+        let deleted_len = self.line_pointers[slot].length() as usize;
+
         // Physical deletion: remove line pointer from Vec (shifts remaining left)
         self.line_pointers.remove(slot);
 
-        // Update header bounds
+        // Compact payload to reclaim space
+        self.compact_payload_after_delete(deleted_offset, deleted_len);
+
+        // Update header (compact_payload_after_delete already updated upper)
         let (lower, upper) = self.header.free_bounds();
         self.header.set_free_bounds(lower - 4, upper);
         self.header.set_slot_count(self.line_pointers.len() as u16);
 
-        // Note: Payload bytes remain in heap (Phase 2 will add compaction)
         Ok(())
     }
 
@@ -1457,22 +1493,59 @@ impl Page<BTreeInternalPage> {
         BTreeInternalEntry::decode(layout, bytes)
     }
 
+    /// Compact payload space after deletion by sliding tuples upward to close gaps
+    /// Tuples with offset < deleted_offset move up by deleted_len bytes
+    fn compact_payload_after_delete(&mut self, deleted_offset: usize, deleted_len: usize) {
+        // Collect tuples that need to move (those "above" the deleted one)
+        let mut moves: Vec<(usize, usize, usize)> = vec![]; // (lp_idx, old_offset, length)
+
+        for (i, lp) in self.line_pointers.iter().enumerate() {
+            let offset = lp.offset() as usize;
+            if offset < deleted_offset {
+                moves.push((i, offset, lp.length() as usize));
+            }
+        }
+
+        // Sort by offset DESCENDING - move highest offsets first to avoid overwriting
+        moves.sort_by_key(|(_, off, _)| std::cmp::Reverse(*off));
+
+        // Move each tuple up and update its pointer
+        for (lp_idx, old_offset, length) in moves {
+            let new_offset = old_offset + deleted_len;
+            self.record_space
+                .copy_within(old_offset..old_offset + length, new_offset);
+            self.line_pointers[lp_idx].set_offset(new_offset as u16);
+        }
+
+        // Update free_upper to reflect reclaimed space
+        let (lower, upper) = self.header.free_bounds();
+        self.header
+            .set_free_bounds(lower, upper + deleted_len as u16);
+    }
+
     /// Delete a B-tree internal entry at the given slot
     /// Uses physical deletion (Vec::remove) to maintain dense sorted array
+    /// Compacts payload space to reclaim deleted tuple bytes
     pub fn delete_internal_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
         if slot >= self.line_pointers.len() {
             return Err("invalid slot".into());
         }
 
+        // Capture deleted tuple info BEFORE removing pointer
+        let deleted_offset = self.line_pointers[slot].offset() as usize;
+        let deleted_len = self.line_pointers[slot].length() as usize;
+
         // Physical deletion: remove line pointer from Vec (shifts remaining left)
         self.line_pointers.remove(slot);
 
-        // Update header bounds
+        // Compact payload to reclaim space
+        self.compact_payload_after_delete(deleted_offset, deleted_len);
+
+        // Update header (compact_payload_after_delete already updated upper)
         let (lower, upper) = self.header.free_bounds();
         self.header.set_free_bounds(lower - 4, upper);
         self.header.set_slot_count(self.line_pointers.len() as u16);
 
-        // Note: Payload bytes remain in heap (Phase 2 will add compaction)
         Ok(())
     }
 
