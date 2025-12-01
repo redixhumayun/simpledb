@@ -473,9 +473,9 @@ mod btree_internal_tests {
 
     fn setup_internal_node(db: &SimpleDB) -> (Arc<Transaction>, BTreeInternal) {
         let tx = db.new_tx();
-        let block = tx.append(&generate_filename());
-        let layout = create_test_layout();
         let filename = generate_filename();
+        let block = tx.append(&filename);
+        let layout = create_test_layout();
 
         // Format the page as internal node
         let mut guard = tx.pin_write_guard(&block);
