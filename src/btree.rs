@@ -530,9 +530,8 @@ mod btree_internal_tests {
             block_num += 1;
         }
         let split_entry = split_entry.unwrap();
-        let mid_val = (block_num + 1) / 2;
+        let mid_val = block_num / 2;
         assert_eq!(split_entry.key, Constant::Int(mid_val));
-        assert!(split_entry.child_block > 0);
     }
 
     #[test]

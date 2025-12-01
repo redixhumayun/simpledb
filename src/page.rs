@@ -1279,8 +1279,22 @@ impl Page<BTreeLeafPage> {
     }
 
     /// Delete a B-tree leaf entry at the given slot
+    /// Uses physical deletion (Vec::remove) to maintain dense sorted array
     pub fn delete_leaf_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.delete_tuple(slot)
+        if slot >= self.line_pointers.len() {
+            return Err("invalid slot".into());
+        }
+
+        // Physical deletion: remove line pointer from Vec (shifts remaining left)
+        self.line_pointers.remove(slot);
+
+        // Update header bounds
+        let (lower, upper) = self.header.free_bounds();
+        self.header.set_free_bounds(lower - 4, upper);
+        self.header.set_slot_count(self.line_pointers.len() as u16);
+
+        // Note: Payload bytes remain in heap (Phase 2 will add compaction)
+        Ok(())
     }
 
     /// Find the slot before the first occurrence of the search key
@@ -1444,8 +1458,22 @@ impl Page<BTreeInternalPage> {
     }
 
     /// Delete a B-tree internal entry at the given slot
+    /// Uses physical deletion (Vec::remove) to maintain dense sorted array
     pub fn delete_internal_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.delete_tuple(slot)
+        if slot >= self.line_pointers.len() {
+            return Err("invalid slot".into());
+        }
+
+        // Physical deletion: remove line pointer from Vec (shifts remaining left)
+        self.line_pointers.remove(slot);
+
+        // Update header bounds
+        let (lower, upper) = self.header.free_bounds();
+        self.header.set_free_bounds(lower - 4, upper);
+        self.header.set_slot_count(self.line_pointers.len() as u16);
+
+        // Note: Payload bytes remain in heap (Phase 2 will add compaction)
+        Ok(())
     }
 
     /// Find the rightmost slot where key <= search_key
