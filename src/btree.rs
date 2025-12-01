@@ -52,7 +52,7 @@ impl BTreeIndex {
             guard.format_as_btree_internal(0);
             guard.mark_modified(txn.id(), Lsn::MAX);
 
-            let mut view = BTreeInternalPageViewMut::new(guard, &internal_layout)?;
+            let mut view = guard.into_btree_internal_page_view_mut(&internal_layout)?;
             let field_type = internal_schema
                 .info
                 .get(IndexInfo::DATA_FIELD)
