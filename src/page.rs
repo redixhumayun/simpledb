@@ -510,10 +510,32 @@ pub trait PageKind {
 
 type SlotId = usize;
 
-pub struct HeapPage;
-/// Raw page kind used to hold an on-disk image without enforcing a specific PageType.
-/// Useful at the IO boundary (FileManager/LogManager) where the page kind is not yet known.
 pub struct RawPage;
+
+impl PageKind for RawPage {
+    const PAGE_TYPE: PageType = PageType::Free;
+    const HAS_HEADER: bool = true;
+
+    type Alloc<'a> = ();
+
+    type Iter<'a> = std::iter::Empty<()>;
+
+    fn allocator<'a>(_page: &'a mut Page<Self>) -> Self::Alloc<'a>
+    where
+        Self: Sized,
+    {
+        ()
+    }
+
+    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
+    where
+        Self: Sized,
+    {
+        std::iter::empty()
+    }
+}
+
+pub struct HeapPage;
 
 pub struct HeapAllocator<'a> {
     page: &'a mut Page<HeapPage>,
@@ -577,29 +599,6 @@ impl PageKind for HeapPage {
             current_slot: 0,
             match_state: None,
         }
-    }
-}
-
-impl PageKind for RawPage {
-    const PAGE_TYPE: PageType = PageType::Free;
-    const HAS_HEADER: bool = true;
-
-    type Alloc<'a> = ();
-
-    type Iter<'a> = std::iter::Empty<()>;
-
-    fn allocator<'a>(_page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized,
-    {
-        ()
-    }
-
-    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized,
-    {
-        std::iter::empty()
     }
 }
 
