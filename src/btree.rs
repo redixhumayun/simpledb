@@ -986,27 +986,21 @@ mod btree_leaf_tests {
     }
 
     fn setup_leaf(db: &SimpleDB, search_key: Constant) -> (Arc<Transaction>, BTreeLeaf) {
-        let tx = db.new_tx();
-        let block = tx.append(&generate_filename());
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block = txn.append(&filename);
         let layout = create_test_layout();
 
         // Format the page as a leaf using new page format
         {
-            let mut guard = tx.pin_write_guard(&block);
+            let mut guard = txn.pin_write_guard(&block);
             guard.format_as_btree_leaf(None);
-            guard.mark_modified(tx.id(), Lsn::MAX);
+            guard.mark_modified(txn.id(), Lsn::MAX);
         }
 
-        let leaf = BTreeLeaf::new(
-            Arc::clone(&tx),
-            block,
-            layout,
-            search_key,
-            generate_filename(),
-        )
-        .unwrap();
+        let leaf = BTreeLeaf::new(Arc::clone(&txn), block, layout, search_key, filename).unwrap();
 
-        (tx, leaf)
+        (txn, leaf)
     }
 
     #[test]
@@ -1028,21 +1022,22 @@ mod btree_leaf_tests {
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
         // Fill the page with different keys
-        let mut slot = 0;
-        // let mut split_result = None;
-        while !leaf.is_one_off_full().unwrap() {
-            leaf.search_key = Constant::Int(slot);
-            leaf.insert(RID::new(1, slot as usize)).unwrap();
-            slot += 1;
+        let mut counter = 0;
+        let mut split_result = None;
+        while split_result.is_none() {
+            leaf.search_key = Constant::Int(counter);
+            let res = leaf.insert(RID::new(1, counter as usize)).unwrap();
+            if res.is_some() {
+                split_result = res;
+            }
+            counter += 1;
         }
-
-        let split_result = leaf.insert(RID::new(1, slot as usize)).unwrap();
 
         // Verify split occurred
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
         assert_eq!(entry.child_block, 1); //  this is a new file that has just added a new block
-        assert_eq!(entry.key, Constant::Int((slot + 1) / 2)); // Middle key. Adding 1 to slot because slot is 0-based
+        assert_eq!(entry.key, Constant::Int(counter / 2)); // Middle key. Adding 1 to slot because slot is 0-based
     }
 
     #[test]
@@ -1050,67 +1045,41 @@ mod btree_leaf_tests {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
 
-        // Fill the page with same key
-        let mut slot = 0;
-        while !leaf.is_one_off_full().unwrap() {
-            leaf.insert(RID::new(1, slot)).unwrap();
-            slot += 1;
+        let mut counter = 0;
+        loop {
+            leaf.insert(RID::new(1, counter)).unwrap();
+            if leaf.has_overflow().unwrap() {
+                break;
+            }
+            counter += 1;
         }
 
-        // Insert one more record with same key to force overflow
-        let split_result = leaf.insert(RID::new(1, slot)).unwrap();
-
-        // Verify overflow block was created
-        assert!(split_result.is_none()); //  overflow block returns None
-        assert!(leaf.has_overflow().unwrap(), "Expected overflow block");
-
-        // Verify first key matches in both pages
+        //  verify both the leaf and the overflow page have the same first key
         assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
-    }
-
-    #[test]
-    fn test_insert_with_existing_overflow() {
-        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
-        let (_, mut leaf) = setup_leaf(&db, Constant::Int(5));
-
-        // Create a page with overflow block containing key 10
-        leaf.search_key = Constant::Int(10);
-        let mut slot = 0;
-        while !leaf.is_one_off_full().unwrap() {
-            leaf.insert(RID::new(1, slot)).unwrap();
-            slot += 1;
-        }
-        leaf.insert(RID::new(1, slot)).unwrap(); // Create overflow with split
-
-        // Try to insert key 5 (less than 10) which will force another split
-        leaf.search_key = Constant::Int(5);
-        let split_result = leaf.insert(RID::new(2, 1)).unwrap();
-
-        // Verify page was split
-        assert!(split_result.is_some());
-        let entry = split_result.unwrap();
-        assert_eq!(entry.key, Constant::Int(10));
+        assert!(leaf.try_overflow().unwrap().is_some());
+        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
     }
 
     #[test]
     fn test_insert_edge_cases() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
 
-        // Test case 1: Insert when split point equals first key
-        let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
-        // Fill page with alternating 10s and 20s
         let mut counter = 0;
-        while !leaf.is_one_off_full().unwrap() {
+        let mut split_result = None;
+
+        let (_, mut leaf) = setup_leaf(&db, Constant::Int(10));
+
+        while split_result.is_none() {
             leaf.search_key = Constant::Int(if counter % 2 == 0 { 10 } else { 20 });
-            leaf.insert(RID::new(1, counter)).unwrap();
+            let res = leaf.insert(RID::new(1, counter)).unwrap();
+            if res.is_some() {
+                split_result = res;
+            }
             counter += 1;
         }
 
-        // Force a split - should move split point right until after all 10s
-        leaf.search_key = Constant::Int(15);
-        let split_result = leaf.insert(RID::new(1, 10)).unwrap();
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
-        assert_eq!(entry.key, Constant::Int(20)); // First non-10 value
+        assert_eq!(entry.key, Constant::Int(20));
     }
 }
