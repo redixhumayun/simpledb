@@ -8,6 +8,7 @@
 2. [Expand type system with additional data types and NULL support](https://github.com/redixhumayun/simpledb/issues/33) - Add 7 new types (boolean, bigint, float, decimal, date, timestamp, blob) with NULL bitmap
 3. [Implement direct I/O](https://github.com/redixhumayun/simpledb/issues/12) - Eliminate double-buffering with OS page cache
 4. [Implement torn write protection](https://github.com/redixhumayun/simpledb/issues/25) - Protect against partial page writes during crashes via checksums, double-write buffer, or full-page WAL logging
+5. [Typed page layouts for B-Tree nodes](https://github.com/redixhumayun/simpledb/issues/61) - Give index pages dedicated headers/slot structures instead of reusing heap metadata
 
 ### Buffer Management
 1. [Implement ReadHandle and WriteHandle for type-safe buffer access](https://github.com/redixhumayun/simpledb/issues/29) - Compile-time enforcement of read/write access and integrated lock management
