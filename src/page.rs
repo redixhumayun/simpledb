@@ -1276,13 +1276,30 @@ impl Page<BTreeLeafPage> {
         self.delete_tuple(slot)
     }
 
-    /// Find the rightmost slot before the search key
+    /// Find the slot before the first occurrence of the search key
+    /// Uses leftmost binary search
     pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
-        let insertion_slot = self.find_insertion_slot(layout, search_key);
-        if insertion_slot == 0 {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+
+            if let Ok(entry) = self.get_leaf_entry(layout, mid) {
+                if entry.key < *search_key {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            } else {
+                left = mid + 1;
+            }
+        }
+
+        if left == 0 {
             None
         } else {
-            Some(insertion_slot - 1)
+            Some(left - 1)
         }
     }
 
@@ -1424,14 +1441,29 @@ impl Page<BTreeInternalPage> {
         self.delete_tuple(slot)
     }
 
-    /// Find the rightmost slot before the search key
+    /// Find the rightmost slot where key <= search_key
+    /// This is used for B-tree internal node routing to find the correct child
     pub fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
-        let insertion_slot = self.find_insertion_slot(layout, search_key);
-        if insertion_slot == 0 {
-            None
-        } else {
-            Some(insertion_slot - 1)
+        let mut left = 0;
+        let mut right = self.slot_count();
+        let mut result = None;
+
+        while left < right {
+            let mid = (left + right) / 2;
+
+            if let Ok(entry) = self.get_internal_entry(layout, mid) {
+                if entry.key <= *search_key {
+                    result = Some(mid);
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            } else {
+                left = mid + 1;
+            }
         }
+
+        result
     }
 
     /// Check if the page is full
