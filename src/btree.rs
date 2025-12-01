@@ -725,6 +725,14 @@ impl BTreeLeaf {
             let guard = self.txn.pin_read_guard(&self.current_block_id);
             let view = BTreeLeafPageView::new(guard, &self.layout)?;
 
+            // Skip over any dead slots to find next live entry
+            while self.current_slot.unwrap() < view.slot_count() {
+                if view.is_slot_live(self.current_slot.unwrap()) {
+                    break;
+                }
+                self.current_slot = Some(self.current_slot.unwrap() + 1);
+            }
+
             let at_end = self.current_slot.unwrap() >= view.slot_count();
             let key_matches = if !at_end {
                 view.get_entry(self.current_slot.unwrap())?.key == self.search_key
@@ -732,7 +740,7 @@ impl BTreeLeaf {
                 false
             };
             (at_end, key_matches)
-        }; // Guard dropped here
+        };
 
         if at_end {
             self.try_overflow()
@@ -894,7 +902,21 @@ impl BTreeLeaf {
         let guard = self.txn.pin_read_guard(&self.current_block_id);
         let view = BTreeLeafPageView::new(guard, &self.layout)?;
 
-        let first_key = view.get_entry(0)?.key;
+        // Find first live slot
+        let mut first_live_slot = 0;
+        while first_live_slot < view.slot_count() {
+            if view.is_slot_live(first_live_slot) {
+                break;
+            }
+            first_live_slot += 1;
+        }
+
+        if first_live_slot >= view.slot_count() {
+            return Ok(None);
+        }
+
+        // Get first live entry - any error here is a real error (corruption, etc.)
+        let first_key = view.get_entry(first_live_slot)?.key;
 
         if first_key != self.search_key {
             return Ok(None);
