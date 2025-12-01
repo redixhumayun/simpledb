@@ -941,35 +941,6 @@ impl BTreeLeaf {
         let entry = view.get_entry(slot)?;
         Ok(entry.rid)
     }
-
-    #[cfg(test)]
-    fn is_one_off_full(&self) -> Result<bool, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
-        // Check if we can fit one more entry
-        Ok(view.is_full())
-    }
-
-    #[cfg(test)]
-    fn get_slot_count(&self) -> Result<usize, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
-        Ok(view.slot_count())
-    }
-
-    #[cfg(test)]
-    fn get_entry_key(&self, slot: usize) -> Result<Constant, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
-        Ok(view.get_entry(slot)?.key)
-    }
-
-    #[cfg(test)]
-    fn has_overflow(&self) -> Result<bool, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
-        Ok(view.overflow_block().is_some())
-    }
 }
 
 #[cfg(test)]
@@ -1012,8 +983,10 @@ mod btree_leaf_tests {
         assert!(leaf.insert(RID::new(1, 1)).unwrap().is_none());
 
         // Verify the record was inserted
-        assert_eq!(leaf.get_slot_count().unwrap(), 1);
-        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
+        let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+        let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+        assert_eq!(view.slot_count(), 1);
+        assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
     }
 
     #[test]
@@ -1048,16 +1021,28 @@ mod btree_leaf_tests {
         let mut counter = 0;
         loop {
             leaf.insert(RID::new(1, counter)).unwrap();
-            if leaf.has_overflow().unwrap() {
-                break;
+            {
+                let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+                let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+                if view.overflow_block().is_some() {
+                    break;
+                }
             }
             counter += 1;
         }
 
         //  verify both the leaf and the overflow page have the same first key
-        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
+        {
+            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+            let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+            assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
+        }
         assert!(leaf.try_overflow().unwrap().is_some());
-        assert_eq!(leaf.get_entry_key(0).unwrap(), Constant::Int(10));
+        {
+            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+            let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+            assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
+        }
     }
 
     #[test]
