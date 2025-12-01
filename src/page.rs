@@ -993,6 +993,14 @@ impl<K: PageKind> Page<K> {
         self.line_pointers.len()
     }
 
+    /// Check if a slot exists and is live
+    pub fn is_slot_live(&self, slot: SlotId) -> bool {
+        self.line_pointers
+            .get(slot)
+            .map(|lp| lp.is_live())
+            .unwrap_or(false)
+    }
+
     /// Serialize the page into a contiguous `PAGE_SIZE_BYTES` buffer.
     ///
     /// Layout matches `docs/record_management.md`:
@@ -1267,7 +1275,7 @@ impl Page<BTreeLeafPage> {
         layout: &Layout,
         slot: SlotId,
     ) -> Result<BTreeLeafEntry, Box<dyn Error>> {
-        let bytes = self.tuple_bytes(slot).ok_or("slot not found")?;
+        let bytes = self.tuple_bytes(slot).ok_or("slot not found or not live")?;
         BTreeLeafEntry::decode(layout, bytes)
     }
 
@@ -2693,6 +2701,10 @@ impl<'a> BTreeLeafPageView<'a> {
         self.page_ref.slot_count()
     }
 
+    pub fn is_slot_live(&self, slot: SlotId) -> bool {
+        self.page_ref.is_slot_live(slot)
+    }
+
     pub fn is_full(&self) -> bool {
         self.page_ref.is_full(self.layout)
     }
@@ -2741,6 +2753,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
+    }
+
+    pub fn is_slot_live(&self, slot: SlotId) -> bool {
+        self.page_ref.is_slot_live(slot)
     }
 
     pub fn is_full(&self) -> bool {
