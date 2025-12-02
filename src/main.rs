@@ -39,7 +39,7 @@ use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
 
 use replacement::PolicyState;
 
-type Lsn = usize;
+pub type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 //  Shared filesystem trait object used across the database components
@@ -8741,8 +8741,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// The public pin method which will return a [`BufferHandle`] for RAII semantics
-    pub fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
+    /// The pin method which will return a [`BufferHandle`] for RAII semantics
+    fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
