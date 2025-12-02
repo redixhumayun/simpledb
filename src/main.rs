@@ -10610,6 +10610,9 @@ impl BufferFrame {
             if cfg!(debug_assertions) {
                 page_guard.assert_layout_valid("buffer_flush_pre_write");
             }
+            page_guard
+                .compute_crc32()
+                .expect("failure while computing crc32");
             self.file_manager
                 .lock()
                 .unwrap()
@@ -10631,6 +10634,12 @@ impl BufferFrame {
             .read(block_id, &mut *page_guard);
         if cfg!(debug_assertions) {
             page_guard.assert_layout_valid("buffer_assign_post_read");
+        }
+        if !page_guard
+            .verify_crc32()
+            .expect("failure while verifying checksum")
+        {
+            panic!("crc mistmatch for {:?}", block_id);
         }
         meta.reset_pins();
         meta.txn = None;

@@ -965,14 +965,6 @@ impl<K: PageKind> Page<K> {
             return Err("output buffer must equal PAGE_SIZE_BYTES".into());
         }
 
-        eprintln!(
-            "[DEBUG] Page::write_bytes: page_type={:?}, slot_count={}, lp_count={}, page_addr={:p}",
-            self.header.page_type(),
-            self.header.slot_count(),
-            self.line_pointers.len(),
-            self as *const _
-        );
-
         if cfg!(debug_assertions) {
             self.assert_layout_valid("write_bytes");
         }
@@ -1040,11 +1032,6 @@ impl<K: PageKind> Page<K> {
         header.set_free_bounds(computed_lower, upper);
         header.set_slot_count(line_pointers.len() as u16);
 
-        eprintln!(
-            "[DESER] Page::from_bytes: page_type={:?}, slot_count={}, free_lower={}, free_upper={}, page_addr={:p}",
-            header.page_type(), lp_count, computed_lower, upper, &record_space as *const _
-        );
-
         let page = Self {
             header,
             line_pointers,
@@ -1055,6 +1042,42 @@ impl<K: PageKind> Page<K> {
             page.assert_layout_valid("from_bytes");
         }
         Ok(page)
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        const CRC32_POLY: u32 = 0xEDB8_8320;
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (CRC32_POLY & mask);
+            }
+        }
+        !crc
+    }
+
+    pub fn compute_crc32(&mut self) -> Result<(), Box<dyn Error>> {
+        self.header.set_crc32(0);
+        let mut bytes = vec![0; PAGE_SIZE_BYTES as usize];
+        self.write_bytes(&mut bytes)?;
+        let crc32 = Self::crc32(&bytes);
+        self.header.set_crc32(crc32);
+        Ok(())
+    }
+
+    pub fn verify_crc32(&mut self) -> Result<bool, Box<dyn Error>> {
+        let stored_crc32 = self.header.crc32();
+        if stored_crc32 == 0 {
+            // Page has never been flushed with a checksum; treat as valid.
+            return Ok(true);
+        }
+        self.header.set_crc32(0);
+        let mut bytes = vec![0; PAGE_SIZE_BYTES as usize];
+        self.write_bytes(&mut bytes)?;
+        let computed_crc32 = Self::crc32(&bytes);
+        self.header.set_crc32(stored_crc32);
+        Ok(stored_crc32 == computed_crc32)
     }
 }
 
@@ -1918,6 +1941,31 @@ mod page_tests {
             TupleRef::Live(tuple) => assert_eq!(tuple.payload(), replacement_payload.as_slice()),
             _ => panic!("in-place update should remain live"),
         }
+    }
+
+    #[test]
+    fn crc32_detects_corruption() {
+        let mut page = Page::<HeapPage>::new();
+        let payload = vec![7u8; 16];
+        page.allocate_tuple(&heap_tuple_bytes(&payload))
+            .expect("tuple allocation");
+        page.compute_crc32().expect("crc compute");
+
+        let mut pristine = vec![0u8; PAGE_SIZE_BYTES as usize];
+        page.write_bytes(&mut pristine)
+            .expect("serialize pristine page");
+
+        let mut corrupted = pristine.clone();
+        corrupted[128] ^= 0xFF; // flip a byte to simulate torn write
+
+        let mut ok_page = Page::<RawPage>::from_bytes(&pristine).expect("deserialize pristine");
+        assert!(ok_page.verify_crc32().expect("crc verify should pass"));
+
+        let mut bad_page = Page::<RawPage>::from_bytes(&corrupted).expect("deserialize corrupted");
+        assert!(
+            !bad_page.verify_crc32().expect("crc verify should fail"),
+            "corruption must be detected"
+        );
     }
 
     #[test]
