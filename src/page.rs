@@ -1,8 +1,10 @@
 use std::{
+    cell::Cell,
     error::Error,
     marker::PhantomData,
     mem::size_of,
     ops::{Deref, DerefMut},
+    rc::Rc,
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
 
@@ -1768,6 +1770,10 @@ impl<'a> PageWriteGuard<'a> {
         self.handle.block_id()
     }
 
+    pub fn txn_id(&self) -> usize {
+        self.handle.txn_id()
+    }
+
     pub fn frame(&self) -> &BufferFrame {
         &self.frame
     }
@@ -2196,7 +2202,8 @@ mod logical_row_tests {
 
         {
             let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-            let mut row_mut = LogicalRowMut::new(tuple_mut, layout.clone());
+            let mut row_mut =
+                LogicalRowMut::new(tuple_mut, layout.clone(), Rc::new(Cell::new(false)));
             row_mut
                 .set_column("a", &Constant::Int(99))
                 .expect("set int");
@@ -2245,7 +2252,8 @@ mod logical_row_tests {
 
             {
                 let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-                let mut row_mut = LogicalRowMut::new(tuple_mut, layout.clone());
+                let mut row_mut =
+                    LogicalRowMut::new(tuple_mut, layout.clone(), Rc::new(Cell::new(false)));
                 row_mut
                     .set_column("num", &Constant::Int(int_val))
                     .expect("set int column");
@@ -2409,11 +2417,16 @@ impl<'a> LogicalRow<'a> {
 pub struct LogicalRowMut<'a> {
     tuple: HeapTupleMut<'a>,
     layout: Layout,
+    dirty: Rc<Cell<bool>>,
 }
 
 impl<'a> LogicalRowMut<'a> {
-    fn new(tuple: HeapTupleMut<'a>, layout: Layout) -> Self {
-        Self { tuple, layout }
+    fn new(tuple: HeapTupleMut<'a>, layout: Layout, dirty: Rc<Cell<bool>>) -> Self {
+        Self {
+            tuple,
+            layout,
+            dirty,
+        }
     }
 
     pub fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
@@ -2425,6 +2438,7 @@ impl<'a> LogicalRowMut<'a> {
             .clear(index);
         let dest = self.tuple.payload_slice_mut(offset, field_length);
         LogicalRowMut::encode(dest, field_info, value);
+        self.dirty.set(true);
         Some(())
     }
 
@@ -2434,6 +2448,7 @@ impl<'a> LogicalRowMut<'a> {
         self.tuple
             .null_bitmap_mut(self.layout.num_of_columns())
             .set_null(index);
+        self.dirty.set(true);
         Some(())
     }
 
@@ -2491,6 +2506,7 @@ pub struct HeapPageViewMut<'a, K: PageKind> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<K>,
     layout: &'a Layout,
+    dirty: Rc<Cell<bool>>,
 }
 
 impl<'a> HeapPageViewMut<'a, HeapPage> {
@@ -2504,6 +2520,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
             guard,
             page_ref,
             layout,
+            dirty: Rc::new(Cell::new(false)),
         })
     }
 
@@ -2523,20 +2540,39 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
         //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
         let layout_clone = self.layout.clone();
+        let dirty = self.dirty.clone();
         let heap_tuple_mut = self.tuple_mut(slot)?;
-        Some(LogicalRowMut::new(heap_tuple_mut, layout_clone))
+        Some(LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty))
     }
 
     pub fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
-        self.page_ref.insert_tuple(bytes)
+        match self.page_ref.insert_tuple(bytes) {
+            Ok(slot) => {
+                self.dirty.set(true);
+                Ok(slot)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_slot(slot)
+        match self.page_ref.delete_slot(slot) {
+            Ok(()) => {
+                self.dirty.set(true);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.redirect_slot(slot, target)
+        match self.page_ref.redirect_slot(slot, target) {
+            Ok(()) => {
+                self.dirty.set(true);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
@@ -2564,21 +2600,28 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
             buf[..header_bytes.len()].copy_from_slice(header_bytes);
         }
         let slot = self.page_ref.insert_tuple(&buf)?;
+        self.dirty.set(true);
         let tuple_mut = self
             .page_ref
             .heap_tuple_mut(slot)
             .expect("tuple must exist after allocation");
-        Ok((slot, LogicalRowMut::new(tuple_mut, self.layout.clone())))
+        let dirty = self.dirty.clone();
+        Ok((
+            slot,
+            LogicalRowMut::new(tuple_mut, self.layout.clone(), dirty),
+        ))
     }
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
     }
+}
 
-    /// Mark this page as modified by a transaction.
-    /// This ensures the page will be flushed to disk during eviction or commit.
-    pub fn mark_modified(&mut self, txn_id: usize, lsn: Lsn) {
-        self.guard.mark_modified(txn_id, lsn);
+impl<'a, K: PageKind> Drop for HeapPageViewMut<'a, K> {
+    fn drop(&mut self) {
+        if self.dirty.get() {
+            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+        }
     }
 }
 

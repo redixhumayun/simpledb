@@ -8264,7 +8264,6 @@ impl RecordPage {
         view.row_mut(slot)
             .unwrap()
             .set_column(field_name, &Constant::Int(value));
-        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
     }
 
     /// Sets a string value in the specified slot and field.
@@ -8275,7 +8274,6 @@ impl RecordPage {
         view.row_mut(slot)
             .unwrap()
             .set_column(field_name, &Constant::String(value.to_string()));
-        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
     }
 
     /// Deletes the record at the specified slot.
@@ -8283,7 +8281,6 @@ impl RecordPage {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.delete_slot(slot)?;
-        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
         Ok(())
     }
 
@@ -8336,7 +8333,6 @@ impl RecordPage {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let (slot_id, _row_mut) = view.insert_row_mut()?;
-        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
         Ok(slot_id)
     }
 
@@ -8357,8 +8353,6 @@ impl RecordPage {
                 .set_column(field_name, value)
                 .ok_or_else(|| format!("failed to set column {} during insert", field_name))?;
         }
-
-        view.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
         Ok(slot_id)
     }
 }
@@ -8616,6 +8610,10 @@ impl BufferHandle {
 
     pub fn block_id(&self) -> &BlockId {
         &self.block_id
+    }
+
+    pub fn txn_id(&self) -> usize {
+        self.txn.id()
     }
 }
 
