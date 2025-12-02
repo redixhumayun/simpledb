@@ -898,7 +898,6 @@ fn multithreaded_pin(
 
 fn multithreaded_hotset_contention(
     db: &SimpleDB,
-    block_size: usize,
     num_threads: usize,
     ops_per_thread: usize,
     hot_set_size: usize,
@@ -944,7 +943,7 @@ fn multithreaded_hotset_contention(
     )
 }
 
-fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+fn buffer_starvation(db: &SimpleDB, num_buffers: usize) {
     let test_file = "starvation_test".to_string();
 
     // Pre-create blocks
@@ -1003,12 +1002,7 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
     println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
-fn run_multithreaded_pin_benchmarks(
-    db: &SimpleDB,
-    block_size: usize,
-    iterations: usize,
-    cases: &[&PinCase],
-) {
+fn run_multithreaded_pin_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&PinCase]) {
     let mut rows = Vec::new();
 
     if cases.is_empty() {
@@ -1025,12 +1019,7 @@ fn run_multithreaded_pin_benchmarks(
     render_throughput_section("Multi-threaded Pin/Unpin (lock contention)", &rows);
 }
 
-fn run_hotset_contention_benchmarks(
-    db: &SimpleDB,
-    block_size: usize,
-    iterations: usize,
-    cases: &[&HotsetCase],
-) {
+fn run_hotset_contention_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&HotsetCase]) {
     let mut rows = Vec::new();
 
     if cases.is_empty() {
@@ -1040,7 +1029,6 @@ fn run_hotset_contention_benchmarks(
     for case in cases {
         let result = multithreaded_hotset_contention(
             db,
-            block_size,
             case.threads,
             case.ops_per_thread,
             case.hot_set_size,
@@ -1054,10 +1042,10 @@ fn run_hotset_contention_benchmarks(
     render_throughput_section("Hot-set Contention (shared buffers)", &rows);
 }
 
-fn run_buffer_starvation_benchmark(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+fn run_buffer_starvation_benchmark(db: &SimpleDB, num_buffers: usize) {
     println!("Buffer Starvation (cond.wait() latency):");
     println!("{}", "-".repeat(70));
-    buffer_starvation(db, block_size, num_buffers);
+    buffer_starvation(db, num_buffers);
     println!();
 }
 
@@ -1096,7 +1084,6 @@ fn main() {
             let (db, _test_dir) = setup_buffer_pool(num_buffers);
             multithreaded_hotset_contention(
                 &db,
-                block_size,
                 case.threads,
                 case.ops_per_thread,
                 case.hot_set_size,
@@ -1255,7 +1242,7 @@ fn main() {
             phase5_has_output = true;
         }
         let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        run_multithreaded_pin_benchmarks(&db, block_size, iterations, &pin_cases);
+        run_multithreaded_pin_benchmarks(&db, iterations, &pin_cases);
     }
 
     let hotset_cases: Vec<&HotsetCase> = match filter_ref {
@@ -1272,7 +1259,7 @@ fn main() {
             phase5_has_output = true;
         }
         let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        run_hotset_contention_benchmarks(&db, block_size, iterations, &hotset_cases);
+        run_hotset_contention_benchmarks(&db, iterations, &hotset_cases);
     }
 
     if should_run("Starvation", filter_ref) {
@@ -1281,7 +1268,7 @@ fn main() {
             println!();
         }
         let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        run_buffer_starvation_benchmark(&db, block_size, num_buffers);
+        run_buffer_starvation_benchmark(&db, num_buffers);
     }
 
     println!("All benchmarks completed!");
