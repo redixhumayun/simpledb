@@ -846,6 +846,50 @@ impl<K: PageKind> Page<K> {
         self.header.free_lower
     }
 
+    #[track_caller]
+    pub fn assert_layout_valid(&self, context: &str) {
+        let expected_lower = PAGE_HEADER_SIZE_BYTES as usize + self.line_pointers.len() * 4;
+        let (lower, upper) = self.header.free_bounds();
+        assert_eq!(
+            expected_lower,
+            lower as usize,
+            "[SLOT-DIR] header.lower mismatch at {} (lp_len={}, header.slot_count={})",
+            context,
+            self.line_pointers.len(),
+            self.header.slot_count()
+        );
+        assert_eq!(
+            self.line_pointers.len(),
+            self.header.slot_count() as usize,
+            "[SLOT-DIR] slot_count mismatch at {} (lower={}, expected_lower={})",
+            context,
+            lower,
+            expected_lower as u16
+        );
+        assert!(
+            (lower as usize) <= (upper as usize),
+            "[PAGE] free_lower exceeds free_upper at {} (lower={}, upper={})",
+            context,
+            lower,
+            upper
+        );
+        for (idx, lp) in self.line_pointers.iter().enumerate() {
+            if lp.is_live() {
+                let off = lp.offset() as usize;
+                let len = lp.length() as usize;
+                assert!(
+                    off >= upper as usize && off + len <= PAGE_SIZE_BYTES as usize,
+                    "[PAGE] tuple slot {} out of bounds at {} (offset={}, len={}, upper={})",
+                    idx,
+                    context,
+                    off,
+                    len,
+                    upper
+                );
+            }
+        }
+    }
+
     fn push_free_slot(&mut self, free_idx: SlotId) {
         let line_pointer = self
             .line_pointers
@@ -871,12 +915,15 @@ impl<K: PageKind> Page<K> {
     }
 
     fn allocate_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
+        let (mut lower, upper) = self.header.free_bounds();
         let needed: u16 = bytes
             .len()
             .try_into()
             .map_err(|_| "tuple larger than max tuple size (u16::MAX)".to_string())?;
+        if lower + needed > upper {
+            return Err("insufficient free space".into());
+        }
 
-        let (mut lower, upper) = self.header.free_bounds();
         let slot = if let Some(idx) = self.pop_free_slot() {
             idx
         } else {
@@ -889,10 +936,6 @@ impl<K: PageKind> Page<K> {
             idx
         };
 
-        if lower + needed > upper {
-            return Err("insufficient free space".into());
-        }
-
         let new_upper = upper - needed;
         self.record_space[new_upper as usize..(new_upper + needed) as usize].copy_from_slice(bytes);
 
@@ -900,6 +943,10 @@ impl<K: PageKind> Page<K> {
         self.header.set_free_bounds(lower, new_upper);
         self.header.set_free_ptr(new_upper as u32);
         self.header.set_slot_count(self.line_pointers.len() as u16);
+
+        if cfg!(debug_assertions) {
+            self.assert_layout_valid("allocate_tuple");
+        }
 
         Ok(slot)
     }
@@ -988,6 +1035,14 @@ impl<K: PageKind> Page<K> {
         self.line_pointers.len()
     }
 
+    pub fn header_free_bounds(&self) -> (u16, u16) {
+        self.header.free_bounds()
+    }
+
+    pub fn header_slot_count(&self) -> usize {
+        self.header.slot_count() as usize
+    }
+
     /// Check if a slot exists and is live
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
         self.line_pointers
@@ -1012,6 +1067,10 @@ impl<K: PageKind> Page<K> {
             self.line_pointers.len(),
             self as *const _
         );
+
+        if cfg!(debug_assertions) {
+            self.assert_layout_valid("write_bytes");
+        }
 
         // Start with heap copy (holds tuple bytes). This is safe because header/LPs are
         // overwritten below.
@@ -1081,12 +1140,16 @@ impl<K: PageKind> Page<K> {
             header.page_type(), lp_count, computed_lower, upper, &record_space as *const _
         );
 
-        Ok(Self {
+        let page = Self {
             header,
             line_pointers,
             record_space,
             kind: PhantomData,
-        })
+        };
+        if cfg!(debug_assertions) {
+            page.assert_layout_valid("from_bytes");
+        }
+        Ok(page)
     }
 }
 
@@ -1171,6 +1234,25 @@ impl Page<HeapPage> {
 }
 
 impl Page<BTreeLeafPage> {
+    pub fn assert_leaf_invariants(&self, layout: &Layout, context: &str) {
+        self.assert_layout_valid(context);
+        if self.slot_count() <= 1 {
+            return;
+        }
+        let mut prev = self.get_leaf_entry(layout, 0).expect("decode leaf entry 0");
+        for idx in 1..self.slot_count() {
+            let curr = self.get_leaf_entry(layout, idx).expect("decode leaf entry");
+            assert!(
+                prev.key <= curr.key,
+                "[BTreeLeaf] key order violated at {} slot {}: {:?} > {:?}",
+                context,
+                idx,
+                prev.key,
+                curr.key
+            );
+            prev = curr;
+        }
+    }
     /// Initialize a new B-tree leaf page
     pub fn init(&mut self, overflow_block: Option<usize>) {
         self.header.set_page_type(PageType::IndexLeaf);
@@ -1262,7 +1344,11 @@ impl Page<BTreeLeafPage> {
         let bytes = entry.encode(layout);
 
         // Insert at the correct position
-        self.insert_tuple_at_slot(slot, &bytes)
+        let result = self.insert_tuple_at_slot(slot, &bytes);
+        if cfg!(debug_assertions) {
+            self.assert_leaf_invariants(layout, "insert_leaf_entry");
+        }
+        result
     }
 
     /// Get a B-tree leaf entry at the given slot
@@ -1307,7 +1393,11 @@ impl Page<BTreeLeafPage> {
     /// Delete a B-tree leaf entry at the given slot
     /// Uses physical deletion (Vec::remove) to maintain dense sorted array
     /// Compacts payload space to reclaim deleted tuple bytes
-    pub fn delete_leaf_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+    pub fn delete_leaf_entry(
+        &mut self,
+        slot: SlotId,
+        layout: &Layout,
+    ) -> Result<(), Box<dyn Error>> {
         if slot >= self.line_pointers.len() {
             return Err("invalid slot".into());
         }
@@ -1334,7 +1424,9 @@ impl Page<BTreeLeafPage> {
         let (lower, upper) = self.header.free_bounds();
         self.header.set_free_bounds(lower - 4, upper);
         self.header.set_slot_count(self.line_pointers.len() as u16);
-
+        if cfg!(debug_assertions) {
+            self.assert_leaf_invariants(layout, "delete_leaf_entry");
+        }
         Ok(())
     }
 
@@ -1394,6 +1486,29 @@ impl Page<BTreeLeafPage> {
 }
 
 impl Page<BTreeInternalPage> {
+    pub fn assert_internal_invariants(&self, layout: &Layout, context: &str) {
+        self.assert_layout_valid(context);
+        if self.slot_count() <= 1 {
+            return;
+        }
+        let mut prev = self
+            .get_internal_entry(layout, 0)
+            .expect("decode internal entry 0");
+        for idx in 1..self.slot_count() {
+            let curr = self
+                .get_internal_entry(layout, idx)
+                .expect("decode internal entry");
+            assert!(
+                prev.key <= curr.key,
+                "[BTreeInternal] key order violated at {} slot {}: {:?} > {:?}",
+                context,
+                idx,
+                prev.key,
+                curr.key
+            );
+            prev = curr;
+        }
+    }
     /// Initialize a new B-tree internal page
     pub fn init(&mut self, level: u16) {
         self.header.set_page_type(PageType::IndexInternal);
@@ -1485,7 +1600,11 @@ impl Page<BTreeInternalPage> {
         let bytes = entry.encode(layout);
 
         // Insert at the correct position
-        self.insert_tuple_at_slot(slot, &bytes)
+        let result = self.insert_tuple_at_slot(slot, &bytes);
+        if cfg!(debug_assertions) {
+            self.assert_internal_invariants(layout, "insert_internal_entry");
+        }
+        result
     }
 
     /// Get a B-tree internal entry at the given slot
@@ -1531,7 +1650,11 @@ impl Page<BTreeInternalPage> {
     /// Delete a B-tree internal entry at the given slot
     /// Uses physical deletion (Vec::remove) to maintain dense sorted array
     /// Compacts payload space to reclaim deleted tuple bytes
-    pub fn delete_internal_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+    pub fn delete_internal_entry(
+        &mut self,
+        slot: SlotId,
+        layout: &Layout,
+    ) -> Result<(), Box<dyn Error>> {
         if slot >= self.line_pointers.len() {
             return Err("invalid slot".into());
         }
@@ -1558,6 +1681,9 @@ impl Page<BTreeInternalPage> {
         let (lower, upper) = self.header.free_bounds();
         self.header.set_free_bounds(lower - 4, upper);
         self.header.set_slot_count(self.line_pointers.len() as u16);
+        if cfg!(debug_assertions) {
+            self.assert_internal_invariants(layout, "delete_internal_entry");
+        }
 
         Ok(())
     }
@@ -2909,7 +3035,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_leaf_entry(slot)
+        self.page_ref.delete_leaf_entry(slot, self.layout)
     }
 
     pub fn set_overflow_block(&mut self, block: Option<usize>) {
@@ -3031,7 +3157,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_internal_entry(slot)
+        self.page_ref.delete_internal_entry(slot, self.layout)
     }
 
     pub fn set_btree_level(&mut self, level: u16) {
@@ -3692,7 +3818,8 @@ mod btree_page_tests {
         assert_eq!(entry1.rid, RID::new(2, 2));
 
         // Delete first entry (slot 0, key=10)
-        page.delete_leaf_entry(0).expect("delete should succeed");
+        page.delete_leaf_entry(0, &layout)
+            .expect("delete should succeed");
 
         // After physical deletion, only one entry remains
         assert_eq!(page.slot_count(), 1);
@@ -3721,7 +3848,7 @@ mod btree_page_tests {
         let mut page = Page::<BTreeLeafPage>::new();
         page.init(None);
 
-        let result = page.delete_leaf_entry(999);
+        let result = page.delete_leaf_entry(999, &_layout);
         assert!(result.is_err());
     }
 
@@ -3765,7 +3892,7 @@ mod btree_page_tests {
         assert_eq!(entry1.child_block, 200);
 
         // Delete the first entry (slot 0, key=10)
-        page.delete_internal_entry(0)
+        page.delete_internal_entry(0, &layout)
             .expect("delete should succeed");
 
         // After physical deletion, only one entry remains
@@ -3877,7 +4004,8 @@ mod btree_page_tests {
 
         // Delete several entries
         for slot in 0..5 {
-            page.delete_leaf_entry(slot).expect("delete should succeed");
+            page.delete_leaf_entry(slot, &layout)
+                .expect("delete should succeed");
         }
 
         // Should no longer be marked as full (freed some space)
@@ -3953,7 +4081,8 @@ mod btree_page_tests {
         assert_eq!(page.find_slot_before(&layout, &Constant::Int(60)), Some(0));
 
         // Delete the only entry - physical deletion removes it from the line_pointers array
-        page.delete_leaf_entry(0).expect("delete should succeed");
+        page.delete_leaf_entry(0, &layout)
+            .expect("delete should succeed");
 
         // After deletion, slot count should be 0 and accessing slot 0 should fail
         assert_eq!(page.slot_count(), 0);
@@ -3978,7 +4107,7 @@ mod btree_page_tests {
         assert_eq!(entry.key, Constant::Int(100));
         assert_eq!(entry.child_block, 500);
 
-        page.delete_internal_entry(slot)
+        page.delete_internal_entry(slot, &layout)
             .expect("delete should succeed");
         assert!(page.tuple_bytes(slot).is_none());
     }
@@ -4135,7 +4264,8 @@ mod btree_page_tests {
         }
 
         // Delete slot 2 (key=20)
-        page.delete_leaf_entry(2).expect("delete should succeed");
+        page.delete_leaf_entry(2, &layout)
+            .expect("delete should succeed");
 
         // Iterate
         let mut iter = BTreeLeafIterator {

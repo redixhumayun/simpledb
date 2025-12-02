@@ -3210,9 +3210,9 @@ mod planner_tests {
         let sql = "create table T1(A int, B varchar(10))".to_string();
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         //  Insert records in T1
-        let count = 200;
-        dbg!("Inserting records in T1", count);
-        for i in 0..count {
+        let t1_records_to_insert = 200;
+        dbg!("Inserting records in T1", t1_records_to_insert);
+        for i in 0..t1_records_to_insert {
             let sql = format!("insert into T1(A, B) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -3222,8 +3222,9 @@ mod planner_tests {
         let sql = "create table T2(C int, D varchar(10))".to_string();
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         //  Insert records into T2
-        dbg!("Inserting records in T2", count);
-        for i in (0..count).rev() {
+        let t2_records_to_insert = 200;
+        dbg!("Inserting records in T2", t2_records_to_insert);
+        for i in (0..t2_records_to_insert).rev() {
             let sql = format!("insert into T2(C, D) values ({i}, 'string{i}')");
             db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         }
@@ -10608,6 +10609,9 @@ impl BufferFrame {
         if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
             self.log_manager.lock().unwrap().flush_lsn(lsn);
             let mut page_guard = self.page.write().unwrap();
+            if cfg!(debug_assertions) {
+                page_guard.assert_layout_valid("buffer_flush_pre_write");
+            }
             self.file_manager
                 .lock()
                 .unwrap()
@@ -10627,6 +10631,9 @@ impl BufferFrame {
             .lock()
             .unwrap()
             .read(block_id, &mut *page_guard);
+        if cfg!(debug_assertions) {
+            page_guard.assert_layout_valid("buffer_assign_post_read");
+        }
         meta.reset_pins();
         meta.txn = None;
         meta.lsn = None;
