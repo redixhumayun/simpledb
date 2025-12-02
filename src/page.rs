@@ -491,7 +491,6 @@ pub trait PageKind {
     /// RawPage keeps the legacy “flat byte array” semantics for legacy callers like B-tree
     /// while they’re still being migrated to the new page API.
     /// TODO: Once B-tree pages have typed views, remove this escape hatch.
-    const HAS_HEADER: bool = true;
     type Alloc<'a>: PageAllocator<'a>
     where
         Self: 'a;
@@ -514,7 +513,6 @@ pub struct RawPage;
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
-    const HAS_HEADER: bool = true;
 
     type Alloc<'a> = ();
 
@@ -682,7 +680,6 @@ impl<'a> Iterator for BTreeInternalIterator<'a> {
 
 impl PageKind for BTreeLeafPage {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
-    const HAS_HEADER: bool = true;
 
     type Alloc<'a> = BTreeLeafAllocator<'a>;
     type Iter<'a> = BTreeLeafIterator<'a>;
@@ -708,7 +705,6 @@ impl PageKind for BTreeLeafPage {
 
 impl PageKind for BTreeInternalPage {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
-    const HAS_HEADER: bool = true;
 
     type Alloc<'a> = BTreeInternalAllocator<'a>;
     type Iter<'a> = BTreeInternalIterator<'a>;
@@ -988,7 +984,7 @@ impl<K: PageKind> Page<K> {
         }
     }
 
-    fn slot_count(&self) -> usize {
+    pub fn slot_count(&self) -> usize {
         self.line_pointers.len()
     }
 
@@ -1009,10 +1005,13 @@ impl<K: PageKind> Page<K> {
             return Err("output buffer must equal PAGE_SIZE_BYTES".into());
         }
 
-        if !K::HAS_HEADER {
-            out.copy_from_slice(&self.record_space);
-            return Ok(());
-        }
+        eprintln!(
+            "[DEBUG] Page::write_bytes: page_type={:?}, slot_count={}, lp_count={}, page_addr={:p}",
+            self.header.page_type(),
+            self.header.slot_count(),
+            self.line_pointers.len(),
+            self as *const _
+        );
 
         // Start with heap copy (holds tuple bytes). This is safe because header/LPs are
         // overwritten below.
@@ -1046,15 +1045,6 @@ impl<K: PageKind> Page<K> {
             return Err("input buffer must equal PAGE_SIZE_BYTES".into());
         }
 
-        if !K::HAS_HEADER {
-            return Ok(Self {
-                header: PageHeader::new(K::PAGE_TYPE),
-                line_pointers: Vec::new(),
-                record_space: bytes.to_vec(),
-                kind: PhantomData,
-            });
-        }
-
         let header = PageHeader::read_from_bytes(&bytes[..PAGE_HEADER_SIZE_BYTES as usize])?;
         // RawPage is allowed to wrap any on-disk page type; other kinds must match.
         if K::PAGE_TYPE != PageType::Free && header.page_type() != K::PAGE_TYPE {
@@ -1085,6 +1075,11 @@ impl<K: PageKind> Page<K> {
         let computed_lower = (PAGE_HEADER_SIZE_BYTES as usize + lp_count * 4) as u16;
         header.set_free_bounds(computed_lower, upper);
         header.set_slot_count(line_pointers.len() as u16);
+
+        eprintln!(
+            "[DESER] Page::from_bytes: page_type={:?}, slot_count={}, free_lower={}, free_upper={}, page_addr={:p}",
+            header.page_type(), lp_count, computed_lower, upper, &record_space as *const _
+        );
 
         Ok(Self {
             header,
@@ -2637,6 +2632,15 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     /// Mark this page as modified by a transaction.
     /// This ensures the page will be flushed to disk during eviction or commit.
     pub fn mark_modified(&mut self, txn_id: usize, lsn: Lsn) {
+        // let block_id = self.guard.block_id();
+        // eprintln!(
+        //     "[DEBUG] HeapPageViewMut::mark_modified: block={:?}, txn={}, lsn={:?}, slot_count={}, page_addr={:p}",
+        //     block_id,
+        //     txn_id,
+        //     lsn,
+        //     self.slot_count(),
+        //     self.page_ref as *const _
+        // );
         self.guard.mark_modified(txn_id, lsn);
     }
 }
