@@ -2096,10 +2096,17 @@ mod heap_tuple_tests {
         payload.extend_from_slice(b"abc");
         let bytes = build_tuple_bytes(&payload, 0);
         let tuple = HeapTuple::from_bytes(&bytes);
-
         assert_eq!(tuple.payload_len(), payload.len() as u32);
-        assert_eq!(tuple.read_i32(1), 0x01020304);
-        assert_eq!(tuple.read_varlen(1 + 4), b"abc");
+
+        let bytes = tuple.payload_slice(1, 4);
+        let i32 = i32::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(i32, 0x01020304);
+
+        let length_bytes = tuple.payload_slice(1 + 4, 4);
+        let length = u32::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
+        let bytes = tuple.payload_slice(1 + 4 + 4, length);
+        assert_eq!(bytes, b"abc");
+
         let bitmap = tuple.null_bitmap(8);
         assert!(bitmap.is_null(3));
         assert!(!bitmap.is_null(2));
@@ -2120,7 +2127,10 @@ mod heap_tuple_tests {
         }
 
         let tuple = HeapTuple::from_bytes(&bytes);
-        assert_eq!(tuple.read_i32(1), 0x0A0B0C0D);
+        let bytes = tuple.payload_slice(1, 4);
+        let i32 = i32::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(i32, 0x0A0B0C0D);
+
         let bitmap = tuple.null_bitmap(8);
         assert!(bitmap.is_null(6));
         assert!(!bitmap.is_null(0));
@@ -2327,17 +2337,6 @@ impl<'a> HeapTuple<'a> {
 
     fn payload_slice(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.payload[offset..offset + len]
-    }
-
-    fn read_i32(&self, offset: usize) -> i32 {
-        let bytes = self.payload_slice(offset, 4);
-        i32::from_be_bytes(bytes.try_into().unwrap())
-    }
-
-    fn read_varlen(&self, offset: usize) -> &'a [u8] {
-        let length_bytes = self.payload_slice(offset, 4);
-        let length = u32::from_be_bytes(length_bytes.try_into().unwrap()) as usize;
-        &self.payload[offset + 4..offset + 4 + length]
     }
 }
 
