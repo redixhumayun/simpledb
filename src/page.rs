@@ -488,21 +488,6 @@ pub trait PageAllocator<'a> {
 
 pub trait PageKind {
     const PAGE_TYPE: PageType;
-
-    type Alloc<'a>: PageAllocator<'a>
-    where
-        Self: 'a;
-    type Iter<'a>: Iterator
-    where
-        Self: 'a;
-
-    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized;
-
-    fn iterator<'a>(page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized;
 }
 
 type SlotId = usize;
@@ -511,24 +496,6 @@ pub struct RawPage;
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
-
-    type Alloc<'a> = ();
-
-    type Iter<'a> = std::iter::Empty<()>;
-
-    fn allocator<'a>(_page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized,
-    {
-        ()
-    }
-
-    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized,
-    {
-        std::iter::empty()
-    }
 }
 
 pub struct HeapPage;
@@ -574,28 +541,6 @@ impl<'a> Iterator for HeapIterator<'a> {
 
 impl PageKind for HeapPage {
     const PAGE_TYPE: PageType = PageType::Heap;
-
-    type Alloc<'a> = HeapAllocator<'a>;
-
-    type Iter<'a> = HeapIterator<'a>;
-
-    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized,
-    {
-        HeapAllocator { page }
-    }
-
-    fn iterator<'a>(page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized,
-    {
-        HeapIterator {
-            page,
-            current_slot: 0,
-            match_state: None,
-        }
-    }
 }
 
 // BTree page types
@@ -678,50 +623,10 @@ impl<'a> Iterator for BTreeInternalIterator<'a> {
 
 impl PageKind for BTreeLeafPage {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
-
-    type Alloc<'a> = BTreeLeafAllocator<'a>;
-    type Iter<'a> = BTreeLeafIterator<'a>;
-
-    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized,
-    {
-        BTreeLeafAllocator { page }
-    }
-
-    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized,
-    {
-        // BTree iteration requires Layout and should be done through views
-        // Use BTreeLeafPageView::iter() instead
-        panic!(
-            "BTree iteration not supported through PageKind trait; use BTreeLeafPageView::iter()"
-        )
-    }
 }
 
 impl PageKind for BTreeInternalPage {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
-
-    type Alloc<'a> = BTreeInternalAllocator<'a>;
-    type Iter<'a> = BTreeInternalIterator<'a>;
-
-    fn allocator<'a>(page: &'a mut Page<Self>) -> Self::Alloc<'a>
-    where
-        Self: Sized,
-    {
-        BTreeInternalAllocator { page }
-    }
-
-    fn iterator<'a>(_page: &'a mut Page<Self>) -> Self::Iter<'a>
-    where
-        Self: Sized,
-    {
-        // BTree iteration requires Layout and should be done through views
-        // Use BTreeInternalPageView::iter() instead
-        panic!("BTree iteration not supported through PageKind trait; use BTreeInternalPageView::iter()")
-    }
 }
 
 /// Type alias for a page image whose kind is not yet known at the IO boundary.
@@ -2007,86 +1912,6 @@ mod page_tests {
             TupleRef::Live(tuple) => assert_eq!(tuple.payload(), replacement_payload.as_slice()),
             _ => panic!("in-place update should remain live"),
         }
-    }
-
-    #[test]
-    fn heap_iterator_filters_by_line_state() {
-        let mut page = Page::<HeapPage>::new();
-        let payload_a = vec![1u8];
-        let payload_b = vec![2u8];
-        let payload_c = vec![3u8];
-        let grown_payload = vec![9u8, 9, 9, 9];
-
-        let _slot_a = page.allocate_tuple(&heap_tuple_bytes(&payload_a)).unwrap();
-        let slot_b = page.allocate_tuple(&heap_tuple_bytes(&payload_b)).unwrap();
-        let slot_c = page.allocate_tuple(&heap_tuple_bytes(&payload_c)).unwrap();
-
-        page.update_tuple(slot_b, &heap_tuple_bytes(&grown_payload))
-            .unwrap();
-        page.delete_tuple(slot_c).unwrap();
-
-        let redirect_target = match page.tuple(slot_b).unwrap() {
-            TupleRef::Redirect(target) => target,
-            _ => panic!("expected redirect state for slot_b"),
-        };
-
-        // live iterator sees slot_a and the redirect target of slot_b
-        {
-            let mut iter = HeapPage::live_iterator(&mut page);
-            let mut seen = Vec::new();
-            while let Some(TupleRef::Live(tuple)) = iter.next() {
-                seen.push(tuple.payload().to_vec());
-            }
-            assert_eq!(seen, vec![payload_a.clone(), grown_payload.clone()]);
-        }
-
-        // default iterator reports every state in slot order
-        {
-            let mut iter = HeapPage::iterator(&mut page);
-            let mut states = Vec::new();
-            while let Some(tref) = iter.next() {
-                states.push(match tref {
-                    TupleRef::Live(tuple) if tuple.payload() == payload_a => "live_a",
-                    TupleRef::Redirect(target) if target == redirect_target => "redirect",
-                    TupleRef::Free => "free",
-                    TupleRef::Live(tuple) if tuple.payload() == grown_payload => "live_grown",
-                    _ => "other",
-                });
-            }
-            assert_eq!(states, vec!["live_a", "redirect", "free", "live_grown"]);
-        }
-    }
-
-    #[test]
-    fn heap_allocator_and_iterator_round_trip() {
-        let mut page = Page::<HeapPage>::new();
-
-        // Use the high-level allocator API (via PageKind)
-        {
-            let mut alloc = HeapPage::allocator(&mut page);
-            let payload1 = vec![1u8, 2, 3];
-            let payload2 = vec![4u8, 5, 6];
-
-            let tuple1 = heap_tuple_bytes(&payload1);
-            let tuple2 = heap_tuple_bytes(&payload2);
-
-            let slot1 = alloc.insert(&tuple1).expect("first insert");
-            let slot2 = alloc.insert(&tuple2).expect("second insert");
-
-            assert_ne!(slot1, slot2, "slots should be distinct");
-        } // alloc drops; page keeps the tuples
-
-        // Use the high-level iterator API (via PageKind)
-        let mut iter = HeapPage::iterator(&mut page);
-        let mut seen = Vec::new();
-        while let Some(tref) = iter.next() {
-            if let TupleRef::Live(tuple) = tref {
-                seen.push(tuple.payload().to_vec());
-            }
-        }
-
-        // Order is insertion order for a fresh page
-        assert_eq!(seen, vec![vec![1u8, 2, 3], vec![4u8, 5, 6]]);
     }
 
     #[test]
@@ -4428,8 +4253,10 @@ mod btree_page_tests {
         // Serialize happens automatically when guard is dropped
         // Re-read the page
         {
-            let guard = txn.pin_read_guard(&block_id);
-            let view = BTreeLeafPageView::new(guard, &layout).expect("create read view");
+            let view = txn
+                .pin_read_guard(&block_id)
+                .into_btree_leaf_page_view(&layout)
+                .expect("create read view");
 
             // Verify 5 live entries still accessible: [10, 30, 50, 70, 90]
             let collected: Vec<i32> = view
