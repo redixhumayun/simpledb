@@ -2834,6 +2834,7 @@ pub struct BTreeLeafPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<BTreeLeafPage>,
     layout: &'a Layout,
+    dirty: bool,
 }
 
 impl<'a> BTreeLeafPageViewMut<'a> {
@@ -2847,6 +2848,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             guard,
             page_ref,
             layout,
+            dirty: false,
         })
     }
 
@@ -2885,19 +2887,32 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, rid: RID) -> Result<SlotId, Box<dyn Error>> {
-        self.page_ref.insert_leaf_entry(self.layout, &key, &rid)
+        let slot = self.page_ref.insert_leaf_entry(self.layout, &key, &rid)?;
+        self.dirty = true;
+        Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_leaf_entry(slot, self.layout)
+        self.page_ref.delete_leaf_entry(slot, self.layout)?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn set_overflow_block(&mut self, block: Option<usize>) {
         self.page_ref.set_overflow_block(block);
+        self.dirty = true;
     }
 
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
         self.guard.mark_modified(txn_id, lsn);
+    }
+}
+
+impl<'a> Drop for BTreeLeafPageViewMut<'a> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+        }
     }
 }
 
@@ -2955,6 +2970,7 @@ pub struct BTreeInternalPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<BTreeInternalPage>,
     layout: &'a Layout,
+    dirty: bool,
 }
 
 impl<'a> BTreeInternalPageViewMut<'a> {
@@ -2968,6 +2984,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             guard,
             page_ref,
             layout,
+            dirty: false,
         })
     }
 
@@ -3006,20 +3023,34 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         key: Constant,
         child_block: usize,
     ) -> Result<SlotId, Box<dyn Error>> {
-        self.page_ref
-            .insert_internal_entry(self.layout, &key, child_block)
+        let slot = self
+            .page_ref
+            .insert_internal_entry(self.layout, &key, child_block)?;
+        self.dirty = true;
+        Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_internal_entry(slot, self.layout)
+        self.page_ref.delete_internal_entry(slot, self.layout)?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn set_btree_level(&mut self, level: u16) {
         self.page_ref.set_btree_level(level);
+        self.dirty = true;
     }
 
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
         self.guard.mark_modified(txn_id, lsn);
+    }
+}
+
+impl<'a> Drop for BTreeInternalPageViewMut<'a> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+        }
     }
 }
 
