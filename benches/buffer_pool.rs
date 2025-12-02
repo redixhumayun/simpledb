@@ -10,7 +10,7 @@ use simpledb::{
         BenchResult, ThroughputRow,
     },
     test_utils::generate_random_number,
-    BlockId, Page, SimpleDB, TestDir,
+    BlockId, Lsn, Page, SimpleDB, TestDir,
 };
 
 fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
@@ -394,8 +394,9 @@ fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> Bench
     for i in 0..num_buffers {
         let block_id = BlockId::new(test_file.clone(), i);
         // Pin the block first, then modify it
-        let _handle = txn.pin(&block_id);
-        txn.set_int(&block_id, 0, 999, false).unwrap();
+        let mut guard = txn.pin_write_guard(&block_id);
+        guard.set_int(0, 999);
+        guard.mark_modified(txn.id(), Lsn::MAX);
     }
     // Don't commit - keeps buffers dirty and pinned by this transaction
 
