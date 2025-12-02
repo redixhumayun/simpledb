@@ -112,7 +112,7 @@ impl DataSyncPolicy {
 // ============================================================================
 
 fn setup_io_test(block_size: usize) -> (SimpleDB, TestDir) {
-    SimpleDB::new_for_test(block_size, 12, 5000) // 12 buffers (enough for tests)
+    SimpleDB::new_for_test(12, 5000) // 12 buffers (enough for tests)
 }
 
 fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
@@ -120,7 +120,7 @@ fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
     let mut file_manager = db.file_manager.lock().unwrap();
 
     for block_num in 0..count {
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         page.set_int(0, block_num as i32);
         file_manager.write(&BlockId::new(file.to_string(), block_num), &mut page);
     }
@@ -148,7 +148,7 @@ fn sequential_read(block_size: usize, num_blocks: usize, iterations: usize) -> B
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             for i in 0..num_blocks {
                 let block_id = BlockId::new(file.clone(), i);
                 fm.read(&block_id, &mut page);
@@ -170,7 +170,7 @@ fn sequential_write(block_size: usize, num_blocks: usize, iterations: usize) -> 
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             for i in 0..num_blocks {
                 page.set_int(0, i as i32);
                 let block_id = BlockId::new(file.clone(), i);
@@ -203,7 +203,7 @@ fn random_read(
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             for &block_idx in &random_indices {
                 let block_id = BlockId::new(file.clone(), block_idx);
                 fm.read(&block_id, &mut page);
@@ -235,7 +235,7 @@ fn random_write(
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             for (i, &block_idx) in random_indices.iter().enumerate() {
                 page.set_int(0, i as i32);
                 let block_id = BlockId::new(file.clone(), block_idx);
@@ -379,7 +379,7 @@ fn mixed_workload(
         iterations,
         2,
         || {
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             let mut policy = flush_policy.clone();
 
             for (i, &is_read) in ops.iter().enumerate() {
@@ -434,7 +434,7 @@ fn concurrent_io_shared(
                     let fm = Arc::clone(&db.file_manager);
 
                     thread::spawn(move || {
-                        let mut page = Page::new(block_size);
+                        let mut page = Page::new();
 
                         for i in 0..ops_per_thread {
                             let block_num = generate_random_number() % total_blocks;
@@ -495,7 +495,7 @@ fn concurrent_io_sharded(
                     let fm = Arc::clone(&db.file_manager);
 
                     thread::spawn(move || {
-                        let mut page = Page::new(block_size);
+                        let mut page = Page::new();
 
                         for i in 0..ops_per_thread {
                             let block_num = i % blocks_per_file;
@@ -556,7 +556,7 @@ fn random_write_durability(
         iterations,
         2,
         || {
-            let mut page = Page::new(block_size);
+            let mut page = Page::new();
             let mut wal_policy = wal_policy.clone();
             let mut data_policy = data_policy.clone();
             let fm = Arc::clone(&db.file_manager);

@@ -14,11 +14,11 @@ use simpledb::{
 };
 
 fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    SimpleDB::new_for_test(block_size, num_buffers, 5000)
+    SimpleDB::new_for_test(num_buffers, 5000)
 }
 
 fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers, 5000);
+    let (db, test_dir) = SimpleDB::new_for_test(num_buffers, 5000);
     db.buffer_manager().enable_stats();
     (db, test_dir)
 }
@@ -28,7 +28,7 @@ fn precreate_blocks(db: &SimpleDB, file: &str, block_size: usize, count: usize) 
     let file = file.to_string();
 
     for block_num in 0..count {
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         page.set_int(0, block_num as i32);
         file_manager.write(&BlockId::new(file.clone(), block_num), &mut page);
     }
@@ -822,7 +822,7 @@ fn run_fixed_workload_with_pool_size(
     // Pre-create blocks
     for i in 0..working_set_size {
         let block_id = BlockId::new(test_file.clone(), i);
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         page.set_int(0, i as i32);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
     }
