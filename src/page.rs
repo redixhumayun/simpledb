@@ -2578,15 +2578,6 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     /// Mark this page as modified by a transaction.
     /// This ensures the page will be flushed to disk during eviction or commit.
     pub fn mark_modified(&mut self, txn_id: usize, lsn: Lsn) {
-        // let block_id = self.guard.block_id();
-        // eprintln!(
-        //     "[DEBUG] HeapPageViewMut::mark_modified: block={:?}, txn={}, lsn={:?}, slot_count={}, page_addr={:p}",
-        //     block_id,
-        //     txn_id,
-        //     lsn,
-        //     self.slot_count(),
-        //     self.page_ref as *const _
-        // );
         self.guard.mark_modified(txn_id, lsn);
     }
 }
