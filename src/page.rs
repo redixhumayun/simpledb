@@ -264,7 +264,7 @@ struct LinePtr(u32);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LineState {
+pub enum LineState {
     Free = 0,
     Live = 1,
     Dead = 2,
@@ -331,16 +331,19 @@ impl LinePtr {
         self.0 = (self.0 & 0xFFFF_FFF0) | (state_bits);
     }
 
+    #[cfg(test)]
     fn with_offset(mut self, offset: u16) -> Self {
         self.set_offset(offset);
         self
     }
 
+    #[cfg(test)]
     fn with_length(mut self, length: u16) -> Self {
         self.set_length(length);
         self
     }
 
+    #[cfg(test)]
     fn with_state(mut self, state: LineState) -> Self {
         self.set_state(state);
         self
@@ -348,10 +351,6 @@ impl LinePtr {
 
     fn is_free(&self) -> bool {
         self.state() == LineState::Free
-    }
-
-    fn is_dead(&self) -> bool {
-        self.state() == LineState::Dead
     }
 
     fn is_live(&self) -> bool {
@@ -362,10 +361,12 @@ impl LinePtr {
         self.set_state(LineState::Free);
     }
 
+    #[cfg(test)]
     fn mark_live(&mut self) {
         self.set_state(LineState::Live);
     }
 
+    #[cfg(test)]
     fn mark_dead(&mut self) {
         self.set_state(LineState::Dead);
     }
@@ -487,10 +488,7 @@ pub trait PageAllocator<'a> {
 
 pub trait PageKind {
     const PAGE_TYPE: PageType;
-    /// Whether this page kind uses the structured header/line-pointer layout.
-    /// RawPage keeps the legacy “flat byte array” semantics for legacy callers like B-tree
-    /// while they’re still being migrated to the new page API.
-    /// TODO: Once B-tree pages have typed views, remove this escape hatch.
+
     type Alloc<'a>: PageAllocator<'a>
     where
         Self: 'a;
@@ -2189,6 +2187,7 @@ impl<'a> NullBitmapMut<'a> {
         Self { bytes }
     }
 
+    #[allow(unused)]
     fn set_null(&mut self, col_idx: usize) {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
@@ -2451,7 +2450,7 @@ struct HeapTupleHeader {
     nullmap_ptr: u16,
 }
 
-struct HeapTuple<'a> {
+pub struct HeapTuple<'a> {
     header: &'a HeapTupleHeader,
     payload: &'a [u8],
 }
@@ -2593,10 +2592,6 @@ impl<'a> LogicalRowMut<'a> {
         Self { tuple, layout }
     }
 
-    fn as_row(&self) -> LogicalRow<'_> {
-        LogicalRow::new(self.tuple.as_tuple(), &self.layout)
-    }
-
     pub fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
         let (offset, index) = self.layout.offset_with_index(column_name)?;
         let field_info = self.layout.field_info(column_name)?;
@@ -2609,6 +2604,7 @@ impl<'a> LogicalRowMut<'a> {
         Some(())
     }
 
+    #[cfg(test)]
     fn set_null(&mut self, column_name: &str) -> Option<()> {
         let (_, index) = self.layout.offset_with_index(column_name)?;
         self.tuple
@@ -2634,7 +2630,7 @@ impl<'a> LogicalRowMut<'a> {
 }
 
 pub struct HeapPageView<'a, K: PageKind> {
-    guard: PageReadGuard<'a>,
+    _guard: PageReadGuard<'a>,
     page_ref: &'a Page<K>,
     layout: &'a Layout,
 }
@@ -2647,7 +2643,7 @@ impl<'a> HeapPageView<'a, HeapPage> {
         let page = &*guard.page as *const Page<RawPage> as *const Page<HeapPage>;
         let page_ref = unsafe { &*page };
         Ok(Self {
-            guard,
+            _guard: guard,
             page_ref,
             layout,
         })
@@ -2924,7 +2920,7 @@ const BTREE_ID_FIELD: &str = "id";
 
 // BTree Leaf Page Views
 pub struct BTreeLeafPageView<'a> {
-    guard: PageReadGuard<'a>,
+    _guard: PageReadGuard<'a>,
     page_ref: &'a Page<BTreeLeafPage>,
     layout: &'a Layout,
 }
@@ -2937,7 +2933,7 @@ impl<'a> BTreeLeafPageView<'a> {
         let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
         let page_ref = unsafe { &*page };
         Ok(Self {
-            guard,
+            _guard: guard,
             page_ref,
             layout,
         })
@@ -3049,7 +3045,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
 // BTree Internal Page Views
 pub struct BTreeInternalPageView<'a> {
-    guard: PageReadGuard<'a>,
+    _guard: PageReadGuard<'a>,
     page_ref: &'a Page<BTreeInternalPage>,
     layout: &'a Layout,
 }
@@ -3062,7 +3058,7 @@ impl<'a> BTreeInternalPageView<'a> {
         let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
         let page_ref = unsafe { &*page };
         Ok(Self {
-            guard,
+            _guard: guard,
             page_ref,
             layout,
         })
