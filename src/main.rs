@@ -8634,27 +8634,17 @@ impl Drop for BufferHandle {
 }
 
 trait TransactionOperations {
-    fn pin(&self, block_id: &BlockId);
-    fn unpin(&self, block_id: &BlockId);
-    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool);
-    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool);
+    fn txn_id(&self) -> usize;
+    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_>;
 }
 
 impl TransactionOperations for Arc<Transaction> {
-    fn pin(&self, block_id: &BlockId) {
-        Transaction::pin_internal(self, block_id);
+    fn txn_id(&self) -> usize {
+        self.id()
     }
 
-    fn unpin(&self, block_id: &BlockId) {
-        Transaction::unpin_internal(self, block_id);
-    }
-
-    fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, log: bool) {
-        Transaction::set_int(self, block_id, offset, val, log).unwrap();
-    }
-
-    fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, log: bool) {
-        Transaction::set_string(self, block_id, offset, val, log).unwrap();
+    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_> {
+        Transaction::pin_write_guard(self, block_id)
     }
 }
 
@@ -9891,160 +9881,6 @@ impl RecoveryManager {
     }
 }
 
-#[cfg(test)]
-mod recovery_manager_tests {
-    use std::sync::{Arc, Mutex};
-
-    use crate::{BlockId, LogRecord, RecoveryManager, SimpleDB, TransactionOperations};
-
-    struct MockTransaction {
-        modified_ints: Mutex<Vec<(BlockId, usize, i32)>>,
-        modified_strings: Mutex<Vec<(BlockId, usize, String)>>,
-    }
-
-    impl MockTransaction {
-        pub fn new() -> Self {
-            Self {
-                modified_ints: Mutex::new(Vec::new()),
-                modified_strings: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn verify_int_was_reset(
-            &self,
-            block_id: &BlockId,
-            offset: usize,
-            expected_val: i32,
-        ) -> bool {
-            self.modified_ints
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
-        }
-
-        fn verify_string_was_reset(
-            &self,
-            block_id: &BlockId,
-            offset: usize,
-            expected_val: String,
-        ) -> bool {
-            self.modified_strings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(b, o, v)| b == block_id && *o == offset && *v == expected_val)
-        }
-    }
-
-    impl TransactionOperations for MockTransaction {
-        fn pin(&self, block_id: &BlockId) {
-            dbg!("Pinning block {:?}", block_id);
-        }
-
-        fn unpin(&self, block_id: &BlockId) {
-            dbg!("Unpinning block {:?}", block_id);
-        }
-
-        fn set_int(&self, block_id: &BlockId, offset: usize, val: i32, _log: bool) {
-            dbg!(
-                "Setting int at block {:?} offset {} to {}",
-                block_id,
-                offset,
-                val
-            );
-            self.modified_ints
-                .lock()
-                .unwrap()
-                .push((block_id.clone(), offset, val));
-        }
-
-        fn set_string(&self, block_id: &BlockId, offset: usize, val: &str, _log: bool) {
-            dbg!(
-                "Setting string at block {:?} offset {} to {}",
-                block_id,
-                offset,
-                val
-            );
-            self.modified_strings
-                .lock()
-                .unwrap()
-                .push((block_id.clone(), offset, val.to_string()));
-        }
-    }
-
-    #[test]
-    fn test_rollback_with_int() {
-        let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
-
-        let recovery_manager = RecoveryManager::new(
-            1,
-            Arc::clone(&db.log_manager),
-            Arc::clone(&db.buffer_manager),
-        );
-
-        let mock_tx = MockTransaction::new();
-        let test_block = BlockId::new("test.txt".to_string(), 1);
-
-        // Write some log records that will need to be rolled back
-        let set_int_record = LogRecord::SetInt {
-            txnum: 1,
-            block_id: test_block.clone(),
-            offset: 0,
-            old_val: 100, // Original value before modification
-        };
-        set_int_record
-            .write_log_record(Arc::clone(&db.log_manager))
-            .unwrap();
-
-        // Perform rollback
-        recovery_manager.rollback(&mock_tx).unwrap();
-
-        // Verify that the value was reset to the original value
-        assert!(mock_tx.verify_int_was_reset(&test_block, 0, 100));
-        assert_eq!(
-            mock_tx.modified_ints.lock().unwrap().len(),
-            1,
-            "Should have exactly one modification"
-        );
-    }
-
-    #[test]
-    fn test_rollback_with_string() {
-        let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
-        let recovery_manager = RecoveryManager::new(
-            1,
-            Arc::clone(&db.log_manager),
-            Arc::clone(&db.buffer_manager),
-        );
-
-        let mock_tx = MockTransaction::new();
-        let test_block = BlockId::new("test.txt".to_string(), 1);
-
-        //  Write some log records that will need to be rolled back
-        let set_string_record = LogRecord::SetString {
-            txnum: 1,
-            block_id: test_block.clone(),
-            offset: 0,
-            old_val: "Hello World".to_string(),
-        };
-        set_string_record
-            .write_log_record(Arc::clone(&db.log_manager))
-            .unwrap();
-
-        //   Perform rollback
-        recovery_manager.rollback(&mock_tx).unwrap();
-
-        //  Verify that the value was reset to the original value
-        assert!(mock_tx.verify_string_was_reset(&test_block, 0, "Hello World".to_string()));
-        assert_eq!(
-            mock_tx.modified_strings.lock().unwrap().len(),
-            1,
-            "Should have exactly one modification"
-        );
-    }
-}
-
 /// The container for all the different types of log records that are written to the WAL
 #[derive(Clone)]
 enum LogRecord {
@@ -10273,7 +10109,7 @@ impl LogRecord {
 
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
-    fn undo(&self, tx: &dyn TransactionOperations) {
+    fn undo(&self, txn: &dyn TransactionOperations) {
         match self {
             LogRecord::Start(_) => (),    //  no-op
             LogRecord::Commit(_) => (),   //  no-op
@@ -10285,9 +10121,9 @@ impl LogRecord {
                 old_val,
                 ..
             } => {
-                tx.pin(block_id);
-                tx.set_int(block_id, *offset, *old_val, false);
-                tx.unpin(block_id);
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.set_int(*offset, *old_val);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::SetString {
                 block_id,
@@ -10295,9 +10131,9 @@ impl LogRecord {
                 old_val,
                 ..
             } => {
-                tx.pin(block_id);
-                tx.set_string(block_id, *offset, old_val, false);
-                tx.unpin(block_id);
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.set_string(*offset, old_val);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
         }
     }
@@ -10312,6 +10148,99 @@ impl LogRecord {
     fn from_bytes(bytes: Vec<u8>) -> Result<LogRecord, Box<dyn Error>> {
         let result: LogRecord = bytes.try_into()?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod recovery_manager_tests {
+    use std::sync::Arc;
+
+    use crate::{LogRecord, RecoveryManager, SimpleDB};
+
+    #[test]
+    fn rollback_restores_int_value() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let txn = db.new_tx();
+
+        let filename = "recovery_int_test".to_string();
+        let block = txn.append(&filename);
+        let offset = 0;
+        let original = 1234;
+
+        {
+            let mut guard = txn.pin_write_guard(&block);
+            guard.set_int(offset, original);
+            guard.mark_modified(txn.id(), crate::Lsn::MAX);
+        }
+
+        let recovery_manager = RecoveryManager::new(
+            txn.id(),
+            Arc::clone(&db.log_manager),
+            Arc::clone(&db.buffer_manager),
+        );
+
+        LogRecord::SetInt {
+            txnum: txn.id(),
+            block_id: block.clone(),
+            offset,
+            old_val: original,
+        }
+        .write_log_record(Arc::clone(&db.log_manager))
+        .unwrap();
+
+        {
+            let mut guard = txn.pin_write_guard(&block);
+            guard.set_int(offset, 9999);
+            guard.mark_modified(txn.id(), crate::Lsn::MAX);
+        }
+
+        recovery_manager.rollback(&txn).unwrap();
+
+        let guard = txn.pin_read_guard(&block);
+        assert_eq!(guard.get_int(offset), original);
+    }
+
+    #[test]
+    fn rollback_restores_string_value() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let txn = db.new_tx();
+
+        let filename = "recovery_string_test".to_string();
+        let block = txn.append(&filename);
+        let offset = 0;
+        let original = "hello recovery".to_string();
+
+        {
+            let mut guard = txn.pin_write_guard(&block);
+            guard.set_string(offset, &original);
+            guard.mark_modified(txn.id(), crate::Lsn::MAX);
+        }
+
+        let recovery_manager = RecoveryManager::new(
+            txn.id(),
+            Arc::clone(&db.log_manager),
+            Arc::clone(&db.buffer_manager),
+        );
+
+        LogRecord::SetString {
+            txnum: txn.id(),
+            block_id: block.clone(),
+            offset,
+            old_val: original.clone(),
+        }
+        .write_log_record(Arc::clone(&db.log_manager))
+        .unwrap();
+
+        {
+            let mut guard = txn.pin_write_guard(&block);
+            guard.set_string(offset, "corrupted value");
+            guard.mark_modified(txn.id(), crate::Lsn::MAX);
+        }
+
+        recovery_manager.rollback(&txn).unwrap();
+
+        let guard = txn.pin_read_guard(&block);
+        assert_eq!(guard.get_string(offset), original);
     }
 }
 
