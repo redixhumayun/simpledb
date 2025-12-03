@@ -10533,7 +10533,7 @@ impl BufferFrame {
             self.file_manager
                 .lock()
                 .unwrap()
-                .write(&block_id, &mut page_guard);
+                .write(&block_id, &page_guard);
             meta.txn = None;
             meta.lsn = None;
         }
@@ -11574,7 +11574,9 @@ impl FileSystemInterface for FileManager {
 fn block_offset(block_num: usize) -> u64 {
     let bytes_per_block = crate::page::PAGE_SIZE_BYTES as u128;
     let block = block_num as u128;
-    let offset = block.checked_mul(bytes_per_block).unwrap_or_else(|| panic!("block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"));
+    let offset = block.checked_mul(bytes_per_block).unwrap_or_else(|| {
+        panic!("block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}")
+    });
     if offset > i64::MAX as u128 {
         panic!(
             "block offset exceeds i64 range: block_num={}, bytes_per_block={}, offset={}",
