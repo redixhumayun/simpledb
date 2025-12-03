@@ -2,6 +2,7 @@
 
 ### Transactions
 1. [Implement deadlock detection strategy](https://github.com/redixhumayun/simpledb/issues/6) - Add wait-for or wait-die strategy
+2. [Enforce transaction guard lifetimes via session API](https://github.com/redixhumayun/simpledb/issues/63) - Introduce transaction sessions backed by RwLock to make guard scoping compile-time enforced and eliminate commit/flush deadlocks
 
 ### Storage
 1. [Redesign Page format with integrated bitmap and ID table](https://github.com/redixhumayun/simpledb/issues/18) - Comprehensive page layout redesign
