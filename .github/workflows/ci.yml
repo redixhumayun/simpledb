@@ -17,8 +17,8 @@ jobs:
       matrix:
         features:
           - ""
-          - "--no-default-features --features replacement_clock"
-          - "--no-default-features --features replacement_sieve"
+          - "--no-default-features --features replacement_clock,page-4k"
+          - "--no-default-features --features replacement_sieve,page-4k"
     
     steps:
     - uses: actions/checkout@v4
