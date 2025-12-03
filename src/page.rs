@@ -795,6 +795,7 @@ impl<K: PageKind> Page<K> {
         self.record_space.get_mut(offset..offset + length)
     }
 
+    #[cfg(test)]
     fn update_tuple(&mut self, slot: SlotId, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let line_pointer = self
             .line_pointers
@@ -1052,11 +1053,6 @@ impl From<Page<BTreeInternalPage>> for PageBytes {
 }
 
 impl Page<HeapPage> {
-    fn heap_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
-        let bytes = self.tuple_bytes(slot)?;
-        Some(HeapTuple::from_bytes(bytes))
-    }
-
     fn heap_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
         let bytes = self.tuple_bytes_mut(slot)?;
         Some(HeapTupleMut::from_bytes(bytes))
@@ -2437,8 +2433,10 @@ impl<'a> HeapPageView<'a, HeapPage> {
     }
 
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        let heap_tuple = self.resolve_live_tuple(slot)?;
-        Some(LogicalRow::new(heap_tuple, self.layout))
+        match self.page_ref.tuple(slot)? {
+            TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
+            TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
+        }
     }
 
     pub fn slot_count(&self) -> usize {
@@ -2449,16 +2447,6 @@ impl<'a> HeapPageView<'a, HeapPage> {
         HeapPage::live_iterator(self.page_ref)
     }
 
-    fn resolve_live_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
-        let mut current = slot;
-        loop {
-            match self.page_ref.tuple(current)? {
-                TupleRef::Live(tuple) => return Some(tuple),
-                TupleRef::Redirect(next) => current = next,
-                TupleRef::Free | TupleRef::Dead => return None,
-            }
-        }
-    }
 }
 
 pub struct HeapPageViewMut<'a, K: PageKind> {
@@ -2483,24 +2471,18 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
         })
     }
 
-    fn tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
-        self.page_ref.heap_tuple(slot)
-    }
-
-    fn tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
-        self.page_ref.heap_tuple_mut(slot)
-    }
-
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        let heap_tuple = self.tuple(slot)?;
-        Some(LogicalRow::new(heap_tuple, self.layout))
+        match self.page_ref.tuple(slot)? {
+            TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
+            TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
+        }
     }
 
     pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
         //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
         let layout_clone = self.layout.clone();
         let dirty = self.dirty.clone();
-        let heap_tuple_mut = self.tuple_mut(slot)?;
+        let heap_tuple_mut = self.resolve_live_tuple_mut(slot)?;
         Some(LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty))
     }
 
@@ -2573,6 +2555,17 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
+    }
+
+    fn resolve_live_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
+        let mut current = slot;
+        loop {
+            match self.page_ref.tuple(current)? {
+                TupleRef::Live(_) => return self.page_ref.heap_tuple_mut(current),
+                TupleRef::Redirect(next) => current = next,
+                TupleRef::Free | TupleRef::Dead => return None,
+            }
+        }
     }
 }
 
