@@ -1725,14 +1725,14 @@ impl Page<RawPage> {
 pub struct PageReadGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
-    page: RwLockReadGuard<'a, Page<RawPage>>,
+    page: RwLockReadGuard<'a, PageBytes>,
 }
 
 impl<'a> PageReadGuard<'a> {
     pub fn new(
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
-        page: RwLockReadGuard<'a, Page<RawPage>>,
+        page: RwLockReadGuard<'a, PageBytes>,
     ) -> Self {
         Self {
             handle,
@@ -1772,7 +1772,7 @@ impl<'a> PageReadGuard<'a> {
 }
 
 impl<'a> Deref for PageReadGuard<'a> {
-    type Target = Page<RawPage>;
+    type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
         &self.page
@@ -1786,14 +1786,14 @@ impl<'a> Deref for PageReadGuard<'a> {
 pub struct PageWriteGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
-    page: RwLockWriteGuard<'a, Page<RawPage>>,
+    page: RwLockWriteGuard<'a, PageBytes>,
 }
 
 impl<'a> PageWriteGuard<'a> {
     pub fn new(
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
-        page: RwLockWriteGuard<'a, Page<RawPage>>,
+        page: RwLockWriteGuard<'a, PageBytes>,
     ) -> Self {
         Self {
             handle,
@@ -1857,7 +1857,7 @@ impl<'a> PageWriteGuard<'a> {
 }
 
 impl<'a> Deref for PageWriteGuard<'a> {
-    type Target = Page<RawPage>;
+    type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
         &self.page
@@ -2561,7 +2561,6 @@ impl<'a> HeapPageView<'a, HeapPage> {
     pub fn live_slot_iter(&self) -> HeapIterator<'_> {
         HeapPage::live_iterator(self.page_ref)
     }
-
 }
 
 /// Mutable view of a heap page with schema-aware row access.
