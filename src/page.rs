@@ -546,7 +546,7 @@ impl<'a> Iterator for HeapIterator<'a> {
             if let Some(tuple_ref) = self.page.tuple(slot) {
                 if self
                     .match_state
-                    .map_or(true, |ms| ms == tuple_ref.line_state())
+                    .is_none_or(|ms| ms == tuple_ref.line_state())
                 {
                     return Some((slot, tuple_ref));
                 }
@@ -579,7 +579,7 @@ pub struct BTreeInternalIterator<'a> {
     current_slot: SlotId,
 }
 
-impl<'a> Iterator for BTreeLeafIterator<'a> {
+impl Iterator for BTreeLeafIterator<'_> {
     type Item = BTreeLeafEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -597,7 +597,7 @@ impl<'a> Iterator for BTreeLeafIterator<'a> {
     }
 }
 
-impl<'a> Iterator for BTreeInternalIterator<'a> {
+impl Iterator for BTreeInternalIterator<'_> {
     type Item = BTreeInternalEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -706,7 +706,7 @@ impl WalPage {
 }
 
 impl HeapPage {
-    fn live_iterator<'a>(page: &'a Page<Self>) -> HeapIterator<'a> {
+    fn live_iterator(page: &Page<Self>) -> HeapIterator<'_> {
         HeapIterator {
             page,
             current_slot: 0,
@@ -729,6 +729,12 @@ pub struct Page<K: PageKind> {
     line_pointers: Vec<LinePtr>,
     record_space: Vec<u8>,
     kind: PhantomData<K>,
+}
+
+impl<K: PageKind> Default for Page<K> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K: PageKind> Page<K> {
@@ -919,7 +925,7 @@ impl<K: PageKind> Page<K> {
         Ok(())
     }
 
-    fn tuple<'a>(&'a self, slot: SlotId) -> Option<TupleRef<'a>> {
+    fn tuple(&self, slot: SlotId) -> Option<TupleRef<'_>> {
         let line_pointer = self.line_pointers.get(slot)?;
         match line_pointer.state() {
             LineState::Free => Some(TupleRef::Free),
@@ -1270,7 +1276,7 @@ impl Page<BTreeLeafPage> {
         // Encode entry
         let entry = BTreeLeafEntry {
             key: key.clone(),
-            rid: rid.clone(),
+            rid: *rid,
         };
         let bytes = entry.encode(layout);
 
@@ -1771,7 +1777,7 @@ impl<'a> PageReadGuard<'a> {
     }
 }
 
-impl<'a> Deref for PageReadGuard<'a> {
+impl Deref for PageReadGuard<'_> {
     type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
@@ -1838,7 +1844,7 @@ impl<'a> PageWriteGuard<'a> {
         self,
         layout: &'a Layout,
     ) -> Result<HeapPageViewMut<'a, HeapPage>, Box<dyn Error>> {
-        HeapPageViewMut::new(self, &layout)
+        HeapPageViewMut::new(self, layout)
     }
 
     pub fn into_btree_leaf_page_view_mut(
@@ -1856,7 +1862,7 @@ impl<'a> PageWriteGuard<'a> {
     }
 }
 
-impl<'a> Deref for PageWriteGuard<'a> {
+impl Deref for PageWriteGuard<'_> {
     type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
@@ -1864,7 +1870,7 @@ impl<'a> Deref for PageWriteGuard<'a> {
     }
 }
 
-impl<'a> DerefMut for PageWriteGuard<'a> {
+impl DerefMut for PageWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.page
     }
@@ -2041,7 +2047,7 @@ pub enum TupleRef<'a> {
     Dead,
 }
 
-impl<'a> TupleRef<'a> {
+impl TupleRef<'_> {
     pub fn line_state(&self) -> LineState {
         match self {
             TupleRef::Live(_) => LineState::Live,
@@ -2083,14 +2089,14 @@ impl<'a> NullBitmapMut<'a> {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
         let mask = 1u8 << bit;
-        self.bytes[byte] = self.bytes[byte] | mask;
+        self.bytes[byte] |= mask;
     }
 
     fn clear(&mut self, col_idx: usize) {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
         let mask = 1u8 << bit;
-        self.bytes[byte] = self.bytes[byte] & !mask;
+        self.bytes[byte] &= !mask;
     }
 }
 
@@ -2452,7 +2458,7 @@ impl<'a> HeapTuple<'a> {
 
     fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
         let offset = self.nullmap_ptr() as usize;
-        let bytes_needed = (num_columns + 7) / 8;
+        let bytes_needed = num_columns.div_ceil(8);
         let bytes = &self.payload()[offset..offset + bytes_needed];
         NullBitmap::new(bytes)
     }
@@ -2484,7 +2490,7 @@ impl<'a> HeapTupleMut<'a> {
 
     fn null_bitmap_mut(&mut self, num_columns: usize) -> NullBitmapMut<'_> {
         let offset = self.header.as_ref().nullmap_ptr() as usize;
-        let bytes_needed = (num_columns + 7) / 8;
+        let bytes_needed = num_columns.div_ceil(8);
         let bytes = &mut self.payload[offset..offset + bytes_needed];
         NullBitmapMut::new(bytes)
     }
@@ -2738,7 +2744,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 }
 
-impl<'a, K: PageKind> Drop for HeapPageViewMut<'a, K> {
+impl<K: PageKind> Drop for HeapPageViewMut<'_, K> {
     fn drop(&mut self) {
         if self.dirty.get() {
             self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
@@ -3034,7 +3040,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 }
 
-impl<'a> Drop for BTreeLeafPageViewMut<'a> {
+impl Drop for BTreeLeafPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty {
             self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
@@ -3176,7 +3182,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     }
 }
 
-impl<'a> Drop for BTreeInternalPageViewMut<'a> {
+impl Drop for BTreeInternalPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty {
             self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
@@ -3359,7 +3365,7 @@ mod heap_page_view_tests {
         assert!(view.row(slot_b).is_none());
         let redirected = view.page_ref.tuple(slot_b).expect("slot_b exists");
         match redirected {
-            TupleRef::Redirect(target) => assert_eq!(target as usize, slot_d),
+            TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
             _ => panic!("slot_b should be redirect after redirect_slot"),
         }
 
@@ -3395,7 +3401,7 @@ mod heap_page_view_tests {
         }
 
         match rebuilt.tuple(slot_b).expect("slot_b tuple") {
-            TupleRef::Redirect(target) => assert_eq!(target as usize, slot_d),
+            TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
             _ => panic!("slot_b redirect state not preserved across serialization"),
         }
     }
@@ -4256,7 +4262,7 @@ mod btree_page_tests {
         };
 
         let mut collected = Vec::new();
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             if let Constant::Int(k) = entry.key {
                 collected.push(k);
             }
@@ -4290,7 +4296,7 @@ mod btree_page_tests {
         };
 
         let mut collected = Vec::new();
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             if let Constant::Int(k) = entry.key {
                 collected.push(k);
             }
@@ -4333,7 +4339,7 @@ mod btree_page_tests {
         };
 
         let mut collected = Vec::new();
-        while let Some(entry) = iter.next() {
+        for entry in iter {
             if let Constant::Int(k) = entry.key {
                 collected.push(k);
             }

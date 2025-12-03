@@ -8746,7 +8746,7 @@ impl Transaction {
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
         let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (&*raw).read_page() };
+        let page = unsafe { (*raw).read_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
         PageReadGuard::new(handle, frame_for_guard, page)
     }
@@ -8757,7 +8757,7 @@ impl Transaction {
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
         let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (&*raw).write_page() };
+        let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
         PageWriteGuard::new(handle, frame_for_guard, page)
     }
@@ -10533,7 +10533,7 @@ impl BufferFrame {
             self.file_manager
                 .lock()
                 .unwrap()
-                .write(&block_id, &mut *page_guard);
+                .write(&block_id, &mut page_guard);
             meta.txn = None;
             meta.lsn = None;
         }
@@ -10548,7 +10548,7 @@ impl BufferFrame {
         self.file_manager
             .lock()
             .unwrap()
-            .read(block_id, &mut *page_guard);
+            .read(block_id, &mut page_guard);
         if cfg!(debug_assertions) {
             page_guard.assert_layout_valid("buffer_assign_post_read");
         }
@@ -10584,7 +10584,7 @@ impl IntrusiveNode for FrameMeta {
 }
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
-impl<'a> IntrusiveNode for MutexGuard<'a, FrameMeta> {
+impl IntrusiveNode for MutexGuard<'_, FrameMeta> {
     fn prev(&self) -> Option<usize> {
         self.prev_idx
     }
@@ -11574,9 +11574,7 @@ impl FileSystemInterface for FileManager {
 fn block_offset(block_num: usize) -> u64 {
     let bytes_per_block = crate::page::PAGE_SIZE_BYTES as u128;
     let block = block_num as u128;
-    let offset = block.checked_mul(bytes_per_block).expect(&format!(
-        "block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"
-    ));
+    let offset = block.checked_mul(bytes_per_block).unwrap_or_else(|| panic!("block offset overflow: block_num={block_num}, bytes_per_block={bytes_per_block}"));
     if offset > i64::MAX as u128 {
         panic!(
             "block offset exceeds i64 range: block_num={}, bytes_per_block={}, offset={}",
