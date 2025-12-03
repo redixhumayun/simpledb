@@ -4254,7 +4254,7 @@ mod btree_page_tests {
         }
 
         // Iterate and collect
-        let mut iter = BTreeLeafIterator {
+        let iter = BTreeLeafIterator {
             page: &page,
             layout: &layout,
             current_slot: 0,
@@ -4288,7 +4288,7 @@ mod btree_page_tests {
             .expect("delete should succeed");
 
         // Iterate
-        let mut iter = BTreeLeafIterator {
+        let iter = BTreeLeafIterator {
             page: &page,
             layout: &layout,
             current_slot: 0,
@@ -4331,7 +4331,7 @@ mod btree_page_tests {
                 .unwrap();
         }
 
-        let mut iter = BTreeInternalIterator {
+        let iter = BTreeInternalIterator {
             page: &page,
             layout: &layout,
             current_slot: 0,
