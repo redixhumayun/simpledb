@@ -2353,11 +2353,13 @@ mod logical_row_tests {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct HeapTupleHeader {
+    /// Length of the payload
     payload_len: u32,
     /// Transaction ID that created this tuple
     xmin: u64,
     /// Transaction ID that deleted this tuple (0 if live)
     xmax: u64,
+    /// Flags
     flags: u16,
     /// Offset to null bitmap within payload
     nullmap_ptr: u16,
