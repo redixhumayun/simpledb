@@ -111,10 +111,6 @@ impl PageHeader {
         self.free_upper.saturating_sub(self.free_lower)
     }
 
-    fn free_ptr(&self) -> u32 {
-        self.free_ptr
-    }
-
     fn set_free_ptr(&mut self, free_ptr: u32) {
         self.free_ptr = free_ptr;
     }
@@ -125,14 +121,6 @@ impl PageHeader {
 
     fn set_crc32(&mut self, crc: u32) {
         self.crc32 = crc;
-    }
-
-    fn latch_word(&self) -> u64 {
-        self.latch_word
-    }
-
-    fn set_latch_word(&mut self, latch: u64) {
-        self.latch_word = latch;
     }
 
     fn free_head(&self) -> u16 {
@@ -151,21 +139,9 @@ impl PageHeader {
         &self.reserved
     }
 
-    fn set_reserved(&mut self, reserved: [u8; 6]) {
-        self.reserved = reserved;
-    }
-
-    fn reserved_flags(&self) -> u8 {
-        self.reserved_flags
-    }
-
-    fn set_reserved_flags(&mut self, flags: u8) {
-        self.reserved_flags = flags;
-    }
-
     /// Get the B-tree level for internal nodes (uses reserved bytes 0-1)
     fn btree_level(&self) -> u16 {
-        u16::from_le_bytes([self.reserved[0], self.reserved[1]])
+        u16::from_le_bytes([self.reserved()[0], self.reserved()[1]])
     }
 
     /// Set the B-tree level for internal nodes (uses reserved bytes 0-1)
@@ -483,11 +459,6 @@ mod line_ptr_tests {
     }
 }
 
-pub trait PageAllocator<'a> {
-    type Output;
-    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>>;
-}
-
 pub trait PageKind {
     const PAGE_TYPE: PageType;
 }
@@ -502,18 +473,6 @@ impl PageKind for RawPage {
 
 pub struct HeapPage;
 
-pub struct HeapAllocator<'a> {
-    page: &'a mut Page<HeapPage>,
-}
-
-impl<'a> PageAllocator<'a> for HeapAllocator<'a> {
-    type Output = SlotId;
-
-    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
-        self.page.allocate_tuple(bytes)
-    }
-}
-
 pub struct HeapIterator<'a> {
     page: &'a Page<HeapPage>,
     current_slot: SlotId,
@@ -521,7 +480,7 @@ pub struct HeapIterator<'a> {
 }
 
 impl<'a> Iterator for HeapIterator<'a> {
-    type Item = TupleRef<'a>;
+    type Item = (SlotId, TupleRef<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let total_slots = self.page.slot_count();
@@ -533,7 +492,7 @@ impl<'a> Iterator for HeapIterator<'a> {
                     .match_state
                     .map_or(true, |ms| ms == tuple_ref.line_state())
                 {
-                    return Some(tuple_ref);
+                    return Some((slot, tuple_ref));
                 }
             }
         }
@@ -549,14 +508,6 @@ impl PageKind for HeapPage {
 pub struct BTreeLeafPage;
 pub struct BTreeInternalPage;
 
-pub struct BTreeLeafAllocator<'a> {
-    page: &'a mut Page<BTreeLeafPage>,
-}
-
-pub struct BTreeInternalAllocator<'a> {
-    page: &'a mut Page<BTreeInternalPage>,
-}
-
 pub struct BTreeLeafIterator<'a> {
     page: &'a Page<BTreeLeafPage>,
     layout: &'a Layout,
@@ -567,24 +518,6 @@ pub struct BTreeInternalIterator<'a> {
     page: &'a Page<BTreeInternalPage>,
     layout: &'a Layout,
     current_slot: SlotId,
-}
-
-impl<'a> PageAllocator<'a> for BTreeLeafAllocator<'a> {
-    type Output = SlotId;
-
-    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
-        // (TODO) BTree leaf pages need sorted insertion
-        self.page.allocate_tuple(bytes)
-    }
-}
-
-impl<'a> PageAllocator<'a> for BTreeInternalAllocator<'a> {
-    type Output = SlotId;
-
-    fn insert(&mut self, bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
-        // (TODO) BTree internal pages need sorted insertion
-        self.page.allocate_tuple(bytes)
-    }
 }
 
 impl<'a> Iterator for BTreeLeafIterator<'a> {
@@ -710,15 +643,8 @@ impl WalPage {
     }
 }
 
-impl<'a> PageAllocator<'a> for () {
-    type Output = SlotId;
-    fn insert(&mut self, _bytes: &[u8]) -> Result<Self::Output, Box<dyn Error>> {
-        Err("RawPage allocator is not supported".into())
-    }
-}
-
 impl HeapPage {
-    fn live_iterator<'a>(page: &'a mut Page<Self>) -> HeapIterator<'a> {
+    fn live_iterator<'a>(page: &'a Page<Self>) -> HeapIterator<'a> {
         HeapIterator {
             page,
             current_slot: 0,
@@ -742,13 +668,6 @@ impl<K: PageKind> Page<K> {
             record_space: vec![0u8; PAGE_SIZE_BYTES as usize],
             kind: PhantomData,
         }
-    }
-
-    fn push_line_pointer(&mut self, line_pointer: LinePtr) -> u16 {
-        self.line_pointers.push(line_pointer);
-        self.header.free_lower += 4;
-        self.header.set_slot_count(self.line_pointers.len() as u16);
-        self.header.free_lower
     }
 
     #[track_caller]
@@ -825,7 +744,7 @@ impl<K: PageKind> Page<K> {
             .len()
             .try_into()
             .map_err(|_| "tuple larger than max tuple size (u16::MAX)".to_string())?;
-        if lower + needed > upper {
+        if self.header.free_space() < needed {
             return Err("insufficient free space".into());
         }
 
@@ -2356,26 +2275,11 @@ impl<'a> HeapTuple<'a> {
         }
     }
 
-    fn from_parts(header: &'a HeapTupleHeader, payload: &'a [u8]) -> Self {
-        Self { header, payload }
-    }
-
-    fn xmin(&self) -> u64 {
-        self.header.xmin
-    }
-
-    fn xmax(&self) -> u64 {
-        self.header.xmax
-    }
-
-    fn flags(&self) -> u16 {
-        self.header.flags
-    }
-
     fn nullmap_ptr(&self) -> u16 {
         self.header.nullmap_ptr
     }
 
+    #[cfg(test)]
     fn payload_len(&self) -> u32 {
         self.header.payload_len
     }
@@ -2385,14 +2289,14 @@ impl<'a> HeapTuple<'a> {
     }
 
     fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
-        let offset = self.header.nullmap_ptr as usize;
+        let offset = self.nullmap_ptr() as usize;
         let bytes_needed = (num_columns + 7) / 8;
-        let bytes = &self.payload[offset..offset + bytes_needed];
+        let bytes = &self.payload()[offset..offset + bytes_needed];
         NullBitmap::new(bytes)
     }
 
     fn payload_slice(&self, offset: usize, len: usize) -> &'a [u8] {
-        &self.payload[offset..offset + len]
+        &self.payload()[offset..offset + len]
     }
 }
 
@@ -2420,10 +2324,6 @@ impl<'a> HeapTupleMut<'a> {
         let bytes_needed = (num_columns + 7) / 8;
         let bytes = &mut self.payload[offset..offset + bytes_needed];
         NullBitmapMut::new(bytes)
-    }
-
-    fn as_tuple(&self) -> HeapTuple<'_> {
-        HeapTuple::from_parts(&self.header, &self.payload)
     }
 }
 
@@ -2547,6 +2447,10 @@ impl<'a> HeapPageView<'a, HeapPage> {
 
     pub fn slot_count(&self) -> usize {
         self.page_ref.slot_count()
+    }
+
+    pub fn live_slot_iter(&self) -> HeapIterator<'_> {
+        HeapPage::live_iterator(self.page_ref)
     }
 }
 

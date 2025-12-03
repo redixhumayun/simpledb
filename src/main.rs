@@ -8301,14 +8301,11 @@ impl RecordPage {
             .into_heap_view(&self.layout)?;
 
         let start_slot = after.map(|s| s + 1).unwrap_or(0);
-        let slot_count = view.slot_count();
-
-        for slot in start_slot..slot_count {
-            if view.row(slot).is_some() {
-                return Ok(Some(slot));
-            }
-        }
-        Ok(None)
+        let mut iter = view.live_slot_iter();
+        let next = iter
+            .find(|(slot, _)| *slot >= start_slot)
+            .map(|(slot, _)| slot);
+        Ok(next)
     }
 
     /// Returns a Vec of all live (non-deleted) slot IDs on this page.
@@ -8319,10 +8316,7 @@ impl RecordPage {
             .pin_read_guard(&self.block_id)
             .into_heap_view(&self.layout)?;
 
-        let slot_count = view.slot_count();
-        let live: Vec<usize> = (0..slot_count)
-            .filter(|&slot| view.row(slot).is_some())
-            .collect();
+        let live: Vec<usize> = view.live_slot_iter().map(|(slot, _)| slot).collect();
 
         Ok(live)
     }
