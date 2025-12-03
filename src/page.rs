@@ -1873,7 +1873,6 @@ impl<'a> DerefMut for PageWriteGuard<'a> {
 #[cfg(test)]
 mod page_tests {
     use super::*;
-    use std::slice;
 
     #[test]
     fn allocate_tuple_exposes_bytes_and_tuple_ref() {
@@ -2015,21 +2014,16 @@ mod page_tests {
     }
 
     fn heap_tuple_bytes(payload: &[u8]) -> Vec<u8> {
-        let header = HeapTupleHeader {
-            payload_len: payload.len() as u32,
-            xmin: 1,
-            xmax: 0,
-            flags: 0,
-            nullmap_ptr: 0,
-        };
-        let header_bytes = unsafe {
-            slice::from_raw_parts(
-                &header as *const HeapTupleHeader as *const u8,
-                std::mem::size_of::<HeapTupleHeader>(),
-            )
-        };
-        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
-        buf.extend_from_slice(header_bytes);
+        let mut header_bytes = [0u8; HEAP_TUPLE_HEADER_BYTES];
+        let mut header = HeapTupleHeaderBytesMut::from_bytes(&mut header_bytes);
+        header.set_xmin(1);
+        header.set_xmax(0);
+        header.set_payload_len(payload.len() as u32);
+        header.set_flags(0);
+        header.set_nullmap_ptr(0);
+
+        let mut buf = Vec::with_capacity(HEAP_TUPLE_HEADER_BYTES + payload.len());
+        buf.extend_from_slice(&header_bytes);
         buf.extend_from_slice(payload);
         buf
     }
@@ -2102,16 +2096,16 @@ impl<'a> NullBitmapMut<'a> {
 
 #[cfg(test)]
 fn build_tuple_bytes(payload: &[u8], nullmap_ptr: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; size_of::<HeapTupleHeader>() + payload.len()];
-    unsafe {
-        let header = &mut *(buf.as_mut_ptr() as *mut HeapTupleHeader);
-        header.payload_len = payload.len() as u32;
-        header.xmin = 1;
-        header.xmax = 0;
-        header.flags = 0;
-        header.nullmap_ptr = nullmap_ptr;
-    }
-    buf[size_of::<HeapTupleHeader>()..].copy_from_slice(payload);
+    let mut header_buf = [0u8; HEAP_TUPLE_HEADER_BYTES];
+    let mut header = HeapTupleHeaderBytesMut::from_bytes(&mut header_buf);
+    header.set_xmin(1);
+    header.set_xmax(0);
+    header.set_payload_len(payload.len() as u32);
+    header.set_flags(0);
+    header.set_nullmap_ptr(nullmap_ptr);
+    let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload.len()];
+    buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
+    buf[HEAP_TUPLE_HEADER_BYTES..].copy_from_slice(payload);
     buf
 }
 
@@ -2349,32 +2343,94 @@ mod logical_row_tests {
     }
 }
 
-/// On-disk heap tuple header.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct HeapTupleHeader {
-    /// Length of the payload
-    payload_len: u32,
-    /// Transaction ID that created this tuple
-    xmin: u64,
-    /// Transaction ID that deleted this tuple (0 if live)
-    xmax: u64,
-    /// Flags
-    flags: u16,
-    /// Offset to null bitmap within payload
-    nullmap_ptr: u16,
+/// The layout of the heap tuple header is as follows:
+/// - xmin: 8 bytes
+/// - xmax: 8 bytes
+/// - payload_len: 4 bytes
+/// - flags: 2 bytes
+/// - nullmap_ptr: 2 bytes
+
+const HEAP_TUPLE_HEADER_BYTES: usize = 24;
+
+struct HeapTupleHeaderBytes<'a> {
+    bytes: &'a [u8; HEAP_TUPLE_HEADER_BYTES],
+}
+
+impl<'a> HeapTupleHeaderBytes<'a> {
+    fn from_bytes(bytes: &'a [u8; HEAP_TUPLE_HEADER_BYTES]) -> Self {
+        Self { bytes }
+    }
+
+    #[allow(dead_code)]
+    fn xmin(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[0..8].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    fn xmax(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[8..16].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    fn payload_len(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[16..20].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    fn flags(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[20..22].try_into().unwrap())
+    }
+
+    fn nullmap_ptr(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[22..24].try_into().unwrap())
+    }
+}
+
+struct HeapTupleHeaderBytesMut<'a> {
+    bytes: &'a mut [u8; HEAP_TUPLE_HEADER_BYTES],
+}
+
+impl<'a> HeapTupleHeaderBytesMut<'a> {
+    fn from_bytes(bytes: &'a mut [u8; HEAP_TUPLE_HEADER_BYTES]) -> Self {
+        Self { bytes }
+    }
+
+    fn as_ref(&self) -> HeapTupleHeaderBytes<'_> {
+        HeapTupleHeaderBytes::from_bytes(self.bytes)
+    }
+
+    fn set_xmin(&mut self, xmin: u64) {
+        self.bytes[0..8].copy_from_slice(&xmin.to_le_bytes());
+    }
+
+    fn set_xmax(&mut self, xmax: u64) {
+        self.bytes[8..16].copy_from_slice(&xmax.to_le_bytes());
+    }
+
+    fn set_payload_len(&mut self, payload_len: u32) {
+        self.bytes[16..20].copy_from_slice(&payload_len.to_le_bytes());
+    }
+
+    fn set_flags(&mut self, flags: u16) {
+        self.bytes[20..22].copy_from_slice(&flags.to_le_bytes());
+    }
+
+    fn set_nullmap_ptr(&mut self, nullmap_ptr: u16) {
+        self.bytes[22..24].copy_from_slice(&nullmap_ptr.to_le_bytes());
+    }
 }
 
 /// Immutable view of a heap tuple with header and payload.
 pub struct HeapTuple<'a> {
-    header: &'a HeapTupleHeader,
+    header: HeapTupleHeaderBytes<'a>,
     payload: &'a [u8],
 }
 
 impl<'a> HeapTuple<'a> {
     fn from_bytes(buf: &'a [u8]) -> Self {
-        let (header_bytes, payload_bytes) = buf.split_at(size_of::<HeapTupleHeader>());
-        let header = unsafe { &*(header_bytes.as_ptr() as *const HeapTupleHeader) };
+        let (header_bytes, payload_bytes) = buf.split_at(HEAP_TUPLE_HEADER_BYTES);
+        let header_bytes: &[u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
+        let header = HeapTupleHeaderBytes::from_bytes(header_bytes);
         Self {
             header,
             payload: payload_bytes,
@@ -2382,12 +2438,12 @@ impl<'a> HeapTuple<'a> {
     }
 
     fn nullmap_ptr(&self) -> u16 {
-        self.header.nullmap_ptr
+        self.header.nullmap_ptr()
     }
 
     #[cfg(test)]
     fn payload_len(&self) -> u32 {
-        self.header.payload_len
+        self.header.payload_len()
     }
 
     fn payload(&self) -> &'a [u8] {
@@ -2407,14 +2463,15 @@ impl<'a> HeapTuple<'a> {
 }
 
 struct HeapTupleMut<'a> {
-    header: &'a mut HeapTupleHeader,
+    header: HeapTupleHeaderBytesMut<'a>,
     payload: &'a mut [u8],
 }
 
 impl<'a> HeapTupleMut<'a> {
     fn from_bytes(bytes: &'a mut [u8]) -> Self {
-        let (header_bytes, payload_bytes) = bytes.split_at_mut(size_of::<HeapTupleHeader>());
-        let header = unsafe { &mut *(header_bytes.as_ptr() as *mut HeapTupleHeader) };
+        let (header_bytes, payload_bytes) = bytes.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
+        let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
+        let header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
         Self {
             header,
             payload: payload_bytes,
@@ -2426,7 +2483,7 @@ impl<'a> HeapTupleMut<'a> {
     }
 
     fn null_bitmap_mut(&mut self, num_columns: usize) -> NullBitmapMut<'_> {
-        let offset = self.header.nullmap_ptr as usize;
+        let offset = self.header.as_ref().nullmap_ptr() as usize;
         let bytes_needed = (num_columns + 7) / 8;
         let bytes = &mut self.payload[offset..offset + bytes_needed];
         NullBitmapMut::new(bytes)
@@ -2643,23 +2700,15 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
 
     pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
         let payload_len = self.layout.slot_size;
-        let mut buf = vec![0u8; size_of::<HeapTupleHeader>() + payload_len];
-        {
-            let header = HeapTupleHeader {
-                payload_len: payload_len as u32,
-                xmin: 0,
-                xmax: 0,
-                flags: 0,
-                nullmap_ptr: 0,
-            };
-            let header_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &header as *const HeapTupleHeader as *const u8,
-                    size_of::<HeapTupleHeader>(),
-                )
-            };
-            buf[..header_bytes.len()].copy_from_slice(header_bytes);
-        }
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
+        let mut header_buf = [0u8; HEAP_TUPLE_HEADER_BYTES];
+        let mut header = HeapTupleHeaderBytesMut::from_bytes(&mut header_buf);
+        header.set_payload_len(payload_len as u32);
+        header.set_xmin(0);
+        header.set_xmax(0);
+        header.set_flags(0);
+        header.set_nullmap_ptr(0);
+        buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
         let slot = self.page_ref.insert_tuple(&buf)?;
         self.dirty.set(true);
         let tuple_mut = self
