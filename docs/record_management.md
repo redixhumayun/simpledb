@@ -889,6 +889,8 @@ This structured format provides the foundation for efficient record management i
 
 ## True Variable-Length Field Implementation (TODO)
 
+Tracking Issue: [#64](https://github.com/redixhumayun/simpledb/issues/64)
+
 ### Current Limitation
 
 The current `Layout` implementation uses **fixed-size slots** with variable-content fields:
