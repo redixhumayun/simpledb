@@ -443,10 +443,7 @@ impl BTreeInternal {
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.block_id);
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
-        let slot = match view.find_slot_before(search_key) {
-            Some(slot) => slot, // Use the rightmost slot where key <= search_key
-            None => 0,          // No entries <= search_key, use first slot
-        };
+        let slot = view.find_slot_before(search_key).unwrap_or(0);
         let block_num = view.get_entry(slot)?.child_block;
         Ok(BlockId::new(self.file_name.clone(), block_num))
     }
