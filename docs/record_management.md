@@ -270,7 +270,7 @@ Offset 26-31: reserved bytes   // LSN, FSM hints, padding
 
 - `free_lower` and `free_upper` mirror PostgreSQL-style bounds; publish `(block_id, free_upper - free_lower)` into a free-space map.
 - Reserved bytes can later hold largest-hole/fragmentation hints if we measure them.
-- Reserved bytes are also the planned home for per-page LSN to coordinate WAL redo/undo; redo must rewrite line pointers and heap consistently before recomputing CRC.
+- Reserved bytes are the planned home for per-page LSN to coordinate WAL redo/undo. See [docs/wal_view_integration.md](wal_view_integration.md) for LSN tracking design.
 - Page latch protocol (future use of `latch_word`):
   - Readers: check `latch_word`; if odd, retry; read page; recheck; retry on change/odd.
   - Writers: spin/CAS to make `latch_word` odd (exclusive), mutate page, recompute CRC, bump to next even.
@@ -883,4 +883,306 @@ This structured format provides the foundation for efficient record management i
 **Status Note (2025-11-27): Remaining migration steps**
 - Add typed page guards (`PageView<'_, K>` / `PageViewMut<'_, K>`) so `Transaction` stops exposing raw `Page<RawPage>` and every caller goes through page-type checks.
 - Port `RecordPage`, TableScan, and executor nodes to the heap-page API (slot IDs, tuple headers, redirects) and introduce `LogicalRow`/`LogicalRowMut` so no one computes offsets manually.
-- Once runtime code uses the new layout, update `RecoveryManager`/`LogRecord` to log slot-level changes via the same page APIs, keeping WAL replay in sync with the physical format.
+- Integrate WAL logging with typed page views (see [docs/wal_view_integration.md](wal_view_integration.md) and [issue #62](https://github.com/redixhumayun/simpledb/issues/62)).
+
+---
+
+## True Variable-Length Field Implementation (TODO)
+
+### Current Limitation
+
+The current `Layout` implementation uses **fixed-size slots** with variable-content fields:
+
+```rust
+// Schema: [id: INT, name: VARCHAR(100), age: INT]
+// Layout calculates:
+slot_size = 4 + (4 + 100) + 4 = 112 bytes
+
+// Every tuple reserves 112 bytes, regardless of actual data
+// Storing "abc" in name wastes 97 bytes
+```
+
+**This is NOT true variable-length storage.** It's a fixed-slot model where:
+- Each tuple reserves `Layout.slot_size` bytes
+- Strings declared as `VARCHAR(N)` always reserve `4 + N` bytes
+- Cannot store strings longer than declared max
+- Significant space waste for short strings
+
+### True Variable-Length Design
+
+The line-pointer + heap architecture already supports variable-length tuples (via `LinePtr.length`). To achieve true variable-length fields:
+
+#### Tuple Format: Postgres-Style Dense Packing
+
+**Current encoding**:
+```
+[Header][flag/offset][field1_reserved_space][field2_reserved_space][...]
+        └─ Layout.slot_size bytes total
+```
+
+**New encoding** (dense packing):
+```
+[HeapTupleHeader][nullmap][field1_actual_data][field2_actual_data][...]
+                          └─ only actual bytes needed, no padding
+```
+
+**Example**: Schema `[id: INT, name: VARCHAR, age: INT]`, Values `[42, "alice", 30]`
+
+```
+Current (fixed slots, VARCHAR(100)):
+[Header][nullmap][42][4]["alice"][...95 padding bytes...][30]  → 112 bytes
+
+Dense packing:
+[Header][nullmap][42][5]["alice"][30]  → 40 bytes
+```
+
+#### NULL Handling
+
+NULL fields consume **zero bytes** in the payload:
+
+```
+Values: [42, NULL, 30]
+Nullmap: [0b00000010]  (bit 1 set → name is NULL)
+Payload: [42][30]      (no data for name, saves space)
+         ↑0  ↑4
+```
+
+When reading field N:
+1. Check `nullmap[N]` - if set, return `None` (don't read payload)
+2. If not NULL, scan fields 0..N-1 to calculate offset, skipping NULL fields (they add 0 bytes)
+
+#### Offset Calculation
+
+**Current approach** (fixed offsets):
+```rust
+impl Layout {
+    fn offset(&self, field: &str) -> Option<usize> {
+        self.offsets.get(field).copied()  // pre-calculated HashMap
+    }
+}
+
+// Direct access
+let offset = layout.offset("age");  // returns 108
+let value = read_at(offset);
+```
+
+**New approach** (dynamic offsets):
+```rust
+impl Layout {
+    // No more pre-calculated offsets HashMap
+    // Instead, calculate on-the-fly by scanning tuple
+
+    fn field_index(&self, field: &str) -> Option<usize> {
+        self.schema.fields.iter().position(|f| f == field)
+    }
+}
+
+// Must scan to calculate offset
+let field_idx = layout.field_index("age").unwrap();  // age = field 2
+let mut offset = nullmap_size;
+
+for i in 0..field_idx {
+    if !tuple.is_null(i) {
+        offset += actual_field_size(i);  // read length prefix for varlens
+    }
+    // NULL fields add 0 bytes
+}
+let value = read_at(offset);
+```
+
+**Optimization**: For fixed-length-only prefix, calculate directly:
+```rust
+// If fields 0..N are all fixed-length (INT) and non-NULL:
+offset = nullmap_size + (field_idx * 4);  // O(1)
+
+// If any varlen or NULL fields precede field_idx:
+offset = scan_and_sum();  // O(N)
+```
+
+#### Implementation Changes Required
+
+**1. Tuple Encoding** (`PageViewMut::insert_row`):
+```rust
+pub fn insert_row(&mut self, values: &RowValues) -> Result<SlotId, Box<dyn Error>> {
+    // Calculate actual payload size (no fixed slot_size)
+    let nullmap_size = (values.len() + 7) / 8;
+    let mut payload_size = nullmap_size;
+
+    for value in values {
+        payload_size += match value {
+            Constant::Int(_) => 4,
+            Constant::String(s) => 4 + s.len(),  // length prefix + actual bytes
+            // NULL values add 0 bytes
+        };
+    }
+
+    let total_size = size_of::<HeapTupleHeader>() + payload_size;
+    let mut buf = vec![0u8; total_size];
+
+    // Write header
+    let header = HeapTupleHeader {
+        payload_len: payload_size as u32,
+        nullmap_ptr: 0,  // nullmap immediately after header
+        // ...
+    };
+    // ... serialize header ...
+
+    // Write nullmap
+    let nullmap_offset = size_of::<HeapTupleHeader>();
+    // ... encode null bits ...
+
+    // Write fields densely (no padding)
+    let mut offset = nullmap_offset + nullmap_size;
+    for (idx, value) in values.iter().enumerate() {
+        if is_null(value) {
+            continue;  // skip, consume 0 bytes
+        }
+        match value {
+            Constant::Int(v) => {
+                buf[offset..offset+4].copy_from_slice(&v.to_le_bytes());
+                offset += 4;
+            }
+            Constant::String(s) => {
+                let len = s.len() as u32;
+                buf[offset..offset+4].copy_from_slice(&len.to_le_bytes());
+                buf[offset+4..offset+4+s.len()].copy_from_slice(s.as_bytes());
+                offset += 4 + s.len();
+            }
+        }
+    }
+
+    self.page_ref.insert_tuple(&buf)
+}
+```
+
+**2. Tuple Decoding** (`LogicalRow::get_column`):
+```rust
+pub fn get_column(&self, field: &str) -> Option<Constant> {
+    let field_idx = self.layout.field_index(field)?;
+
+    // Check null bitmap first
+    let nullmap = self.tuple.null_bitmap(self.layout.num_of_columns());
+    if nullmap.is_null(field_idx) {
+        return None;
+    }
+
+    // Calculate offset by scanning preceding fields
+    let nullmap_size = (self.layout.num_of_columns() + 7) / 8;
+    let mut offset = nullmap_size;
+
+    for i in 0..field_idx {
+        if nullmap.is_null(i) {
+            continue;  // NULL field, 0 bytes
+        }
+
+        let field_info = self.layout.schema.info.get(&self.layout.schema.fields[i])?;
+        match field_info.field_type {
+            FieldType::Int => offset += 4,
+            FieldType::String => {
+                let len = u32::from_le_bytes(self.tuple.payload()[offset..offset+4].try_into().unwrap());
+                offset += 4 + len as usize;
+            }
+        }
+    }
+
+    // Now at field_idx, decode it
+    let field_info = self.layout.field_info(field)?;
+    match field_info.field_type {
+        FieldType::Int => {
+            let bytes = &self.tuple.payload()[offset..offset+4];
+            Some(Constant::Int(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        FieldType::String => {
+            let len = u32::from_le_bytes(self.tuple.payload()[offset..offset+4].try_into().unwrap()) as usize;
+            let bytes = &self.tuple.payload()[offset+4..offset+4+len];
+            Some(Constant::String(String::from_utf8(bytes.to_vec()).unwrap()))
+        }
+    }
+}
+```
+
+**3. Layout Refactor**:
+```rust
+pub struct Layout {
+    pub schema: Schema,
+    column_index: HashMap<String, usize>,  // field name → schema position
+    // Remove: offsets HashMap (can't pre-calculate)
+    // Remove: slot_size (varies per tuple)
+}
+
+impl Layout {
+    pub fn new(schema: Schema) -> Self {
+        let mut column_index = HashMap::new();
+        for (idx, field) in schema.fields.iter().enumerate() {
+            column_index.insert(field.clone(), idx);
+        }
+        Self { schema, column_index }
+    }
+
+    fn field_index(&self, field: &str) -> Option<usize> {
+        self.column_index.get(field).copied()
+    }
+
+    // offset() removed - must calculate dynamically from tuple data
+}
+```
+
+#### Benefits
+
+**Space efficiency**:
+- VARCHAR fields use only actual bytes needed
+- NULL fields consume 0 bytes (not 4+ bytes)
+- Example: 10 NULL `VARCHAR(1000)` fields = 0 bytes instead of 10KB
+
+**Flexibility**:
+- No arbitrary max string length (limited only by tuple size ~4KB)
+- Different tuples can be vastly different sizes
+- Better for sparse data (many NULLs)
+
+**Costs**:
+- Field access requires scanning (O(N) for Nth field in worst case)
+- Slightly more complex encoding/decoding logic
+- Optimization needed for fixed-length-only schemas
+
+#### Migration Path
+
+1. **Phase 1**: Implement dense packing for new inserts, keep current Layout for compatibility
+2. **Phase 2**: Add `Layout::calculate_offset_dynamic(tuple, field)` method
+3. **Phase 3**: Migrate `LogicalRow::get_column` to use dynamic offset calculation
+4. **Phase 4**: Remove `Layout.offsets` HashMap and `slot_size`
+5. **Phase 5**: Add optimizations (skip scanning for fixed-length-only prefixes)
+
+**Status**: Not yet implemented. Current design uses fixed-size slots as interim step.
+
+---
+
+## Transaction Lock Integration Issue (2025-11-30)
+
+### Current BTree Migration Status
+
+The BTree migration to the new page API (BTreeLeaf using `PageWriteGuard`/`BTreeLeafPageViewMut`) has a **concurrency correctness issue**:
+
+**Problem**: The new page API bypasses transaction-level locks.
+
+**Legacy approach** (correct):
+```rust
+impl BTreePage {
+    fn set_int(&self, slot: usize, field: &str, value: i32) {
+        self.txn.set_int(...)  // ← Calls Transaction::set_int
+                                // ← Acquires xlock via ConcurrencyManager
+    }
+}
+```
+
+**New approach** (missing transaction locks):
+```rust
+impl BTreeLeafPageViewMut {
+    pub fn insert_entry(&mut self, key: Constant, rid: RID) {
+        self.page_ref.insert_leaf_entry(...)  // ← Direct page modification
+                                               // ← Only has page latch (RwLock)
+                                               // ✗ No transaction lock acquired!
+    }
+}
+```
+
+**Note on WAL Integration**: Write-ahead logging integration with typed page views is documented separately in [docs/wal_view_integration.md](wal_view_integration.md) and tracked in [issue #62](https://github.com/redixhumayun/simpledb/issues/62).
