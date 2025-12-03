@@ -1,3 +1,19 @@
+//! LRU (Least Recently Used) replacement policy.
+//!
+//! Implements classic LRU using an intrusive doubly-linked list where the head
+//! represents the most recently used frame and the tail is the eviction candidate.
+//!
+//! # Algorithm
+//!
+//! - On hit: Move accessed frame to head
+//! - On allocation: Insert new frame at head
+//! - On eviction: Scan from tail to head, evicting first unpinned frame
+//!
+//! # Complexity
+//!
+//! - Hit: O(1) with optimized promotion
+//! - Eviction: O(n) worst case if all frames pinned
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -8,12 +24,16 @@ use crate::{
     BlockId, BufferFrame, FrameMeta,
 };
 
+/// LRU policy state maintaining an intrusive doubly-linked list.
+///
+/// The list is ordered by recency: head = most recent, tail = least recent.
 #[derive(Debug)]
 pub struct PolicyState {
     intrusive_list: Mutex<IntrusiveList>,
 }
 
 impl PolicyState {
+    /// Initializes LRU state by constructing an intrusive list from buffer pool frames.
     pub fn new(buffer_pool: &[Arc<BufferFrame>]) -> Self {
         let mut guards = buffer_pool
             .iter()
@@ -25,6 +45,10 @@ impl PolicyState {
         }
     }
 
+    /// Records a cache hit by promoting the accessed frame to the head of the LRU list.
+    ///
+    /// Optimizes promotion for frames adjacent to the head. Returns None if the frame
+    /// no longer contains the requested block (eviction race).
     pub fn record_hit<'a>(
         &self,
         buffer_pool: &'a [Arc<BufferFrame>],
@@ -81,6 +105,9 @@ impl PolicyState {
         Some(frame_guard)
     }
 
+    /// Notifies the policy that a frame has been assigned a new block.
+    ///
+    /// Inserts the frame at the head of the LRU list as the most recently used.
     pub fn on_frame_assigned(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
         let current_head = intrusive_list_guard.peek_head();
@@ -104,6 +131,10 @@ impl PolicyState {
         }
     }
 
+    /// Selects a victim frame for eviction.
+    ///
+    /// Scans from tail (LRU) towards head, skipping pinned frames, and returns the
+    /// first unpinned frame. Returns None if all frames are pinned.
     pub fn evict_frame<'a>(
         &self,
         buffer_pool: &'a [Arc<BufferFrame>],

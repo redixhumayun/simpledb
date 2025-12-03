@@ -1,3 +1,28 @@
+//! SIEVE replacement policy.
+//!
+//! Implements the SIEVE eviction algorithm which combines aspects of both LRU-style
+//! lists and clock-style reference bits. Designed to be scan-resistant while maintaining
+//! simplicity and efficiency.
+//!
+//! # Algorithm
+//!
+//! - Maintains an intrusive doubly-linked list ordered by insertion time
+//! - Uses a "hand" pointer similar to clock, but traverses the list
+//! - On hit: Sets reference bit (doesn't move in list)
+//! - On allocation: Inserts at head with ref bit set
+//! - On eviction: Sweeps hand backward from tail
+//!   - If pinned: skip
+//!   - If ref bit set: clear bit and continue
+//!   - Otherwise: evict
+//!
+//! # Advantages
+//!
+//! - Scan-resistant: Sequential scans don't pollute the entire cache
+//! - Simple: No complex promotion logic like LRU
+//! - Efficient: Reference bits avoid unnecessary list manipulation
+//!
+//! See the SIEVE paper: https://cachemon.github.io/SIEVE-website/
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -8,12 +33,15 @@ use crate::{
     BlockId, BufferFrame, FrameMeta,
 };
 
+/// Internal state combining list structure and hand pointer.
 #[derive(Debug)]
 struct ListState {
     intrusive_list: IntrusiveList,
+    /// Hand pointer for eviction sweeps (None if list empty)
     hand: Option<usize>,
 }
 
+/// SIEVE policy state with list and hand.
 #[derive(Debug)]
 pub struct PolicyState {
     list_state: Mutex<ListState>,
@@ -21,6 +49,7 @@ pub struct PolicyState {
 }
 
 impl PolicyState {
+    /// Initializes SIEVE state with a list and hand pointing at tail.
     pub fn new(buffer_pool: &[Arc<BufferFrame>]) -> Self {
         let mut guards = buffer_pool
             .iter()
@@ -36,6 +65,10 @@ impl PolicyState {
         }
     }
 
+    /// Records a cache hit by setting the frame's reference bit.
+    ///
+    /// Unlike LRU, SIEVE does not move the frame in the list on hit.
+    /// Returns None if the frame no longer contains the requested block.
     pub fn record_hit<'a>(
         &self,
         _buffer_pool: &[Arc<BufferFrame>],
@@ -56,6 +89,10 @@ impl PolicyState {
         Some(frame_guard)
     }
 
+    /// Notifies the policy that a frame has been assigned.
+    ///
+    /// Inserts the frame at the head of the list with reference bit set,
+    /// giving it protection from immediate eviction.
     pub fn on_frame_assigned(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
         let mut list_guard = self.list_state.lock().unwrap();
         let current_head = list_guard.intrusive_list.peek_head();
@@ -83,6 +120,12 @@ impl PolicyState {
         }
     }
 
+    /// Selects a victim frame using the SIEVE algorithm.
+    ///
+    /// Sweeps the hand backward from tail through the list, clearing reference bits
+    /// and skipping pinned frames. Evicts the first unpinned frame with ref_bit = false.
+    /// Resets hand to tail if it reaches the head. Returns None if all frames are
+    /// pinned or recently accessed after a full sweep.
     pub fn evict_frame<'a>(
         &self,
         buffer_pool: &'a [Arc<BufferFrame>],
