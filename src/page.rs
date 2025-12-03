@@ -2436,12 +2436,8 @@ impl<'a> HeapPageView<'a, HeapPage> {
         })
     }
 
-    fn tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
-        self.page_ref.heap_tuple(slot)
-    }
-
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        let heap_tuple = self.tuple(slot)?;
+        let heap_tuple = self.resolve_live_tuple(slot)?;
         Some(LogicalRow::new(heap_tuple, self.layout))
     }
 
@@ -2451,6 +2447,17 @@ impl<'a> HeapPageView<'a, HeapPage> {
 
     pub fn live_slot_iter(&self) -> HeapIterator<'_> {
         HeapPage::live_iterator(self.page_ref)
+    }
+
+    fn resolve_live_tuple(&self, slot: SlotId) -> Option<HeapTuple<'_>> {
+        let mut current = slot;
+        loop {
+            match self.page_ref.tuple(current)? {
+                TupleRef::Live(tuple) => return Some(tuple),
+                TupleRef::Redirect(next) => current = next,
+                TupleRef::Free | TupleRef::Dead => return None,
+            }
+        }
     }
 }
 
