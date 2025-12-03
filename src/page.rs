@@ -1023,7 +1023,7 @@ impl<K: PageKind> Page<K> {
             return Err("corrupt free_lower in header".into());
         }
         let lp_bytes = free_lower - PAGE_HEADER_SIZE_BYTES as usize;
-        if lp_bytes % 4 != 0 {
+        if !lp_bytes.is_multiple_of(4) {
             return Err("line pointer region not aligned to 4 bytes".into());
         }
         let lp_count = lp_bytes / 4;
