@@ -2355,7 +2355,6 @@ mod logical_row_tests {
 /// - payload_len: 4 bytes
 /// - flags: 2 bytes
 /// - nullmap_ptr: 2 bytes
-
 const HEAP_TUPLE_HEADER_BYTES: usize = 24;
 
 struct HeapTupleHeaderBytes<'a> {

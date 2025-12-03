@@ -296,7 +296,6 @@ mod btree_index_tests {
 /// +-------------+------------------+
 /// | key         | child block num  |
 /// +-------------+------------------+
-
 struct BTreeInternal {
     txn: Arc<Transaction>,
     block_id: BlockId,
