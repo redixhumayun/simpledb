@@ -1,3 +1,28 @@
+//! Page management with slotted page architecture for heap and B-tree pages.
+//!
+//! This module implements the core page structures and operations for the database,
+//! supporting both heap pages (table rows) and B-tree pages (index entries).
+//!
+//! # Architecture
+//!
+//! Pages use a slotted layout with three regions:
+//! - Fixed 32-byte header containing metadata and free space pointers
+//! - Line pointer array growing downward (4 bytes per slot)
+//! - Tuple heap growing upward from the end
+//!
+//! # Page Types
+//!
+//! - [`HeapPage`]: Table rows with slotted page layout and MVCC support
+//! - [`BTreeLeafPage`]: Index leaf entries with sorted key-RID pairs
+//! - [`BTreeInternalPage`]: Index internal nodes with sorted key-child pointers
+//! - [`WalPage`]: Write-ahead log pages with boundary-pointer format
+//!
+//! # Type Safety
+//!
+//! The [`Page<K>`] struct uses compile-time phantom types to enforce page-type-specific
+//! operations. Page views ([`HeapPageView`], [`BTreeLeafPageView`], etc.) provide
+//! schema-aware access with automatic dirty tracking.
+
 use std::{
     cell::Cell,
     error::Error,
@@ -10,14 +35,21 @@ use std::{
 
 use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, Lsn, RID};
 
+/// Discriminator for the type of data stored in a page.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageType {
+    /// Heap page storing table rows with slotted page layout
     Heap = 0,
+    /// B-tree leaf page containing key-value entries
     IndexLeaf = 1,
+    /// B-tree internal page containing key-child pointers
     IndexInternal = 2,
+    /// Overflow page for large tuples
     Overflow = 3,
+    /// Metadata page
     Meta = 4,
+    /// Uninitialized/free page
     Free = 255,
 }
 
@@ -37,19 +69,30 @@ compile_error!(
 
 /// Fixed header size as per `docs/record_management.md`.
 pub const PAGE_HEADER_SIZE_BYTES: u16 = 32;
-/// Sentinel for "no free slot" in `free_head`.
+/// Sentinel value indicating no free slots in the free list.
 pub const NO_FREE_SLOT: u16 = 0xFFFF;
 
+/// 32-byte fixed-size page header tracking page metadata and free space.
+///
+/// See `docs/record_management.md` for detailed layout specification.
 struct PageHeader {
     page_type: PageType,
     reserved_flags: u8,
+    /// Number of slots in the line pointer array
     slot_count: u16,
+    /// Offset to end of line pointer array (grows downward)
     free_lower: u16,
+    /// Offset to start of tuple heap (grows upward)
     free_upper: u16,
+    /// Pointer to free space boundary
     free_ptr: u32,
+    /// CRC32 checksum for corruption detection
     crc32: u32,
+    /// Reserved for future latch/lock word
     latch_word: u64,
+    /// Head of free slot linked list
     free_head: u16,
+    /// Reserved bytes for page-type-specific metadata
     reserved: [u8; 6],
 }
 
@@ -237,15 +280,23 @@ impl PageHeader {
     }
 }
 
+/// 4-byte line pointer encoding offset (16 bits), length (12 bits), and state (4 bits).
+///
+/// Layout: `[offset:16][length:12][state:4]`
 #[derive(Clone, Copy)]
 struct LinePtr(u32);
 
+/// State of a tuple slot in the slotted page.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineState {
+    /// Slot is free and available for reuse
     Free = 0,
+    /// Slot contains a live tuple
     Live = 1,
+    /// Slot contains a dead tuple (marked for garbage collection)
     Dead = 2,
+    /// Slot redirects to another slot (for tuple updates)
     Redirect = 3,
 }
 
@@ -459,20 +510,25 @@ mod line_ptr_tests {
     }
 }
 
+/// Marker trait associating a compile-time page kind with its runtime PageType.
 pub trait PageKind {
     const PAGE_TYPE: PageType;
 }
 
+/// Slot identifier within a page.
 type SlotId = usize;
 
+/// Raw page with unknown type, used at I/O boundaries.
 pub struct RawPage;
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
 }
 
+/// Heap page storing table rows with slotted page layout.
 pub struct HeapPage;
 
+/// Iterator over tuples in a heap page, optionally filtering by LineState.
 pub struct HeapIterator<'a> {
     page: &'a Page<HeapPage>,
     current_slot: SlotId,
@@ -504,16 +560,19 @@ impl PageKind for HeapPage {
     const PAGE_TYPE: PageType = PageType::Heap;
 }
 
-// BTree page types
+/// B-tree leaf page containing sorted key-RID entries.
 pub struct BTreeLeafPage;
+/// B-tree internal page containing sorted key-child block pointers.
 pub struct BTreeInternalPage;
 
+/// Iterator over entries in a B-tree leaf page.
 pub struct BTreeLeafIterator<'a> {
     page: &'a Page<BTreeLeafPage>,
     layout: &'a Layout,
     current_slot: SlotId,
 }
 
+/// Iterator over entries in a B-tree internal page.
 pub struct BTreeInternalIterator<'a> {
     page: &'a Page<BTreeInternalPage>,
     layout: &'a Layout,
@@ -564,11 +623,14 @@ impl PageKind for BTreeInternalPage {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
 }
 
-/// Type alias for a page image whose kind is not yet known at the IO boundary.
+/// Type alias for a page whose kind is not yet known at the I/O boundary.
 pub type PageBytes = Page<RawPage>;
 
-/// Write-ahead log pages use a simple "boundary pointer + payload" format that is
-/// unrelated to heap/index layouts. They only need to manage raw bytes.
+/// Write-ahead log page using boundary-pointer format for sequential record storage.
+///
+/// WAL pages don't use slotted page layout. Instead, they store records sequentially
+/// from the end of the page towards the beginning, with a boundary pointer tracking
+/// the current insertion point.
 #[derive(Debug)]
 pub struct WalPage {
     data: Vec<u8>,
@@ -653,6 +715,15 @@ impl HeapPage {
     }
 }
 
+/// Generic slotted page with compile-time page kind.
+///
+/// Implements the slotted page architecture with:
+/// - Fixed 32-byte header at offset 0
+/// - Line pointer array growing downward from offset 32
+/// - Tuple heap growing upward from the end
+///
+/// The generic parameter `K` determines the page type at compile time,
+/// enabling type-safe operations specific to heap vs B-tree pages.
 pub struct Page<K: PageKind> {
     header: PageHeader,
     line_pointers: Vec<LinePtr>,
@@ -670,6 +741,12 @@ impl<K: PageKind> Page<K> {
         }
     }
 
+    /// Validates page layout invariants. Panics if corrupted.
+    ///
+    /// Checks:
+    /// - Slot directory and header consistency
+    /// - Free space bounds
+    /// - Live tuple offsets within bounds
     #[track_caller]
     pub fn assert_layout_valid(&self, context: &str) {
         let expected_lower = PAGE_HEADER_SIZE_BYTES as usize + self.line_pointers.len() * 4;
@@ -738,6 +815,10 @@ impl<K: PageKind> Page<K> {
         Some(idx)
     }
 
+    /// Allocates space for a tuple and returns its slot ID.
+    ///
+    /// Attempts to reuse a free slot from the free list; otherwise appends a new slot.
+    /// Fails if insufficient space for both the line pointer and tuple data.
     fn allocate_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
         let (mut lower, upper) = self.header.free_bounds();
         let needed: u16 = bytes
@@ -876,10 +957,11 @@ impl<K: PageKind> Page<K> {
             .unwrap_or(false)
     }
 
-    /// Serialize the page into a contiguous `PAGE_SIZE_BYTES` buffer.
+    /// Serializes the page into a contiguous buffer matching PAGE_SIZE_BYTES.
     ///
-    /// Layout matches `docs/record_management.md`:
-    /// header (32B) + line pointer array (4B each, downward) + heap (upward).
+    /// Layout: `[header:32B][line pointers:4B each][free space][tuples]`
+    ///
+    /// See `docs/record_management.md` for detailed specification.
     pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
         if out.len() != PAGE_SIZE_BYTES as usize {
             return Err("output buffer must equal PAGE_SIZE_BYTES".into());
@@ -913,9 +995,12 @@ impl<K: PageKind> Page<K> {
         Ok(())
     }
 
-    /// Construct a page from a contiguous `PAGE_SIZE_BYTES` buffer.
+    /// Deserializes a page from a buffer.
     ///
-    /// Validates the page type matches `K::PAGE_TYPE` and rebuilds line pointers and heap.
+    /// Validates:
+    /// - Buffer size matches PAGE_SIZE_BYTES
+    /// - Page type matches K::PAGE_TYPE (except RawPage accepts any type)
+    /// - Header invariants (free_lower, slot alignment)
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
         if bytes.len() != PAGE_SIZE_BYTES as usize {
             return Err("input buffer must equal PAGE_SIZE_BYTES".into());
@@ -1103,8 +1188,9 @@ impl Page<BTreeLeafPage> {
         self.header.set_slot_count(0);
     }
 
-    /// Find the slot where a key should be inserted to maintain sorted order (binary search)
-    /// For duplicate keys, finds the rightmost position (after all existing duplicates)
+    /// Binary search for insertion point to maintain sorted order.
+    ///
+    /// For duplicate keys, returns the rightmost position (after all existing duplicates).
     fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
         let mut left = 0;
         let mut right = self.slot_count();
@@ -1169,7 +1255,9 @@ impl Page<BTreeLeafPage> {
         Ok(slot)
     }
 
-    /// Insert a B-tree leaf entry in sorted order by key
+    /// Inserts a B-tree leaf entry maintaining sorted order.
+    ///
+    /// Uses binary search to find insertion point and shifts subsequent entries right.
     pub fn insert_leaf_entry(
         &mut self,
         layout: &Layout,
@@ -1233,9 +1321,10 @@ impl Page<BTreeLeafPage> {
             .set_free_bounds(lower, upper + deleted_len as u16);
     }
 
-    /// Delete a B-tree leaf entry at the given slot
-    /// Uses physical deletion (Vec::remove) to maintain dense sorted array
-    /// Compacts payload space to reclaim deleted tuple bytes
+    /// Deletes a B-tree leaf entry using physical deletion.
+    ///
+    /// Removes the line pointer from the array (shifting remaining entries left)
+    /// and compacts payload space to reclaim bytes. Maintains dense sorted array.
     pub fn delete_leaf_entry(
         &mut self,
         slot: SlotId,
@@ -1359,8 +1448,9 @@ impl Page<BTreeInternalPage> {
         self.header.set_slot_count(0);
     }
 
-    /// Find the slot where a key should be inserted to maintain sorted order (binary search)
-    /// For duplicate keys, finds the rightmost position (after all existing duplicates)
+    /// Binary search for insertion point to maintain sorted order.
+    ///
+    /// For duplicate keys, returns the rightmost position (after all existing duplicates).
     fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
         let mut left = 0;
         let mut right = self.slot_count();
@@ -1628,6 +1718,10 @@ impl Page<RawPage> {
     }
 }
 
+/// Read guard providing shared access to a pinned page.
+///
+/// Holds a buffer handle, frame reference, and read lock on the page data.
+/// Automatically unpins when dropped.
 pub struct PageReadGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
@@ -1685,6 +1779,10 @@ impl<'a> Deref for PageReadGuard<'a> {
     }
 }
 
+/// Write guard providing exclusive access to a pinned page.
+///
+/// Holds a buffer handle, frame reference, and write lock on the page data.
+/// Automatically unpins when dropped.
 pub struct PageWriteGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
@@ -1937,10 +2035,15 @@ mod page_tests {
     }
 }
 
+/// Reference to a tuple slot in various states.
 pub enum TupleRef<'a> {
+    /// Live tuple with accessible data
     Live(HeapTuple<'a>),
+    /// Redirect to another slot (for updated tuples)
     Redirect(SlotId),
+    /// Free slot available for reuse
     Free,
+    /// Dead tuple marked for garbage collection
     Dead,
 }
 
@@ -2246,16 +2349,21 @@ mod logical_row_tests {
     }
 }
 
+/// On-disk heap tuple header.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct HeapTupleHeader {
     payload_len: u32,
+    /// Transaction ID that created this tuple
     xmin: u64,
+    /// Transaction ID that deleted this tuple (0 if live)
     xmax: u64,
     flags: u16,
+    /// Offset to null bitmap within payload
     nullmap_ptr: u16,
 }
 
+/// Immutable view of a heap tuple with header and payload.
 pub struct HeapTuple<'a> {
     header: &'a HeapTupleHeader,
     payload: &'a [u8],
@@ -2323,6 +2431,7 @@ impl<'a> HeapTupleMut<'a> {
     }
 }
 
+/// Type-safe view of a heap tuple with schema-aware column access.
 pub struct LogicalRow<'a> {
     tuple: HeapTuple<'a>,
     layout: &'a Layout,
@@ -2358,6 +2467,9 @@ impl<'a> LogicalRow<'a> {
     }
 }
 
+/// Mutable type-safe view of a heap tuple with schema-aware column access.
+///
+/// Tracks modifications via a shared dirty flag.
 pub struct LogicalRowMut<'a> {
     tuple: HeapTupleMut<'a>,
     layout: Layout,
@@ -2412,6 +2524,9 @@ impl<'a> LogicalRowMut<'a> {
     }
 }
 
+/// Read-only view of a heap page with schema-aware row access.
+///
+/// Holds a read guard and provides typed access to logical rows.
 pub struct HeapPageView<'a, K: PageKind> {
     _guard: PageReadGuard<'a>,
     page_ref: &'a Page<K>,
@@ -2449,6 +2564,10 @@ impl<'a> HeapPageView<'a, HeapPage> {
 
 }
 
+/// Mutable view of a heap page with schema-aware row access.
+///
+/// Holds a write guard, tracks modifications via dirty flag, and automatically
+/// marks the page as modified when dropped if any changes were made.
 pub struct HeapPageViewMut<'a, K: PageKind> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<K>,
@@ -2577,7 +2696,7 @@ impl<'a, K: PageKind> Drop for HeapPageViewMut<'a, K> {
     }
 }
 
-// BTree entry types
+/// B-tree leaf entry mapping a key to a record identifier (RID).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BTreeLeafEntry {
     pub key: Constant,
@@ -2656,6 +2775,7 @@ impl BTreeLeafEntry {
     }
 }
 
+/// B-tree internal entry mapping a key to a child block number.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BTreeInternalEntry {
     pub key: Constant,
@@ -2728,7 +2848,7 @@ const BTREE_DATA_FIELD: &str = "dataval";
 const BTREE_BLOCK_FIELD: &str = "block";
 const BTREE_ID_FIELD: &str = "id";
 
-// BTree Leaf Page Views
+/// Read-only view of a B-tree leaf page.
 pub struct BTreeLeafPageView<'a> {
     _guard: PageReadGuard<'a>,
     page_ref: &'a Page<BTreeLeafPage>,
@@ -2782,6 +2902,10 @@ impl<'a> BTreeLeafPageView<'a> {
     }
 }
 
+/// Mutable view of a B-tree leaf page.
+///
+/// Provides insertion, deletion, and search operations on leaf entries.
+/// Automatically marks the page as modified when dropped if changes were made.
 pub struct BTreeLeafPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<BTreeLeafPage>,
@@ -2868,7 +2992,7 @@ impl<'a> Drop for BTreeLeafPageViewMut<'a> {
     }
 }
 
-// BTree Internal Page Views
+/// Read-only view of a B-tree internal page.
 pub struct BTreeInternalPageView<'a> {
     _guard: PageReadGuard<'a>,
     page_ref: &'a Page<BTreeInternalPage>,
@@ -2918,6 +3042,10 @@ impl<'a> BTreeInternalPageView<'a> {
     }
 }
 
+/// Mutable view of a B-tree internal page.
+///
+/// Provides insertion, deletion, and search operations on internal entries.
+/// Automatically marks the page as modified when dropped if changes were made.
 pub struct BTreeInternalPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     page_ref: &'a mut Page<BTreeInternalPage>,
