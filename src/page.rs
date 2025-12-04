@@ -119,18 +119,22 @@ impl PageHeader {
         }
     }
 
+    /// Returns the page type discriminator.
     fn page_type(&self) -> PageType {
         self.page_type
     }
 
+    /// Sets the page type.
     fn set_page_type(&mut self, page_type: PageType) {
         self.page_type = page_type;
     }
 
+    /// Returns the number of slots in the line pointer array.
     fn slot_count(&self) -> u16 {
         self.slot_count
     }
 
+    /// Sets the slot count.
     fn set_slot_count(&mut self, slot_count: u16) {
         self.slot_count = slot_count;
     }
@@ -154,30 +158,37 @@ impl PageHeader {
         self.free_upper.saturating_sub(self.free_lower)
     }
 
+    /// Sets the free space boundary pointer.
     fn set_free_ptr(&mut self, free_ptr: u32) {
         self.free_ptr = free_ptr;
     }
 
+    /// Returns the stored CRC32 checksum.
     fn crc32(&self) -> u32 {
         self.crc32
     }
 
+    /// Sets the CRC32 checksum.
     fn set_crc32(&mut self, crc: u32) {
         self.crc32 = crc;
     }
 
+    /// Returns the head of the free slot linked list.
     fn free_head(&self) -> u16 {
         self.free_head
     }
 
+    /// Sets the free slot list head.
     fn set_free_head(&mut self, head: u16) {
         self.free_head = head;
     }
 
+    /// Checks if there are any free slots in the free list.
     fn has_free_slot(&self) -> bool {
         self.free_head != NO_FREE_SLOT
     }
 
+    /// Returns the reserved metadata bytes.
     fn reserved(&self) -> &[u8; 6] {
         &self.reserved
     }
@@ -321,6 +332,7 @@ impl LineState {
 }
 
 impl LinePtr {
+    /// Creates a new line pointer with the given offset, length, and state.
     fn new(offset: u16, length: u16, state: LineState) -> Self {
         let mut line_pointer = LinePtr(0);
         line_pointer.set_offset(offset);
@@ -329,32 +341,39 @@ impl LinePtr {
         line_pointer
     }
 
+    /// Extracts the 16-bit offset field.
     fn offset(&self) -> u16 {
         (self.0 >> 16) as u16
     }
 
+    /// Extracts the 12-bit length field.
     fn length(&self) -> u16 {
         ((self.0 >> 4) & 0x0FFF) as u16
     }
 
+    /// Returns offset and length as (usize, usize).
     fn offset_and_length(&self) -> (usize, usize) {
         (self.offset() as usize, self.length() as usize)
     }
 
+    /// Extracts the 4-bit state field.
     fn state(&self) -> LineState {
         let state = self.0 & 0x000F;
         LineState::from_u32(state)
     }
 
+    /// Updates the offset field.
     fn set_offset(&mut self, offset: u16) {
         self.0 = (self.0 & 0x0000_FFFF) | ((offset as u32) << 16);
     }
 
+    /// Updates the length field (clamped to 12 bits).
     fn set_length(&mut self, length: u16) {
         let length_bits = (length as u32) & 0x0FFF;
         self.0 = (self.0 & 0xFFFF_000F) | (length_bits << 4);
     }
 
+    /// Updates the state field.
     fn set_state(&mut self, state: LineState) {
         let state_bits = (state as u32) & 0x000F;
         self.0 = (self.0 & 0xFFFF_FFF0) | (state_bits);
@@ -378,14 +397,17 @@ impl LinePtr {
         self
     }
 
+    /// Checks if this slot is free.
     fn is_free(&self) -> bool {
         self.state() == LineState::Free
     }
 
+    /// Checks if this slot is live.
     fn is_live(&self) -> bool {
         self.state() == LineState::Live
     }
 
+    /// Marks this slot as free.
     fn mark_free(&mut self) {
         self.set_state(LineState::Free);
     }
@@ -400,6 +422,7 @@ impl LinePtr {
         self.set_state(LineState::Dead);
     }
 
+    /// Marks this slot as a redirect to another slot.
     fn mark_redirect(&mut self, offset: u16) {
         self.set_offset(offset);
         self.set_length(0x000);
@@ -639,6 +662,7 @@ pub struct WalPage {
 impl WalPage {
     pub const HEADER_BYTES: usize = 4;
 
+    /// Creates a new WAL page with the boundary at the end.
     pub fn new() -> Self {
         let mut page = Self {
             data: vec![0u8; PAGE_SIZE_BYTES as usize],
@@ -647,17 +671,20 @@ impl WalPage {
         page
     }
 
+    /// Resets the page by zeroing data and setting boundary to end.
     pub fn reset(&mut self) {
         self.data.fill(0);
         self.set_boundary(self.data.len());
     }
 
+    /// Returns the current boundary offset.
     pub fn boundary(&self) -> usize {
         let mut buf = [0u8; Self::HEADER_BYTES];
         buf.copy_from_slice(&self.data[..Self::HEADER_BYTES]);
         i32::from_be_bytes(buf) as usize
     }
 
+    /// Sets the boundary offset.
     pub fn set_boundary(&mut self, offset: usize) {
         assert!(
             offset <= self.data.len(),
@@ -667,6 +694,7 @@ impl WalPage {
         self.data[..Self::HEADER_BYTES].copy_from_slice(&value.to_be_bytes());
     }
 
+    /// Returns the total page capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.data.len()
     }
@@ -685,6 +713,7 @@ impl WalPage {
         self.data[start + Self::HEADER_BYTES..end].copy_from_slice(bytes);
     }
 
+    /// Reads a record from the given offset. Returns (data, next_offset).
     pub fn read_record(&self, src: usize) -> (Vec<u8>, usize) {
         let mut len_buf = [0u8; Self::HEADER_BYTES];
         len_buf.copy_from_slice(&self.data[src..src + Self::HEADER_BYTES]);
@@ -696,10 +725,12 @@ impl WalPage {
         (bytes, end)
     }
 
+    /// Returns a reference to the page bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.data
     }
 
+    /// Returns a mutable reference to the page bytes.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.data
     }
@@ -862,6 +893,7 @@ impl<K: PageKind> Page<K> {
         Ok(slot)
     }
 
+    /// Returns the raw bytes for a tuple at the given slot if it's live.
     fn tuple_bytes(&self, slot: SlotId) -> Option<&[u8]> {
         let line_pointer = self.line_pointers.get(slot)?;
         if !line_pointer.is_live() {
@@ -872,6 +904,7 @@ impl<K: PageKind> Page<K> {
         self.record_space.get(offset..offset + length)
     }
 
+    /// Returns mutable raw bytes for a tuple at the given slot if it's live.
     fn tuple_bytes_mut(&mut self, slot: SlotId) -> Option<&mut [u8]> {
         let line_pointer = self.line_pointers.get(slot)?;
         if !line_pointer.is_live() {
@@ -925,6 +958,7 @@ impl<K: PageKind> Page<K> {
         Ok(())
     }
 
+    /// Returns a reference to the tuple at the given slot with its current state.
     fn tuple(&self, slot: SlotId) -> Option<TupleRef<'_>> {
         let line_pointer = self.line_pointers.get(slot)?;
         match line_pointer.state() {
@@ -943,14 +977,17 @@ impl<K: PageKind> Page<K> {
         }
     }
 
+    /// Returns the number of slots in the line pointer array.
     pub fn slot_count(&self) -> usize {
         self.line_pointers.len()
     }
 
+    /// Returns the header's free space bounds.
     pub fn header_free_bounds(&self) -> (u16, u16) {
         self.header.free_bounds()
     }
 
+    /// Returns the slot count from the header.
     pub fn header_slot_count(&self) -> usize {
         self.header.slot_count() as usize
     }
@@ -1055,6 +1092,7 @@ impl<K: PageKind> Page<K> {
         Ok(page)
     }
 
+    /// Computes CRC32 checksum using polynomial 0xEDB88320.
     fn crc32(bytes: &[u8]) -> u32 {
         const CRC32_POLY: u32 = 0xEDB8_8320;
         let mut crc = 0xFFFF_FFFFu32;
@@ -1068,6 +1106,7 @@ impl<K: PageKind> Page<K> {
         !crc
     }
 
+    /// Computes and stores the CRC32 checksum for this page.
     pub fn compute_crc32(&mut self) -> Result<(), Box<dyn Error>> {
         self.header.set_crc32(0);
         let mut bytes = vec![0; PAGE_SIZE_BYTES as usize];
@@ -1077,6 +1116,7 @@ impl<K: PageKind> Page<K> {
         Ok(())
     }
 
+    /// Verifies the page's CRC32 checksum. Returns true if valid.
     pub fn verify_crc32(&mut self) -> Result<bool, Box<dyn Error>> {
         let stored_crc32 = self.header.crc32();
         if stored_crc32 == 0 {
@@ -1144,19 +1184,23 @@ impl From<Page<BTreeInternalPage>> for PageBytes {
 }
 
 impl Page<HeapPage> {
+    /// Returns a mutable heap tuple reference for the given slot.
     fn heap_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
         let bytes = self.tuple_bytes_mut(slot)?;
         Some(HeapTupleMut::from_bytes(bytes))
     }
 
+    /// Inserts a new tuple and returns its slot ID.
     fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
         self.allocate_tuple(bytes)
     }
 
+    /// Deletes the tuple at the given slot.
     fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
         self.delete_tuple(slot)
     }
 
+    /// Marks a slot as redirecting to another slot.
     fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
         let line_pointer = self
             .line_pointers
@@ -1686,6 +1730,7 @@ impl std::fmt::Debug for Page<RawPage> {
 impl Page<RawPage> {
     pub const INT_BYTES: usize = 4;
 
+    /// Reads a big-endian i32 from the given offset (legacy compatibility).
     pub fn get_int(&self, offset: usize) -> i32 {
         let bytes: [u8; Self::INT_BYTES] = self.record_space[offset..offset + Self::INT_BYTES]
             .try_into()
@@ -1693,10 +1738,12 @@ impl Page<RawPage> {
         i32::from_be_bytes(bytes)
     }
 
+    /// Writes a big-endian i32 to the given offset (legacy compatibility).
     pub fn set_int(&mut self, offset: usize, n: i32) {
         self.record_space[offset..offset + Self::INT_BYTES].copy_from_slice(&n.to_be_bytes());
     }
 
+    /// Reads a length-prefixed byte array from the given offset (legacy compatibility).
     pub fn get_bytes(&self, mut offset: usize) -> Vec<u8> {
         let length_bytes: [u8; Self::INT_BYTES] = self.record_space
             [offset..offset + Self::INT_BYTES]
@@ -1707,6 +1754,7 @@ impl Page<RawPage> {
         self.record_space[offset..offset + length].to_vec()
     }
 
+    /// Writes a length-prefixed byte array to the given offset (legacy compatibility).
     pub fn set_bytes(&mut self, mut offset: usize, bytes: &[u8]) {
         let length = bytes.len() as u32;
         self.record_space[offset..offset + Self::INT_BYTES].copy_from_slice(&length.to_be_bytes());
@@ -1714,11 +1762,13 @@ impl Page<RawPage> {
         self.record_space[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
+    /// Reads a UTF-8 string from the given offset (legacy compatibility).
     pub fn get_string(&self, offset: usize) -> String {
         let bytes = self.get_bytes(offset);
         String::from_utf8(bytes).unwrap()
     }
 
+    /// Writes a UTF-8 string to the given offset (legacy compatibility).
     pub fn set_string(&mut self, offset: usize, string: &str) {
         self.set_bytes(offset, string.as_bytes());
     }
@@ -1735,6 +1785,7 @@ pub struct PageReadGuard<'a> {
 }
 
 impl<'a> PageReadGuard<'a> {
+    /// Creates a new read guard.
     pub fn new(
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
@@ -1747,14 +1798,17 @@ impl<'a> PageReadGuard<'a> {
         }
     }
 
+    /// Returns the block ID of the pinned page.
     pub fn block_id(&self) -> &BlockId {
         self.handle.block_id()
     }
 
+    /// Returns the buffer frame.
     pub fn frame(&self) -> &BufferFrame {
         &self.frame
     }
 
+    /// Converts to a typed heap page view with schema access.
     pub fn into_heap_view(
         self,
         layout: &'a Layout,
@@ -1762,6 +1816,7 @@ impl<'a> PageReadGuard<'a> {
         HeapPageView::new(self, layout)
     }
 
+    /// Converts to a B-tree leaf page view.
     pub fn into_btree_leaf_page_view(
         self,
         layout: &'a Layout,
@@ -1769,6 +1824,7 @@ impl<'a> PageReadGuard<'a> {
         BTreeLeafPageView::new(self, layout)
     }
 
+    /// Converts to a B-tree internal page view.
     pub fn into_btree_internal_page_view(
         self,
         layout: &'a Layout,
@@ -1796,6 +1852,7 @@ pub struct PageWriteGuard<'a> {
 }
 
 impl<'a> PageWriteGuard<'a> {
+    /// Creates a new write guard.
     pub fn new(
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
@@ -1808,38 +1865,46 @@ impl<'a> PageWriteGuard<'a> {
         }
     }
 
+    /// Returns the block ID of the pinned page.
     pub fn block_id(&self) -> &BlockId {
         self.handle.block_id()
     }
 
+    /// Returns the transaction ID.
     pub fn txn_id(&self) -> usize {
         self.handle.txn_id()
     }
 
+    /// Returns the buffer frame.
     pub fn frame(&self) -> &BufferFrame {
         &self.frame
     }
 
+    /// Marks the page as modified for WAL.
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
         self.frame.set_modified(txn_id, lsn);
     }
 
+    /// Formats the page as an empty heap page.
     pub fn format_as_heap(&mut self) {
         **self = Page::<HeapPage>::new().into()
     }
 
+    /// Formats the page as an empty B-tree leaf page.
     pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
         let mut page = Page::<BTreeLeafPage>::new();
         page.init(overflow_block);
         **self = page.into();
     }
 
+    /// Formats the page as an empty B-tree internal page.
     pub fn format_as_btree_internal(&mut self, level: u16) {
         let mut page = Page::<BTreeInternalPage>::new();
         page.init(level);
         **self = page.into();
     }
 
+    /// Converts to a mutable typed heap page view with schema access.
     pub fn into_heap_view_mut(
         self,
         layout: &'a Layout,
@@ -1847,6 +1912,7 @@ impl<'a> PageWriteGuard<'a> {
         HeapPageViewMut::new(self, layout)
     }
 
+    /// Converts to a mutable B-tree leaf page view.
     pub fn into_btree_leaf_page_view_mut(
         self,
         layout: &'a Layout,
@@ -1854,6 +1920,7 @@ impl<'a> PageWriteGuard<'a> {
         BTreeLeafPageViewMut::new(self, layout)
     }
 
+    /// Converts to a mutable B-tree internal page view.
     pub fn into_btree_internal_page_view_mut(
         self,
         layout: &'a Layout,
@@ -2759,6 +2826,7 @@ pub struct BTreeLeafEntry {
 }
 
 impl BTreeLeafEntry {
+    /// Encodes the entry to bytes using the given layout.
     pub fn encode(&self, layout: &Layout) -> Vec<u8> {
         let mut bytes = vec![0u8; layout.slot_size];
 
@@ -2791,6 +2859,7 @@ impl BTreeLeafEntry {
         bytes
     }
 
+    /// Decodes an entry from bytes using the given layout.
     pub fn decode(layout: &Layout, bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
         // Decode key from "dataval" offset
         let key_offset = layout
@@ -2838,6 +2907,7 @@ pub struct BTreeInternalEntry {
 }
 
 impl BTreeInternalEntry {
+    /// Encodes the entry to bytes using the given layout.
     pub fn encode(&self, layout: &Layout) -> Vec<u8> {
         let mut bytes = vec![0u8; layout.slot_size];
 
@@ -2866,6 +2936,7 @@ impl BTreeInternalEntry {
         bytes
     }
 
+    /// Decodes an entry from bytes using the given layout.
     pub fn decode(layout: &Layout, bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
         // Decode key from "dataval" offset
         let key_offset = layout
