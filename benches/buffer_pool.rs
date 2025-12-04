@@ -386,8 +386,12 @@ fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> Bench
     let test_file = "dirtyfile".to_string();
     let buffer_manager = db.buffer_manager();
 
-    // Pre-create blocks on disk (twice the buffer pool size)
-    precreate_blocks(db, &test_file, num_buffers * 2);
+    // Benchmark closure pins a fresh block each time (starting at `num_buffers`).
+    // Account for both warmup runs and measured iterations so we never read
+    // beyond the blocks we laid out on disk.
+    const WARMUP_ITERS: usize = 2;
+    let total_unique_blocks = num_buffers + WARMUP_ITERS + iterations;
+    precreate_blocks(db, &test_file, total_unique_blocks);
 
     // Fill buffer pool with dirty buffers using transactions
     let txn = db.new_tx();
@@ -402,7 +406,7 @@ fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> Bench
 
     // Now benchmark: pinning new blocks forces dirty buffer eviction + flush
     let mut block_idx = num_buffers;
-    let result = benchmark("Dirty Eviction", iterations, 2, || {
+    let result = benchmark("Dirty Eviction", iterations, WARMUP_ITERS, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
         let buffer = buffer_manager.pin(&block_id).unwrap(); // Forces eviction + flush
         buffer_manager.unpin(buffer);
