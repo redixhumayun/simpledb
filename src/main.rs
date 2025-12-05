@@ -8831,6 +8831,7 @@ mod transaction_tests {
         let block_id = t1.append(&file);
         {
             let mut guard = t1.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 1);
             guard.set_string(40, "one");
             guard.mark_modified(t1.id(), Lsn::MAX);
@@ -8847,6 +8848,7 @@ mod transaction_tests {
         }
         {
             let mut guard = t2.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 2);
             guard.set_string(40, "two");
             guard.mark_modified(t2.id(), Lsn::MAX);
@@ -8882,6 +8884,7 @@ mod transaction_tests {
         .unwrap();
         {
             let mut guard = t3.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 3);
             guard.set_string(40, "three");
             guard.mark_modified(t3.id(), Lsn::MAX);
@@ -8935,6 +8938,7 @@ mod transaction_tests {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
                 let mut guard = txn.pin_write_guard(&bid2);
+                guard.format_as_heap();
                 guard.set_int(80, 1);
                 guard.set_string(40, "Hello");
                 guard.mark_modified(txn.id(), Lsn::MAX);
@@ -8977,6 +8981,7 @@ mod transaction_tests {
         ));
         {
             let mut guard = init_txn.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 0);
             guard.set_string(40, "initial");
             guard.mark_modified(init_txn.id(), Lsn::MAX);
@@ -9018,6 +9023,7 @@ mod transaction_tests {
         ));
         {
             let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 42);
             guard.set_string(40, "final");
             guard.mark_modified(txn.id(), Lsn::MAX);
@@ -9061,6 +9067,7 @@ mod transaction_tests {
         ));
         {
             let mut guard = t1.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 100);
             guard.set_string(40, "initial");
             guard.mark_modified(t1.id(), Lsn::MAX);
@@ -9096,6 +9103,7 @@ mod transaction_tests {
         .unwrap();
         {
             let mut guard = t2.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 200);
             guard.set_string(40, "modified");
             guard.mark_modified(t2.id(), Lsn::MAX);
@@ -9147,6 +9155,7 @@ mod transaction_tests {
         ));
         {
             let mut guard = t1.pin_write_guard(&block_id);
+            guard.format_as_heap();
             guard.set_int(80, 0);
             guard.mark_modified(t1.id(), Lsn::MAX);
         }
@@ -9188,6 +9197,7 @@ mod transaction_tests {
 
                         {
                             let mut guard = txn.pin_write_guard(&bid);
+                            guard.format_as_heap();
                             guard.set_int(80, val + 1);
                             guard.mark_modified(txn.id(), Lsn::MAX);
                         }
@@ -9282,6 +9292,7 @@ mod transaction_tests {
             let block_id = t1.append(&file);
             {
                 let mut guard = t1.pin_write_guard(&block_id);
+                guard.format_as_heap();
                 guard.set_int(80, 100);
                 guard.mark_modified(t1.id(), Lsn::MAX);
             }
