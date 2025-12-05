@@ -7,7 +7,7 @@
   "generated_at": "2025-11-18T15:39:00.402403+00:00",
   "policies": {
     "replacement_lru": {
-      "display": "Replacement LRU (`--no-default-features --features replacement_lru`)",
+      "display": "Replacement LRU (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_lru.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_lru.txt",
       "hit_rates": {
@@ -117,5 +117,6 @@
         }
       }
     }
-  }
+  },
+  "page_size": "page-4k"
 }
