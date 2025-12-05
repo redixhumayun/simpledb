@@ -4,10 +4,10 @@
   "environment": "linux (x86_64)",
   "iterations": 100,
   "num_buffers": 12,
-  "generated_at": "2025-11-14T11:40:02.857583+00:00",
+  "generated_at": "2025-12-05T18:50:19.806026+00:00",
   "policies": {
     "replacement_lru": {
-      "display": "Replacement LRU (`--no-default-features --features replacement_lru`)",
+      "display": "Replacement LRU (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_lru.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_lru.txt",
       "hit_rates": {
@@ -22,9 +22,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 80.4,
-          "hits": 40996,
-          "misses": 10004
+          "hit_rate": 81.2,
+          "hits": 41405,
+          "misses": 9595
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -32,19 +32,19 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 25.0,
-          "hits": 12749,
-          "misses": 38251
+          "hit_rate": 18.8,
+          "hits": 9587,
+          "misses": 41413
         },
         "Random (K=100)": {
-          "hit_rate": 11.6,
-          "hits": 5916,
-          "misses": 45084
+          "hit_rate": 10.6,
+          "hits": 5406,
+          "misses": 45594
         }
       }
     },
     "replacement_clock": {
-      "display": "Replacement Clock (`--no-default-features --features replacement_clock`)",
+      "display": "Replacement Clock (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_clock.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_clock.txt",
       "hit_rates": {
@@ -59,9 +59,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 75.6,
-          "hits": 38650,
-          "misses": 12456
+          "hit_rate": 79.1,
+          "hits": 40487,
+          "misses": 10718
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -69,19 +69,19 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 26.0,
-          "hits": 13257,
-          "misses": 37745
+          "hit_rate": 22.4,
+          "hits": 11423,
+          "misses": 39578
         },
         "Random (K=100)": {
-          "hit_rate": 10.6,
-          "hits": 5406,
-          "misses": 45598
+          "hit_rate": 11.8,
+          "hits": 6019,
+          "misses": 44983
         }
       }
     },
     "replacement_sieve": {
-      "display": "Replacement SIEVE (`--no-default-features --features replacement_sieve`)",
+      "display": "Replacement SIEVE (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_sieve.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/linux/replacement_sieve.txt",
       "hit_rates": {
@@ -96,9 +96,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 62.5,
-          "hits": 32945,
-          "misses": 19737
+          "hit_rate": 67.9,
+          "hits": 35594,
+          "misses": 16834
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -108,14 +108,15 @@
         "Random (K=50)": {
           "hit_rate": 23.3,
           "hits": 12646,
-          "misses": 41618
+          "misses": 41720
         },
         "Random (K=100)": {
-          "hit_rate": 11.9,
-          "hits": 6528,
-          "misses": 48245
+          "hit_rate": 12.1,
+          "hits": 6629,
+          "misses": 48111
         }
       }
     }
-  }
+  },
+  "page_size": "page-4k"
 }

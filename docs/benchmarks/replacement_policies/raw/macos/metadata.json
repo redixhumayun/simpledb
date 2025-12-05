@@ -4,7 +4,7 @@
   "environment": "macos (aarch64)",
   "iterations": 100,
   "num_buffers": 12,
-  "generated_at": "2025-12-05T16:07:33.186219+00:00",
+  "generated_at": "2025-12-05T18:43:28.465085+00:00",
   "policies": {
     "replacement_lru": {
       "display": "Replacement LRU (4KB pages)",
@@ -22,9 +22,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 76.8,
-          "hits": 39161,
-          "misses": 11839
+          "hit_rate": 79.6,
+          "hits": 40589,
+          "misses": 10411
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -32,19 +32,19 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 24.2,
-          "hits": 12342,
-          "misses": 38658
+          "hit_rate": 20.2,
+          "hits": 10301,
+          "misses": 40699
         },
         "Random (K=100)": {
-          "hit_rate": 9.2,
-          "hits": 4692,
-          "misses": 46308
+          "hit_rate": 12.0,
+          "hits": 6118,
+          "misses": 44882
         }
       }
     },
     "replacement_clock": {
-      "display": "Replacement Clock (`--no-default-features --features replacement_clock`)",
+      "display": "Replacement Clock (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_clock.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_clock.txt",
       "hit_rates": {
@@ -59,9 +59,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 73.6,
-          "hits": 37528,
-          "misses": 13474
+          "hit_rate": 70.1,
+          "hits": 35795,
+          "misses": 15257
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -69,19 +69,19 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 24.2,
-          "hits": 12342,
-          "misses": 38762
+          "hit_rate": 25.8,
+          "hits": 13153,
+          "misses": 37848
         },
         "Random (K=100)": {
-          "hit_rate": 10.6,
-          "hits": 5406,
-          "misses": 45595
+          "hit_rate": 11.4,
+          "hits": 5814,
+          "misses": 45188
         }
       }
     },
     "replacement_sieve": {
-      "display": "Replacement SIEVE (`--no-default-features --features replacement_sieve`)",
+      "display": "Replacement SIEVE (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_sieve.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_sieve.txt",
       "hit_rates": {
@@ -96,9 +96,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 67.1,
-          "hits": 35173,
-          "misses": 17256
+          "hit_rate": 73.2,
+          "hits": 38252,
+          "misses": 13970
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -106,14 +106,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 21.2,
-          "hits": 11518,
-          "misses": 42849
+          "hit_rate": 20.6,
+          "hits": 11218,
+          "misses": 43148
         },
         "Random (K=100)": {
-          "hit_rate": 12.5,
-          "hits": 6834,
-          "misses": 47940
+          "hit_rate": 11.0,
+          "hits": 6016,
+          "misses": 48758
         }
       }
     }
