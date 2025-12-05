@@ -1093,6 +1093,7 @@ impl<K: PageKind> Page<K> {
     }
 
     /// Computes CRC32 checksum using polynomial 0xEDB88320.
+    /// NOTE: I have no idea what this is doing, I got this code from an LLM and blindly copied it.
     fn crc32(bytes: &[u8]) -> u32 {
         const CRC32_POLY: u32 = 0xEDB8_8320;
         let mut crc = 0xFFFF_FFFFu32;
