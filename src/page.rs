@@ -1828,11 +1828,26 @@ impl<'a> PageReadGuard<'a> {
         Ok(unsafe { &*page })
     }
 
+    /// Attempts to interpret the underlying bytes as a B-tree leaf page.
+    pub fn as_btree_leaf_page(&self) -> Result<&Page<BTreeLeafPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexLeaf {
+            return Err("page is not a B-tree leaf page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
+        Ok(unsafe { &*page })
+    }
+
+    /// Attempts to interpret the underlying bytes as a B-tree internal page.
+    pub fn as_btree_internal_page(&self) -> Result<&Page<BTreeInternalPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexInternal {
+            return Err("page is not a B-tree internal page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
+        Ok(unsafe { &*page })
+    }
+
     /// Converts to a typed heap page view with schema access.
-    pub fn into_heap_view(
-        self,
-        layout: &'a Layout,
-    ) -> Result<HeapPageView<'a, HeapPage>, Box<dyn Error>> {
+    pub fn into_heap_view(self, layout: &'a Layout) -> Result<HeapPageView<'a>, Box<dyn Error>> {
         HeapPageView::new(self, layout)
     }
 
@@ -1850,14 +1865,6 @@ impl<'a> PageReadGuard<'a> {
         layout: &'a Layout,
     ) -> Result<BTreeInternalPageView<'a>, Box<dyn Error>> {
         BTreeInternalPageView::new(self, layout)
-    }
-}
-
-impl Deref for PageReadGuard<'_> {
-    type Target = PageBytes;
-
-    fn deref(&self) -> &Self::Target {
-        &self.page
     }
 }
 
@@ -1949,6 +1956,44 @@ impl<'a> PageWriteGuard<'a> {
             return Err("page is not a heap page".into());
         }
         let page = &mut *self.page as *mut Page<RawPage> as *mut Page<HeapPage>;
+        Ok(unsafe { &mut *page })
+    }
+
+    /// Attempts to interpret the underlying bytes as a B-tree leaf page and returns a typed reference.
+    fn as_btree_leaf_page(&self) -> Result<&Page<BTreeLeafPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexLeaf {
+            return Err("page is not a B-tree leaf page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
+        Ok(unsafe { &*page })
+    }
+
+    /// Attempts to interpret the underlying bytes as a B-tree leaf page and returns a mutable typed reference.
+    fn as_btree_leaf_page_mut(&mut self) -> Result<&mut Page<BTreeLeafPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexLeaf {
+            return Err("page is not a B-tree leaf page".into());
+        }
+        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<BTreeLeafPage>;
+        Ok(unsafe { &mut *page })
+    }
+
+    /// Attempts to interpret the underlying bytes as a B-tree internal page and returns a typed reference.
+    fn as_btree_internal_page(&self) -> Result<&Page<BTreeInternalPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexInternal {
+            return Err("page is not a B-tree internal page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
+        Ok(unsafe { &*page })
+    }
+
+    /// Attempts to interpret the underlying bytes as a B-tree internal page and returns a mutable typed reference.
+    fn as_btree_internal_page_mut(
+        &mut self,
+    ) -> Result<&mut Page<BTreeInternalPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::IndexInternal {
+            return Err("page is not a B-tree internal page".into());
+        }
+        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<BTreeInternalPage>;
         Ok(unsafe { &mut *page })
     }
 
@@ -2700,39 +2745,32 @@ impl<'a> LogicalRowMut<'a> {
 /// Read-only view of a heap page with schema-aware row access.
 ///
 /// Holds a read guard and provides typed access to logical rows.
-pub struct HeapPageView<'a, K: PageKind> {
-    _guard: PageReadGuard<'a>,
-    page_ref: &'a Page<K>,
+pub struct HeapPageView<'a> {
+    guard: PageReadGuard<'a>,
     layout: &'a Layout,
 }
 
-impl<'a> HeapPageView<'a, HeapPage> {
+impl<'a> HeapPageView<'a> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::Heap {
             return Err("cannot initialize PageView<'a, HeapPage> with a non-heap page".into());
         }
-        let page = &*guard.page as *const Page<RawPage> as *const Page<HeapPage>;
-        let page_ref = unsafe { &*page };
-        Ok(Self {
-            _guard: guard,
-            page_ref,
-            layout,
-        })
+        Ok(Self { guard, layout })
     }
 
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        match self.page_ref.tuple(slot)? {
+        match self.guard.as_heap_page().unwrap().tuple(slot)? {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
             TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
         }
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_heap_page().unwrap().slot_count()
     }
 
     pub fn live_slot_iter(&self) -> HeapIterator<'_> {
-        HeapPage::live_iterator(self.page_ref)
+        HeapPage::live_iterator(self.guard.as_heap_page().unwrap())
     }
 }
 
@@ -3031,8 +3069,7 @@ const BTREE_ID_FIELD: &str = "id";
 
 /// Read-only view of a B-tree leaf page.
 pub struct BTreeLeafPageView<'a> {
-    _guard: PageReadGuard<'a>,
-    page_ref: &'a Page<BTreeLeafPage>,
+    guard: PageReadGuard<'a>,
     layout: &'a Layout,
 }
 
@@ -3041,42 +3078,44 @@ impl<'a> BTreeLeafPageView<'a> {
         if guard.page.header.page_type() != PageType::IndexLeaf {
             return Err("cannot initialize BTreeLeafPageView with non-leaf page".into());
         }
-        let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
-        let page_ref = unsafe { &*page };
-        Ok(Self {
-            _guard: guard,
-            page_ref,
-            layout,
-        })
+        Ok(Self { guard, layout })
     }
 
     pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
-        self.page_ref.get_leaf_entry(self.layout, slot)
+        self.guard
+            .as_btree_leaf_page()?
+            .get_leaf_entry(self.layout, slot)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.page_ref.find_slot_before(self.layout, search_key)
+        self.guard
+            .as_btree_leaf_page()
+            .unwrap()
+            .find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_btree_leaf_page().unwrap().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.page_ref.is_slot_live(slot)
+        self.guard.as_btree_leaf_page().unwrap().is_slot_live(slot)
     }
 
     pub fn is_full(&self) -> bool {
-        self.page_ref.is_full(self.layout)
+        self.guard
+            .as_btree_leaf_page()
+            .unwrap()
+            .is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.page_ref.overflow_block()
+        self.guard.as_btree_leaf_page().unwrap().overflow_block()
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
         BTreeLeafIterator {
-            page: self.page_ref,
+            page: self.guard.as_btree_leaf_page().unwrap(),
             layout: self.layout,
             current_slot: 0,
         }
@@ -3089,21 +3128,17 @@ impl<'a> BTreeLeafPageView<'a> {
 /// Automatically marks the page as modified when dropped if changes were made.
 pub struct BTreeLeafPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
-    page_ref: &'a mut Page<BTreeLeafPage>,
     layout: &'a Layout,
     dirty: bool,
 }
 
 impl<'a> BTreeLeafPageViewMut<'a> {
-    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::IndexLeaf {
             return Err("cannot initialize BTreeLeafPageViewMut with non-leaf page".into());
         }
-        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<BTreeLeafPage>;
-        let page_ref = unsafe { &mut *page };
         Ok(Self {
             guard,
-            page_ref,
             layout,
             dirty: false,
         })
@@ -3111,32 +3146,40 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     // Read operations
     pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
-        self.page_ref.get_leaf_entry(self.layout, slot)
+        self.guard
+            .as_btree_leaf_page()?
+            .get_leaf_entry(self.layout, slot)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.page_ref.find_slot_before(self.layout, search_key)
+        self.guard
+            .as_btree_leaf_page()
+            .unwrap()
+            .find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_btree_leaf_page().unwrap().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.page_ref.is_slot_live(slot)
+        self.guard.as_btree_leaf_page().unwrap().is_slot_live(slot)
     }
 
     pub fn is_full(&self) -> bool {
-        self.page_ref.is_full(self.layout)
+        self.guard
+            .as_btree_leaf_page()
+            .unwrap()
+            .is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.page_ref.overflow_block()
+        self.guard.as_btree_leaf_page().unwrap().overflow_block()
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
         BTreeLeafIterator {
-            page: self.page_ref,
+            page: self.guard.as_btree_leaf_page().unwrap(),
             layout: self.layout,
             current_slot: 0,
         }
@@ -3144,19 +3187,27 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, rid: RID) -> Result<SlotId, Box<dyn Error>> {
-        let slot = self.page_ref.insert_leaf_entry(self.layout, &key, &rid)?;
+        let slot =
+            self.guard
+                .as_btree_leaf_page_mut()?
+                .insert_leaf_entry(self.layout, &key, &rid)?;
         self.dirty = true;
         Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_leaf_entry(slot, self.layout)?;
+        self.guard
+            .as_btree_leaf_page_mut()?
+            .delete_leaf_entry(slot, self.layout)?;
         self.dirty = true;
         Ok(())
     }
 
     pub fn set_overflow_block(&mut self, block: Option<usize>) {
-        self.page_ref.set_overflow_block(block);
+        self.guard
+            .as_btree_leaf_page_mut()
+            .unwrap()
+            .set_overflow_block(block);
         self.dirty = true;
     }
 
@@ -3175,8 +3226,7 @@ impl Drop for BTreeLeafPageViewMut<'_> {
 
 /// Read-only view of a B-tree internal page.
 pub struct BTreeInternalPageView<'a> {
-    _guard: PageReadGuard<'a>,
-    page_ref: &'a Page<BTreeInternalPage>,
+    guard: PageReadGuard<'a>,
     layout: &'a Layout,
 }
 
@@ -3185,38 +3235,40 @@ impl<'a> BTreeInternalPageView<'a> {
         if guard.page.header.page_type() != PageType::IndexInternal {
             return Err("cannot initialize BTreeInternalPageView with non-internal page".into());
         }
-        let page = &*guard.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
-        let page_ref = unsafe { &*page };
-        Ok(Self {
-            _guard: guard,
-            page_ref,
-            layout,
-        })
+        Ok(Self { guard, layout })
     }
 
     pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
-        self.page_ref.get_internal_entry(self.layout, slot)
+        self.guard
+            .as_btree_internal_page()?
+            .get_internal_entry(self.layout, slot)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.page_ref.find_slot_before(self.layout, search_key)
+        self.guard
+            .as_btree_internal_page()
+            .unwrap()
+            .find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_btree_internal_page().unwrap().slot_count()
     }
 
     pub fn is_full(&self) -> bool {
-        self.page_ref.is_full(self.layout)
+        self.guard
+            .as_btree_internal_page()
+            .unwrap()
+            .is_full(self.layout)
     }
 
     pub fn btree_level(&self) -> u16 {
-        self.page_ref.btree_level()
+        self.guard.as_btree_internal_page().unwrap().btree_level()
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
         BTreeInternalIterator {
-            page: self.page_ref,
+            page: self.guard.as_btree_internal_page().unwrap(),
             layout: self.layout,
             current_slot: 0,
         }
@@ -3229,21 +3281,17 @@ impl<'a> BTreeInternalPageView<'a> {
 /// Automatically marks the page as modified when dropped if changes were made.
 pub struct BTreeInternalPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
-    page_ref: &'a mut Page<BTreeInternalPage>,
     layout: &'a Layout,
     dirty: bool,
 }
 
 impl<'a> BTreeInternalPageViewMut<'a> {
-    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::IndexInternal {
             return Err("cannot initialize BTreeInternalPageViewMut with non-internal page".into());
         }
-        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<BTreeInternalPage>;
-        let page_ref = unsafe { &mut *page };
         Ok(Self {
             guard,
-            page_ref,
             layout,
             dirty: false,
         })
@@ -3251,28 +3299,36 @@ impl<'a> BTreeInternalPageViewMut<'a> {
 
     // Read operations
     pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
-        self.page_ref.get_internal_entry(self.layout, slot)
+        self.guard
+            .as_btree_internal_page()?
+            .get_internal_entry(self.layout, slot)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.page_ref.find_slot_before(self.layout, search_key)
+        self.guard
+            .as_btree_internal_page()
+            .unwrap()
+            .find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_btree_internal_page().unwrap().slot_count()
     }
 
     pub fn is_full(&self) -> bool {
-        self.page_ref.is_full(self.layout)
+        self.guard
+            .as_btree_internal_page()
+            .unwrap()
+            .is_full(self.layout)
     }
 
     pub fn btree_level(&self) -> u16 {
-        self.page_ref.btree_level()
+        self.guard.as_btree_internal_page().unwrap().btree_level()
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
         BTreeInternalIterator {
-            page: self.page_ref,
+            page: self.guard.as_btree_internal_page().unwrap(),
             layout: self.layout,
             current_slot: 0,
         }
@@ -3285,20 +3341,26 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         child_block: usize,
     ) -> Result<SlotId, Box<dyn Error>> {
         let slot = self
-            .page_ref
+            .guard
+            .as_btree_internal_page_mut()?
             .insert_internal_entry(self.layout, &key, child_block)?;
         self.dirty = true;
         Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.page_ref.delete_internal_entry(slot, self.layout)?;
+        self.guard
+            .as_btree_internal_page_mut()?
+            .delete_internal_entry(slot, self.layout)?;
         self.dirty = true;
         Ok(())
     }
 
     pub fn set_btree_level(&mut self, level: u16) {
-        self.page_ref.set_btree_level(level);
+        self.guard
+            .as_btree_internal_page_mut()
+            .unwrap()
+            .set_btree_level(level);
         self.dirty = true;
     }
 
