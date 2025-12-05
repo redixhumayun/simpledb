@@ -1819,6 +1819,7 @@ impl<'a> PageReadGuard<'a> {
         &self.frame
     }
 
+    /// Attempts to interpret the underlying bytes as a heap page and returns a typed reference.
     pub fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
         if self.page.header.page_type() != PageType::Heap {
             return Err("page is not a heap page".into());
@@ -1933,6 +1934,7 @@ impl<'a> PageWriteGuard<'a> {
         *self.page = page.into();
     }
 
+    /// Attempts to interpret the underlying bytes as a heap page and returns a typed reference.
     fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
         if self.page.header.page_type() != PageType::Heap {
             return Err("page is not a heap page".into());
@@ -1941,6 +1943,7 @@ impl<'a> PageWriteGuard<'a> {
         Ok(unsafe { &*page })
     }
 
+    /// Attempts to interpret the underlying bytes as a mutable heap page reference.
     fn as_heap_page_mut(&mut self) -> Result<&mut Page<HeapPage>, Box<dyn Error>> {
         if self.page.header.page_type() != PageType::Heap {
             return Err("page is not a heap page".into());
@@ -2755,10 +2758,12 @@ impl<'a> HeapPageViewMut<'a> {
         })
     }
 
+    /// Returns the current [`TupleRef`] at `slot`, including redirect/dead markers.
     pub fn tuple_ref(&self, slot: SlotId) -> Result<Option<TupleRef<'_>>, Box<dyn Error>> {
         Ok(self.guard.as_heap_page()?.tuple(slot))
     }
 
+    /// Returns a logical row for the slot if it is live; otherwise `None`.
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
         match self.guard.as_heap_page().unwrap().tuple(slot)? {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
@@ -2766,6 +2771,7 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
+    /// Returns a mutable logical row for a live slot, following redirect chains.
     pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
         //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
         let layout_clone = self.layout.clone();
@@ -2774,6 +2780,7 @@ impl<'a> HeapPageViewMut<'a> {
         Some(LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty))
     }
 
+    /// Inserts a raw tuple payload into the page and returns the allocated slot.
     pub fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
         match self.guard.as_heap_page_mut()?.insert_tuple(bytes) {
             Ok(slot) => {
@@ -2784,6 +2791,7 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
+    /// Deletes the tuple at `slot`, marking it free for reuse.
     pub fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
         match self.guard.as_heap_page_mut()?.delete_slot(slot) {
             Ok(()) => {
@@ -2794,6 +2802,7 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
+    /// Marks `slot` as a redirect to `target`, used for tuple forwarding.
     pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
         match self.guard.as_heap_page_mut()?.redirect_slot(slot, target) {
             Ok(()) => {
@@ -2804,10 +2813,12 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
+    /// Serializes the page into the provided buffer.
     pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
         self.guard.as_heap_page()?.write_bytes(out)
     }
 
+    /// Allocates a new heap tuple and returns both the slot and a mutable logical row handle.
     pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
         let payload_len = self.layout.slot_size;
         let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
@@ -2831,6 +2842,7 @@ impl<'a> HeapPageViewMut<'a> {
         Ok((slot, LogicalRowMut::new(tuple_mut, layout_clone, dirty)))
     }
 
+    /// Returns the number of slot entries currently present.
     pub fn slot_count(&self) -> usize {
         self.guard.as_heap_page().unwrap().slot_count()
     }
