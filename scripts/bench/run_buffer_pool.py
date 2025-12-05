@@ -49,18 +49,15 @@ RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
 
 
 POLICIES = {
-    "replacement_lru": {
-        "display": "Replacement LRU (`--no-default-features --features replacement_lru`)",
-        "cargo_args": ["--no-default-features", "--features", "replacement_lru"],
-    },
-    "replacement_clock": {
-        "display": "Replacement Clock (`--no-default-features --features replacement_clock`)",
-        "cargo_args": ["--no-default-features", "--features", "replacement_clock"],
-    },
-    "replacement_sieve": {
-        "display": "Replacement SIEVE (`--no-default-features --features replacement_sieve`)",
-        "cargo_args": ["--no-default-features", "--features", "replacement_sieve"],
-    },
+    "replacement_lru": "Replacement LRU",
+    "replacement_clock": "Replacement Clock",
+    "replacement_sieve": "Replacement SIEVE",
+}
+
+PAGE_SIZES = {
+    "page-4k": "4KB pages",
+    "page-8k": "8KB pages",
+    "page-1m": "1MB pages",
 }
 
 HIT_RATE_RE = re.compile(
@@ -88,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         choices=POLICIES.keys(),
         default=list(POLICIES.keys()),
         help="Subset of policies to run (default: all)",
+    )
+    parser.add_argument(
+        "--page-size",
+        choices=PAGE_SIZES.keys(),
+        default="page-4k",
+        help="Page size feature to use (default: page-4k)",
     )
     parser.add_argument(
         "--skip-text",
@@ -181,16 +184,24 @@ def main() -> None:
             "environment": args.environment,
             "iterations": args.iterations,
             "num_buffers": args.num_buffers,
+            "page_size": args.page_size,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
     metadata.setdefault("policies", {})
 
     for policy_key in args.policies:
-        config = POLICIES[policy_key]
+        policy_display = POLICIES[policy_key]
+        page_size_display = PAGE_SIZES[args.page_size]
         print(f"Running policy: {policy_key}")
 
-        base_cmd = ["cargo", "bench", "--bench", "buffer_pool"] + config["cargo_args"]
+        # Build cargo args with both policy and page size features
+        cargo_args = [
+            "--no-default-features",
+            "--features", policy_key,
+            "--features", args.page_size,
+        ]
+        base_cmd = ["cargo", "bench", "--bench", "buffer_pool"] + cargo_args
 
         # JSON run
         json_cmd = base_cmd + ["--", str(args.iterations), str(args.num_buffers), "--json"]
@@ -213,8 +224,9 @@ def main() -> None:
         else:
             log_rel = None
 
+        full_display = f"{policy_display} ({page_size_display})"
         metadata["policies"][policy_key] = {
-            "display": config["display"],
+            "display": full_display,
             "json_path": json_path.relative_to(REPO_ROOT).as_posix(),
             "log_path": log_rel,
             "hit_rates": hit_rates,

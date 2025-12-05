@@ -4,10 +4,10 @@
   "environment": "macos (aarch64)",
   "iterations": 100,
   "num_buffers": 12,
-  "generated_at": "2025-11-14T09:55:41.608762+00:00",
+  "generated_at": "2025-12-05T16:07:33.186219+00:00",
   "policies": {
     "replacement_lru": {
-      "display": "Replacement LRU (`--no-default-features --features replacement_lru`)",
+      "display": "Replacement LRU (4KB pages)",
       "json_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_lru.json",
       "log_path": "docs/benchmarks/replacement_policies/raw/macos/replacement_lru.txt",
       "hit_rates": {
@@ -22,9 +22,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 79.6,
-          "hits": 40589,
-          "misses": 10411
+          "hit_rate": 76.8,
+          "hits": 39161,
+          "misses": 11839
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -32,14 +32,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 21.4,
-          "hits": 10914,
-          "misses": 40086
+          "hit_rate": 24.2,
+          "hits": 12342,
+          "misses": 38658
         },
         "Random (K=100)": {
-          "hit_rate": 13.2,
-          "hits": 6731,
-          "misses": 44269
+          "hit_rate": 9.2,
+          "hits": 4692,
+          "misses": 46308
         }
       }
     },
@@ -117,5 +117,6 @@
         }
       }
     }
-  }
+  },
+  "page_size": "page-4k"
 }
