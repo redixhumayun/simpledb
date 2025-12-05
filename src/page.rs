@@ -28,7 +28,7 @@ use std::{
     error::Error,
     marker::PhantomData,
     mem::size_of,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     rc::Rc,
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -1804,9 +1804,27 @@ impl<'a> PageReadGuard<'a> {
         self.handle.block_id()
     }
 
+    /// Legacy helper: read a big-endian i32 at the given offset.
+    pub fn get_int(&self, offset: usize) -> i32 {
+        self.page.get_int(offset)
+    }
+
+    /// Legacy helper: read a UTF-8 string at the given offset.
+    pub fn get_string(&self, offset: usize) -> String {
+        self.page.get_string(offset)
+    }
+
     /// Returns the buffer frame.
     pub fn frame(&self) -> &BufferFrame {
         &self.frame
+    }
+
+    pub fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::Heap {
+            return Err("page is not a heap page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<HeapPage>;
+        Ok(unsafe { &*page })
     }
 
     /// Converts to a typed heap page view with schema access.
@@ -1871,6 +1889,16 @@ impl<'a> PageWriteGuard<'a> {
         self.handle.block_id()
     }
 
+    /// Legacy helper: write a big-endian i32 at the given offset.
+    pub fn set_int(&mut self, offset: usize, value: i32) {
+        self.page.set_int(offset, value);
+    }
+
+    /// Legacy helper: write a UTF-8 string at the given offset.
+    pub fn set_string(&mut self, offset: usize, value: &str) {
+        self.page.set_string(offset, value);
+    }
+
     /// Returns the transaction ID.
     pub fn txn_id(&self) -> usize {
         self.handle.txn_id()
@@ -1888,28 +1916,44 @@ impl<'a> PageWriteGuard<'a> {
 
     /// Formats the page as an empty heap page.
     pub fn format_as_heap(&mut self) {
-        **self = Page::<HeapPage>::new().into()
+        *self.page = Page::<HeapPage>::new().into();
     }
 
     /// Formats the page as an empty B-tree leaf page.
     pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
         let mut page = Page::<BTreeLeafPage>::new();
         page.init(overflow_block);
-        **self = page.into();
+        *self.page = page.into();
     }
 
     /// Formats the page as an empty B-tree internal page.
     pub fn format_as_btree_internal(&mut self, level: u16) {
         let mut page = Page::<BTreeInternalPage>::new();
         page.init(level);
-        **self = page.into();
+        *self.page = page.into();
+    }
+
+    fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::Heap {
+            return Err("page is not a heap page".into());
+        }
+        let page = &*self.page as *const Page<RawPage> as *const Page<HeapPage>;
+        Ok(unsafe { &*page })
+    }
+
+    fn as_heap_page_mut(&mut self) -> Result<&mut Page<HeapPage>, Box<dyn Error>> {
+        if self.page.header.page_type() != PageType::Heap {
+            return Err("page is not a heap page".into());
+        }
+        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<HeapPage>;
+        Ok(unsafe { &mut *page })
     }
 
     /// Converts to a mutable typed heap page view with schema access.
     pub fn into_heap_view_mut(
         self,
         layout: &'a Layout,
-    ) -> Result<HeapPageViewMut<'a, HeapPage>, Box<dyn Error>> {
+    ) -> Result<HeapPageViewMut<'a>, Box<dyn Error>> {
         HeapPageViewMut::new(self, layout)
     }
 
@@ -1935,12 +1979,6 @@ impl Deref for PageWriteGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.page
-    }
-}
-
-impl DerefMut for PageWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.page
     }
 }
 
@@ -2699,30 +2737,30 @@ impl<'a> HeapPageView<'a, HeapPage> {
 ///
 /// Holds a write guard, tracks modifications via dirty flag, and automatically
 /// marks the page as modified when dropped if any changes were made.
-pub struct HeapPageViewMut<'a, K: PageKind> {
+pub struct HeapPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
-    page_ref: &'a mut Page<K>,
     layout: &'a Layout,
     dirty: Rc<Cell<bool>>,
 }
 
-impl<'a> HeapPageViewMut<'a, HeapPage> {
-    fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+impl<'a> HeapPageViewMut<'a> {
+    fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         if guard.page.header.page_type() != PageType::Heap {
             return Err("cannot initialize PageViewMut<'a, HeapPage> with a non-heap page".into());
         }
-        let page = &mut *guard.page as *mut Page<RawPage> as *mut Page<HeapPage>;
-        let page_ref = unsafe { &mut *page };
         Ok(Self {
             guard,
-            page_ref,
             layout,
             dirty: Rc::new(Cell::new(false)),
         })
     }
 
+    pub fn tuple_ref(&self, slot: SlotId) -> Result<Option<TupleRef<'_>>, Box<dyn Error>> {
+        Ok(self.guard.as_heap_page()?.tuple(slot))
+    }
+
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        match self.page_ref.tuple(slot)? {
+        match self.guard.as_heap_page().unwrap().tuple(slot)? {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
             TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
         }
@@ -2737,7 +2775,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 
     pub fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
-        match self.page_ref.insert_tuple(bytes) {
+        match self.guard.as_heap_page_mut()?.insert_tuple(bytes) {
             Ok(slot) => {
                 self.dirty.set(true);
                 Ok(slot)
@@ -2747,7 +2785,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 
     pub fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        match self.page_ref.delete_slot(slot) {
+        match self.guard.as_heap_page_mut()?.delete_slot(slot) {
             Ok(()) => {
                 self.dirty.set(true);
                 Ok(())
@@ -2757,7 +2795,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 
     pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
-        match self.page_ref.redirect_slot(slot, target) {
+        match self.guard.as_heap_page_mut()?.redirect_slot(slot, target) {
             Ok(()) => {
                 self.dirty.set(true);
                 Ok(())
@@ -2767,8 +2805,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 
     pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
-        let page_ref = &*self.page_ref;
-        page_ref.write_bytes(out)
+        self.guard.as_heap_page()?.write_bytes(out)
     }
 
     pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
@@ -2782,28 +2819,33 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
         header.set_flags(0);
         header.set_nullmap_ptr(0);
         buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
-        let slot = self.page_ref.insert_tuple(&buf)?;
+        let slot = self.guard.as_heap_page_mut()?.insert_tuple(&buf)?;
         self.dirty.set(true);
+        let dirty = self.dirty.clone();
+        let layout_clone = self.layout.clone();
         let tuple_mut = self
-            .page_ref
+            .guard
+            .as_heap_page_mut()?
             .heap_tuple_mut(slot)
             .expect("tuple must exist after allocation");
-        let dirty = self.dirty.clone();
-        Ok((
-            slot,
-            LogicalRowMut::new(tuple_mut, self.layout.clone(), dirty),
-        ))
+        Ok((slot, LogicalRowMut::new(tuple_mut, layout_clone, dirty)))
     }
 
     pub fn slot_count(&self) -> usize {
-        self.page_ref.slot_count()
+        self.guard.as_heap_page().unwrap().slot_count()
     }
 
     fn resolve_live_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
         let mut current = slot;
         loop {
-            match self.page_ref.tuple(current)? {
-                TupleRef::Live(_) => return self.page_ref.heap_tuple_mut(current),
+            match self.guard.as_heap_page().unwrap().tuple(current)? {
+                TupleRef::Live(_) => {
+                    return self
+                        .guard
+                        .as_heap_page_mut()
+                        .unwrap()
+                        .heap_tuple_mut(current)
+                }
                 TupleRef::Redirect(next) => current = next,
                 TupleRef::Free | TupleRef::Dead => return None,
             }
@@ -2811,7 +2853,7 @@ impl<'a> HeapPageViewMut<'a, HeapPage> {
     }
 }
 
-impl<K: PageKind> Drop for HeapPageViewMut<'_, K> {
+impl Drop for HeapPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
             self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
@@ -3275,7 +3317,7 @@ mod heap_page_view_tests {
     }
 
     fn format_heap_page(guard: &mut PageWriteGuard<'_>) {
-        **guard = Page::<HeapPage>::new().into();
+        guard.format_as_heap();
     }
 
     #[test]
@@ -3434,7 +3476,10 @@ mod heap_page_view_tests {
 
         // slot_b should now report redirect state (rows returns None)
         assert!(view.row(slot_b).is_none());
-        let redirected = view.page_ref.tuple(slot_b).expect("slot_b exists");
+        let redirected = view
+            .tuple_ref(slot_b)
+            .expect("error while converting to Page<HeapPage>")
+            .expect("slot_b exists");
         match redirected {
             TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
             _ => panic!("slot_b should be redirect after redirect_slot"),
