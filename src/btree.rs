@@ -2,10 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use crate::{
     debug,
-    page::{
-        BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeLeafPageView,
-        BTreeLeafPageViewMut,
-    },
+    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
     BlockId, Constant, FieldType, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
 };
 
@@ -651,13 +648,13 @@ impl BTreeLeaf {
     ) -> Result<BlockId, Box<dyn Error>> {
         let txn_id = self.txn.id();
         let orig_guard = self.txn.pin_write_guard(&self.current_block_id);
-        let mut orig_view = BTreeLeafPageViewMut::new(orig_guard, &self.layout)?;
+        let mut orig_view = orig_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let new_block_id = self.txn.append(&self.file_name);
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         new_guard.format_as_btree_leaf(overflow_block);
         new_guard.mark_modified(txn_id, Lsn::MAX);
-        let mut new_view = BTreeLeafPageViewMut::new(new_guard, &self.layout)?;
+        let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         while split_slot < orig_view.slot_count() {
             let entry = orig_view.get_entry(split_slot)?.clone();
@@ -680,7 +677,7 @@ impl BTreeLeaf {
         // Calculate initial slot using a temporary guard
         let current_slot = {
             let guard = txn.pin_read_guard(&block_id);
-            let view = BTreeLeafPageView::new(guard, &layout)?;
+            let view = guard.into_btree_leaf_page_view(&layout)?;
             view.find_slot_before(&search_key)
         };
 
@@ -707,7 +704,7 @@ impl BTreeLeaf {
 
         let (at_end, key_matches) = {
             let guard = self.txn.pin_read_guard(&self.current_block_id);
-            let view = BTreeLeafPageView::new(guard, &self.layout)?;
+            let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
             // Skip over any dead slots to find next live entry
             while self.current_slot.unwrap() < view.slot_count() {
@@ -741,7 +738,7 @@ impl BTreeLeaf {
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
         while (self.next()?).is_some() {
             let guard = self.txn.pin_write_guard(&self.current_block_id);
-            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             let slot = self.current_slot.unwrap();
 
             if view.get_entry(slot)?.rid == rid {
@@ -763,7 +760,7 @@ impl BTreeLeaf {
         // Check for overflow + smaller key case
         {
             let guard = self.txn.pin_read_guard(&self.current_block_id);
-            let view = BTreeLeafPageView::new(guard, &self.layout)?;
+            let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
             if let Some(overflow_block) = view.overflow_block() {
                 let first_key = view.get_entry(0)?.key;
@@ -776,7 +773,7 @@ impl BTreeLeaf {
 
                     // Clear overflow on current page and insert new entry
                     let guard = self.txn.pin_write_guard(&self.current_block_id);
-                    let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+                    let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
                     view.set_overflow_block(None);
                     view.insert_entry(self.search_key.clone(), rid)?;
 
@@ -800,7 +797,7 @@ impl BTreeLeaf {
 
         {
             let guard = self.txn.pin_write_guard(&self.current_block_id);
-            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             view.insert_entry(self.search_key.clone(), rid)?;
 
             if !view.is_full() {
@@ -825,7 +822,7 @@ impl BTreeLeaf {
         debug!("Splitting BTreeLeaf");
 
         let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
         let first_key = view.get_entry(0)?.key;
         let last_key = view.get_entry(view.slot_count() - 1)?.key;
@@ -838,7 +835,7 @@ impl BTreeLeaf {
 
             // Set overflow on current page
             let guard = self.txn.pin_write_guard(&self.current_block_id);
-            let mut view = BTreeLeafPageViewMut::new(guard, &self.layout)?;
+            let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             view.set_overflow_block(Some(new_block_id.block_num));
 
             debug!("Done splitting BTreeLeaf");
@@ -879,7 +876,7 @@ impl BTreeLeaf {
     /// If no overflow page can be found, just return. Otherwise swap out the current contents for the overflow contents
     fn try_overflow(&mut self) -> Result<Option<()>, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
         // Find first live slot
         let mut first_live_slot = 0;
@@ -917,7 +914,7 @@ impl BTreeLeaf {
             .expect("Current slot not set in BTreeLeaf::get_data_rid");
 
         let guard = self.txn.pin_read_guard(&self.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &self.layout)?;
+        let view = guard.into_btree_leaf_page_view(&self.layout)?;
         let entry = view.get_entry(slot)?;
         Ok(entry.rid)
     }
@@ -964,7 +961,7 @@ mod btree_leaf_tests {
 
         // Verify the record was inserted
         let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
-        let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+        let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
         assert_eq!(view.slot_count(), 1);
         assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
     }
@@ -1003,7 +1000,7 @@ mod btree_leaf_tests {
             leaf.insert(RID::new(1, counter)).unwrap();
             {
                 let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
-                let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+                let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
                 if view.overflow_block().is_some() {
                     break;
                 }
@@ -1014,13 +1011,13 @@ mod btree_leaf_tests {
         //  verify both the leaf and the overflow page have the same first key
         {
             let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
-            let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+            let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
             assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
         }
         assert!(leaf.try_overflow().unwrap().is_some());
         {
             let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
-            let view = BTreeLeafPageView::new(guard, &leaf.layout).unwrap();
+            let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
             assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
         }
     }
