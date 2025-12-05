@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     // Initialize database
-    let db = SimpleDB::new("./simpledb-data", 1024, 8, false, 100);
+    let db = SimpleDB::new("./simpledb-data", 8, false, 100);
 
     // Main REPL loop
     loop {
@@ -118,7 +118,7 @@ fn show_database_info(db: &SimpleDB) {
 }
 
 fn show_tables(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
 
     let tables = match db.metadata_manager().get_table_names(&txn) {
         Ok(t) => t,
@@ -148,7 +148,7 @@ fn show_buffers(db: &SimpleDB) {
 }
 
 fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
 
     match txn.recover() {
         Ok(_) => {
@@ -163,7 +163,7 @@ fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
 }
 
 fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
     let layout = db
         .metadata_manager()
         .get_layout(table_name, Arc::clone(&txn));
@@ -234,7 +234,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
 }
 
 fn execute_sql(db: &SimpleDB, sql: &str) -> Result<String, Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
 
     // Determine if this is a query or update command
     let sql_lower = sql.to_lowercase();

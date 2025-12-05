@@ -10,25 +10,25 @@ use simpledb::{
         BenchResult, ThroughputRow,
     },
     test_utils::generate_random_number,
-    BlockId, Page, SimpleDB, TestDir,
+    BlockId, Lsn, Page, SimpleDB, TestDir,
 };
 
-fn setup_buffer_pool(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    SimpleDB::new_for_test(block_size, num_buffers, 5000)
+fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
+    SimpleDB::new_for_test(num_buffers, 5000)
 }
 
-fn setup_buffer_pool_with_stats(block_size: usize, num_buffers: usize) -> (SimpleDB, TestDir) {
-    let (db, test_dir) = SimpleDB::new_for_test(block_size, num_buffers, 5000);
+fn setup_buffer_pool_with_stats(num_buffers: usize) -> (SimpleDB, TestDir) {
+    let (db, test_dir) = SimpleDB::new_for_test(num_buffers, 5000);
     db.buffer_manager().enable_stats();
     (db, test_dir)
 }
 
-fn precreate_blocks(db: &SimpleDB, file: &str, block_size: usize, count: usize) {
+fn precreate_blocks(db: &SimpleDB, file: &str, count: usize) {
     let mut file_manager = db.file_manager.lock().unwrap();
     let file = file.to_string();
 
     for block_num in 0..count {
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         page.set_int(0, block_num as i32);
         file_manager.write(&BlockId::new(file.clone(), block_num), &mut page);
     }
@@ -93,56 +93,34 @@ struct AccessCase {
 }
 
 impl AccessCase {
-    fn run(&self, block_size: usize, num_buffers: usize, iterations: usize) -> BenchResult {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    fn run(&self, num_buffers: usize, iterations: usize) -> BenchResult {
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
         match self.pattern {
-            AccessPattern::Sequential => sequential_scan(&db, block_size, num_buffers, iterations),
+            AccessPattern::Sequential => sequential_scan(&db, num_buffers, iterations),
             AccessPattern::SequentialMt { threads } => sequential_scan_multithreaded(
                 &db,
-                block_size,
                 num_buffers,
                 iterations,
                 threads,
                 num_buffers * 10,
             ),
-            AccessPattern::Repeated { .. } => {
-                repeated_access(&db, block_size, num_buffers, iterations)
+            AccessPattern::Repeated { .. } => repeated_access(&db, num_buffers, iterations),
+            AccessPattern::RepeatedMt { threads, total_ops } => {
+                repeated_access_multithreaded(&db, num_buffers, iterations, threads, total_ops)
             }
-            AccessPattern::RepeatedMt { threads, total_ops } => repeated_access_multithreaded(
-                &db,
-                block_size,
-                num_buffers,
-                iterations,
-                threads,
-                total_ops,
-            ),
             AccessPattern::Random {
                 working_set,
                 total_ops: _,
-            } => random_access(&db, block_size, working_set, iterations),
+            } => random_access(&db, working_set, iterations),
             AccessPattern::RandomMt {
                 threads,
                 working_set,
                 total_ops,
-            } => random_access_multithreaded(
-                &db,
-                block_size,
-                working_set,
-                iterations,
-                threads,
-                total_ops,
-            ),
-            AccessPattern::Zipfian { .. } => {
-                zipfian_access(&db, block_size, num_buffers, iterations)
+            } => random_access_multithreaded(&db, working_set, iterations, threads, total_ops),
+            AccessPattern::Zipfian { .. } => zipfian_access(&db, num_buffers, iterations),
+            AccessPattern::ZipfianMt { threads, total_ops } => {
+                zipfian_access_multithreaded(&db, num_buffers, iterations, threads, total_ops)
             }
-            AccessPattern::ZipfianMt { threads, total_ops } => zipfian_access_multithreaded(
-                &db,
-                block_size,
-                num_buffers,
-                iterations,
-                threads,
-                total_ops,
-            ),
         }
     }
 
@@ -375,11 +353,11 @@ const ACCESS_CASES: &[AccessCase] = &[
     },
 ];
 
-fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult {
+fn pin_unpin_overhead(db: &SimpleDB, iterations: usize) -> BenchResult {
     let test_file = "testfile".to_string();
     let buffer_manager = db.buffer_manager();
 
-    precreate_blocks(db, &test_file, block_size, 2);
+    precreate_blocks(db, &test_file, 2);
 
     benchmark("Pin/Unpin (hit)", iterations, 5, || {
         let block_id = BlockId::new(test_file.clone(), 1);
@@ -388,12 +366,12 @@ fn pin_unpin_overhead(db: &SimpleDB, block_size: usize, iterations: usize) -> Be
     })
 }
 
-fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult {
+fn cold_pin(db: &SimpleDB, iterations: usize) -> BenchResult {
     let test_file = "coldfile".to_string();
     let buffer_manager = db.buffer_manager();
 
     // Pre-create blocks on disk
-    precreate_blocks(db, &test_file, block_size, iterations);
+    precreate_blocks(db, &test_file, iterations);
 
     let mut block_idx = 0;
     benchmark("Cold Pin (miss)", iterations, 0, || {
@@ -404,31 +382,31 @@ fn cold_pin(db: &SimpleDB, block_size: usize, iterations: usize) -> BenchResult 
     })
 }
 
-fn dirty_eviction(
-    db: &SimpleDB,
-    block_size: usize,
-    iterations: usize,
-    num_buffers: usize,
-) -> BenchResult {
+fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> BenchResult {
     let test_file = "dirtyfile".to_string();
     let buffer_manager = db.buffer_manager();
 
-    // Pre-create blocks on disk (twice the buffer pool size)
-    precreate_blocks(db, &test_file, block_size, num_buffers * 2);
+    // Benchmark closure pins a fresh block each time (starting at `num_buffers`).
+    // Account for both warmup runs and measured iterations so we never read
+    // beyond the blocks we laid out on disk.
+    const WARMUP_ITERS: usize = 2;
+    let total_unique_blocks = num_buffers + WARMUP_ITERS + iterations;
+    precreate_blocks(db, &test_file, total_unique_blocks);
 
     // Fill buffer pool with dirty buffers using transactions
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
     for i in 0..num_buffers {
         let block_id = BlockId::new(test_file.clone(), i);
         // Pin the block first, then modify it
-        let _handle = txn.pin(&block_id);
-        txn.set_int(&block_id, 0, 999, false).unwrap();
+        let mut guard = txn.pin_write_guard(&block_id);
+        guard.set_int(0, 999);
+        guard.mark_modified(txn.id(), Lsn::MAX);
     }
     // Don't commit - keeps buffers dirty and pinned by this transaction
 
     // Now benchmark: pinning new blocks forces dirty buffer eviction + flush
     let mut block_idx = num_buffers;
-    let result = benchmark("Dirty Eviction", iterations, 2, || {
+    let result = benchmark("Dirty Eviction", iterations, WARMUP_ITERS, || {
         let block_id = BlockId::new(test_file.clone(), block_idx);
         let buffer = buffer_manager.pin(&block_id).unwrap(); // Forces eviction + flush
         buffer_manager.unpin(buffer);
@@ -442,18 +420,13 @@ fn dirty_eviction(
 }
 
 // Phase 2: Access Pattern Benchmarks
-fn sequential_scan(
-    db: &SimpleDB,
-    block_size: usize,
-    num_buffers: usize,
-    iterations: usize,
-) -> BenchResult {
+fn sequential_scan(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
     let test_file = "seqfile".to_string();
     let buffer_manager = db.buffer_manager();
     let total_blocks = num_buffers * 10; // Working set > pool
 
     // Pre-create blocks
-    precreate_blocks(db, &test_file, block_size, total_blocks);
+    precreate_blocks(db, &test_file, total_blocks);
 
     // Benchmark: complete scan as one workload
     benchmark(
@@ -470,19 +443,14 @@ fn sequential_scan(
     )
 }
 
-fn repeated_access(
-    db: &SimpleDB,
-    block_size: usize,
-    num_buffers: usize,
-    iterations: usize,
-) -> BenchResult {
+fn repeated_access(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
     let test_file = "repeatfile".to_string();
     let buffer_manager = db.buffer_manager();
     let working_set = 10.min(num_buffers - 2); // Small working set < pool
     let total_accesses = 1000;
 
     // Pre-create blocks
-    precreate_blocks(db, &test_file, block_size, working_set);
+    precreate_blocks(db, &test_file, working_set);
 
     // Benchmark: repeated access pattern as one workload
     benchmark(
@@ -500,18 +468,13 @@ fn repeated_access(
     )
 }
 
-fn random_access(
-    db: &SimpleDB,
-    block_size: usize,
-    working_set_size: usize,
-    iterations: usize,
-) -> BenchResult {
+fn random_access(db: &SimpleDB, working_set_size: usize, iterations: usize) -> BenchResult {
     let test_file = format!("randomfile_{working_set_size}");
     let buffer_manager = db.buffer_manager();
     let total_accesses = 500;
 
     // Pre-create blocks
-    precreate_blocks(db, &test_file, block_size, working_set_size);
+    precreate_blocks(db, &test_file, working_set_size);
 
     // Pre-generate random sequence (exclude RNG overhead from benchmark)
     let random_indices: Vec<usize> = (0..total_accesses)
@@ -533,12 +496,7 @@ fn random_access(
     )
 }
 
-fn zipfian_access(
-    db: &SimpleDB,
-    block_size: usize,
-    num_buffers: usize,
-    iterations: usize,
-) -> BenchResult {
+fn zipfian_access(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
     let test_file = "zipffile".to_string();
     let buffer_manager = db.buffer_manager();
     let total_blocks = num_buffers * 3;
@@ -546,7 +504,7 @@ fn zipfian_access(
     let total_accesses = 500;
 
     // Pre-create blocks
-    precreate_blocks(db, &test_file, block_size, total_blocks);
+    precreate_blocks(db, &test_file, total_blocks);
 
     // Pre-generate zipfian sequence (exclude RNG overhead from benchmark)
     let zipfian_indices: Vec<usize> = (0..total_accesses)
@@ -579,7 +537,6 @@ fn zipfian_access(
 
 fn sequential_scan_multithreaded(
     db: &SimpleDB,
-    block_size: usize,
     _num_buffers: usize,
     iterations: usize,
     num_threads: usize,
@@ -587,7 +544,7 @@ fn sequential_scan_multithreaded(
 ) -> BenchResult {
     let test_file = format!("seqfile_mt_{num_threads}");
 
-    precreate_blocks(db, &test_file, block_size, total_blocks);
+    precreate_blocks(db, &test_file, total_blocks);
 
     let base = total_blocks / num_threads;
     let remainder = total_blocks % num_threads;
@@ -633,7 +590,6 @@ fn sequential_scan_multithreaded(
 
 fn repeated_access_multithreaded(
     db: &SimpleDB,
-    block_size: usize,
     num_buffers: usize,
     iterations: usize,
     num_threads: usize,
@@ -642,7 +598,7 @@ fn repeated_access_multithreaded(
     let test_file = format!("repeatfile_mt_{num_threads}");
     let working_set = 10.min(num_buffers.saturating_sub(2)).max(1);
 
-    precreate_blocks(db, &test_file, block_size, working_set);
+    precreate_blocks(db, &test_file, working_set);
 
     let per_thread_ops = partition_work(total_accesses, num_threads);
     let per_thread_ops = Arc::new(per_thread_ops);
@@ -683,7 +639,6 @@ fn repeated_access_multithreaded(
 
 fn random_access_multithreaded(
     db: &SimpleDB,
-    block_size: usize,
     working_set_size: usize,
     iterations: usize,
     num_threads: usize,
@@ -691,7 +646,7 @@ fn random_access_multithreaded(
 ) -> BenchResult {
     let test_file = format!("randomfile_mt_{working_set_size}_{num_threads}");
 
-    precreate_blocks(db, &test_file, block_size, working_set_size);
+    precreate_blocks(db, &test_file, working_set_size);
 
     let per_thread_ops = partition_work(total_accesses, num_threads);
 
@@ -740,7 +695,6 @@ fn random_access_multithreaded(
 
 fn zipfian_access_multithreaded(
     db: &SimpleDB,
-    block_size: usize,
     num_buffers: usize,
     iterations: usize,
     num_threads: usize,
@@ -750,7 +704,7 @@ fn zipfian_access_multithreaded(
     let total_blocks = num_buffers * 3;
     let hot_set_size = ((total_blocks as f64 * 0.2) as usize).max(1);
 
-    precreate_blocks(db, &test_file, block_size, total_blocks);
+    precreate_blocks(db, &test_file, total_blocks);
 
     let per_thread_ops = partition_work(total_accesses, num_threads);
 
@@ -809,12 +763,11 @@ fn zipfian_access_multithreaded(
 
 // Phase 3: Pool Size Sensitivity
 fn run_fixed_workload_with_pool_size(
-    block_size: usize,
     num_buffers: usize,
     working_set_size: usize,
     iterations: usize,
 ) -> f64 {
-    let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+    let (db, _test_dir) = setup_buffer_pool(num_buffers);
     let test_file = "scaling_test".to_string();
     let buffer_manager = db.buffer_manager();
     let total_accesses = 500;
@@ -822,7 +775,7 @@ fn run_fixed_workload_with_pool_size(
     // Pre-create blocks
     for i in 0..working_set_size {
         let block_id = BlockId::new(test_file.clone(), i);
-        let mut page = Page::new(block_size);
+        let mut page = Page::new();
         page.set_int(0, i as i32);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
     }
@@ -844,7 +797,7 @@ fn run_fixed_workload_with_pool_size(
     total_accesses as f64 / result.mean.as_secs_f64()
 }
 
-fn pool_size_scaling(block_size: usize, iterations: usize) {
+fn pool_size_scaling(iterations: usize) {
     let pool_sizes = vec![8, 16, 32, 64, 128, 256];
     let working_set_size = 100; // Fixed workload: 100 blocks
 
@@ -855,13 +808,12 @@ fn pool_size_scaling(block_size: usize, iterations: usize) {
     println!("{}", "-".repeat(50));
 
     for pool_size in pool_sizes {
-        let throughput =
-            run_fixed_workload_with_pool_size(block_size, pool_size, working_set_size, iterations);
+        let throughput = run_fixed_workload_with_pool_size(pool_size, working_set_size, iterations);
         println!("{pool_size:19} | {throughput:>10.0}");
     }
 }
 
-fn memory_pressure_test(block_size: usize, iterations: usize) {
+fn memory_pressure_test(iterations: usize) {
     println!();
     println!("Phase 3B: Memory Pressure Test");
     println!("Memory Pressure Test: Working set = pool_size + K");
@@ -873,8 +825,7 @@ fn memory_pressure_test(block_size: usize, iterations: usize) {
 
     for offset in pressure_offsets {
         let working_set = base_pool_size + offset;
-        let throughput =
-            run_fixed_workload_with_pool_size(block_size, base_pool_size, working_set, iterations);
+        let throughput = run_fixed_workload_with_pool_size(base_pool_size, working_set, iterations);
         println!("{base_pool_size:9} | {working_set:11} | {throughput:>10.0}");
     }
 }
@@ -882,19 +833,18 @@ fn memory_pressure_test(block_size: usize, iterations: usize) {
 // Phase 4: Hit Rate Measurement
 fn run_pattern_with_stats(
     name: &str,
-    block_size: usize,
     pool_buffers: usize,
     pattern_arg: usize,
     iterations: usize,
-    pattern_fn: impl Fn(&SimpleDB, usize, usize, usize) -> BenchResult,
+    pattern_fn: impl Fn(&SimpleDB, usize, usize) -> BenchResult,
 ) {
-    let (db, _test_dir) = setup_buffer_pool_with_stats(block_size, pool_buffers);
+    let (db, _test_dir) = setup_buffer_pool_with_stats(pool_buffers);
 
     // Reset stats before run
     db.buffer_manager().reset_stats();
 
     // Run the pattern (ignore timing result, we only care about hit rate here)
-    let _ = pattern_fn(&db, block_size, pattern_arg, iterations);
+    let _ = pattern_fn(&db, pattern_arg, iterations);
 
     // Get stats
     if let Some(stats) = db.buffer_manager().stats() {
@@ -907,7 +857,6 @@ fn run_pattern_with_stats(
 // Phase 5: Concurrent Access
 fn multithreaded_pin(
     db: &SimpleDB,
-    block_size: usize,
     num_threads: usize,
     ops_per_thread: usize,
     iterations: usize,
@@ -915,7 +864,7 @@ fn multithreaded_pin(
     let test_file = "concurrent_test".to_string();
 
     // Pre-create blocks (each thread gets its own range)
-    precreate_blocks(db, &test_file, block_size, num_threads * 10);
+    precreate_blocks(db, &test_file, num_threads * 10);
 
     benchmark(
         &format!(
@@ -954,7 +903,6 @@ fn multithreaded_pin(
 
 fn multithreaded_hotset_contention(
     db: &SimpleDB,
-    block_size: usize,
     num_threads: usize,
     ops_per_thread: usize,
     hot_set_size: usize,
@@ -965,7 +913,7 @@ fn multithreaded_hotset_contention(
     let test_file = "concurrent_hotset".to_string();
 
     // Pre-create a small hot set shared across all threads
-    precreate_blocks(db, &test_file, block_size, hot_set_size);
+    precreate_blocks(db, &test_file, hot_set_size);
 
     benchmark(
         &format!(
@@ -1000,11 +948,11 @@ fn multithreaded_hotset_contention(
     )
 }
 
-fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+fn buffer_starvation(db: &SimpleDB, num_buffers: usize) {
     let test_file = "starvation_test".to_string();
 
     // Pre-create blocks
-    precreate_blocks(db, &test_file, block_size, num_buffers + 10);
+    precreate_blocks(db, &test_file, num_buffers + 10);
 
     // Pin entire buffer pool
     let buffer_manager = db.buffer_manager();
@@ -1059,12 +1007,7 @@ fn buffer_starvation(db: &SimpleDB, block_size: usize, num_buffers: usize) {
     println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
 }
 
-fn run_multithreaded_pin_benchmarks(
-    db: &SimpleDB,
-    block_size: usize,
-    iterations: usize,
-    cases: &[&PinCase],
-) {
+fn run_multithreaded_pin_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&PinCase]) {
     let mut rows = Vec::new();
 
     if cases.is_empty() {
@@ -1072,13 +1015,7 @@ fn run_multithreaded_pin_benchmarks(
     }
 
     for case in cases {
-        let result = multithreaded_pin(
-            db,
-            block_size,
-            case.threads,
-            case.ops_per_thread,
-            iterations,
-        );
+        let result = multithreaded_pin(db, case.threads, case.ops_per_thread, iterations);
         let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
         row.label = case.label();
         rows.push(row);
@@ -1087,12 +1024,7 @@ fn run_multithreaded_pin_benchmarks(
     render_throughput_section("Multi-threaded Pin/Unpin (lock contention)", &rows);
 }
 
-fn run_hotset_contention_benchmarks(
-    db: &SimpleDB,
-    block_size: usize,
-    iterations: usize,
-    cases: &[&HotsetCase],
-) {
+fn run_hotset_contention_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&HotsetCase]) {
     let mut rows = Vec::new();
 
     if cases.is_empty() {
@@ -1102,7 +1034,6 @@ fn run_hotset_contention_benchmarks(
     for case in cases {
         let result = multithreaded_hotset_contention(
             db,
-            block_size,
             case.threads,
             case.ops_per_thread,
             case.hot_set_size,
@@ -1116,10 +1047,10 @@ fn run_hotset_contention_benchmarks(
     render_throughput_section("Hot-set Contention (shared buffers)", &rows);
 }
 
-fn run_buffer_starvation_benchmark(db: &SimpleDB, block_size: usize, num_buffers: usize) {
+fn run_buffer_starvation_benchmark(db: &SimpleDB, num_buffers: usize) {
     println!("Buffer Starvation (cond.wait() latency):");
     println!("{}", "-".repeat(70));
-    buffer_starvation(db, block_size, num_buffers);
+    buffer_starvation(db, num_buffers);
     println!();
 }
 
@@ -1133,38 +1064,31 @@ fn main() {
 
         // Phase 1
         {
-            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-            results.push(pin_unpin_overhead(&db, block_size, iterations));
+            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            results.push(pin_unpin_overhead(&db, iterations));
         }
         {
-            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-            results.push(cold_pin(&db, block_size, iterations));
+            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            results.push(cold_pin(&db, iterations));
         }
         {
-            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-            results.push(dirty_eviction(&db, block_size, iterations, num_buffers));
+            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            results.push(dirty_eviction(&db, iterations, num_buffers));
         }
 
         for case in ACCESS_CASES {
-            results.push(case.run(block_size, num_buffers, iterations));
+            results.push(case.run(num_buffers, iterations));
         }
 
         results.extend(PIN_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-            multithreaded_pin(
-                &db,
-                block_size,
-                case.threads,
-                case.ops_per_thread,
-                iterations,
-            )
+            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            multithreaded_pin(&db, case.threads, case.ops_per_thread, iterations)
         }));
 
         results.extend(HOTSET_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
+            let (db, _test_dir) = setup_buffer_pool(num_buffers);
             multithreaded_hotset_contention(
                 &db,
-                block_size,
                 case.threads,
                 case.ops_per_thread,
                 case.hot_set_size,
@@ -1193,16 +1117,16 @@ fn main() {
     let mut phase1_results = Vec::new();
 
     if should_run("Pin/Unpin (hit)", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        phase1_results.push(pin_unpin_overhead(&db, block_size, iterations));
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        phase1_results.push(pin_unpin_overhead(&db, iterations));
     }
     if should_run("Cold Pin (miss)", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        phase1_results.push(cold_pin(&db, block_size, iterations));
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        phase1_results.push(cold_pin(&db, iterations));
     }
     if should_run("Dirty Eviction", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        phase1_results.push(dirty_eviction(&db, block_size, iterations, num_buffers));
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        phase1_results.push(dirty_eviction(&db, iterations, num_buffers));
     }
 
     render_latency_section("Phase 1: Core Latency Benchmarks", &phase1_results);
@@ -1212,7 +1136,7 @@ fn main() {
 
     for case in ACCESS_CASES {
         if should_run(case.filter_token, filter_ref) {
-            let result = case.run(block_size, num_buffers, iterations);
+            let result = case.run(num_buffers, iterations);
             let total_ops = case.total_ops(num_buffers);
             phase2_rows.push(throughput_row_from_benchmark(
                 result,
@@ -1228,12 +1152,12 @@ fn main() {
 
     // Phase 3
     if should_run("Pool Size", filter_ref) {
-        pool_size_scaling(block_size, iterations);
+        pool_size_scaling(iterations);
         println!();
     }
 
     if should_run("Memory Pressure", filter_ref) {
-        memory_pressure_test(block_size, iterations);
+        memory_pressure_test(iterations);
         println!();
     }
 
@@ -1252,7 +1176,6 @@ fn main() {
         print_phase4_header();
         run_pattern_with_stats(
             "Sequential Scan",
-            block_size,
             num_buffers,
             num_buffers,
             iterations,
@@ -1264,7 +1187,6 @@ fn main() {
         print_phase4_header();
         run_pattern_with_stats(
             "Repeated Access",
-            block_size,
             num_buffers,
             num_buffers,
             iterations,
@@ -1276,7 +1198,6 @@ fn main() {
         print_phase4_header();
         run_pattern_with_stats(
             "Zipfian (80/20)",
-            block_size,
             num_buffers,
             num_buffers,
             iterations,
@@ -1286,33 +1207,18 @@ fn main() {
 
     if should_run("Random (K=10)", filter_ref) {
         print_phase4_header();
-        run_pattern_with_stats(
-            "Random (K=10)",
-            block_size,
-            num_buffers,
-            10,
-            iterations,
-            random_access,
-        );
+        run_pattern_with_stats("Random (K=10)", num_buffers, 10, iterations, random_access);
     }
 
     if should_run("Random (K=50)", filter_ref) {
         print_phase4_header();
-        run_pattern_with_stats(
-            "Random (K=50)",
-            block_size,
-            num_buffers,
-            50,
-            iterations,
-            random_access,
-        );
+        run_pattern_with_stats("Random (K=50)", num_buffers, 50, iterations, random_access);
     }
 
     if should_run("Random (K=100)", filter_ref) {
         print_phase4_header();
         run_pattern_with_stats(
             "Random (K=100)",
-            block_size,
             num_buffers,
             100,
             iterations,
@@ -1340,8 +1246,8 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        run_multithreaded_pin_benchmarks(&db, block_size, iterations, &pin_cases);
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        run_multithreaded_pin_benchmarks(&db, iterations, &pin_cases);
     }
 
     let hotset_cases: Vec<&HotsetCase> = match filter_ref {
@@ -1357,8 +1263,8 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        run_hotset_contention_benchmarks(&db, block_size, iterations, &hotset_cases);
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        run_hotset_contention_benchmarks(&db, iterations, &hotset_cases);
     }
 
     if should_run("Starvation", filter_ref) {
@@ -1366,8 +1272,8 @@ fn main() {
             println!("Phase 5: Concurrent Access");
             println!();
         }
-        let (db, _test_dir) = setup_buffer_pool(block_size, num_buffers);
-        run_buffer_starvation_benchmark(&db, block_size, num_buffers);
+        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        run_buffer_starvation_benchmark(&db, num_buffers);
     }
 
     println!("All benchmarks completed!");

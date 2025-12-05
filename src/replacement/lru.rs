@@ -1,3 +1,19 @@
+//! LRU (Least Recently Used) replacement policy.
+//!
+//! Implements classic LRU using an intrusive doubly-linked list where the head
+//! represents the most recently used frame and the tail is the eviction candidate.
+//!
+//! # Algorithm
+//!
+//! - On hit: Move accessed frame to head
+//! - On allocation: Insert new frame at head
+//! - On eviction: Scan from tail to head, evicting first unpinned frame
+//!
+//! # Complexity
+//!
+//! - Hit: O(1) with optimized promotion
+//! - Eviction: O(n) worst case if all frames pinned
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -5,40 +21,50 @@ use std::{
 
 use crate::{
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId, BufferFrame,
+    BlockId, BufferFrame, FrameMeta,
 };
 
+/// LRU policy state maintaining an intrusive doubly-linked list.
+///
+/// The list is ordered by recency: head = most recent, tail = least recent.
 #[derive(Debug)]
 pub struct PolicyState {
     intrusive_list: Mutex<IntrusiveList>,
 }
 
 impl PolicyState {
-    pub fn new(buffer_pool: &[Arc<Mutex<BufferFrame>>]) -> Self {
+    /// Initializes LRU state by constructing an intrusive list from buffer pool frames.
+    pub fn new(buffer_pool: &[Arc<BufferFrame>]) -> Self {
         let mut guards = buffer_pool
             .iter()
-            .map(|frame| frame.lock().unwrap())
-            .collect::<Vec<MutexGuard<'_, BufferFrame>>>();
+            .map(|frame| frame.lock_meta())
+            .collect::<Vec<MutexGuard<'_, FrameMeta>>>();
         let intrusive_list = IntrusiveList::from_nodes(&mut guards);
         Self {
             intrusive_list: Mutex::new(intrusive_list),
         }
     }
 
+    /// Records a cache hit by promoting the accessed frame to the head of the LRU list.
+    ///
+    /// Optimizes promotion for frames adjacent to the head. Returns None if the frame
+    /// no longer contains the requested block (eviction race).
     pub fn record_hit<'a>(
         &self,
-        buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
-        frame_ptr: &'a Arc<Mutex<BufferFrame>>,
+        buffer_pool: &'a [Arc<BufferFrame>],
+        frame_ptr: &'a Arc<BufferFrame>,
         block_id: &BlockId,
-        resident_table: &Mutex<HashMap<BlockId, Weak<Mutex<BufferFrame>>>>,
-    ) -> Option<MutexGuard<'a, BufferFrame>> {
+        resident_table: &Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
+    ) -> Option<MutexGuard<'a, FrameMeta>> {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
-        let mut frame_guard = frame_ptr.lock().unwrap();
-        if let Some(frame_block_id) = frame_guard.block_id.as_ref() {
-            if frame_block_id != block_id {
-                resident_table.lock().unwrap().remove(block_id);
-                return None;
-            }
+        let mut frame_guard = frame_ptr.lock_meta();
+        if !frame_guard
+            .block_id
+            .as_ref()
+            .is_some_and(|current| current == block_id)
+        {
+            resident_table.lock().unwrap().remove(block_id);
+            return None;
         }
         let current_head = intrusive_list_guard.peek_head();
         if let Some(head) = current_head {
@@ -53,10 +79,8 @@ impl PolicyState {
 
         if adjacent_to_head {
             let mut current_head_guard =
-                current_head.map(|current_head| buffer_pool[current_head].lock().unwrap());
-            let mut next_guard = frame_guard
-                .next()
-                .map(|idx| buffer_pool[idx].lock().unwrap());
+                current_head.map(|current_head| buffer_pool[current_head].lock_meta());
+            let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
             let head_guard = current_head_guard
                 .as_mut()
                 .expect("Head guard must exist when list is non-empty");
@@ -67,11 +91,9 @@ impl PolicyState {
             );
         } else {
             let mut current_head_guard =
-                current_head.map(|current_head| buffer_pool[current_head].lock().unwrap());
-            let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock().unwrap());
-            let mut next_guard = frame_guard
-                .next()
-                .map(|idx| buffer_pool[idx].lock().unwrap());
+                current_head.map(|current_head| buffer_pool[current_head].lock_meta());
+            let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock_meta());
+            let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
             intrusive_list_guard.move_to_head(
                 frame_guard.index,
                 &mut frame_guard,
@@ -83,7 +105,10 @@ impl PolicyState {
         Some(frame_guard)
     }
 
-    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<Mutex<BufferFrame>>], frame_idx: usize) {
+    /// Notifies the policy that a frame has been assigned a new block.
+    ///
+    /// Inserts the frame at the head of the LRU list as the most recently used.
+    pub fn on_frame_assigned(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
         let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
         let current_head = intrusive_list_guard.peek_head();
         match current_head {
@@ -91,8 +116,8 @@ impl PolicyState {
                 if frame_idx == head {
                     return;
                 }
-                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
-                let mut current_head_guard = buffer_pool[head].lock().unwrap();
+                let mut frame_guard = buffer_pool[frame_idx].lock_meta();
+                let mut current_head_guard = buffer_pool[head].lock_meta();
                 intrusive_list_guard.insert_at_head(
                     frame_idx,
                     &mut frame_guard,
@@ -100,16 +125,20 @@ impl PolicyState {
                 );
             }
             None => {
-                let mut frame_guard = buffer_pool[frame_idx].lock().unwrap();
+                let mut frame_guard = buffer_pool[frame_idx].lock_meta();
                 intrusive_list_guard.insert_at_head(frame_idx, &mut frame_guard, None);
             }
         }
     }
 
+    /// Selects a victim frame for eviction.
+    ///
+    /// Scans from tail (LRU) towards head, skipping pinned frames, and returns the
+    /// first unpinned frame. Returns None if all frames are pinned.
     pub fn evict_frame<'a>(
         &self,
-        buffer_pool: &'a [Arc<Mutex<BufferFrame>>],
-    ) -> Option<(usize, MutexGuard<'a, BufferFrame>)> {
+        buffer_pool: &'a [Arc<BufferFrame>],
+    ) -> Option<(usize, MutexGuard<'a, FrameMeta>)> {
         assert!(
             buffer_pool.len() > 1,
             "Buffer pools must have more than one frame for LRU replacement"
@@ -118,8 +147,8 @@ impl PolicyState {
         let tail = intrusive_list_guard.peek_tail()?;
         let mut current = tail;
         loop {
-            let mut current_guard = buffer_pool[current].lock().unwrap();
-            if current_guard.is_pinned() {
+            let mut current_guard = buffer_pool[current].lock_meta();
+            if current_guard.pins > 0 {
                 if let Some(head) = intrusive_list_guard.peek_head() {
                     if current_guard.index == head {
                         return None;
@@ -133,10 +162,10 @@ impl PolicyState {
             }
             let mut prev_node = current_guard
                 .prev()
-                .map(|prev| buffer_pool[prev].lock().unwrap());
+                .map(|prev| buffer_pool[prev].lock_meta());
             let mut next_node = current_guard
                 .next()
-                .map(|next| buffer_pool[next].lock().unwrap());
+                .map(|next| buffer_pool[next].lock_meta());
             intrusive_list_guard.remove_node(
                 current,
                 &mut current_guard,

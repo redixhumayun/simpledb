@@ -36,9 +36,16 @@ There is a test suite which provides basic coverage to ensure the code still wor
 3. **Work autonomously using available tools** until blocked
 
 4. **Test thoroughly before committing**:
+   Testing requires running tests with combinations of compiler flags.
    ```bash
    cargo build
-   cargo test
+   cargo test --no-default-features --features replacement_lru --features page-4k
+   # Verify build works and tests pass
+
+   cargo test --no-default-features --features replacement_clock --features page-4k
+   # Verify build works and tests pass
+
+   cargo test --no-default-features --features replacement_sieve --features page-4k
    # Verify build works and tests pass
    ```
 
@@ -46,7 +53,13 @@ There is a test suite which provides basic coverage to ensure the code still wor
    ```bash
    cargo run --bin simplebench 50
    # verify that the operations complete and see results
-   cargo bench --bench buffer_pool -- 50 12
+   cargo bench --bench buffer_pool --no-default-features --features replacement_lru --features page-4k -- 100 12
+   # verify that the operations complete and see results
+
+   cargo bench --bench buffer_pool --no-default-features --features replacement_clock --features page-4k -- 100 12
+   # verify that the operations complete and see results
+
+   cargo bench --bench buffer_pool --no-default-features --features replacement_sieve --features page-4k -- 100 12
    # verify that the operations complete and see results
    ```
 

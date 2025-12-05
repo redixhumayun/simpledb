@@ -2,7 +2,7 @@
 
 Command template: `cargo bench --bench buffer_pool -- <iterations> <num_buffers>`
 
-## Replacement LRU (`--no-default-features --features replacement_lru`)
+## Replacement LRU (4KB pages)
 
 ```
 SimpleDB Buffer Pool Benchmark Suite
@@ -14,54 +14,54 @@ Environment: macos (aarch64)
 Phase 1: Core Latency Benchmarks
 Operation                                                    |       Mean |     Median |     StdDev |    Iters
 ------------------------------------------------------------------------------------------------------------------------
-Pin/Unpin (hit)                                              |   275.00ns |   291.00ns |    26.00ns |      100
-Cold Pin (miss)                                              |     2.39µs |     2.06µs |   688.00ns |      100
-Dirty Eviction                                               |     3.80ms |     3.07ms |     1.93ms |      100
+Pin/Unpin (hit)                                              |   284.00ns |   291.00ns |    29.00ns |      100
+Cold Pin (miss)                                              |     2.42µs |     2.21µs |   806.00ns |      100
+Dirty Eviction                                               |   421.85µs |     2.25µs |     1.44ms |      100
 
 Phase 2: Access Pattern Benchmarks
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-Sequential Scan (120 blocks)                                 | 200304.13 blocks/sec |        599.09µs
-Seq Scan MT x4 (120 blocks)                                  | 194520.68 blocks/sec |        616.90µs
-Seq Scan MT x16 (120 blocks)                                 | 115331.16 blocks/sec |          1.04ms
-Repeated Access (1000 ops)                                   | 3566143.04 blocks/sec |        280.42µs
-Repeated Access MT x4 (1000 ops)                             | 942492.86 blocks/sec |          1.06ms
-Repeated Access MT x16 (1000 ops)                            | 306684.21 blocks/sec |          3.26ms
-Random (K=10, 500 ops)                                       | 3526963.64 blocks/sec |        141.77µs
-Random (K=50, 500 ops)                                       | 601301.22 blocks/sec |        831.53µs
-Random (K=100, 500 ops)                                      | 535583.07 blocks/sec |        933.56µs
-Random MT x4 (K=10, 500 ops)                                 | 916197.27 blocks/sec |        545.73µs
-Random MT x16 (K=10, 500 ops)                                | 287041.90 blocks/sec |          1.74ms
-Random MT x4 (K=50, 500 ops)                                 | 213250.90 blocks/sec |          2.34ms
-Random MT x16 (K=50, 500 ops)                                | 126550.14 blocks/sec |          3.95ms
-Random MT x4 (K=100, 500 ops)                                | 265569.55 blocks/sec |          1.88ms
-Random MT x16 (K=100, 500 ops)                               | 116163.18 blocks/sec |          4.30ms
-Zipfian (80/20, 500 ops)                                     | 1513303.45 blocks/sec |        330.40µs
-Zipfian MT x4 (80/20, 500 ops)                               | 539475.00 blocks/sec |        926.83µs
-Zipfian MT x16 (80/20, 500 ops)                              | 237819.82 blocks/sec |          2.10ms
+Sequential Scan (120 blocks)                                 | 233080.76 blocks/sec |        514.84µs
+Seq Scan MT x4 (120 blocks)                                  |  66942.96 blocks/sec |          1.79ms
+Seq Scan MT x16 (120 blocks)                                 |  69760.75 blocks/sec |          1.72ms
+Repeated Access (1000 ops)                                   | 2131818.89 blocks/sec |        469.08µs
+Repeated Access MT x4 (1000 ops)                             | 298007.52 blocks/sec |          3.36ms
+Repeated Access MT x16 (1000 ops)                            | 116811.66 blocks/sec |          8.56ms
+Random (K=10, 500 ops)                                       | 3216302.80 blocks/sec |        155.46µs
+Random (K=50, 500 ops)                                       | 317271.57 blocks/sec |          1.58ms
+Random (K=100, 500 ops)                                      | 324151.84 blocks/sec |          1.54ms
+Random MT x4 (K=10, 500 ops)                                 | 187420.07 blocks/sec |          2.67ms
+Random MT x16 (K=10, 500 ops)                                | 110022.64 blocks/sec |          4.54ms
+Random MT x4 (K=50, 500 ops)                                 | 161493.54 blocks/sec |          3.10ms
+Random MT x16 (K=50, 500 ops)                                | 103736.79 blocks/sec |          4.82ms
+Random MT x4 (K=100, 500 ops)                                | 133274.41 blocks/sec |          3.75ms
+Random MT x16 (K=100, 500 ops)                               |  97324.81 blocks/sec |          5.14ms
+Zipfian (80/20, 500 ops)                                     | 1184943.63 blocks/sec |        421.96µs
+Zipfian MT x4 (80/20, 500 ops)                               | 236657.60 blocks/sec |          2.11ms
+Zipfian MT x16 (80/20, 500 ops)                              | 109317.50 blocks/sec |          4.57ms
 
 Phase 3A: Pool Size Sensitivity
 
 Fixed workload: Random access to 100 blocks
 Pool Size (buffers) | Throughput (blocks/sec)
 --------------------------------------------------
-                  8 |     500631
-                 16 |     577423
-                 32 |     735360
-                 64 |    1166086
-                128 |    3522714
-                256 |    3546124
+                  8 |     389446
+                 16 |     504013
+                 32 |     615911
+                 64 |     773843
+                128 |    2931863
+                256 |    2104714
 
 
 Phase 3B: Memory Pressure Test
 Memory Pressure Test: Working set = pool_size + K
 Pool Size | Working Set | Throughput (blocks/sec)
 ------------------------------------------------------------
-       32 |          32 |    3527561
-       32 |          33 |    2893000
-       32 |          37 |    1729505
-       32 |          42 |    1452846
-       32 |          52 |    1068981
+       32 |          32 |    2270880
+       32 |          33 |    2215212
+       32 |          37 |    1423338
+       32 |          42 |    1080817
+       32 |          52 |     531434
 
 Phase 4: Hit Rate Measurement
 Operation            | Hit Rate & Statistics
@@ -70,36 +70,36 @@ Sequential Scan      | Hit rate:   0.0% (hits: 0, misses: 12240)
 Repeated Access      | Hit rate: 100.0% (hits: 101990, misses: 10)
 Zipfian (80/20)      | Hit rate:  79.6% (hits: 40589, misses: 10411)
 Random (K=10)        | Hit rate: 100.0% (hits: 50990, misses: 10)
-Random (K=50)        | Hit rate:  21.4% (hits: 10914, misses: 40086)
-Random (K=100)       | Hit rate:  13.2% (hits: 6731, misses: 44269)
+Random (K=50)        | Hit rate:  20.2% (hits: 10301, misses: 40699)
+Random (K=100)       | Hit rate:  12.0% (hits: 6118, misses: 44882)
 
 Phase 5: Concurrent Access
 
 Multi-threaded Pin/Unpin (lock contention)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-2 threads, 1000 ops/thread                                   |   1243130.15 ops/sec |          1.61ms
-4 threads, 1000 ops/thread                                   |    295647.43 ops/sec |         13.53ms
-8 threads, 1000 ops/thread                                   |    185532.43 ops/sec |         43.12ms
-16 threads, 1000 ops/thread                                  |    100164.02 ops/sec |        159.74ms
+2 threads, 1000 ops/thread                                   |    543478.41 ops/sec |          3.68ms
+4 threads, 1000 ops/thread                                   |    183754.96 ops/sec |         21.77ms
+8 threads, 1000 ops/thread                                   |    135070.57 ops/sec |         59.23ms
+16 threads, 1000 ops/thread                                  |    124027.99 ops/sec |        129.00ms
 
 Hot-set Contention (shared buffers)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-4 threads, K=4, 1000 ops/thread                              |   1034344.37 ops/sec |          3.87ms
-8 threads, K=4, 1000 ops/thread                              |    516540.73 ops/sec |         15.49ms
-16 threads, K=4, 1000 ops/thread                             |    336741.94 ops/sec |         47.51ms
+4 threads, K=4, 1000 ops/thread                              |    566279.23 ops/sec |          7.06ms
+8 threads, K=4, 1000 ops/thread                              |    275250.45 ops/sec |         29.06ms
+16 threads, K=4, 1000 ops/thread                             |    187872.36 ops/sec |         85.16ms
 
 Buffer Starvation (cond.wait() latency):
 ----------------------------------------------------------------------
-Starved 4 threads | Pool recovery time:   205.02ms
+Starved 4 threads | Pool recovery time:   204.92ms
 
 All benchmarks completed!
     Finished `bench` profile [optimized + debuginfo] target(s) in 0.00s
-     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-595f081dbf33478a)
+     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-ebee752303b75e09)
 ```
 
-## Replacement Clock (`--no-default-features --features replacement_clock`)
+## Replacement Clock (4KB pages)
 
 ```
 SimpleDB Buffer Pool Benchmark Suite
@@ -111,92 +111,92 @@ Environment: macos (aarch64)
 Phase 1: Core Latency Benchmarks
 Operation                                                    |       Mean |     Median |     StdDev |    Iters
 ------------------------------------------------------------------------------------------------------------------------
-Pin/Unpin (hit)                                              |   266.00ns |   250.00ns |    26.00ns |      100
-Cold Pin (miss)                                              |     2.27µs |     1.96µs |   758.00ns |      100
-Dirty Eviction                                               |     3.16ms |     3.01ms |   687.84µs |      100
+Pin/Unpin (hit)                                              |   273.00ns |   291.00ns |    26.00ns |      100
+Cold Pin (miss)                                              |     2.35µs |     2.21µs |   361.00ns |      100
+Dirty Eviction                                               |   292.26µs |     2.29µs |   889.95µs |      100
 
 Phase 2: Access Pattern Benchmarks
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-Sequential Scan (120 blocks)                                 | 192499.27 blocks/sec |        623.38µs
-Seq Scan MT x4 (120 blocks)                                  | 160047.37 blocks/sec |        749.78µs
-Seq Scan MT x16 (120 blocks)                                 | 116938.55 blocks/sec |          1.03ms
-Repeated Access (1000 ops)                                   | 3829598.20 blocks/sec |        261.12µs
-Repeated Access MT x4 (1000 ops)                             | 1028334.74 blocks/sec |        972.45µs
-Repeated Access MT x16 (1000 ops)                            | 568193.76 blocks/sec |          1.76ms
-Random (K=10, 500 ops)                                       | 3846716.06 blocks/sec |        129.98µs
-Random (K=50, 500 ops)                                       | 624964.85 blocks/sec |        800.05µs
-Random (K=100, 500 ops)                                      | 546648.23 blocks/sec |        914.67µs
-Random MT x4 (K=10, 500 ops)                                 | 1003741.95 blocks/sec |        498.14µs
-Random MT x16 (K=10, 500 ops)                                | 586674.74 blocks/sec |        852.26µs
-Random MT x4 (K=50, 500 ops)                                 | 217183.85 blocks/sec |          2.30ms
-Random MT x16 (K=50, 500 ops)                                | 184703.25 blocks/sec |          2.71ms
-Random MT x4 (K=100, 500 ops)                                | 211873.56 blocks/sec |          2.36ms
-Random MT x16 (K=100, 500 ops)                               | 152102.91 blocks/sec |          3.29ms
-Zipfian (80/20, 500 ops)                                     | 1517851.45 blocks/sec |        329.41µs
-Zipfian MT x4 (80/20, 500 ops)                               | 549016.16 blocks/sec |        910.72µs
-Zipfian MT x16 (80/20, 500 ops)                              | 394160.12 blocks/sec |          1.27ms
+Sequential Scan (120 blocks)                                 | 358592.17 blocks/sec |        334.64µs
+Seq Scan MT x4 (120 blocks)                                  |  76475.11 blocks/sec |          1.57ms
+Seq Scan MT x16 (120 blocks)                                 |  41600.65 blocks/sec |          2.88ms
+Repeated Access (1000 ops)                                   | 3048250.76 blocks/sec |        328.06µs
+Repeated Access MT x4 (1000 ops)                             | 357850.38 blocks/sec |          2.79ms
+Repeated Access MT x16 (1000 ops)                            | 458085.83 blocks/sec |          2.18ms
+Random (K=10, 500 ops)                                       | 3117634.59 blocks/sec |        160.38µs
+Random (K=50, 500 ops)                                       | 389232.58 blocks/sec |          1.28ms
+Random (K=100, 500 ops)                                      | 408610.90 blocks/sec |          1.22ms
+Random MT x4 (K=10, 500 ops)                                 | 360150.37 blocks/sec |          1.39ms
+Random MT x16 (K=10, 500 ops)                                | 449925.13 blocks/sec |          1.11ms
+Random MT x4 (K=50, 500 ops)                                 | 100106.17 blocks/sec |          4.99ms
+Random MT x16 (K=50, 500 ops)                                | 112698.23 blocks/sec |          4.44ms
+Random MT x4 (K=100, 500 ops)                                | 116041.02 blocks/sec |          4.31ms
+Random MT x16 (K=100, 500 ops)                               |  92985.89 blocks/sec |          5.38ms
+Zipfian (80/20, 500 ops)                                     | 835854.83 blocks/sec |        598.19µs
+Zipfian MT x4 (80/20, 500 ops)                               | 264108.83 blocks/sec |          1.89ms
+Zipfian MT x16 (80/20, 500 ops)                              | 158671.73 blocks/sec |          3.15ms
 
 Phase 3A: Pool Size Sensitivity
 
 Fixed workload: Random access to 100 blocks
 Pool Size (buffers) | Throughput (blocks/sec)
 --------------------------------------------------
-                  8 |     483166
-                 16 |     575640
-                 32 |     751590
-                 64 |    1238298
-                128 |    3871108
-                256 |    3886000
+                  8 |     231661
+                 16 |     243233
+                 32 |     292259
+                 64 |     507439
+                128 |    1979728
+                256 |    2081010
 
 
 Phase 3B: Memory Pressure Test
 Memory Pressure Test: Working set = pool_size + K
 Pool Size | Working Set | Throughput (blocks/sec)
 ------------------------------------------------------------
-       32 |          32 |    3899335
-       32 |          33 |    2651999
-       32 |          37 |    2160527
-       32 |          42 |    1527305
-       32 |          52 |    1139059
+       32 |          32 |    2229406
+       32 |          33 |    1441707
+       32 |          37 |     961171
+       32 |          42 |     605003
+       32 |          52 |     518084
 
 Phase 4: Hit Rate Measurement
 Operation            | Hit Rate & Statistics
 ----------------------------------------------------------------------
 Sequential Scan      | Hit rate:   0.0% (hits: 0, misses: 13260)
 Repeated Access      | Hit rate: 100.0% (hits: 101990, misses: 10)
-Zipfian (80/20)      | Hit rate:  73.6% (hits: 37528, misses: 13474)
+Zipfian (80/20)      | Hit rate:  70.1% (hits: 35795, misses: 15257)
 Random (K=10)        | Hit rate: 100.0% (hits: 50990, misses: 10)
-Random (K=50)        | Hit rate:  24.2% (hits: 12342, misses: 38762)
-Random (K=100)       | Hit rate:  10.6% (hits: 5406, misses: 45595)
+Random (K=50)        | Hit rate:  25.8% (hits: 13153, misses: 37848)
+Random (K=100)       | Hit rate:  11.4% (hits: 5814, misses: 45188)
 
 Phase 5: Concurrent Access
 
 Multi-threaded Pin/Unpin (lock contention)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-2 threads, 1000 ops/thread                                   |   1524449.50 ops/sec |          1.31ms
-4 threads, 1000 ops/thread                                   |    311785.04 ops/sec |         12.83ms
-8 threads, 1000 ops/thread                                   |    151912.67 ops/sec |         52.66ms
-16 threads, 1000 ops/thread                                  |    137918.94 ops/sec |        116.01ms
+2 threads, 1000 ops/thread                                   |    492919.58 ops/sec |          4.06ms
+4 threads, 1000 ops/thread                                   |    247658.30 ops/sec |         16.15ms
+8 threads, 1000 ops/thread                                   |    245714.23 ops/sec |         32.56ms
+16 threads, 1000 ops/thread                                  |    198721.19 ops/sec |         80.51ms
 
 Hot-set Contention (shared buffers)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-4 threads, K=4, 1000 ops/thread                              |   1122190.25 ops/sec |          3.56ms
-8 threads, K=4, 1000 ops/thread                              |    716089.36 ops/sec |         11.17ms
-16 threads, K=4, 1000 ops/thread                             |    535460.34 ops/sec |         29.88ms
+4 threads, K=4, 1000 ops/thread                              |    865884.08 ops/sec |          4.62ms
+8 threads, K=4, 1000 ops/thread                              |    737186.82 ops/sec |         10.85ms
+16 threads, K=4, 1000 ops/thread                             |    563106.52 ops/sec |         28.41ms
 
 Buffer Starvation (cond.wait() latency):
 ----------------------------------------------------------------------
-Starved 4 threads | Pool recovery time:   205.41ms
+Starved 4 threads | Pool recovery time:   205.46ms
 
 All benchmarks completed!
     Finished `bench` profile [optimized + debuginfo] target(s) in 0.00s
-     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-2ed923e46913521e)
+     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-7e9b6dadb956fd52)
 ```
 
-## Replacement SIEVE (`--no-default-features --features replacement_sieve`)
+## Replacement SIEVE (4KB pages)
 
 ```
 SimpleDB Buffer Pool Benchmark Suite
@@ -208,87 +208,87 @@ Environment: macos (aarch64)
 Phase 1: Core Latency Benchmarks
 Operation                                                    |       Mean |     Median |     StdDev |    Iters
 ------------------------------------------------------------------------------------------------------------------------
-Pin/Unpin (hit)                                              |   274.00ns |   291.00ns |    24.00ns |      100
-Cold Pin (miss)                                              |     2.41µs |     2.04µs |   814.00ns |      100
-Dirty Eviction                                               |     3.20ms |     3.04ms |   853.72µs |      100
+Pin/Unpin (hit)                                              |   278.00ns |   291.00ns |    19.00ns |      100
+Cold Pin (miss)                                              |     2.35µs |     2.21µs |   660.00ns |      100
+Dirty Eviction                                               |   306.15µs |     5.85µs |   904.20µs |      100
 
 Phase 2: Access Pattern Benchmarks
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-Sequential Scan (120 blocks)                                 | 203932.50 blocks/sec |        588.43µs
-Seq Scan MT x4 (120 blocks)                                  | 201817.70 blocks/sec |        594.60µs
-Seq Scan MT x16 (120 blocks)                                 | 111845.46 blocks/sec |          1.07ms
-Repeated Access (1000 ops)                                   | 3815541.46 blocks/sec |        262.09µs
-Repeated Access MT x4 (1000 ops)                             | 972055.35 blocks/sec |          1.03ms
-Repeated Access MT x16 (1000 ops)                            | 565370.71 blocks/sec |          1.77ms
-Random (K=10, 500 ops)                                       | 3666253.60 blocks/sec |        136.38µs
-Random (K=50, 500 ops)                                       | 591015.15 blocks/sec |        846.00µs
-Random (K=100, 500 ops)                                      | 519800.77 blocks/sec |        961.91µs
-Random MT x4 (K=10, 500 ops)                                 | 1024709.85 blocks/sec |        487.94µs
-Random MT x16 (K=10, 500 ops)                                | 570963.97 blocks/sec |        875.71µs
-Random MT x4 (K=50, 500 ops)                                 | 281440.10 blocks/sec |          1.78ms
-Random MT x16 (K=50, 500 ops)                                | 164464.70 blocks/sec |          3.04ms
-Random MT x4 (K=100, 500 ops)                                | 274905.93 blocks/sec |          1.82ms
-Random MT x16 (K=100, 500 ops)                               | 133240.53 blocks/sec |          3.75ms
-Zipfian (80/20, 500 ops)                                     | 1297222.13 blocks/sec |        385.44µs
-Zipfian MT x4 (80/20, 500 ops)                               | 518807.28 blocks/sec |        963.75µs
-Zipfian MT x16 (80/20, 500 ops)                              | 322162.46 blocks/sec |          1.55ms
+Sequential Scan (120 blocks)                                 | 438373.78 blocks/sec |        273.74µs
+Seq Scan MT x4 (120 blocks)                                  | 141045.88 blocks/sec |        850.79µs
+Seq Scan MT x16 (120 blocks)                                 | 107405.33 blocks/sec |          1.12ms
+Repeated Access (1000 ops)                                   | 1665009.98 blocks/sec |        600.60µs
+Repeated Access MT x4 (1000 ops)                             | 338300.14 blocks/sec |          2.96ms
+Repeated Access MT x16 (1000 ops)                            | 345493.55 blocks/sec |          2.89ms
+Random (K=10, 500 ops)                                       | 2486411.76 blocks/sec |        201.09µs
+Random (K=50, 500 ops)                                       | 240607.18 blocks/sec |          2.08ms
+Random (K=100, 500 ops)                                      | 268551.54 blocks/sec |          1.86ms
+Random MT x4 (K=10, 500 ops)                                 | 224115.05 blocks/sec |          2.23ms
+Random MT x16 (K=10, 500 ops)                                | 184463.93 blocks/sec |          2.71ms
+Random MT x4 (K=50, 500 ops)                                 | 142643.34 blocks/sec |          3.51ms
+Random MT x16 (K=50, 500 ops)                                | 107071.47 blocks/sec |          4.67ms
+Random MT x4 (K=100, 500 ops)                                | 138874.46 blocks/sec |          3.60ms
+Random MT x16 (K=100, 500 ops)                               | 105569.78 blocks/sec |          4.74ms
+Zipfian (80/20, 500 ops)                                     | 480452.32 blocks/sec |          1.04ms
+Zipfian MT x4 (80/20, 500 ops)                               | 195144.11 blocks/sec |          2.56ms
+Zipfian MT x16 (80/20, 500 ops)                              | 166715.63 blocks/sec |          3.00ms
 
 Phase 3A: Pool Size Sensitivity
 
 Fixed workload: Random access to 100 blocks
 Pool Size (buffers) | Throughput (blocks/sec)
 --------------------------------------------------
-                  8 |     475395
-                 16 |     569141
-                 32 |     680137
-                 64 |    1129010
-                128 |    3875008
-                256 |    3878916
+                  8 |     329080
+                 16 |     232008
+                 32 |     288808
+                 64 |     448703
+                128 |    2179219
+                256 |    2529545
 
 
 Phase 3B: Memory Pressure Test
 Memory Pressure Test: Working set = pool_size + K
 Pool Size | Working Set | Throughput (blocks/sec)
 ------------------------------------------------------------
-       32 |          32 |    3890990
-       32 |          33 |    3132636
-       32 |          37 |    1926315
-       32 |          42 |    1478559
-       32 |          52 |    1085774
+       32 |          32 |    1730140
+       32 |          33 |    1348403
+       32 |          37 |     838224
+       32 |          42 |     615701
+       32 |          52 |     503745
 
 Phase 4: Hit Rate Measurement
 Operation            | Hit Rate & Statistics
 ----------------------------------------------------------------------
 Sequential Scan      | Hit rate:   0.0% (hits: 0, misses: 13260)
 Repeated Access      | Hit rate: 100.0% (hits: 101990, misses: 10)
-Zipfian (80/20)      | Hit rate:  67.1% (hits: 35173, misses: 17256)
+Zipfian (80/20)      | Hit rate:  73.2% (hits: 38252, misses: 13970)
 Random (K=10)        | Hit rate: 100.0% (hits: 50990, misses: 10)
-Random (K=50)        | Hit rate:  21.2% (hits: 11518, misses: 42849)
-Random (K=100)       | Hit rate:  12.5% (hits: 6834, misses: 47940)
+Random (K=50)        | Hit rate:  20.6% (hits: 11218, misses: 43148)
+Random (K=100)       | Hit rate:  11.0% (hits: 6016, misses: 48758)
 
 Phase 5: Concurrent Access
 
 Multi-threaded Pin/Unpin (lock contention)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-2 threads, 1000 ops/thread                                   |   1365985.86 ops/sec |          1.46ms
-4 threads, 1000 ops/thread                                   |    301520.05 ops/sec |         13.27ms
-8 threads, 1000 ops/thread                                   |    189182.50 ops/sec |         42.29ms
-16 threads, 1000 ops/thread                                  |    101077.98 ops/sec |        158.29ms
+2 threads, 1000 ops/thread                                   |    534204.87 ops/sec |          3.74ms
+4 threads, 1000 ops/thread                                   |    212185.47 ops/sec |         18.85ms
+8 threads, 1000 ops/thread                                   |    136861.24 ops/sec |         58.45ms
+16 threads, 1000 ops/thread                                  |    126281.82 ops/sec |        126.70ms
 
 Hot-set Contention (shared buffers)
 Operation                                                    |           Throughput |   Mean Duration
 ------------------------------------------------------------------------------------------------------------------------
-4 threads, K=4, 1000 ops/thread                              |   1114876.61 ops/sec |          3.59ms
-8 threads, K=4, 1000 ops/thread                              |    713411.53 ops/sec |         11.21ms
-16 threads, K=4, 1000 ops/thread                             |    528242.90 ops/sec |         30.29ms
+4 threads, K=4, 1000 ops/thread                              |    899675.40 ops/sec |          4.45ms
+8 threads, K=4, 1000 ops/thread                              |    723947.50 ops/sec |         11.05ms
+16 threads, K=4, 1000 ops/thread                             |    576252.77 ops/sec |         27.77ms
 
 Buffer Starvation (cond.wait() latency):
 ----------------------------------------------------------------------
-Starved 4 threads | Pool recovery time:   203.91ms
+Starved 4 threads | Pool recovery time:   205.76ms
 
 All benchmarks completed!
     Finished `bench` profile [optimized + debuginfo] target(s) in 0.00s
-     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-83da990292f15006)
+     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-32828b2194705bfe)
 ```

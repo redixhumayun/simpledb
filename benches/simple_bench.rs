@@ -18,7 +18,7 @@ fn cleanup_bench_data() {
 }
 
 fn setup_test_table(db: &SimpleDB) -> Result<(), Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
 
     // Create the table using SQL
     let create_sql = "CREATE TABLE bench_table(id int, name varchar(20), age int)";
@@ -30,7 +30,7 @@ fn setup_test_table(db: &SimpleDB) -> Result<(), Box<dyn Error>> {
 }
 
 fn populate_table(db: &SimpleDB, num_records: usize) -> Result<(), Box<dyn Error>> {
-    let txn = Arc::new(db.new_tx());
+    let txn = db.new_tx();
 
     for i in 0..num_records {
         let insert_sql = format!(
@@ -49,7 +49,7 @@ fn populate_table(db: &SimpleDB, num_records: usize) -> Result<(), Box<dyn Error
 fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framework::BenchResult {
     // Benchmark single INSERT operations
     benchmark("INSERT (single record)", iterations, 2, || {
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (99999, 'test_user', 25)";
         db.planner
             .execute_update(insert_sql.to_string(), Arc::clone(&txn))
@@ -57,7 +57,7 @@ fn run_insert_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
         txn.commit().unwrap();
 
         // Clean up the inserted record
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let delete_sql = "DELETE FROM bench_table WHERE id = 99999";
         db.planner
             .execute_update(delete_sql.to_string(), Arc::clone(&txn))
@@ -72,7 +72,7 @@ fn run_select_benchmarks(
 ) -> Vec<benchmark_framework::BenchResult> {
     // Benchmark SELECT operations
     let result1 = benchmark("SELECT (table scan)", iterations, 2, || {
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let select_sql = "SELECT id, name FROM bench_table WHERE age > 30";
         let _plan = db
             .planner
@@ -82,7 +82,7 @@ fn run_select_benchmarks(
     });
 
     let result2 = benchmark("SELECT COUNT(*)", iterations, 2, || {
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let select_sql = "SELECT * FROM bench_table";
         let plan = db
             .planner
@@ -101,7 +101,7 @@ fn run_select_benchmarks(
 fn run_update_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framework::BenchResult {
     // Benchmark UPDATE operations
     benchmark("UPDATE (single record)", iterations, 2, || {
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let update_sql = "UPDATE bench_table SET age = 99 WHERE id = 0";
         db.planner
             .execute_update(update_sql.to_string(), Arc::clone(&txn))
@@ -109,7 +109,7 @@ fn run_update_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
         txn.commit().unwrap();
 
         // Reset the record
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let reset_sql = "UPDATE bench_table SET age = 20 WHERE id = 0";
         db.planner
             .execute_update(reset_sql.to_string(), Arc::clone(&txn))
@@ -122,7 +122,7 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
     // Benchmark DELETE operations
     benchmark("DELETE (single record)", iterations, 2, || {
         // Insert a record to delete
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let insert_sql = "INSERT INTO bench_table(id, name, age) VALUES (88888, 'delete_me', 25)";
         db.planner
             .execute_update(insert_sql.to_string(), Arc::clone(&txn))
@@ -130,7 +130,7 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
         txn.commit().unwrap();
 
         // Delete the record
-        let txn = Arc::new(db.new_tx());
+        let txn = db.new_tx();
         let delete_sql = "DELETE FROM bench_table WHERE id = 88888";
         db.planner
             .execute_update(delete_sql.to_string(), Arc::clone(&txn))
@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cleanup_bench_data();
 
     // Initialize database with clean=true for fresh benchmark runs
-    let db = SimpleDB::new("./bench-data", 1024, 64, true, 100);
+    let db = SimpleDB::new("./bench-data", 64, true, 100);
 
     // Setup test table
     setup_test_table(&db)?;
