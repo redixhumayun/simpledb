@@ -28,12 +28,15 @@ use std::{
     error::Error,
     marker::PhantomData,
     mem::size_of,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     rc::Rc,
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use crate::{BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, Lsn, RID};
+use crate::{
+    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, Lsn,
+    SimpleDBResult, RID,
+};
 
 /// Discriminator for the type of data stored in a page.
 #[repr(u8)]
@@ -76,7 +79,9 @@ pub const NO_FREE_SLOT: u16 = 0xFFFF;
 ///
 /// See `docs/record_management.md` for detailed layout specification.
 struct PageHeader {
+    /// Page type discriminator
     page_type: PageType,
+    /// Reserved flags for future use
     reserved_flags: u8,
     /// Number of slots in the line pointer array
     slot_count: u16,
@@ -291,6 +296,447 @@ impl PageHeader {
     }
 }
 
+/// The trait that must be implemented by all headers
+trait HeaderCodec: Sized {
+    /// Defines the [PageType] this codec is implemented for
+    const PAGE_TYPE: PageType;
+    /// Returns the page type discriminator
+    fn page_type_byte(&self) -> PageType;
+    /// Parses the header from a byte slice
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self>;
+    /// Writes the header to a byte slice
+    fn write_bytes(&self, dest: &mut [u8]);
+}
+
+pub struct HeapHeader {
+    /// Page type discriminator
+    page_type: PageType,
+    /// Reserved flags for future use
+    reserved_flags: u8,
+    /// Number of slots in the line pointer array
+    slot_count: u16,
+    /// Offset to end of line pointer array (grows downward)
+    free_lower: u16,
+    /// Offset to start of tuple heap (grows upward)
+    free_upper: u16,
+    /// Pointer to free space boundary
+    free_ptr: u32,
+    /// CRC32 checksum for corruption detection
+    crc32: u32,
+    /// Reserved for future latch/lock word
+    latch_word: u64,
+    /// Head of free slot linked list
+    free_head: u16,
+    /// Reserved bytes for page-type-specific metadata
+    reserved: [u8; 6],
+}
+
+impl HeaderCodec for HeapHeader {
+    const PAGE_TYPE: PageType = PageType::Heap;
+
+    fn page_type_byte(&self) -> PageType {
+        Self::PAGE_TYPE
+    }
+
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+        let view = HeapHeaderRef::new(bytes);
+        Ok(Self {
+            page_type: PageType::Heap,
+            reserved_flags: view.reserved_flags(),
+            slot_count: view.slot_count(),
+            free_lower: view.free_lower(),
+            free_upper: view.free_upper(),
+            free_ptr: view.free_ptr(),
+            crc32: view.crc32(),
+            latch_word: view.latch_word(),
+            free_head: view.free_head(),
+            reserved: view.reserved_bytes(),
+        })
+    }
+
+    fn write_bytes(&self, dest: &mut [u8]) {
+        let mut view = HeapHeaderMut::new(dest);
+        view.set_page_type(self.page_type);
+        view.set_reserved_flags(self.reserved_flags);
+        view.set_slot_count(self.slot_count);
+        view.set_free_lower(self.free_lower);
+        view.set_free_upper(self.free_upper);
+        view.set_free_ptr(self.free_ptr);
+        view.set_crc32(self.crc32);
+        view.set_latch_word(self.latch_word);
+        view.set_free_head(self.free_head);
+        view.set_reserved_bytes(self.reserved);
+    }
+}
+
+/// Read-only view over a heap header stored inline in `PageBytes`.
+pub struct HeapHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> HeapHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        debug_assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    fn range<const N: usize>(&self, start: usize) -> [u8; N] {
+        self.bytes[start..start + N]
+            .try_into()
+            .expect("invalid header slice length")
+    }
+
+    pub fn page_type(&self) -> PageType {
+        match self.bytes[0] {
+            0 => PageType::Heap,
+            1 => PageType::IndexLeaf,
+            2 => PageType::IndexInternal,
+            3 => PageType::Overflow,
+            4 => PageType::Meta,
+            255 => PageType::Free,
+            _ => panic!("invalid page type byte"),
+        }
+    }
+
+    pub fn reserved_flags(&self) -> u8 {
+        self.bytes[1]
+    }
+
+    pub fn slot_count(&self) -> u16 {
+        u16::from_le_bytes(self.range::<2>(2))
+    }
+
+    pub fn free_lower(&self) -> u16 {
+        u16::from_le_bytes(self.range::<2>(4))
+    }
+
+    pub fn free_upper(&self) -> u16 {
+        u16::from_le_bytes(self.range::<2>(6))
+    }
+
+    pub fn free_ptr(&self) -> u32 {
+        u32::from_le_bytes(self.range::<4>(8))
+    }
+
+    pub fn crc32(&self) -> u32 {
+        u32::from_le_bytes(self.range::<4>(12))
+    }
+
+    pub fn latch_word(&self) -> u64 {
+        u64::from_le_bytes(self.range::<8>(16))
+    }
+
+    pub fn free_head(&self) -> u16 {
+        u16::from_le_bytes(self.range::<2>(24))
+    }
+
+    pub fn reserved_bytes(&self) -> [u8; 6] {
+        self.range::<6>(26)
+    }
+
+    pub fn has_free_slot(&self) -> bool {
+        self.free_head() != NO_FREE_SLOT
+    }
+}
+
+/// Mutable view over a heap header stored inline in `PageBytes`.
+pub struct HeapHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> HeapHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        debug_assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn as_ref(&self) -> HeapHeaderRef<'_> {
+        HeapHeaderRef {
+            bytes: &self.bytes[..],
+        }
+    }
+
+    fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
+        self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn set_page_type(&mut self, page_type: PageType) {
+        self.bytes[0] = page_type as u8;
+    }
+
+    pub fn set_reserved_flags(&mut self, flags: u8) {
+        self.bytes[1] = flags;
+    }
+
+    pub fn set_slot_count(&mut self, slot_count: u16) {
+        self.write(2, slot_count.to_le_bytes());
+    }
+
+    pub fn set_free_lower(&mut self, free_lower: u16) {
+        self.write(4, free_lower.to_le_bytes());
+    }
+
+    pub fn set_free_upper(&mut self, free_upper: u16) {
+        self.write(6, free_upper.to_le_bytes());
+    }
+
+    pub fn set_free_ptr(&mut self, free_ptr: u32) {
+        self.write(8, free_ptr.to_le_bytes());
+    }
+
+    pub fn set_crc32(&mut self, crc32: u32) {
+        self.write(12, crc32.to_le_bytes());
+    }
+
+    pub fn set_latch_word(&mut self, latch: u64) {
+        self.write(16, latch.to_le_bytes());
+    }
+
+    pub fn set_free_head(&mut self, free_head: u16) {
+        self.write(24, free_head.to_le_bytes());
+    }
+
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
+        self.write(26, reserved);
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut *self.bytes
+    }
+}
+
+pub struct BTreeLeafHeader {
+    /// Page type discriminator
+    page_type: PageType,
+    /// B-tree level
+    level: u8,
+    /// Number of slots in the line pointer array
+    slot_count: u16,
+    /// Length of optional high-key payload
+    high_key_len: u16,
+    /// Right sibling block number
+    right_sibling_block: u32,
+    /// Overflow block number
+    overflow_block: u32,
+    /// CRC32 checksum for corruption detection
+    crc32: u32,
+    /// Last modified LSN
+    lsn: u64,
+    /// Reserved bytes for page-type-specific metadata
+    reserved: [u8; 6],
+}
+
+impl HeaderCodec for BTreeInternalHeader {
+    const PAGE_TYPE: PageType = PageType::IndexInternal;
+
+    fn page_type_byte(&self) -> PageType {
+        Self::PAGE_TYPE
+    }
+
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+        Ok(Self {
+            page_type: PageType::IndexInternal,
+            level: bytes[1],
+            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
+            rightmost_child_block: u32::from_le_bytes(bytes[4..8].try_into()?),
+            high_key_len: u16::from_le_bytes(bytes[8..10].try_into()?),
+            crc32: u32::from_le_bytes(bytes[10..14].try_into()?),
+            lsn: u64::from_le_bytes(bytes[14..22].try_into()?),
+            reserved: bytes[22..32].try_into()?,
+        })
+    }
+
+    fn write_bytes(&self, dest: &mut [u8]) {
+        dest[0] = self.page_type as u8;
+        dest[1] = self.level;
+        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
+        dest[4..8].copy_from_slice(&self.rightmost_child_block.to_le_bytes());
+        dest[8..10].copy_from_slice(&self.high_key_len.to_le_bytes());
+        dest[10..14].copy_from_slice(&self.crc32.to_le_bytes());
+        dest[14..22].copy_from_slice(&self.lsn.to_le_bytes());
+        dest[22..32].copy_from_slice(&self.reserved);
+    }
+}
+
+impl HeaderCodec for BTreeLeafHeader {
+    const PAGE_TYPE: PageType = PageType::IndexLeaf;
+
+    fn page_type_byte(&self) -> PageType {
+        Self::PAGE_TYPE
+    }
+
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+        Ok(Self {
+            page_type: PageType::IndexLeaf,
+            level: bytes[1],
+            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
+            high_key_len: u16::from_le_bytes(bytes[4..6].try_into()?),
+            right_sibling_block: u32::from_le_bytes(bytes[6..10].try_into()?),
+            overflow_block: u32::from_le_bytes(bytes[10..14].try_into()?),
+            crc32: u32::from_le_bytes(bytes[14..18].try_into()?),
+            lsn: u64::from_le_bytes(bytes[18..26].try_into()?),
+            reserved: bytes[26..32].try_into()?,
+        })
+    }
+
+    fn write_bytes(&self, dest: &mut [u8]) {
+        dest[0] = self.page_type as u8;
+        dest[1] = self.level;
+        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
+        dest[4..6].copy_from_slice(&self.high_key_len.to_le_bytes());
+        dest[6..10].copy_from_slice(&self.right_sibling_block.to_le_bytes());
+        dest[10..14].copy_from_slice(&self.overflow_block.to_le_bytes());
+        dest[14..18].copy_from_slice(&self.crc32.to_le_bytes());
+        dest[18..26].copy_from_slice(&self.lsn.to_le_bytes());
+        dest[26..32].copy_from_slice(&self.reserved);
+    }
+}
+
+pub struct BTreeInternalHeader {
+    /// Page type discriminator
+    page_type: PageType,
+    /// B-tree level
+    level: u8,
+    /// Number of slots in the line pointer array
+    slot_count: u16,
+    /// Rightmost child block number
+    rightmost_child_block: u32,
+    /// Length of optional high-key payload
+    high_key_len: u16,
+    /// CRC32 checksum for corruption detection
+    crc32: u32,
+    /// Last modified LSN
+    lsn: u64,
+    /// Reserved bytes for page-type-specific metadata
+    reserved: [u8; 10],
+}
+
+struct LinePtrBytes<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> LinePtrBytes<'a> {
+    const LINE_PTR_BYTES: usize = 4;
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn read(&self, index: usize) -> Vec<u8> {
+        let start = index * Self::LINE_PTR_BYTES;
+        let end = start + Self::LINE_PTR_BYTES;
+        let mut dest = vec![0u8; Self::LINE_PTR_BYTES];
+        dest.copy_from_slice(&self.bytes[start..end]);
+        dest
+    }
+}
+
+struct LinePtrBytesMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> LinePtrBytesMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn as_ref(&self) -> LinePtrBytes<'_> {
+        LinePtrBytes::new(&self.bytes)
+    }
+
+    pub fn write(&mut self, index: usize, line_ptr: LinePtr) {
+        let start = index * LinePtrBytes::LINE_PTR_BYTES;
+        let end = start + LinePtrBytes::LINE_PTR_BYTES;
+        self.bytes[start..end].copy_from_slice(&line_ptr.to_bytes());
+    }
+
+    pub fn shift_left(&mut self, start: usize, end: usize) {
+        assert!(start > 0, "cannot shift left starting at the beginning");
+        assert!(
+            start < end,
+            "cannot call shift_left with start <= end - {} >= {}",
+            start,
+            end
+        );
+        let head = start * LinePtrBytes::LINE_PTR_BYTES;
+        let tail = end * LinePtrBytes::LINE_PTR_BYTES;
+        self.bytes.copy_within(head..tail, head - 4);
+    }
+
+    pub fn shift_right(&mut self, start: usize, end: usize) {
+        assert!(
+            start < end,
+            "cannot call shift_left with start <= end - {} >= {}",
+            start,
+            end
+        );
+        let head = start * LinePtrBytes::LINE_PTR_BYTES;
+        let tail = end * LinePtrBytes::LINE_PTR_BYTES;
+        self.bytes.copy_within(head..tail, head + 4);
+    }
+}
+
+impl<'a> Deref for LinePtrBytesMut<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes
+    }
+}
+
+struct LinePtrArray<'a> {
+    bytes: LinePtrBytes<'a>,
+    slot_count: usize,
+}
+
+impl<'a> LinePtrArray<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        let bytes = LinePtrBytes::new(bytes);
+        Self { bytes, slot_count }
+    }
+
+    fn len(&self) -> usize {
+        self.slot_count
+    }
+
+    fn get(&self, index: usize) -> LinePtr {
+        LinePtr::from_bytes(&self.bytes.read(index))
+    }
+}
+
+struct LinePtrArrayMut<'a> {
+    bytes: LinePtrBytesMut<'a>,
+    slot_count: usize,
+}
+
+impl<'a> LinePtrArrayMut<'a> {
+    fn new(bytes: &'a mut [u8]) -> Self {
+        let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        let bytes = LinePtrBytesMut::new(bytes);
+        Self { bytes, slot_count }
+    }
+
+    fn as_ref(&self) -> LinePtrArray<'_> {
+        LinePtrArray::new(&self.bytes)
+    }
+
+    fn set(&mut self, index: usize, line_ptr: LinePtr) {
+        self.bytes.write(index, line_ptr);
+    }
+
+    fn insert(&mut self, index: usize, line_ptr: LinePtr) {
+        self.bytes
+            .shift_right(index, index + LinePtrBytes::LINE_PTR_BYTES);
+        self.set(index, line_ptr);
+    }
+
+    fn delete(&mut self, index: usize) {
+        self.bytes
+            .shift_left(index, index + LinePtrBytes::LINE_PTR_BYTES);
+        self.slot_count -= 1;
+    }
+}
+
 /// 4-byte line pointer encoding offset (16 bits), length (12 bits), and state (4 bits).
 ///
 /// Layout: `[offset:16][length:12][state:4]`
@@ -341,6 +787,15 @@ impl LinePtr {
         line_pointer
     }
 
+    fn from_bytes(bytes: &[u8]) -> Self {
+        assert_eq!(bytes.len(), 4);
+        Self(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn to_bytes(&self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
     /// Extracts the 16-bit offset field.
     fn offset(&self) -> u16 {
         (self.0 >> 16) as u16
@@ -379,19 +834,16 @@ impl LinePtr {
         self.0 = (self.0 & 0xFFFF_FFF0) | (state_bits);
     }
 
-    #[cfg(test)]
     fn with_offset(mut self, offset: u16) -> Self {
         self.set_offset(offset);
         self
     }
 
-    #[cfg(test)]
     fn with_length(mut self, length: u16) -> Self {
         self.set_length(length);
         self
     }
 
-    #[cfg(test)]
     fn with_state(mut self, state: LineState) -> Self {
         self.set_state(state);
         self
@@ -536,20 +988,118 @@ mod line_ptr_tests {
 /// Marker trait associating a compile-time page kind with its runtime PageType.
 pub trait PageKind {
     const PAGE_TYPE: PageType;
+    type Header: HeaderCodec;
+
+    fn decode_header(bytes: &[u8]) -> SimpleDBResult<Self::Header> {
+        let header = Self::Header::from_bytes(bytes)?;
+        if header.page_type_byte() != Self::PAGE_TYPE {
+            return Err("invalid conversion".into());
+        }
+        Ok(header)
+    }
+
+    fn encode_header(header: &Self::Header, dest: &mut [u8]) {
+        header.write_bytes(dest);
+    }
 }
 
 /// Slot identifier within a page.
 type SlotId = usize;
+
+pub struct DummyRawPageHeader {}
+
+impl HeaderCodec for DummyRawPageHeader {
+    const PAGE_TYPE: PageType = PageType::Free;
+
+    fn page_type_byte(&self) -> PageType {
+        Self::PAGE_TYPE
+    }
+
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+        todo!()
+    }
+
+    fn write_bytes(&self, dest: &mut [u8]) {
+        todo!()
+    }
+}
 
 /// Raw page with unknown type, used at I/O boundaries.
 pub struct RawPage;
 
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
+    type Header = DummyRawPageHeader;
+}
+
+struct HeapLinePtrArray<'a> {
+    header: HeapHeaderRef<'a>,
+    array: LinePtrArray<'a>,
+}
+
+impl<'a> HeapLinePtrArray<'a> {
+    fn new(header: HeapHeaderRef<'a>, bytes: &'a [u8]) -> Self {
+        Self {
+            header,
+            array: LinePtrArray::new(bytes),
+        }
+    }
+
+    fn get(&self, index: usize) -> LinePtr {
+        self.array.get(index)
+    }
+}
+
+struct HeapLinePtrArrayMut<'a> {
+    header: HeapHeaderMut<'a>,
+    line_pointers: LinePtrArrayMut<'a>,
+}
+
+impl<'a> HeapLinePtrArrayMut<'a> {
+    fn new(header: HeapHeaderMut<'a>, bytes: &'a mut [u8]) -> Self {
+        Self {
+            header,
+            line_pointers: LinePtrArrayMut::new(bytes),
+        }
+    }
+
+    fn push_free_slot(&mut self, free_index: SlotId) {
+        let mut line_ptr = self.line_pointers.as_ref().get(free_index);
+        assert!(line_ptr.is_free(), "slot {free_index} must be free");
+        let header = self.header.as_ref();
+        let next = header.free_head();
+        line_ptr.set_offset(next);
+        line_ptr.set_length(0);
+        self.line_pointers.set(free_index, line_ptr);
+        self.header
+            .set_free_head(free_index.try_into().expect("slot id fits in u16"));
+    }
+
+    fn pop_free_slot(&mut self) -> Option<SlotId> {
+        let header = self.header.as_ref();
+        if !header.has_free_slot() {
+            return None;
+        }
+        let free_idx = header.free_head() as usize;
+        let line_ptr = self.line_pointers.as_ref().get(free_idx);
+        self.header.set_free_head(line_ptr.offset());
+        Some(free_idx)
+    }
+}
+
+struct HeapPageZeroCopy<'a> {
+    header: HeapHeaderRef<'a>,
+    line_pointers: HeapLinePtrArray<'a>,
+    record_space: Vec<u8>,
 }
 
 /// Heap page storing table rows with slotted page layout.
 pub struct HeapPage;
+
+impl PageKind for HeapPage {
+    const PAGE_TYPE: PageType = PageType::Heap;
+    type Header = HeapHeader;
+}
 
 /// Iterator over tuples in a heap page, optionally filtering by LineState.
 pub struct HeapIterator<'a> {
@@ -577,10 +1127,6 @@ impl<'a> Iterator for HeapIterator<'a> {
         }
         None
     }
-}
-
-impl PageKind for HeapPage {
-    const PAGE_TYPE: PageType = PageType::Heap;
 }
 
 /// B-tree leaf page containing sorted key-RID entries.
@@ -640,10 +1186,12 @@ impl Iterator for BTreeInternalIterator<'_> {
 
 impl PageKind for BTreeLeafPage {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
+    type Header = BTreeLeafHeader;
 }
 
 impl PageKind for BTreeInternalPage {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
+    type Header = BTreeInternalHeader;
 }
 
 /// Type alias for a page whose kind is not yet known at the I/O boundary.
