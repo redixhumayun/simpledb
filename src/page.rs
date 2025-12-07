@@ -695,6 +695,11 @@ struct LinePtrArray<'a> {
 
 impl<'a> LinePtrArray<'a> {
     fn new(bytes: &'a [u8]) -> Self {
+        assert!(
+            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            "line pointer region must be multiple of {} bytes",
+            LinePtrBytes::LINE_PTR_BYTES
+        );
         let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
         let bytes = LinePtrBytes::new(bytes);
         Self { bytes, slot_count }
@@ -716,6 +721,11 @@ struct LinePtrArrayMut<'a> {
 
 impl<'a> LinePtrArrayMut<'a> {
     fn new(bytes: &'a mut [u8]) -> Self {
+        assert!(
+            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            "line pointer region must be multiple of {} bytes",
+            LinePtrBytes::LINE_PTR_BYTES
+        );
         let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
         let bytes = LinePtrBytesMut::new(bytes);
         Self { bytes, slot_count }
@@ -1045,6 +1055,14 @@ struct HeapRecordSpace<'a> {
 
 impl<'a> HeapRecordSpace<'a> {
     fn new(bytes: &'a [u8], base_offset: usize) -> Self {
+        assert!(
+            base_offset <= PAGE_SIZE_BYTES as usize,
+            "base offset must lie within page"
+        );
+        assert!(
+            base_offset + bytes.len() == PAGE_SIZE_BYTES as usize,
+            "record space must cover remaining page bytes"
+        );
         Self { bytes, base_offset }
     }
 
@@ -1066,6 +1084,14 @@ struct HeapRecordSpaceMut<'a> {
 
 impl<'a> HeapRecordSpaceMut<'a> {
     fn new(bytes: &'a mut [u8], base_offset: usize) -> Self {
+        assert!(
+            base_offset <= PAGE_SIZE_BYTES as usize,
+            "base offset must lie within page"
+        );
+        assert!(
+            base_offset + bytes.len() == PAGE_SIZE_BYTES as usize,
+            "record space must cover remaining page bytes"
+        );
         Self { bytes, base_offset }
     }
 
@@ -1102,12 +1128,13 @@ impl<'a> HeapPageZeroCopy<'a> {
         let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         let (line_ptr_bytes, record_space_bytes) = rest.split_at(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
-        Ok(Self::from_parts(
-            header,
-            line_ptr_bytes,
-            record_space_bytes,
-            base_offset,
-        ))
+        let page = Self::from_parts(header, line_ptr_bytes, record_space_bytes, base_offset);
+        assert_eq!(
+            page.slot_count(),
+            header.slot_count() as usize,
+            "slot directory length must match header slot_count"
+        );
+        Ok(page)
     }
 
     fn from_parts(
@@ -1179,12 +1206,13 @@ impl<'a> HeapPageZeroCopyMut<'a> {
         }
         let (line_ptr_bytes, record_bytes) = (&self.body_bytes[..]).split_at(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
-        Ok(HeapPageZeroCopy::from_parts(
-            header,
-            line_ptr_bytes,
-            record_bytes,
-            base_offset,
-        ))
+        let page = HeapPageZeroCopy::from_parts(header, line_ptr_bytes, record_bytes, base_offset);
+        assert_eq!(
+            page.slot_count(),
+            header.slot_count() as usize,
+            "slot directory length must match header slot_count"
+        );
+        Ok(page)
     }
 
     /// Splits the mutable page into header/slot-dir/record-space views tied together by a guard.
@@ -1199,11 +1227,17 @@ impl<'a> HeapPageZeroCopyMut<'a> {
         }
         let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
-        Ok(HeapPageParts {
+        let parts = HeapPageParts {
             header: HeapHeaderMut::new(self.header_bytes),
             line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
             record_space: HeapRecordSpaceMut::new(record_bytes, base_offset),
-        })
+        };
+        assert_eq!(
+            parts.line_ptrs.as_ref().len(),
+            parts.header.as_ref().slot_count() as usize,
+            "slot directory length must match header slot_count"
+        );
+        Ok(parts)
     }
 }
 
