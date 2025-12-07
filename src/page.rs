@@ -28,7 +28,7 @@ use std::{
     error::Error,
     marker::PhantomData,
     mem::size_of,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     rc::Rc,
     sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
 };
@@ -297,7 +297,7 @@ impl PageHeader {
 }
 
 /// The trait that must be implemented by all headers
-trait HeaderCodec: Sized {
+pub trait HeaderCodec: Sized {
     /// Defines the [PageType] this codec is implemented for
     const PAGE_TYPE: PageType;
     /// Returns the page type discriminator
@@ -370,13 +370,14 @@ impl HeaderCodec for HeapHeader {
 }
 
 /// Read-only view over a heap header stored inline in `PageBytes`.
+#[derive(Clone, Copy)]
 pub struct HeapHeaderRef<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> HeapHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        debug_assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
         Self { bytes }
     }
 
@@ -628,6 +629,10 @@ impl<'a> LinePtrBytes<'a> {
         dest.copy_from_slice(&self.bytes[start..end]);
         dest
     }
+
+    fn as_slice(&self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 struct LinePtrBytesMut<'a> {
@@ -640,7 +645,7 @@ impl<'a> LinePtrBytesMut<'a> {
     }
 
     pub fn as_ref(&self) -> LinePtrBytes<'_> {
-        LinePtrBytes::new(&self.bytes)
+        LinePtrBytes::new(&self.bytes[..])
     }
 
     pub fn write(&mut self, index: usize, line_ptr: LinePtr) {
@@ -717,7 +722,7 @@ impl<'a> LinePtrArrayMut<'a> {
     }
 
     fn as_ref(&self) -> LinePtrArray<'_> {
-        LinePtrArray::new(&self.bytes)
+        LinePtrArray::new(self.bytes.as_ref().as_slice())
     }
 
     fn set(&mut self, index: usize, line_ptr: LinePtr) {
@@ -725,14 +730,13 @@ impl<'a> LinePtrArrayMut<'a> {
     }
 
     fn insert(&mut self, index: usize, line_ptr: LinePtr) {
-        self.bytes
-            .shift_right(index, index + LinePtrBytes::LINE_PTR_BYTES);
+        self.bytes.shift_right(index, self.slot_count);
         self.set(index, line_ptr);
+        self.slot_count += 1;
     }
 
     fn delete(&mut self, index: usize) {
-        self.bytes
-            .shift_left(index, index + LinePtrBytes::LINE_PTR_BYTES);
+        self.bytes.shift_left(index + 1, self.slot_count);
         self.slot_count -= 1;
     }
 }
@@ -989,6 +993,7 @@ mod line_ptr_tests {
 pub trait PageKind {
     const PAGE_TYPE: PageType;
     type Header: HeaderCodec;
+    const HEADER_SIZE: usize;
 
     fn decode_header(bytes: &[u8]) -> SimpleDBResult<Self::Header> {
         let header = Self::Header::from_bytes(bytes)?;
@@ -1030,67 +1035,220 @@ pub struct RawPage;
 impl PageKind for RawPage {
     const PAGE_TYPE: PageType = PageType::Free;
     type Header = DummyRawPageHeader;
+    const HEADER_SIZE: usize = 0;
 }
 
-struct HeapLinePtrArray<'a> {
-    header: HeapHeaderRef<'a>,
-    array: LinePtrArray<'a>,
+struct HeapRecordSpace<'a> {
+    bytes: &'a [u8],
+    base_offset: usize,
 }
 
-impl<'a> HeapLinePtrArray<'a> {
-    fn new(header: HeapHeaderRef<'a>, bytes: &'a [u8]) -> Self {
-        Self {
-            header,
-            array: LinePtrArray::new(bytes),
-        }
+impl<'a> HeapRecordSpace<'a> {
+    fn new(bytes: &'a [u8], base_offset: usize) -> Self {
+        Self { bytes, base_offset }
     }
 
-    fn get(&self, index: usize) -> LinePtr {
-        self.array.get(index)
-    }
-}
-
-struct HeapLinePtrArrayMut<'a> {
-    header: HeapHeaderMut<'a>,
-    line_pointers: LinePtrArrayMut<'a>,
-}
-
-impl<'a> HeapLinePtrArrayMut<'a> {
-    fn new(header: HeapHeaderMut<'a>, bytes: &'a mut [u8]) -> Self {
-        Self {
-            header,
-            line_pointers: LinePtrArrayMut::new(bytes),
-        }
-    }
-
-    fn push_free_slot(&mut self, free_index: SlotId) {
-        let mut line_ptr = self.line_pointers.as_ref().get(free_index);
-        assert!(line_ptr.is_free(), "slot {free_index} must be free");
-        let header = self.header.as_ref();
-        let next = header.free_head();
-        line_ptr.set_offset(next);
-        line_ptr.set_length(0);
-        self.line_pointers.set(free_index, line_ptr);
-        self.header
-            .set_free_head(free_index.try_into().expect("slot id fits in u16"));
-    }
-
-    fn pop_free_slot(&mut self) -> Option<SlotId> {
-        let header = self.header.as_ref();
-        if !header.has_free_slot() {
+    fn tuple_bytes(&self, ptr: LinePtr) -> Option<&'a [u8]> {
+        if !ptr.is_live() {
             return None;
         }
-        let free_idx = header.free_head() as usize;
-        let line_ptr = self.line_pointers.as_ref().get(free_idx);
-        self.header.set_free_head(line_ptr.offset());
-        Some(free_idx)
+        let offset = ptr.offset() as usize;
+        let length = ptr.length() as usize;
+        let relative = offset.checked_sub(self.base_offset)?;
+        self.bytes.get(relative..relative + length)
+    }
+}
+
+struct HeapRecordSpaceMut<'a> {
+    bytes: &'a mut [u8],
+    base_offset: usize,
+}
+
+impl<'a> HeapRecordSpaceMut<'a> {
+    fn new(bytes: &'a mut [u8], base_offset: usize) -> Self {
+        Self { bytes, base_offset }
+    }
+
+    fn as_ref(&self) -> HeapRecordSpace<'_> {
+        HeapRecordSpace::new(&self.bytes[..], self.base_offset)
+    }
+
+    fn write_tuple(&mut self, offset: usize, tuple: &[u8]) {
+        let relative = offset
+            .checked_sub(self.base_offset)
+            .expect("tuple offset precedes record space");
+        let end = relative + tuple.len();
+        self.bytes[relative..end].copy_from_slice(tuple);
+    }
+
+    fn zero(&mut self) {
+        self.bytes.fill(0);
     }
 }
 
 struct HeapPageZeroCopy<'a> {
     header: HeapHeaderRef<'a>,
-    line_pointers: HeapLinePtrArray<'a>,
-    record_space: Vec<u8>,
+    line_pointers: LinePtrArray<'a>,
+    record_space: HeapRecordSpace<'a>,
+}
+
+impl<'a> HeapPageZeroCopy<'a> {
+    fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, rest) = bytes.split_at(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = HeapHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::Heap {
+            return Err("not a heap page".into());
+        }
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let (line_ptr_bytes, record_space_bytes) = rest.split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        Ok(Self::from_parts(
+            header,
+            line_ptr_bytes,
+            record_space_bytes,
+            base_offset,
+        ))
+    }
+
+    fn from_parts(
+        header: HeapHeaderRef<'a>,
+        line_ptr_bytes: &'a [u8],
+        record_space_bytes: &'a [u8],
+        base_offset: usize,
+    ) -> Self {
+        Self {
+            header,
+            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            record_space: HeapRecordSpace::new(record_space_bytes, base_offset),
+        }
+    }
+
+    fn header(&self) -> HeapHeaderRef<'a> {
+        self.header
+    }
+
+    fn slot_count(&self) -> usize {
+        self.line_pointers.len()
+    }
+
+    fn line_ptr(&self, slot: SlotId) -> Option<LinePtr> {
+        if slot >= self.line_pointers.len() {
+            None
+        } else {
+            Some(self.line_pointers.get(slot))
+        }
+    }
+
+    fn tuple_bytes(&self, slot: SlotId) -> Option<&'a [u8]> {
+        let lp = self.line_ptr(slot)?;
+        self.record_space.tuple_bytes(lp)
+    }
+}
+
+struct HeapPageZeroCopyMut<'a> {
+    header_bytes: &'a mut [u8],
+    body_bytes: &'a mut [u8],
+}
+
+impl<'a> HeapPageZeroCopyMut<'a> {
+    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = HeapHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::Heap {
+            return Err("not a heap page".into());
+        }
+        Ok(Self {
+            header_bytes,
+            body_bytes,
+        })
+    }
+
+    fn header(&self) -> HeapHeaderRef<'_> {
+        HeapHeaderRef::new(self.header_bytes)
+    }
+
+    fn header_mut(&mut self) -> HeapHeaderMut<'_> {
+        HeapHeaderMut::new(self.header_bytes)
+    }
+
+    fn as_read(&self) -> SimpleDBResult<HeapPageZeroCopy<'_>> {
+        let header = self.header();
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > self.body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = (&self.body_bytes[..]).split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        Ok(HeapPageZeroCopy::from_parts(
+            header,
+            line_ptr_bytes,
+            record_bytes,
+            base_offset,
+        ))
+    }
+
+    /// Splits the mutable page into header/slot-dir/record-space views tied together by a guard.
+    /// Callers must obtain this guard before performing any mutation so the slot-directory
+    /// boundary always reflects the latest `slot_count`. Dropping the guard releases the borrows,
+    /// forcing the next operation to resplit.
+    fn split(&mut self) -> SimpleDBResult<HeapPageParts<'_>> {
+        let header_view = HeapHeaderRef::new(self.header_bytes);
+        let slot_len = header_view.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > self.body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        Ok(HeapPageParts {
+            header: HeapHeaderMut::new(self.header_bytes),
+            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
+            record_space: HeapRecordSpaceMut::new(record_bytes, base_offset),
+        })
+    }
+}
+
+/// Guard holding disjoint mutable views over a heap page's header, slot directory, and record
+/// space. All heap mutations must go through this guard so the slices stay aligned with the
+/// latest `slot_count`. Drop releases the borrows so the next mutation re-splits the page.
+pub struct HeapPageParts<'a> {
+    header: HeapHeaderMut<'a>,
+    line_ptrs: LinePtrArrayMut<'a>,
+    record_space: HeapRecordSpaceMut<'a>,
+}
+
+impl<'a> HeapPageParts<'a> {
+    pub fn header(&mut self) -> &mut HeapHeaderMut<'a> {
+        &mut self.header
+    }
+
+    pub fn line_ptrs(&mut self) -> &mut LinePtrArrayMut<'a> {
+        &mut self.line_ptrs
+    }
+
+    pub fn record_space(&mut self) -> &mut HeapRecordSpaceMut<'a> {
+        &mut self.record_space
+    }
+
+    pub fn push_free_slot(&mut self, slot: SlotId) {
+        let mut lp = self.line_ptrs.as_ref().get(slot);
+        assert!(lp.is_free(), "slot {slot} must be free");
+        let next = self.header.as_ref().free_head();
+        lp.set_offset(next);
+        lp.set_length(0);
+        self.line_ptrs.set(slot, lp);
+        self.header
+            .set_free_head(slot.try_into().expect("slot id fits in u16"));
+    }
+
+    pub fn pop_free_slot(&mut self) -> Option<SlotId> {
+        if !self.header.as_ref().has_free_slot() {
+            return None;
+        }
+        let free_idx = self.header.as_ref().free_head() as usize;
+        let lp = self.line_ptrs.as_ref().get(free_idx);
+        self.header.set_free_head(lp.offset());
+        Some(free_idx)
+    }
 }
 
 /// Heap page storing table rows with slotted page layout.
@@ -1099,6 +1257,7 @@ pub struct HeapPage;
 impl PageKind for HeapPage {
     const PAGE_TYPE: PageType = PageType::Heap;
     type Header = HeapHeader;
+    const HEADER_SIZE: usize = 32;
 }
 
 /// Iterator over tuples in a heap page, optionally filtering by LineState.
@@ -1187,11 +1346,13 @@ impl Iterator for BTreeInternalIterator<'_> {
 impl PageKind for BTreeLeafPage {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
     type Header = BTreeLeafHeader;
+    const HEADER_SIZE: usize = 32;
 }
 
 impl PageKind for BTreeInternalPage {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
     type Header = BTreeInternalHeader;
+    const HEADER_SIZE: usize = 32;
 }
 
 /// Type alias for a page whose kind is not yet known at the I/O boundary.
