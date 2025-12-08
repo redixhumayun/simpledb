@@ -612,6 +612,108 @@ pub struct BTreeInternalHeader {
     reserved: [u8; 10],
 }
 
+/// Read-only view over a B-tree leaf header.
+#[derive(Clone, Copy)]
+pub struct BTreeLeafHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> BTreeLeafHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn page_type(&self) -> PageType {
+        match self.bytes[0] {
+            1 => PageType::IndexLeaf,
+            _ => panic!("invalid B-tree leaf page type byte"),
+        }
+    }
+
+    pub fn level(&self) -> u8 {
+        self.bytes[1]
+    }
+
+    pub fn slot_count(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+
+    pub fn high_key_len(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
+    }
+
+    pub fn right_sibling(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[6..10].try_into().unwrap())
+    }
+
+    pub fn overflow_block(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[10..14].try_into().unwrap())
+    }
+}
+
+pub struct BTreeLeafHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeLeafHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn as_ref(&self) -> BTreeLeafHeaderRef<'_> {
+        BTreeLeafHeaderRef::new(&self.bytes[..])
+    }
+
+    pub fn set_slot_count(&mut self, slot_count: u16) {
+        self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
+    }
+}
+
+/// Read-only view over a B-tree internal header.
+#[derive(Clone, Copy)]
+pub struct BTreeInternalHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> BTreeInternalHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn page_type(&self) -> PageType {
+        match self.bytes[0] {
+            2 => PageType::IndexInternal,
+            _ => panic!("invalid B-tree internal page type byte"),
+        }
+    }
+
+    pub fn slot_count(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+}
+
+pub struct BTreeInternalHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeInternalHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn as_ref(&self) -> BTreeInternalHeaderRef<'_> {
+        BTreeInternalHeaderRef::new(&self.bytes[..])
+    }
+
+    pub fn set_slot_count(&mut self, slot_count: u16) {
+        self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
+    }
+}
+
 struct LinePtrBytes<'a> {
     bytes: &'a [u8],
 }
@@ -748,6 +850,10 @@ impl<'a> LinePtrArrayMut<'a> {
     fn delete(&mut self, index: usize) {
         self.bytes.shift_left(index + 1, self.slot_count);
         self.slot_count -= 1;
+    }
+
+    fn len(&self) -> usize {
+        self.slot_count
     }
 }
 
@@ -1109,6 +1215,68 @@ impl<'a> HeapRecordSpaceMut<'a> {
 
     fn zero(&mut self) {
         self.bytes.fill(0);
+    }
+}
+
+/// B-tree-specific payload helpers operate directly on the record slice.
+struct BTreeRecordSpace<'a> {
+    bytes: &'a [u8],
+    base_offset: usize,
+}
+
+impl<'a> BTreeRecordSpace<'a> {
+    fn new(bytes: &'a [u8], base_offset: usize) -> Self {
+        assert!(
+            base_offset + bytes.len() == PAGE_SIZE_BYTES as usize,
+            "record space must cover remaining page"
+        );
+        Self { bytes, base_offset }
+    }
+
+    fn entry_bytes(&self, ptr: LinePtr) -> Option<&'a [u8]> {
+        let offset = ptr.offset() as usize;
+        let length = ptr.length() as usize;
+        let relative = offset.checked_sub(self.base_offset)?;
+        self.bytes.get(relative..relative + length)
+    }
+}
+
+struct BTreeRecordSpaceMut<'a> {
+    bytes: &'a mut [u8],
+    base_offset: usize,
+}
+
+impl<'a> BTreeRecordSpaceMut<'a> {
+    fn new(bytes: &'a mut [u8], base_offset: usize) -> Self {
+        assert!(
+            base_offset + bytes.len() == PAGE_SIZE_BYTES as usize,
+            "record space must cover remaining page"
+        );
+        Self { bytes, base_offset }
+    }
+
+    fn entry_bytes(&self, ptr: LinePtr) -> Option<&[u8]> {
+        let offset = ptr.offset() as usize;
+        let length = ptr.length() as usize;
+        let relative = offset.checked_sub(self.base_offset)?;
+        Some(&self.bytes[relative..relative + length])
+    }
+
+    fn insert(&mut self, offset: usize, bytes: &[u8]) {
+        let relative = offset
+            .checked_sub(self.base_offset)
+            .expect("offset before record space");
+        self.bytes
+            .copy_within(relative..self.bytes.len(), relative + bytes.len());
+        self.bytes[relative..relative + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn remove(&mut self, offset: usize, len: usize) {
+        let relative = offset
+            .checked_sub(self.base_offset)
+            .expect("offset before record space");
+        let end = relative + len;
+        self.bytes.copy_within(end..self.bytes.len(), relative);
     }
 }
 
@@ -5626,5 +5794,198 @@ mod btree_page_tests {
             // Verify level preserved
             assert_eq!(view.btree_level(), 2);
         }
+    }
+}
+struct BTreeLeafPageZeroCopy<'a> {
+    header: BTreeLeafHeaderRef<'a>,
+    line_pointers: LinePtrArray<'a>,
+    record_space: BTreeRecordSpace<'a>,
+}
+
+impl<'a> BTreeLeafPageZeroCopy<'a> {
+    fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, rest) = bytes.split_at(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeLeafHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexLeaf {
+            return Err("not a B-tree leaf page".into());
+        }
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > rest.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = rest.split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let page = Self {
+            header,
+            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+        };
+        assert_eq!(
+            page.line_pointers.len(),
+            header.slot_count() as usize,
+            "slot directory must match header slot_count"
+        );
+        Ok(page)
+    }
+
+    fn header(&self) -> BTreeLeafHeaderRef<'a> {
+        self.header
+    }
+
+    fn slot_count(&self) -> usize {
+        self.line_pointers.len()
+    }
+}
+
+struct BTreeLeafPageZeroCopyMut<'a> {
+    header_bytes: &'a mut [u8],
+    body_bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeLeafPageZeroCopyMut<'a> {
+    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeLeafHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexLeaf {
+            return Err("not a B-tree leaf page".into());
+        }
+        Ok(Self {
+            header_bytes,
+            body_bytes,
+        })
+    }
+
+    fn split(&mut self) -> SimpleDBResult<BTreeLeafPageParts<'_>> {
+        let header_ref = BTreeLeafHeaderRef::new(self.header_bytes);
+        let slot_len = header_ref.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > self.body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let parts = BTreeLeafPageParts {
+            header: BTreeLeafHeaderMut::new(self.header_bytes),
+            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
+            record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
+        };
+        assert_eq!(
+            parts.line_ptrs.len(),
+            parts.header.as_ref().slot_count() as usize,
+            "slot directory must match header slot_count"
+        );
+        Ok(parts)
+    }
+}
+
+pub struct BTreeLeafPageParts<'a> {
+    header: BTreeLeafHeaderMut<'a>,
+    line_ptrs: LinePtrArrayMut<'a>,
+    record_space: BTreeRecordSpaceMut<'a>,
+}
+
+impl<'a> BTreeLeafPageParts<'a> {
+    pub fn header(&mut self) -> &mut BTreeLeafHeaderMut<'a> {
+        &mut self.header
+    }
+
+    pub fn line_ptrs(&mut self) -> &mut LinePtrArrayMut<'a> {
+        &mut self.line_ptrs
+    }
+
+    pub fn record_space(&mut self) -> &mut BTreeRecordSpaceMut<'a> {
+        &mut self.record_space
+    }
+}
+
+struct BTreeInternalPageZeroCopy<'a> {
+    header: BTreeInternalHeaderRef<'a>,
+    line_pointers: LinePtrArray<'a>,
+    record_space: BTreeRecordSpace<'a>,
+}
+
+impl<'a> BTreeInternalPageZeroCopy<'a> {
+    fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, rest) = bytes.split_at(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeInternalHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexInternal {
+            return Err("not a B-tree internal page".into());
+        }
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > rest.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = rest.split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let page = Self {
+            header,
+            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+        };
+        assert_eq!(
+            page.line_pointers.len(),
+            header.slot_count() as usize,
+            "slot directory must match header slot_count"
+        );
+        Ok(page)
+    }
+}
+
+struct BTreeInternalPageZeroCopyMut<'a> {
+    header_bytes: &'a mut [u8],
+    body_bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeInternalPageZeroCopyMut<'a> {
+    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeInternalHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexInternal {
+            return Err("not a B-tree internal page".into());
+        }
+        Ok(Self {
+            header_bytes,
+            body_bytes,
+        })
+    }
+
+    fn split(&mut self) -> SimpleDBResult<BTreeInternalPageParts<'_>> {
+        let header_ref = BTreeInternalHeaderRef::new(self.header_bytes);
+        let slot_len = header_ref.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > self.body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let parts = BTreeInternalPageParts {
+            header: BTreeInternalHeaderMut::new(self.header_bytes),
+            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
+            record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
+        };
+        assert_eq!(
+            parts.line_ptrs.len(),
+            parts.header.as_ref().slot_count() as usize,
+            "slot directory must match header slot_count"
+        );
+        Ok(parts)
+    }
+}
+
+pub struct BTreeInternalPageParts<'a> {
+    header: BTreeInternalHeaderMut<'a>,
+    line_ptrs: LinePtrArrayMut<'a>,
+    record_space: BTreeRecordSpaceMut<'a>,
+}
+
+impl<'a> BTreeInternalPageParts<'a> {
+    pub fn header(&mut self) -> &mut BTreeInternalHeaderMut<'a> {
+        &mut self.header
+    }
+
+    pub fn line_ptrs(&mut self) -> &mut LinePtrArrayMut<'a> {
+        &mut self.line_ptrs
+    }
+
+    pub fn record_space(&mut self) -> &mut BTreeRecordSpaceMut<'a> {
+        &mut self.record_space
     }
 }
