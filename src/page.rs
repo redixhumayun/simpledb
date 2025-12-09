@@ -1629,43 +1629,38 @@ impl<'a> HeapPageZeroCopy<'a> {
 }
 
 struct HeapPageZeroCopyMut<'a> {
-    header_bytes: &'a mut [u8],
+    header: HeapHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
 impl<'a> HeapPageZeroCopyMut<'a> {
     fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-        let header = HeapHeaderRef::new(header_bytes);
-        if header.page_type() != PageType::Heap {
+        // let header = HeapHeaderRef::new(header_bytes);
+        let header = HeapHeaderMut::new(header_bytes);
+        if header.as_ref().page_type() != PageType::Heap {
             return Err("not a heap page".into());
         }
-        Ok(Self {
-            header_bytes,
-            body_bytes,
-        })
-    }
-
-    fn header(&self) -> HeapHeaderRef<'_> {
-        HeapHeaderRef::new(self.header_bytes)
-    }
-
-    fn header_mut(&mut self) -> HeapHeaderMut<'_> {
-        HeapHeaderMut::new(self.header_bytes)
+        Ok(Self { header, body_bytes })
     }
 
     fn as_read(&self) -> SimpleDBResult<HeapPageZeroCopy<'_>> {
-        let header = self.header();
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        // let header = self.header();
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = (&self.body_bytes[..]).split_at(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
-        let page = HeapPageZeroCopy::from_parts(header, line_ptr_bytes, record_bytes, base_offset);
+        let page = HeapPageZeroCopy::from_parts(
+            self.header.as_ref(),
+            line_ptr_bytes,
+            record_bytes,
+            base_offset,
+        );
         assert_eq!(
             page.slot_count(),
-            header.slot_count() as usize,
+            self.header.as_ref().slot_count() as usize,
             "slot directory length must match header slot_count"
         );
         Ok(page)
@@ -1676,15 +1671,15 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     /// boundary always reflects the latest `slot_count`. Dropping the guard releases the borrows,
     /// forcing the next operation to resplit.
     fn split(&mut self) -> SimpleDBResult<HeapPageParts<'_>> {
-        let header_view = HeapHeaderRef::new(self.header_bytes);
-        let slot_len = header_view.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        // let header_view = HeapHeaderRef::new(self.header_bytes);
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
         let parts = HeapPageParts {
-            header: HeapHeaderMut::new(self.header_bytes),
+            header: HeapHeaderMut::new(self.header.bytes_mut()),
             line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
             record_space: HeapRecordSpaceMut::new(record_bytes, base_offset),
         };
@@ -4447,37 +4442,40 @@ pub struct BTreeInternalPageView<'a> {
 }
 
 impl<'a> BTreeInternalPageView<'a> {
-    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
         BTreeInternalPageZeroCopy::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
-    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
-        self.guard
-            .as_btree_internal_page()?
-            .get_internal_entry(self.layout, slot)
+    fn build_view(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
+        BTreeInternalPageZeroCopy::new(self.guard.bytes())
+    }
+
+    fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
+        self.build_view()
+            .expect("BTreeInternalPageView constructed with valid internal page")
+    }
+
+    pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeInternalEntry> {
+        let view = self.build_view()?;
+        let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
+        BTreeInternalEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.guard
-            .as_btree_internal_page()
-            .unwrap()
-            .find_slot_before(self.layout, search_key)
+        self.view().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.guard.as_btree_internal_page().unwrap().slot_count()
+        self.view().slot_count()
     }
 
     pub fn is_full(&self) -> bool {
-        self.guard
-            .as_btree_internal_page()
-            .unwrap()
-            .is_full(self.layout)
+        self.view().is_full(self.layout)
     }
 
     pub fn btree_level(&self) -> u16 {
-        self.guard.as_btree_internal_page().unwrap().btree_level()
+        self.view().btree_level()
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
@@ -4500,7 +4498,7 @@ pub struct BTreeInternalPageViewMut<'a> {
 }
 
 impl<'a> BTreeInternalPageViewMut<'a> {
-    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
         BTreeInternalPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
@@ -4509,33 +4507,40 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         })
     }
 
+    fn build_view(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
+        BTreeInternalPageZeroCopy::new(self.guard.bytes())
+    }
+
+    fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
+        self.build_view()
+            .expect("BTreeInternalPageViewMut constructed with valid internal page")
+    }
+
+    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageZeroCopyMut<'_>> {
+        BTreeInternalPageZeroCopyMut::new(self.guard.bytes_mut())
+    }
+
     // Read operations
-    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeInternalEntry, Box<dyn Error>> {
-        self.guard
-            .as_btree_internal_page()?
-            .get_internal_entry(self.layout, slot)
+    pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeInternalEntry> {
+        let view = self.build_view()?;
+        let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
+        BTreeInternalEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.guard
-            .as_btree_internal_page()
-            .unwrap()
-            .find_slot_before(self.layout, search_key)
+        self.view().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.guard.as_btree_internal_page().unwrap().slot_count()
+        self.view().slot_count()
     }
 
     pub fn is_full(&self) -> bool {
-        self.guard
-            .as_btree_internal_page()
-            .unwrap()
-            .is_full(self.layout)
+        self.view().is_full(self.layout)
     }
 
     pub fn btree_level(&self) -> u16 {
-        self.guard.as_btree_internal_page().unwrap().btree_level()
+        self.view().btree_level()
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
@@ -4547,33 +4552,27 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     }
 
     // Write operations
-    pub fn insert_entry(
-        &mut self,
-        key: Constant,
-        child_block: usize,
-    ) -> Result<SlotId, Box<dyn Error>> {
-        let slot = self
-            .guard
-            .as_btree_internal_page_mut()?
-            .insert_internal_entry(self.layout, &key, child_block)?;
+    pub fn insert_entry(&mut self, key: Constant, child_block: usize) -> SimpleDBResult<SlotId> {
+        let layout = self.layout;
+        let mut page = self.build_mut_page()?;
+        let slot = page.insert_entry(layout, key, child_block)?;
         self.dirty = true;
         Ok(slot)
     }
 
-    pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        self.guard
-            .as_btree_internal_page_mut()?
-            .delete_internal_entry(slot, self.layout)?;
+    pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let layout = self.layout;
+        let mut page = self.build_mut_page()?;
+        page.delete_entry(slot, layout)?;
         self.dirty = true;
         Ok(())
     }
 
-    pub fn set_btree_level(&mut self, level: u16) {
-        self.guard
-            .as_btree_internal_page_mut()
-            .unwrap()
-            .set_btree_level(level);
+    pub fn set_btree_level(&mut self, level: u16) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.set_btree_level(level)?;
         self.dirty = true;
+        Ok(())
     }
 
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
@@ -4764,8 +4763,7 @@ mod heap_page_view_tests {
         assert!(view.row(slot_b).is_none());
         let redirected = view
             .tuple_ref(slot_b)
-            .expect("error while converting to Page<HeapPage>")
-            .expect("slot_b exists");
+            .expect("error while converting to Page<HeapPage>");
         match redirected {
             TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
             _ => panic!("slot_b should be redirect after redirect_slot"),
@@ -6210,33 +6208,29 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
 }
 
 struct BTreeLeafPageZeroCopyMut<'a> {
-    header_bytes: &'a mut [u8],
+    header: BTreeLeafHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
 impl<'a> BTreeLeafPageZeroCopyMut<'a> {
     fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-        let header = BTreeLeafHeaderRef::new(header_bytes);
-        if header.page_type() != PageType::IndexLeaf {
+        let header = BTreeLeafHeaderMut::new(header_bytes);
+        if header.as_ref().page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
         }
-        Ok(Self {
-            header_bytes,
-            body_bytes,
-        })
+        Ok(Self { header, body_bytes })
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeLeafPageParts<'_>> {
-        let header_ref = BTreeLeafHeaderRef::new(self.header_bytes);
-        let slot_len = header_ref.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
         let parts = BTreeLeafPageParts {
-            header: BTreeLeafHeaderMut::new(self.header_bytes),
+            header: BTreeLeafHeaderMut::new(self.header.bytes),
             line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
             record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
         };
@@ -6249,20 +6243,18 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
     }
 
     fn as_read(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
-        let header_bytes: &[u8] = &self.header_bytes[..];
         let body_bytes: &[u8] = &self.body_bytes[..];
-        let header = BTreeLeafHeaderRef::new(header_bytes);
-        if header.page_type() != PageType::IndexLeaf {
+        if self.header.as_ref().page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
         }
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
         Ok(BTreeLeafPageZeroCopy {
-            header,
+            header: self.header.as_ref(),
             line_pointers: LinePtrArray::new(line_ptr_bytes),
             record_space: BTreeRecordSpace::new(record_bytes, base_offset),
         })
@@ -6441,6 +6433,78 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
         );
         Ok(page)
     }
+
+    fn header(&self) -> BTreeInternalHeaderRef<'a> {
+        self.header
+    }
+
+    fn slot_count(&self) -> usize {
+        self.line_pointers.len()
+    }
+
+    fn line_ptr(&self, slot: SlotId) -> Option<LinePtr> {
+        if slot >= self.line_pointers.len() {
+            None
+        } else {
+            Some(self.line_pointers.get(slot))
+        }
+    }
+
+    fn entry_bytes(&self, slot: SlotId) -> Option<&'a [u8]> {
+        let lp = self.line_ptr(slot)?;
+        self.record_space.entry_bytes(lp)
+    }
+
+    fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            match self
+                .entry_bytes(mid)
+                .and_then(|bytes| BTreeInternalEntry::decode(layout, bytes).ok())
+            {
+                Some(entry) if entry.key <= *search_key => left = mid + 1,
+                Some(_) => right = mid,
+                None => left = mid + 1,
+            }
+        }
+
+        left
+    }
+
+    fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
+        let mut left = 0;
+        let mut right = self.slot_count();
+        let mut result = None;
+
+        while left < right {
+            let mid = (left + right) / 2;
+            match self
+                .entry_bytes(mid)
+                .and_then(|bytes| BTreeInternalEntry::decode(layout, bytes).ok())
+            {
+                Some(entry) if entry.key <= *search_key => {
+                    result = Some(mid);
+                    left = mid + 1;
+                }
+                Some(_) => right = mid,
+                None => left = mid + 1,
+            }
+        }
+
+        result
+    }
+
+    fn is_full(&self, layout: &Layout) -> bool {
+        let needed = layout.slot_size as u16 + LinePtrBytes::LINE_PTR_BYTES as u16;
+        self.header.free_lower() + needed > self.header.free_upper()
+    }
+
+    fn btree_level(&self) -> u16 {
+        self.header.level() as u16
+    }
 }
 
 struct BTreeInternalPageZeroCopyMut<'a> {
@@ -6480,6 +6544,153 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
             "slot directory must match header slot_count"
         );
         Ok(parts)
+    }
+
+    fn as_read(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
+        let header_bytes: &[u8] = &self.header_bytes[..];
+        let body_bytes: &[u8] = &self.body_bytes[..];
+        let header = BTreeInternalHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexInternal {
+            return Err("not a B-tree internal page".into());
+        }
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        Ok(BTreeInternalPageZeroCopy {
+            header,
+            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+        })
+    }
+
+    fn insert_entry(
+        &mut self,
+        layout: &Layout,
+        key: Constant,
+        child_block: usize,
+    ) -> SimpleDBResult<SlotId> {
+        let slot = {
+            let view = self.as_read()?;
+            view.find_insertion_slot(layout, &key)
+        };
+
+        let entry = BTreeInternalEntry { key, child_block };
+        let entry_bytes = entry.encode(layout);
+        let entry_len: u16 = entry_bytes
+            .len()
+            .try_into()
+            .map_err(|_| "entry larger than maximum internal payload".to_string())?;
+        let slot_bytes = LinePtrBytes::LINE_PTR_BYTES as u16;
+
+        let line_ptr = {
+            let mut parts = self.split()?;
+            let (free_lower, free_upper, slot_count) = {
+                let header = parts.header();
+                (
+                    header.free_lower(),
+                    header.free_upper(),
+                    header.as_ref().slot_count(),
+                )
+            };
+            if free_lower + slot_bytes + entry_len > free_upper {
+                return Err("page full".into());
+            }
+            let new_upper = free_upper - entry_len;
+            {
+                parts
+                    .record_space()
+                    .write_entry(new_upper as usize, &entry_bytes);
+            }
+            {
+                let header = parts.header();
+                header.set_free_lower(free_lower + slot_bytes);
+                header.set_free_upper(new_upper);
+                header.set_slot_count(slot_count + 1);
+            }
+            LinePtr::new(new_upper, entry_len, LineState::Live)
+        };
+
+        let mut parts = self.split()?;
+        parts.line_ptrs().insert(slot, line_ptr);
+        Ok(slot)
+    }
+
+    fn delete_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
+        let (free_lower, free_upper) = {
+            let header = BTreeInternalHeaderRef::new(self.header_bytes);
+            (header.free_lower(), header.free_upper())
+        };
+        let mut parts = self.split()?;
+        let (deleted_offset, deleted_len_u16) = {
+            let line_ptrs = parts.line_ptrs();
+            if slot >= line_ptrs.len() {
+                return Err("invalid slot".into());
+            }
+            let lp = line_ptrs.as_ref().get(slot);
+            if !lp.is_live() {
+                return Err("slot not live".into());
+            }
+            let offset = lp.offset() as usize;
+            let len_u16 = lp.length();
+            line_ptrs.delete(slot);
+            (offset, len_u16)
+        };
+        let deleted_len = deleted_len_u16 as usize;
+        let free_upper_usize = free_upper as usize;
+
+        if deleted_offset > free_upper_usize {
+            let shift_len = deleted_offset - free_upper_usize;
+            parts.record_space().copy_within(
+                free_upper_usize,
+                free_upper_usize + deleted_len,
+                shift_len,
+            );
+        }
+
+        {
+            let line_ptrs = parts.line_ptrs();
+            let len = line_ptrs.len();
+            for idx in 0..len {
+                let mut lp = {
+                    let view = line_ptrs.as_ref();
+                    view.get(idx)
+                };
+                if (lp.offset() as usize) < deleted_offset {
+                    let new_offset = lp.offset() as usize + deleted_len;
+                    lp.set_offset(new_offset as u16);
+                    line_ptrs.set(idx, lp);
+                }
+            }
+        }
+
+        {
+            let new_lower = free_lower
+                .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower underflow during delete");
+            let new_upper = free_upper
+                .checked_add(deleted_len_u16)
+                .expect("free_upper overflow during delete");
+            let new_slot_count = {
+                let line_ptrs = parts.line_ptrs();
+                line_ptrs.len() as u16
+            };
+            let header = parts.header();
+            header.set_free_lower(new_lower);
+            header.set_free_upper(new_upper);
+            header.set_slot_count(new_slot_count);
+        }
+
+        Ok(())
+    }
+
+    fn set_btree_level(&mut self, level: u16) -> SimpleDBResult<()> {
+        let lvl = u8::try_from(level).map_err(|_| "btree level exceeds u8".to_string())?;
+        let mut header = BTreeInternalHeaderMut::new(self.header_bytes);
+        header.set_level(lvl);
+        Ok(())
     }
 }
 

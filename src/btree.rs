@@ -376,7 +376,7 @@ impl BTreeInternal {
 
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
-        view.set_btree_level(level + 1);
+        view.set_btree_level(level + 1)?;
         Ok(())
     }
 
