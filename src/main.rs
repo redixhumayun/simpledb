@@ -11013,7 +11013,7 @@ impl BufferManager {
 mod buffer_manager_tests {
     use std::{sync::Arc, thread};
 
-    use crate::{BlockId, Constant, Layout, Schema, SimpleDB, Transaction};
+    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Schema, SimpleDB};
 
     const BUFFER_FIELD: &str = "val";
 
@@ -11023,147 +11023,128 @@ mod buffer_manager_tests {
         Layout::new(schema)
     }
 
-    fn write_block_value(txn: &Arc<Transaction>, block_id: &BlockId, layout: &Layout, value: i32) {
-        let mut guard = txn.pin_write_guard(block_id);
-        guard.format_as_heap();
-        {
-            let mut view = guard
-                .into_heap_view_mut(layout)
-                .expect("heap page view mut");
-            let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
-            assert_eq!(slot, 0);
-            row_mut
-                .set_column(BUFFER_FIELD, &Constant::Int(value))
-                .expect("set row value");
+    struct HeapPageTestHarness {
+        buffer_manager: Arc<BufferManager>,
+        layout: Layout,
+    }
+
+    impl HeapPageTestHarness {
+        fn new(buffer_manager: Arc<BufferManager>, layout: Layout) -> Self {
+            Self {
+                buffer_manager,
+                layout,
+            }
+        }
+
+        fn overwrite_row(&self, block_id: &BlockId, value: i32) {
+            let buffer = self
+                .buffer_manager
+                .pin(block_id)
+                .expect("pin block for overwrite");
+            {
+                let mut page = buffer.write_page();
+                test_helpers::init_heap_page_with_int(&mut page, &self.layout, BUFFER_FIELD, value)
+                    .expect("initialize heap page");
+            }
+            buffer.set_modified(0, Lsn::MAX);
+            self.buffer_manager.unpin(buffer);
+        }
+
+        fn read_row(&self, block_id: &BlockId) -> i32 {
+            let buffer = self
+                .buffer_manager
+                .pin(block_id)
+                .expect("pin block for read");
+            let value = {
+                let page = buffer.read_page();
+                test_helpers::read_single_int_field(&page, &self.layout, BUFFER_FIELD)
+                    .expect("read heap row")
+            };
+            self.buffer_manager.unpin(buffer);
+            value
         }
     }
 
-    fn read_block_value(txn: &Arc<Transaction>, block_id: &BlockId, layout: &Layout) -> i32 {
-        let guard = txn.pin_read_guard(block_id);
-        let view = guard.into_heap_view(layout).expect("heap page view");
-        let row = view.row(0).expect("row 0 present");
-        match row.get_column(BUFFER_FIELD) {
-            Some(Constant::Int(v)) => v,
-            other => panic!("expected int column value, got {:?}", other),
-        }
-    }
-
-    /// This test will assert that when the buffer pool swaps out a page from the buffer pool, it properly flushes those contents to disk
-    /// and can then correctly read them back later
     #[test]
     fn test_buffer_replacement() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        let file_manager = Arc::clone(&db.file_manager);
         let buffer_manager = db.buffer_manager;
-        let layout = buffer_layout();
+        let harness = HeapPageTestHarness::new(Arc::clone(&buffer_manager), buffer_layout());
         let file = "testfile".to_string();
 
-        // Initialize four heap-formatted blocks with deterministic data.
-        let seed_txn = db.new_tx();
         let mut block_ids = Vec::new();
-        for i in 0..4 {
-            let block = seed_txn.append(&file);
-            write_block_value(&seed_txn, &block, &layout, i as i32);
+        for _ in 0..4 {
+            let block = file_manager.lock().unwrap().append(file.clone());
             block_ids.push(block);
         }
-        // Ensure block 0 starts with value 1 so we can detect the later update to 100.
-        write_block_value(&seed_txn, &block_ids[0], &layout, 1);
-        seed_txn.commit().unwrap();
 
-        // Modify block 0 but keep the transaction uncommitted so eviction must flush it.
-        let writer_txn = db.new_tx();
-        write_block_value(&writer_txn, &block_ids[0], &layout, 100);
+        harness.overwrite_row(&block_ids[0], 1);
+        for idx in 1..block_ids.len() {
+            harness.overwrite_row(&block_ids[idx], idx as i32);
+        }
 
-        let buffer_manager_guard = &buffer_manager;
+        harness.overwrite_row(&block_ids[0], 100);
 
-        // Force buffer replacement by pinning three additional blocks.
-        let buffer_2 = buffer_manager_guard.pin(&block_ids[1]).unwrap();
-        let buffer_3 = buffer_manager_guard.pin(&block_ids[2]).unwrap();
-        let buffer_4 = buffer_manager_guard.pin(&block_ids[3]).unwrap();
+        let buffer_2 = buffer_manager.pin(&block_ids[1]).unwrap();
+        let buffer_3 = buffer_manager.pin(&block_ids[2]).unwrap();
+        let buffer_4 = buffer_manager.pin(&block_ids[3]).unwrap();
 
-        //  remove one of the buffers so block 1 can be read back in
-        buffer_manager_guard.unpin(buffer_2);
-        buffer_manager_guard.unpin(buffer_3);
-        buffer_manager_guard.unpin(buffer_4);
+        buffer_manager.unpin(buffer_2);
+        buffer_manager.unpin(buffer_3);
+        buffer_manager.unpin(buffer_4);
 
-        //  Read block 0 back via a transaction and verify the updated value persisted.
-        let reader_txn = db.new_tx();
-        let observed = read_block_value(&reader_txn, &block_ids[0], &layout);
+        let observed = harness.read_row(&block_ids[0]);
         assert_eq!(observed, 100);
-        reader_txn.commit().unwrap();
-
-        writer_txn.commit().unwrap();
         assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
 
-    /// Concurrent stress test: multiple threads hammering same small working set
-    /// Tests for:
-    /// 1. Concurrent eviction races (multiple threads evicting/pinning same buffer slots)
-    /// 2. Pin count correctness (concurrent pin/unpin on same BlockId)
-    /// 3. Stats counter accuracy (AtomicUsize under concurrent updates)
-    /// 4. No panics/deadlocks under high contention
     #[test]
     fn test_concurrent_buffer_pool_stress() {
-        // Small buffer pool (4 buffers) with small working set (6 blocks)
-        // Forces evictions and contention
         let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
         db.buffer_manager.enable_stats();
+        let buffer_manager = db.buffer_manager;
+        let file_manager = Arc::clone(&db.file_manager);
+        let harness = Arc::new(HeapPageTestHarness::new(
+            Arc::clone(&buffer_manager),
+            buffer_layout(),
+        ));
 
         let num_blocks = 6;
         let num_threads = 8;
         let ops_per_thread = 100;
 
-        // Pre-create heap-formatted blocks with deterministic payloads.
-        let layout = Arc::new(buffer_layout());
-        let file = "stressfile".to_string();
-        let seed_txn = db.new_tx();
-        let mut block_ids = Vec::new();
-        for i in 0..num_blocks {
-            let block = seed_txn.append(&file);
-            write_block_value(&seed_txn, &block, layout.as_ref(), i as i32);
-            block_ids.push(block);
-        }
-        seed_txn.commit().unwrap();
-        let block_ids = Arc::new(block_ids);
+        let blocks: Vec<BlockId> = (0..num_blocks)
+            .map(|i| {
+                let block = file_manager
+                    .lock()
+                    .unwrap()
+                    .append("stressfile".to_string());
+                harness.overwrite_row(&block, i as i32);
+                block
+            })
+            .collect();
+        let blocks = Arc::new(blocks);
 
-        // Spawn threads that all hammer the same small working set
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
-                let fm = Arc::clone(&db.file_manager);
-                let lm = Arc::clone(&db.log_manager);
-                let bm = Arc::clone(&db.buffer_manager);
-                let lt = Arc::clone(&db.lock_table);
-                let blocks = Arc::clone(&block_ids);
-                let layout = Arc::clone(&layout);
+                let harness = Arc::clone(&harness);
+                let blocks = Arc::clone(&blocks);
                 thread::spawn(move || {
-                    let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
                     for op in 0..ops_per_thread {
-                        // Each thread accesses all blocks in round-robin
-                        // This creates maximum contention on buffer slots
                         let block_num = (thread_id + op) % num_blocks;
-                        let block_id = blocks[block_num].clone();
-                        let guard = txn.pin_read_guard(&block_id);
-                        let view = guard.into_heap_view(layout.as_ref()).expect("heap view");
-                        let row = view.row(0).expect("row 0 present");
-                        let val = match row.get_column(BUFFER_FIELD) {
-                            Some(Constant::Int(v)) => v,
-                            other => panic!("expected int value, got {:?}", other),
-                        };
-                        assert_eq!(val, block_num as i32);
+                        let value = harness.read_row(&blocks[block_num]);
+                        assert_eq!(value, block_num as i32);
                     }
-                    txn.commit().unwrap();
                 })
             })
             .collect();
 
-        // Wait for all threads to complete
         for handle in handles {
             handle.join().expect("Thread panicked during stress test");
         }
 
-        // Verify stats counters are consistent with deterministic lower bounds
-        // Note: Total may exceed num_threads * ops_per_thread because pin() can call
-        // try_to_pin() multiple times (retries when waiting for buffers)
-        if let Some(stats) = db.buffer_manager.stats() {
+        if let Some(stats) = buffer_manager.stats() {
             let (hits, misses) = stats.get();
             let total = hits + misses;
             let min_expected = num_threads * ops_per_thread;
@@ -11173,23 +11154,19 @@ mod buffer_manager_tests {
                 "Stats counter sanity check failed: got {total} total accesses (hits={hits}, misses={misses}), expected at least {min_expected}"
             );
 
-            // Misses: Must miss on first access to each unique block (6 blocks)
             assert!(
                 misses >= num_blocks,
                 "Expected at least {num_blocks} misses (cold start for {num_blocks} blocks), got {misses}"
             );
 
-            // Hits: With 4 buffers for 6 blocks, even with thrashing, expect some hits
-            // Conservative lower bound: ~12% hit rate under worst-case thrashing
             let min_hits = 100;
             if hits < min_hits {
                 eprintln!(
-                    "[buffer_manager_tests::stress] warning: expected >= {min_hits} hits under contention, got {hits}. This heuristic is noisy on contended CI hardware—verify manually if this regresses further."
+                    "[buffer_manager_tests::stress] warning: expected >= {min_hits} hits, got {hits}"
                 );
             }
 
-            // Verify buffer pool is consistent (all buffers unpinned)
-            let available = db.buffer_manager.available();
+            let available = buffer_manager.available();
             assert_eq!(
                 available, 4,
                 "Buffer pool inconsistent: expected 4 available buffers, got {available}"
@@ -11977,49 +11954,5 @@ mod durability_tests {
             recovered_string, "durability",
             "Data preserved: string should survive crash with sync"
         );
-    }
-}
-
-// Orphaned main function removed - CLI binary is in src/bin/simpledb-cli.rs
-
-#[cfg(test)]
-mod offset_smoke_tests {
-    use super::*;
-
-    #[test]
-    fn prints_buffer_manager_num_available_offset() {
-        let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
-        let bm = Arc::clone(&db.buffer_manager);
-
-        println!(
-            "num_available offset: 0x{:X}",
-            core::mem::offset_of!(BufferManager, num_available)
-        );
-
-        // Get pointer to the actual BufferManager inside the Arc
-        let bm_ptr = Arc::as_ptr(&bm);
-        let bm_addr = bm_ptr as usize;
-
-        // Calculate num_available address
-        let num_avail_addr = unsafe { std::ptr::addr_of!((*bm_ptr).num_available) as usize };
-
-        println!("BufferManager base: 0x{:X}", bm_addr);
-        println!("num_available addr: 0x{:X}", num_avail_addr);
-        println!("Offset: 0x{:X}", num_avail_addr - bm_addr);
-
-        // Lock and check data address
-        {
-            let guard = bm.num_available.lock().unwrap();
-            let data_addr = &*guard as *const usize as usize;
-            println!("Data inside mutex:  0x{:X}", data_addr);
-            println!(
-                "Data offset from BufferManager: 0x{:X}",
-                data_addr - bm_addr
-            );
-            println!(
-                "Data offset from num_available: 0x{:X}",
-                data_addr - num_avail_addr
-            );
-        }
     }
 }

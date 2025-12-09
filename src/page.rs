@@ -519,6 +519,82 @@ impl<'a> HeapHeaderMut<'a> {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+
+    pub fn init_heap_page_with_int(
+        page: &mut PageBytes,
+        layout: &Layout,
+        field: &str,
+        value: i32,
+    ) -> SimpleDBResult<()> {
+        let bytes = page.bytes_mut();
+        bytes.fill(0);
+        let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let mut header = HeapHeaderMut::new(header_bytes);
+        header.init_heap();
+        insert_single_int_row(bytes, layout, field, value)
+    }
+
+    pub fn read_single_int_field(
+        page: &PageBytes,
+        layout: &Layout,
+        field: &str,
+    ) -> SimpleDBResult<i32> {
+        let view = HeapPageZeroCopy::new(page.bytes())?;
+        let tuple = match view.tuple_ref(0).ok_or_else(|| "slot 0 missing".into())? {
+            TupleRef::Live(tuple) => tuple,
+            _ => return Err("slot 0 not live".into()),
+        };
+        let offset = layout
+            .offset(field)
+            .ok_or_else(|| format!("field {field} not found in layout"))?;
+        let bytes = tuple.payload_slice(offset, 4);
+        Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn insert_single_int_row(
+        bytes: &mut [u8],
+        layout: &Layout,
+        field: &str,
+        value: i32,
+    ) -> SimpleDBResult<()> {
+        let tuple_bytes = build_single_int_tuple(layout, field, value)?;
+        let mut page = HeapPageZeroCopyMut::new(bytes)?;
+        let mut split_guard = page.split()?;
+        let slot = match split_guard.insert_tuple_fast(&tuple_bytes)? {
+            HeapInsert::Done(slot) => slot,
+            HeapInsert::Reserved(reservation) => {
+                drop(split_guard);
+                let mut split_guard = page.split()?;
+                split_guard.insert_tuple_slow(reservation, &tuple_bytes)?
+            }
+        };
+        assert_eq!(slot, 0, "test helper expects writes to slot 0");
+        Ok(())
+    }
+
+    fn build_single_int_tuple(layout: &Layout, field: &str, value: i32) -> SimpleDBResult<Vec<u8>> {
+        let offset = layout
+            .offset(field)
+            .ok_or_else(|| format!("field {field} not found in layout"))?;
+        let mut payload = vec![0u8; layout.slot_size];
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload.len()];
+        let (header_bytes, body_bytes) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
+        let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
+        let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
+        header.set_xmin(0);
+        header.set_xmax(0);
+        header.set_payload_len(payload.len() as u32);
+        header.set_flags(0);
+        header.set_nullmap_ptr(0);
+        body_bytes.copy_from_slice(&payload);
+        Ok(buf)
+    }
+}
+
 pub struct BTreeLeafHeader {
     /// Page type discriminator
     page_type: PageType,
