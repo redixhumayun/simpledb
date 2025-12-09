@@ -11399,33 +11399,6 @@ impl BlockId {
 /// Page backed by the new layout; alias to the RawPage bytes type.
 pub type Page = crate::page::PageBytes;
 
-#[cfg(test)]
-mod page_tests {
-    use super::*;
-    #[test]
-    fn test_page_int_operations() {
-        let mut page = Page::new();
-        page.set_int(100, 4000);
-        assert_eq!(page.get_int(100), 4000);
-
-        page.set_int(200, -67890);
-        assert_eq!(page.get_int(200), -67890);
-
-        page.set_int(200, 1);
-        assert_eq!(page.get_int(200), 1);
-    }
-
-    #[test]
-    fn test_page_string_operations() {
-        let mut page = Page::new();
-        page.set_string(100, "Hello");
-        assert_eq!(page.get_string(100), "Hello");
-
-        page.set_string(200, "World");
-        assert_eq!(page.get_string(200), "World");
-    }
-}
-
 /// Trait defining the file system interface for database operations
 pub trait FileSystemInterface: std::fmt::Debug {
     fn block_size(&self) -> usize;
@@ -11515,7 +11488,8 @@ impl FileSystemInterface for FileManager {
             }
             Err(e) => panic!("Failed to read from file {e}"),
         }
-        *page = Page::from_bytes(&buf).expect("deserialize page");
+        let buf: &[u8; 4096] = buf.as_slice().try_into().unwrap();
+        *page = Page::from_bytes(*buf);
     }
 
     fn write(&mut self, block_id: &BlockId, page: &Page) {
@@ -11523,7 +11497,7 @@ impl FileSystemInterface for FileManager {
         let offset = block_offset(block_id.block_num);
         file.seek(io::SeekFrom::Start(offset)).unwrap();
         let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        page.write_bytes(&mut buf).expect("serialize page");
+        buf.copy_from_slice(page.bytes());
         file.write_all(&buf).unwrap();
     }
 
@@ -11710,7 +11684,9 @@ mod mock_file_manager {
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
-                *page = Page::from_bytes(&block.data).unwrap();
+                let arr: [u8; crate::page::PAGE_SIZE_BYTES as usize] =
+                    block.data.as_slice().try_into().unwrap();
+                *page = Page::from_bytes(arr);
             } else {
                 *page = Page::new();
             }
@@ -11724,7 +11700,7 @@ mod mock_file_manager {
             self.ensure_block_exists(&block_id.filename, block_id.block_num);
             let file = self.files.get_mut(&block_id.filename).unwrap();
             let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-            page.write_bytes(&mut buf).expect("serialize page");
+            buf.copy_from_slice(page.bytes());
 
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf,

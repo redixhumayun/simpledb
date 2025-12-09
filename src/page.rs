@@ -451,6 +451,19 @@ impl<'a> HeapHeaderMut<'a> {
         Self { bytes }
     }
 
+    pub fn init_heap(&mut self) {
+        self.set_page_type(PageType::Heap);
+        self.set_reserved_flags(0);
+        self.set_slot_count(0);
+        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_upper(PAGE_SIZE_BYTES);
+        self.set_free_ptr(PAGE_SIZE_BYTES as u32);
+        self.set_crc32(0);
+        self.set_latch_word(0);
+        self.set_free_head(NO_FREE_SLOT);
+        self.set_reserved_bytes([0; 6]);
+    }
+
     pub fn as_ref(&self) -> HeapHeaderRef<'_> {
         HeapHeaderRef {
             bytes: &self.bytes[..],
@@ -666,8 +679,62 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         BTreeLeafHeaderRef::new(&self.bytes[..])
     }
 
+    fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
+        self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn set_page_type(&mut self) {
+        self.bytes[0] = PageType::IndexLeaf as u8;
+    }
+
+    pub fn set_level(&mut self, level: u8) {
+        self.bytes[1] = level;
+    }
+
     pub fn set_slot_count(&mut self, slot_count: u16) {
         self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
+    }
+
+    pub fn set_high_key_len(&mut self, len: u16) {
+        self.write(4, len.to_le_bytes());
+    }
+
+    pub fn set_right_sibling_block(&mut self, block: u32) {
+        self.write(6, block.to_le_bytes());
+    }
+
+    pub fn set_overflow_block(&mut self, block: u32) {
+        self.write(10, block.to_le_bytes());
+    }
+
+    pub fn set_crc32(&mut self, crc32: u32) {
+        self.write(14, crc32.to_le_bytes());
+    }
+
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.write(18, lsn.to_le_bytes());
+    }
+
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
+        self.write(26, reserved);
+    }
+
+    pub fn init_leaf(
+        &mut self,
+        level: u8,
+        right_sibling: Option<u32>,
+        overflow_block: Option<u32>,
+    ) {
+        self.bytes.fill(0);
+        self.set_page_type();
+        self.set_level(level);
+        self.set_slot_count(0);
+        self.set_high_key_len(0);
+        self.set_right_sibling_block(right_sibling.unwrap_or(u32::MAX));
+        self.set_overflow_block(overflow_block.unwrap_or(u32::MAX));
+        self.set_crc32(0);
+        self.set_lsn(0);
+        self.set_reserved_bytes([0; 6]);
     }
 }
 
@@ -709,8 +776,52 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         BTreeInternalHeaderRef::new(&self.bytes[..])
     }
 
+    fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
+        self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn set_page_type(&mut self) {
+        self.bytes[0] = PageType::IndexInternal as u8;
+    }
+
+    pub fn set_level(&mut self, level: u8) {
+        self.bytes[1] = level;
+    }
+
     pub fn set_slot_count(&mut self, slot_count: u16) {
         self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
+    }
+
+    pub fn set_rightmost_child_block(&mut self, block: u32) {
+        self.write(4, block.to_le_bytes());
+    }
+
+    pub fn set_high_key_len(&mut self, len: u16) {
+        self.write(8, len.to_le_bytes());
+    }
+
+    pub fn set_crc32(&mut self, crc32: u32) {
+        self.write(10, crc32.to_le_bytes());
+    }
+
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.write(14, lsn.to_le_bytes());
+    }
+
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 10]) {
+        self.write(22, reserved);
+    }
+
+    pub fn init_internal(&mut self, level: u8, rightmost_child: Option<u32>) {
+        self.bytes.fill(0);
+        self.set_page_type();
+        self.set_level(level);
+        self.set_slot_count(0);
+        self.set_rightmost_child_block(rightmost_child.unwrap_or(u32::MAX));
+        self.set_high_key_len(0);
+        self.set_crc32(0);
+        self.set_lsn(0);
+        self.set_reserved_bytes([0; 10]);
     }
 }
 
@@ -1127,6 +1238,31 @@ pub trait PageKind {
 /// Slot identifier within a page.
 type SlotId = usize;
 
+#[derive(Debug)]
+pub struct PageBytes {
+    bytes: [u8; PAGE_SIZE_BYTES as usize],
+}
+
+impl PageBytes {
+    pub fn new() -> Self {
+        Self {
+            bytes: [0; PAGE_SIZE_BYTES as usize],
+        }
+    }
+
+    pub fn from_bytes(bytes: [u8; PAGE_SIZE_BYTES as usize]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn bytes<'a>(&'a self) -> &'a [u8] {
+        &self.bytes
+    }
+
+    fn bytes_mut<'a>(&'a mut self) -> &'a mut [u8] {
+        &mut self.bytes
+    }
+}
+
 pub struct DummyRawPageHeader {}
 
 impl HeaderCodec for DummyRawPageHeader {
@@ -1211,6 +1347,16 @@ impl<'a> HeapRecordSpaceMut<'a> {
             .expect("tuple offset precedes record space");
         let end = relative + tuple.len();
         self.bytes[relative..end].copy_from_slice(tuple);
+    }
+
+    fn tuple_bytes_mut(&mut self, ptr: LinePtr) -> Option<&mut [u8]> {
+        if !ptr.is_live() {
+            return None;
+        }
+        let offset = ptr.offset() as usize;
+        let length = ptr.length() as usize;
+        let relative = offset.checked_sub(self.base_offset)?;
+        self.bytes.get_mut(relative..relative + length)
     }
 
     fn zero(&mut self) {
@@ -1338,6 +1484,18 @@ impl<'a> HeapPageZeroCopy<'a> {
         let lp = self.line_ptr(slot)?;
         self.record_space.tuple_bytes(lp)
     }
+
+    fn tuple_ref(&self, slot: SlotId) -> Option<TupleRef<'a>> {
+        let lp = self.line_ptr(slot)?;
+        match lp.state() {
+            LineState::Free => Some(TupleRef::Free),
+            LineState::Live => Some(TupleRef::Live(HeapTuple::from_bytes(
+                self.tuple_bytes(slot)?,
+            ))),
+            LineState::Dead => Some(TupleRef::Dead),
+            LineState::Redirect => Some(TupleRef::Redirect(lp.offset() as usize)),
+        }
+    }
 }
 
 struct HeapPageZeroCopyMut<'a> {
@@ -1409,6 +1567,18 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     }
 }
 
+struct ReservedSlot {
+    slot_idx: SlotId,
+}
+
+/// Outcome of attempting to insert through the freelist fast path.
+enum HeapInsert {
+    /// Tuple inserted via freelist
+    Done(SlotId),
+    /// Freelist empty; header reserved a new slot entry that must be initialized after re-splitting
+    Reserved(ReservedSlot),
+}
+
 /// Guard holding disjoint mutable views over a heap page's header, slot directory, and record
 /// space. All heap mutations must go through this guard so the slices stay aligned with the
 /// latest `slot_count`. Drop releases the borrows so the next mutation re-splits the page.
@@ -1450,6 +1620,105 @@ impl<'a> HeapPageParts<'a> {
         let lp = self.line_ptrs.as_ref().get(free_idx);
         self.header.set_free_head(lp.offset());
         Some(free_idx)
+    }
+
+    pub fn insert_tuple_fast(&mut self, bytes: &[u8]) -> SimpleDBResult<HeapInsert> {
+        let needed: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size (u16::MAX)".to_string())?;
+
+        //  Try the fast path freelist first
+        if let Some(slot) = self.pop_free_slot() {
+            let (lower, upper) = {
+                let hdr = self.header.as_ref();
+                (hdr.free_lower(), hdr.free_upper())
+            };
+            if upper - lower < needed {
+                return Err("insufficient free space".into());
+            }
+            let new_upper = upper - needed;
+            self.record_space.write_tuple(new_upper as usize, bytes);
+            self.line_ptrs
+                .set(slot, LinePtr::new(new_upper, needed, LineState::Live));
+            self.header.set_free_upper(new_upper);
+            self.header.set_free_ptr(new_upper as u32);
+            return Ok(HeapInsert::Done(slot));
+        }
+
+        //  Fast path didn't work, need to carve out space
+        let lower = self.header.as_ref().free_lower();
+        let upper = self.header.as_ref().free_upper();
+        if lower as usize + LinePtrBytes::LINE_PTR_BYTES > upper as usize {
+            return Err("insufficient space for line pointer".into());
+        }
+        self.header
+            .set_free_lower(lower + LinePtrBytes::LINE_PTR_BYTES as u16);
+        let new_slot_count = self.header.as_ref().slot_count() + 1;
+        self.header.set_slot_count(new_slot_count);
+        let slot_idx = (new_slot_count - 1) as SlotId;
+        Ok(HeapInsert::Reserved(ReservedSlot { slot_idx }))
+    }
+
+    pub fn insert_tuple_slow(
+        &mut self,
+        reservation: ReservedSlot,
+        bytes: &[u8],
+    ) -> SimpleDBResult<SlotId> {
+        let needed: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size (u16::MAX)".to_string())?;
+        let (lower, upper) = {
+            let header = self.header.as_ref();
+            (header.free_lower(), header.free_upper())
+        };
+        if upper - lower < needed {
+            return Err("insufficient free space".into());
+        }
+        let new_upper = upper - needed;
+        self.record_space().write_tuple(new_upper as usize, bytes);
+        let slot = reservation.slot_idx;
+        let expected = self
+            .line_ptrs()
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| -> Box<dyn Error> { "slot directory empty after reservation".into() })?;
+        if slot != expected {
+            return Err("reserved slot index mismatch".into());
+        }
+        self.line_ptrs()
+            .set(slot, LinePtr::new(new_upper, needed, LineState::Live));
+
+        self.header.set_free_upper(new_upper);
+        self.header.set_free_ptr(new_upper as u32);
+        Ok(slot)
+    }
+
+    fn delete_slot(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        assert_eq!(
+            self.header().as_ref().slot_count() as usize,
+            self.line_ptrs().len()
+        );
+        let mut lp = self.line_ptrs.as_ref().get(slot);
+        if !lp.is_live() {
+            return Err(format!("slot {slot} is not live").into());
+        }
+        lp.mark_free();
+        lp.set_length(0);
+        lp.set_offset(0);
+        self.line_ptrs.set(slot, lp);
+        self.header
+            .set_free_head(slot.try_into().expect("slot id does not in u16"));
+        Ok(())
+    }
+
+    fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> SimpleDBResult<()> {
+        let mut line_pointer = self.line_ptrs().as_ref().get(slot);
+        assert!(line_pointer.is_live(), "slot {slot} must be live");
+        line_pointer.mark_redirect(target.try_into().expect("slot id does not in u16"));
+        self.line_ptrs.set(slot, line_pointer);
+        Ok(())
     }
 }
 
@@ -1556,9 +1825,6 @@ impl PageKind for BTreeInternalPage {
     type Header = BTreeInternalHeader;
     const HEADER_SIZE: usize = 32;
 }
-
-/// Type alias for a page whose kind is not yet known at the I/O boundary.
-pub type PageBytes = Page<RawPage>;
 
 /// Write-ahead log page using boundary-pointer format for sequential record storage.
 ///
@@ -2041,57 +2307,6 @@ impl<K: PageKind> Page<K> {
         let computed_crc32 = Self::crc32(&bytes);
         self.header.set_crc32(stored_crc32);
         Ok(stored_crc32 == computed_crc32)
-    }
-}
-
-impl From<Page<HeapPage>> for PageBytes {
-    fn from(page: Page<HeapPage>) -> Self {
-        let Page {
-            header,
-            line_pointers,
-            record_space,
-            ..
-        } = page;
-        Page::<RawPage> {
-            header,
-            line_pointers,
-            record_space,
-            kind: PhantomData,
-        }
-    }
-}
-
-impl From<Page<BTreeLeafPage>> for PageBytes {
-    fn from(page: Page<BTreeLeafPage>) -> Self {
-        let Page {
-            header,
-            line_pointers,
-            record_space,
-            ..
-        } = page;
-        Page::<RawPage> {
-            header,
-            line_pointers,
-            record_space,
-            kind: PhantomData,
-        }
-    }
-}
-
-impl From<Page<BTreeInternalPage>> for PageBytes {
-    fn from(page: Page<BTreeInternalPage>) -> Self {
-        let Page {
-            header,
-            line_pointers,
-            record_space,
-            ..
-        } = page;
-        Page::<RawPage> {
-            header,
-            line_pointers,
-            record_space,
-            kind: PhantomData,
-        }
     }
 }
 
@@ -2710,51 +2925,18 @@ impl<'a> PageReadGuard<'a> {
         }
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        self.page.bytes()
+    }
+
     /// Returns the block ID of the pinned page.
     pub fn block_id(&self) -> &BlockId {
         self.handle.block_id()
     }
 
-    /// Legacy helper: read a big-endian i32 at the given offset.
-    pub fn get_int(&self, offset: usize) -> i32 {
-        self.page.get_int(offset)
-    }
-
-    /// Legacy helper: read a UTF-8 string at the given offset.
-    pub fn get_string(&self, offset: usize) -> String {
-        self.page.get_string(offset)
-    }
-
     /// Returns the buffer frame.
     pub fn frame(&self) -> &BufferFrame {
         &self.frame
-    }
-
-    /// Attempts to interpret the underlying bytes as a heap page and returns a typed reference.
-    pub fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::Heap {
-            return Err("page is not a heap page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<HeapPage>;
-        Ok(unsafe { &*page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree leaf page.
-    pub fn as_btree_leaf_page(&self) -> Result<&Page<BTreeLeafPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexLeaf {
-            return Err("page is not a B-tree leaf page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
-        Ok(unsafe { &*page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree internal page.
-    pub fn as_btree_internal_page(&self) -> Result<&Page<BTreeInternalPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexInternal {
-            return Err("page is not a B-tree internal page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
-        Ok(unsafe { &*page })
     }
 
     /// Converts to a typed heap page view with schema access.
@@ -2803,19 +2985,17 @@ impl<'a> PageWriteGuard<'a> {
         }
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        self.page.bytes()
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        self.page.bytes_mut()
+    }
+
     /// Returns the block ID of the pinned page.
     pub fn block_id(&self) -> &BlockId {
         self.handle.block_id()
-    }
-
-    /// Legacy helper: write a big-endian i32 at the given offset.
-    pub fn set_int(&mut self, offset: usize, value: i32) {
-        self.page.set_int(offset, value);
-    }
-
-    /// Legacy helper: write a UTF-8 string at the given offset.
-    pub fn set_string(&mut self, offset: usize, value: &str) {
-        self.page.set_string(offset, value);
     }
 
     /// Returns the transaction ID.
@@ -2835,85 +3015,29 @@ impl<'a> PageWriteGuard<'a> {
 
     /// Formats the page as an empty heap page.
     pub fn format_as_heap(&mut self) {
-        *self.page = Page::<HeapPage>::new().into();
+        let bytes = self.bytes_mut();
+        bytes.fill(0);
+
+        let mut header = HeapHeaderMut::new(bytes);
+        header.init_heap();
     }
 
     /// Formats the page as an empty B-tree leaf page.
     pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(overflow_block);
-        *self.page = page.into();
+        let bytes = self.bytes_mut();
+        bytes.fill(0);
+
+        let mut header = BTreeLeafHeaderMut::new(bytes);
+        header.init_leaf(0, None, overflow_block.map(|b| b as u32));
     }
 
     /// Formats the page as an empty B-tree internal page.
-    pub fn format_as_btree_internal(&mut self, level: u16) {
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(level);
-        *self.page = page.into();
-    }
+    pub fn format_as_btree_internal(&mut self, level: u8) {
+        let bytes = self.bytes_mut();
+        bytes.fill(0);
 
-    /// Attempts to interpret the underlying bytes as a heap page and returns a typed reference.
-    fn as_heap_page(&self) -> Result<&Page<HeapPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::Heap {
-            return Err("page is not a heap page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<HeapPage>;
-        Ok(unsafe { &*page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a mutable heap page reference.
-    fn as_heap_page_mut(&mut self) -> Result<&mut Page<HeapPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::Heap {
-            return Err("page is not a heap page".into());
-        }
-        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<HeapPage>;
-        Ok(unsafe { &mut *page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree leaf page and returns a typed reference.
-    fn as_btree_leaf_page(&self) -> Result<&Page<BTreeLeafPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexLeaf {
-            return Err("page is not a B-tree leaf page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeLeafPage>;
-        Ok(unsafe { &*page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree leaf page and returns a mutable typed reference.
-    fn as_btree_leaf_page_mut(&mut self) -> Result<&mut Page<BTreeLeafPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexLeaf {
-            return Err("page is not a B-tree leaf page".into());
-        }
-        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<BTreeLeafPage>;
-        Ok(unsafe { &mut *page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree internal page and returns a typed reference.
-    fn as_btree_internal_page(&self) -> Result<&Page<BTreeInternalPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexInternal {
-            return Err("page is not a B-tree internal page".into());
-        }
-        let page = &*self.page as *const Page<RawPage> as *const Page<BTreeInternalPage>;
-        Ok(unsafe { &*page })
-    }
-
-    /// Attempts to interpret the underlying bytes as a B-tree internal page and returns a mutable typed reference.
-    fn as_btree_internal_page_mut(
-        &mut self,
-    ) -> Result<&mut Page<BTreeInternalPage>, Box<dyn Error>> {
-        if self.page.header.page_type() != PageType::IndexInternal {
-            return Err("page is not a B-tree internal page".into());
-        }
-        let page = &mut *self.page as *mut Page<RawPage> as *mut Page<BTreeInternalPage>;
-        Ok(unsafe { &mut *page })
-    }
-
-    /// Converts to a mutable typed heap page view with schema access.
-    pub fn into_heap_view_mut(
-        self,
-        layout: &'a Layout,
-    ) -> Result<HeapPageViewMut<'a>, Box<dyn Error>> {
-        HeapPageViewMut::new(self, layout)
+        let mut header = BTreeInternalHeaderMut::new(bytes);
+        header.init_internal(level, None);
     }
 
     /// Converts to a mutable B-tree leaf page view.
@@ -3662,26 +3786,31 @@ pub struct HeapPageView<'a> {
 }
 
 impl<'a> HeapPageView<'a> {
-    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::Heap {
-            return Err("cannot initialize PageView<'a, HeapPage> with a non-heap page".into());
-        }
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
+        HeapPageZeroCopy::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
+    fn build_page(&'a self) -> HeapPageZeroCopy<'a> {
+        HeapPageZeroCopy::new(self.guard.bytes()).unwrap()
+    }
+
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        match self.guard.as_heap_page().unwrap().tuple(slot)? {
+        let view = self.build_page();
+        let tuple_ref = view.tuple_ref(slot)?;
+        match tuple_ref {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
             TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
         }
     }
 
     pub fn slot_count(&self) -> usize {
-        self.guard.as_heap_page().unwrap().slot_count()
+        self.build_page().slot_count()
     }
 
     pub fn live_slot_iter(&self) -> HeapIterator<'_> {
-        HeapPage::live_iterator(self.guard.as_heap_page().unwrap())
+        todo!()
+        // HeapPage::live_iterator(self.guard.as_heap_page().unwrap())
     }
 }
 
@@ -3696,10 +3825,8 @@ pub struct HeapPageViewMut<'a> {
 }
 
 impl<'a> HeapPageViewMut<'a> {
-    fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::Heap {
-            return Err("cannot initialize PageViewMut<'a, HeapPage> with a non-heap page".into());
-        }
+    fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
+        HeapPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
@@ -3707,14 +3834,25 @@ impl<'a> HeapPageViewMut<'a> {
         })
     }
 
+    fn build_page(&'a self) -> HeapPageZeroCopy<'a> {
+        HeapPageZeroCopy::new(self.guard.bytes()).unwrap()
+    }
+
+    fn build_mut_page(&mut self) -> HeapPageZeroCopyMut<'_> {
+        HeapPageZeroCopyMut::new(self.guard.bytes_mut()).unwrap()
+    }
+
     /// Returns the current [`TupleRef`] at `slot`, including redirect/dead markers.
-    pub fn tuple_ref(&self, slot: SlotId) -> Result<Option<TupleRef<'_>>, Box<dyn Error>> {
-        Ok(self.guard.as_heap_page()?.tuple(slot))
+    pub fn tuple_ref(&self, slot: SlotId) -> Option<TupleRef<'_>> {
+        let view = self.build_page();
+        view.tuple_ref(slot)
     }
 
     /// Returns a logical row for the slot if it is live; otherwise `None`.
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
-        match self.guard.as_heap_page().unwrap().tuple(slot)? {
+        let view = self.build_page();
+        let tuple_ref = view.tuple_ref(slot)?;
+        match tuple_ref {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
             TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
         }
@@ -3730,45 +3868,51 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Inserts a raw tuple payload into the page and returns the allocated slot.
-    pub fn insert_tuple(&mut self, bytes: &[u8]) -> Result<SlotId, Box<dyn Error>> {
-        match self.guard.as_heap_page_mut()?.insert_tuple(bytes) {
-            Ok(slot) => {
+    pub fn insert_tuple(&mut self, bytes: &[u8]) -> SimpleDBResult<SlotId> {
+        let mut page = self.build_mut_page();
+        let mut split_guard = page.split()?;
+        match split_guard.insert_tuple_fast(bytes)? {
+            HeapInsert::Done(slot) => {
+                drop(split_guard);
                 self.dirty.set(true);
-                Ok(slot)
+                return Ok(slot);
             }
-            Err(e) => Err(e),
+            HeapInsert::Reserved(reservation) => {
+                drop(split_guard);
+                let mut split_guard = page.split()?;
+                let slot = split_guard.insert_tuple_slow(reservation, bytes)?;
+                self.dirty.set(true);
+                return Ok(slot);
+            }
         }
     }
 
     /// Deletes the tuple at `slot`, marking it free for reuse.
-    pub fn delete_slot(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
-        match self.guard.as_heap_page_mut()?.delete_slot(slot) {
-            Ok(()) => {
-                self.dirty.set(true);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+    pub fn delete_slot(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page();
+        let mut split_guard = page.split()?;
+        split_guard.delete_slot(slot)?;
+        self.dirty.set(true);
+        Ok(())
     }
 
     /// Marks `slot` as a redirect to `target`, used for tuple forwarding.
-    pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> Result<(), Box<dyn Error>> {
-        match self.guard.as_heap_page_mut()?.redirect_slot(slot, target) {
-            Ok(()) => {
-                self.dirty.set(true);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+    pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page();
+        let mut split_guard = page.split()?;
+        split_guard.redirect_slot(slot, target)?;
+        self.dirty.set(true);
+        Ok(())
     }
 
     /// Serializes the page into the provided buffer.
-    pub fn write_bytes(&self, out: &mut [u8]) -> Result<(), Box<dyn Error>> {
-        self.guard.as_heap_page()?.write_bytes(out)
+    pub fn write_bytes(&self, out: &mut [u8]) -> SimpleDBResult<()> {
+        out.copy_from_slice(self.guard.bytes());
+        Ok(())
     }
 
     /// Allocates a new heap tuple and returns both the slot and a mutable logical row handle.
-    pub fn insert_row_mut(&mut self) -> Result<(SlotId, LogicalRowMut<'_>), Box<dyn Error>> {
+    pub fn insert_row_mut(&mut self) -> SimpleDBResult<(SlotId, LogicalRowMut<'_>)> {
         let payload_len = self.layout.slot_size;
         let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
         let mut header_buf = [0u8; HEAP_TUPLE_HEADER_BYTES];
@@ -3779,38 +3923,59 @@ impl<'a> HeapPageViewMut<'a> {
         header.set_flags(0);
         header.set_nullmap_ptr(0);
         buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
-        let slot = self.guard.as_heap_page_mut()?.insert_tuple(&buf)?;
+        let slot = self.insert_tuple(&buf)?;
         self.dirty.set(true);
         let dirty = self.dirty.clone();
         let layout_clone = self.layout.clone();
-        let tuple_mut = self
-            .guard
-            .as_heap_page_mut()?
-            .heap_tuple_mut(slot)
+        let heap_tuple_mut = self
+            .resolve_live_tuple_mut(slot)
             .expect("tuple must exist after allocation");
-        Ok((slot, LogicalRowMut::new(tuple_mut, layout_clone, dirty)))
+        Ok((
+            slot,
+            LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty),
+        ))
     }
 
     /// Returns the number of slot entries currently present.
     pub fn slot_count(&self) -> usize {
-        self.guard.as_heap_page().unwrap().slot_count()
+        self.build_page().slot_count()
     }
 
     fn resolve_live_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
         let mut current = slot;
         loop {
-            match self.guard.as_heap_page().unwrap().tuple(current)? {
-                TupleRef::Live(_) => {
-                    return self
-                        .guard
-                        .as_heap_page_mut()
-                        .unwrap()
-                        .heap_tuple_mut(current)
-                }
+            let view = self.build_page();
+            match view.tuple_ref(current)? {
+                TupleRef::Live(_) => break,
                 TupleRef::Redirect(next) => current = next,
                 TupleRef::Free | TupleRef::Dead => return None,
             }
         }
+
+        //  This block of code is here so that the compiler can see that the lifetime of the bytes provided to LogicalRowMut is valid
+        //  If we were to build page and then operate on that, the lifetime of the underlying bytes cannot be proven by the compiler
+        //  since the compiler has no idea that page aliases the same underlying bytes
+        let bytes = self.guard.bytes_mut();
+        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPage::HEADER_SIZE as usize);
+        let header = HeapHeaderRef::new(header_bytes);
+        if current >= header.slot_count() as usize {
+            return None;
+        }
+        let slot_bytes = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let (lp_bytes, record_bytes) = body_bytes.split_at_mut(slot_bytes);
+        let line_ptr = {
+            let lp_array = LinePtrArrayMut::new(lp_bytes);
+            lp_array.as_ref().get(current)
+        };
+        if !line_ptr.is_live() {
+            return None;
+        }
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_bytes;
+        let offset = line_ptr.offset() as usize;
+        let length = line_ptr.length() as usize;
+        let relative = offset.checked_sub(base_offset)?;
+        let tuple_bytes = record_bytes.get_mut(relative..relative + length)?;
+        Some(HeapTupleMut::from_bytes(tuple_bytes))
     }
 }
 
@@ -3985,10 +4150,8 @@ pub struct BTreeLeafPageView<'a> {
 }
 
 impl<'a> BTreeLeafPageView<'a> {
-    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::IndexLeaf {
-            return Err("cannot initialize BTreeLeafPageView with non-leaf page".into());
-        }
+    pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
+        BTreeLeafPageZeroCopy::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
@@ -4045,9 +4208,7 @@ pub struct BTreeLeafPageViewMut<'a> {
 
 impl<'a> BTreeLeafPageViewMut<'a> {
     pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::IndexLeaf {
-            return Err("cannot initialize BTreeLeafPageViewMut with non-leaf page".into());
-        }
+        BTreeLeafPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
@@ -4143,9 +4304,7 @@ pub struct BTreeInternalPageView<'a> {
 
 impl<'a> BTreeInternalPageView<'a> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::IndexInternal {
-            return Err("cannot initialize BTreeInternalPageView with non-internal page".into());
-        }
+        BTreeInternalPageZeroCopy::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
@@ -4198,9 +4357,7 @@ pub struct BTreeInternalPageViewMut<'a> {
 
 impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
-        if guard.page.header.page_type() != PageType::IndexInternal {
-            return Err("cannot initialize BTreeInternalPageViewMut with non-internal page".into());
-        }
+        BTreeInternalPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
