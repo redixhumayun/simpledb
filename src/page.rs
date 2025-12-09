@@ -1516,6 +1516,28 @@ impl<'a> BTreeRecordSpaceMut<'a> {
         Some(&self.bytes[relative..relative + length])
     }
 
+    fn write_entry(&mut self, offset: usize, bytes: &[u8]) {
+        let relative = offset
+            .checked_sub(self.base_offset)
+            .expect("entry offset precedes record space");
+        let end = relative + bytes.len();
+        self.bytes[relative..end].copy_from_slice(bytes);
+    }
+
+    fn copy_within(&mut self, src_offset: usize, dst_offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let src_relative = src_offset
+            .checked_sub(self.base_offset)
+            .expect("source offset precedes record space");
+        let dst_relative = dst_offset
+            .checked_sub(self.base_offset)
+            .expect("destination offset precedes record space");
+        let src_end = src_relative + len;
+        self.bytes.copy_within(src_relative..src_end, dst_relative);
+    }
+
     fn insert(&mut self, offset: usize, bytes: &[u8]) {
         let relative = offset
             .checked_sub(self.base_offset)
@@ -4339,7 +4361,6 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             .expect("BTreeLeafPageViewMut constructed with valid leaf page")
     }
 
-    #[allow(dead_code)]
     fn build_mut_page(&mut self) -> SimpleDBResult<BTreeLeafPageZeroCopyMut<'_>> {
         BTreeLeafPageZeroCopyMut::new(self.guard.bytes_mut())
     }
@@ -4384,28 +4405,26 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, rid: RID) -> SimpleDBResult<SlotId> {
-        let slot =
-            self.guard
-                .as_btree_leaf_page_mut()?
-                .insert_leaf_entry(self.layout, &key, &rid)?;
+        let layout = self.layout;
+        let mut page = self.build_mut_page()?;
+        let slot = page.insert_entry(layout, key, rid)?;
         self.dirty = true;
         Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
-        self.guard
-            .as_btree_leaf_page_mut()?
-            .delete_leaf_entry(slot, self.layout)?;
+        let layout = self.layout;
+        let mut page = self.build_mut_page()?;
+        page.delete_entry(slot, layout)?;
         self.dirty = true;
         Ok(())
     }
 
-    pub fn set_overflow_block(&mut self, block: Option<usize>) {
-        self.guard
-            .as_btree_leaf_page_mut()
-            .unwrap()
-            .set_overflow_block(block);
+    pub fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.set_overflow_block(block)?;
         self.dirty = true;
+        Ok(())
     }
 
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
@@ -6154,6 +6173,25 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
         }
     }
 
+    fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            match self
+                .entry_bytes(mid)
+                .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
+            {
+                Some(entry) if entry.key <= *search_key => left = mid + 1,
+                Some(_) => right = mid,
+                None => left = mid + 1,
+            }
+        }
+
+        left
+    }
+
     fn is_full(&self, layout: &Layout) -> bool {
         let lower = self.header.free_lower();
         let upper = self.header.free_upper();
@@ -6208,6 +6246,147 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             "slot directory must match header slot_count"
         );
         Ok(parts)
+    }
+
+    fn as_read(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+        let header_bytes: &[u8] = &self.header_bytes[..];
+        let body_bytes: &[u8] = &self.body_bytes[..];
+        let header = BTreeLeafHeaderRef::new(header_bytes);
+        if header.page_type() != PageType::IndexLeaf {
+            return Err("not a B-tree leaf page".into());
+        }
+        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        if slot_len > body_bytes.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
+        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        Ok(BTreeLeafPageZeroCopy {
+            header,
+            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+        })
+    }
+
+    fn insert_entry(&mut self, layout: &Layout, key: Constant, rid: RID) -> SimpleDBResult<SlotId> {
+        let slot = {
+            let view = self.as_read()?;
+            view.find_insertion_slot(layout, &key)
+        };
+
+        let entry = BTreeLeafEntry { key, rid };
+        let entry_bytes = entry.encode(layout);
+        let entry_len: u16 = entry_bytes
+            .len()
+            .try_into()
+            .map_err(|_| "entry larger than maximum leaf payload".to_string())?;
+        let slot_bytes = LinePtrBytes::LINE_PTR_BYTES as u16;
+
+        let line_ptr = {
+            let mut parts = self.split()?;
+            let (free_lower, free_upper) = {
+                let header = parts.header();
+                (header.free_lower(), header.free_upper())
+            };
+            if free_lower + slot_bytes + entry_len > free_upper {
+                return Err("page full".into());
+            }
+            let new_upper = free_upper - entry_len;
+            parts
+                .record_space()
+                .write_entry(new_upper as usize, &entry_bytes);
+            {
+                let header = parts.header();
+                header.set_free_lower(free_lower + slot_bytes);
+                header.set_free_upper(new_upper);
+                let slot_count = header.as_ref().slot_count();
+                header.set_slot_count(slot_count + 1);
+            }
+            LinePtr::new(new_upper, entry_len, LineState::Live)
+        };
+
+        let mut parts = self.split()?;
+        parts.line_ptrs().insert(slot, line_ptr);
+        Ok(slot)
+    }
+
+    fn delete_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        let free_upper = {
+            let header = parts.header();
+            header.free_upper() as usize
+        };
+        let (deleted_offset, deleted_len) = {
+            let line_ptrs = parts.line_ptrs();
+            if slot >= line_ptrs.len() {
+                return Err("invalid slot".into());
+            }
+            let lp = line_ptrs.as_ref().get(slot);
+            if !lp.is_live() {
+                return Err("slot not live".into());
+            }
+            let offset = lp.offset() as usize;
+            let len = lp.length() as usize;
+            line_ptrs.delete(slot);
+            (offset, len)
+        };
+        let deleted_len_u16: u16 = deleted_len
+            .try_into()
+            .map_err(|_| "entry length exceeds header capacity".to_string())?;
+
+        if deleted_offset > free_upper {
+            let shift_len = deleted_offset - free_upper;
+            parts
+                .record_space()
+                .copy_within(free_upper, free_upper + deleted_len, shift_len);
+        }
+
+        {
+            let line_ptrs = parts.line_ptrs();
+            let len = line_ptrs.len();
+            for idx in 0..len {
+                let mut lp = {
+                    let view = line_ptrs.as_ref();
+                    view.get(idx)
+                };
+                if (lp.offset() as usize) < deleted_offset {
+                    let new_offset = lp.offset() as usize + deleted_len;
+                    lp.set_offset(new_offset as u16);
+                    line_ptrs.set(idx, lp);
+                }
+            }
+        }
+
+        {
+            let header = parts.header();
+            let current_lower = header.free_lower();
+            let current_upper = header.free_upper();
+            header.set_free_lower(
+                current_lower
+                    .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                    .expect("free_lower underflow during delete"),
+            );
+            header.set_free_upper(
+                current_upper
+                    .checked_add(deleted_len_u16)
+                    .expect("free_upper overflow during delete"),
+            );
+            let slot_count = header.as_ref().slot_count();
+            header.set_slot_count(
+                slot_count
+                    .checked_sub(1)
+                    .expect("slot_count underflow during delete"),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        let value = block.map(|b| b as u32).unwrap_or(u32::MAX);
+        parts.header().set_overflow_block(value);
+        Ok(())
     }
 }
 

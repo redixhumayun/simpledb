@@ -774,7 +774,7 @@ impl BTreeLeaf {
                     // Clear overflow on current page and insert new entry
                     let guard = self.txn.pin_write_guard(&self.current_block_id);
                     let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
-                    view.set_overflow_block(None);
+                    view.set_overflow_block(None)?;
                     view.insert_entry(self.search_key.clone(), rid)?;
 
                     self.current_slot = Some(0);
@@ -836,7 +836,7 @@ impl BTreeLeaf {
             // Set overflow on current page
             let guard = self.txn.pin_write_guard(&self.current_block_id);
             let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
-            view.set_overflow_block(Some(new_block_id.block_num));
+            view.set_overflow_block(Some(new_block_id.block_num))?;
 
             debug!("Done splitting BTreeLeaf");
             return Ok(None);
