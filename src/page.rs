@@ -526,6 +526,10 @@ pub struct BTreeLeafHeader {
     level: u8,
     /// Number of slots in the line pointer array
     slot_count: u16,
+    /// Offset to end of line pointer array (grows downward)
+    free_lower: u16,
+    /// Offset to start of entry payload (grows upward)
+    free_upper: u16,
     /// Length of optional high-key payload
     high_key_len: u16,
     /// Right sibling block number
@@ -537,39 +541,7 @@ pub struct BTreeLeafHeader {
     /// Last modified LSN
     lsn: u64,
     /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 6],
-}
-
-impl HeaderCodec for BTreeInternalHeader {
-    const PAGE_TYPE: PageType = PageType::IndexInternal;
-
-    fn page_type_byte(&self) -> PageType {
-        Self::PAGE_TYPE
-    }
-
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
-        Ok(Self {
-            page_type: PageType::IndexInternal,
-            level: bytes[1],
-            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
-            rightmost_child_block: u32::from_le_bytes(bytes[4..8].try_into()?),
-            high_key_len: u16::from_le_bytes(bytes[8..10].try_into()?),
-            crc32: u32::from_le_bytes(bytes[10..14].try_into()?),
-            lsn: u64::from_le_bytes(bytes[14..22].try_into()?),
-            reserved: bytes[22..32].try_into()?,
-        })
-    }
-
-    fn write_bytes(&self, dest: &mut [u8]) {
-        dest[0] = self.page_type as u8;
-        dest[1] = self.level;
-        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        dest[4..8].copy_from_slice(&self.rightmost_child_block.to_le_bytes());
-        dest[8..10].copy_from_slice(&self.high_key_len.to_le_bytes());
-        dest[10..14].copy_from_slice(&self.crc32.to_le_bytes());
-        dest[14..22].copy_from_slice(&self.lsn.to_le_bytes());
-        dest[22..32].copy_from_slice(&self.reserved);
-    }
+    reserved: [u8; 2],
 }
 
 impl HeaderCodec for BTreeLeafHeader {
@@ -584,9 +556,48 @@ impl HeaderCodec for BTreeLeafHeader {
             page_type: PageType::IndexLeaf,
             level: bytes[1],
             slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
-            high_key_len: u16::from_le_bytes(bytes[4..6].try_into()?),
-            right_sibling_block: u32::from_le_bytes(bytes[6..10].try_into()?),
-            overflow_block: u32::from_le_bytes(bytes[10..14].try_into()?),
+            free_lower: u16::from_le_bytes(bytes[4..6].try_into()?),
+            free_upper: u16::from_le_bytes(bytes[6..8].try_into()?),
+            high_key_len: u16::from_le_bytes(bytes[8..10].try_into()?),
+            right_sibling_block: u32::from_le_bytes(bytes[10..14].try_into()?),
+            overflow_block: u32::from_le_bytes(bytes[14..18].try_into()?),
+            crc32: u32::from_le_bytes(bytes[18..22].try_into()?),
+            lsn: u64::from_le_bytes(bytes[22..30].try_into()?),
+            reserved: bytes[30..32].try_into()?,
+        })
+    }
+
+    fn write_bytes(&self, dest: &mut [u8]) {
+        dest[0] = self.page_type as u8;
+        dest[1] = self.level;
+        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
+        dest[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
+        dest[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
+        dest[8..10].copy_from_slice(&self.high_key_len.to_le_bytes());
+        dest[10..14].copy_from_slice(&self.right_sibling_block.to_le_bytes());
+        dest[14..18].copy_from_slice(&self.overflow_block.to_le_bytes());
+        dest[18..22].copy_from_slice(&self.crc32.to_le_bytes());
+        dest[22..30].copy_from_slice(&self.lsn.to_le_bytes());
+        dest[30..32].copy_from_slice(&self.reserved);
+    }
+}
+
+impl HeaderCodec for BTreeInternalHeader {
+    const PAGE_TYPE: PageType = PageType::IndexInternal;
+
+    fn page_type_byte(&self) -> PageType {
+        Self::PAGE_TYPE
+    }
+
+    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+        Ok(Self {
+            page_type: PageType::IndexInternal,
+            level: bytes[1],
+            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
+            free_lower: u16::from_le_bytes(bytes[4..6].try_into()?),
+            free_upper: u16::from_le_bytes(bytes[6..8].try_into()?),
+            rightmost_child_block: u32::from_le_bytes(bytes[8..12].try_into()?),
+            high_key_len: u16::from_le_bytes(bytes[12..14].try_into()?),
             crc32: u32::from_le_bytes(bytes[14..18].try_into()?),
             lsn: u64::from_le_bytes(bytes[18..26].try_into()?),
             reserved: bytes[26..32].try_into()?,
@@ -597,9 +608,10 @@ impl HeaderCodec for BTreeLeafHeader {
         dest[0] = self.page_type as u8;
         dest[1] = self.level;
         dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        dest[4..6].copy_from_slice(&self.high_key_len.to_le_bytes());
-        dest[6..10].copy_from_slice(&self.right_sibling_block.to_le_bytes());
-        dest[10..14].copy_from_slice(&self.overflow_block.to_le_bytes());
+        dest[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
+        dest[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
+        dest[8..12].copy_from_slice(&self.rightmost_child_block.to_le_bytes());
+        dest[12..14].copy_from_slice(&self.high_key_len.to_le_bytes());
         dest[14..18].copy_from_slice(&self.crc32.to_le_bytes());
         dest[18..26].copy_from_slice(&self.lsn.to_le_bytes());
         dest[26..32].copy_from_slice(&self.reserved);
@@ -613,6 +625,10 @@ pub struct BTreeInternalHeader {
     level: u8,
     /// Number of slots in the line pointer array
     slot_count: u16,
+    /// Offset to end of line pointer array
+    free_lower: u16,
+    /// Offset to start of payload region
+    free_upper: u16,
     /// Rightmost child block number
     rightmost_child_block: u32,
     /// Length of optional high-key payload
@@ -622,7 +638,7 @@ pub struct BTreeInternalHeader {
     /// Last modified LSN
     lsn: u64,
     /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 10],
+    reserved: [u8; 6],
 }
 
 /// Read-only view over a B-tree leaf header.
@@ -652,16 +668,28 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
     }
 
-    pub fn high_key_len(&self) -> u16 {
+    pub fn free_lower(&self) -> u16 {
         u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
     }
 
+    pub fn free_upper(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
+    }
+
+    pub fn free_space(&self) -> u16 {
+        self.free_upper().saturating_sub(self.free_lower())
+    }
+
+    pub fn high_key_len(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[8..10].try_into().unwrap())
+    }
+
     pub fn right_sibling(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[6..10].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[10..14].try_into().unwrap())
     }
 
     pub fn overflow_block(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[10..14].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[14..18].try_into().unwrap())
     }
 }
 
@@ -695,28 +723,52 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
     }
 
+    pub fn set_free_lower(&mut self, lower: u16) {
+        self.write(4, lower.to_le_bytes());
+    }
+
+    pub fn set_free_upper(&mut self, upper: u16) {
+        self.write(6, upper.to_le_bytes());
+    }
+
+    pub fn free_lower(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
+    }
+
+    pub fn free_upper(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
+    }
+
+    pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
+        debug_assert!(lower >= PAGE_HEADER_SIZE_BYTES);
+        debug_assert!(upper <= PAGE_SIZE_BYTES);
+        debug_assert!(lower <= upper);
+        self.set_free_lower(lower);
+        self.set_free_upper(upper);
+    }
+
     pub fn set_high_key_len(&mut self, len: u16) {
-        self.write(4, len.to_le_bytes());
+        self.write(8, len.to_le_bytes());
     }
 
     pub fn set_right_sibling_block(&mut self, block: u32) {
-        self.write(6, block.to_le_bytes());
-    }
-
-    pub fn set_overflow_block(&mut self, block: u32) {
         self.write(10, block.to_le_bytes());
     }
 
+    pub fn set_overflow_block(&mut self, block: u32) {
+        self.write(14, block.to_le_bytes());
+    }
+
     pub fn set_crc32(&mut self, crc32: u32) {
-        self.write(14, crc32.to_le_bytes());
+        self.write(18, crc32.to_le_bytes());
     }
 
     pub fn set_lsn(&mut self, lsn: u64) {
-        self.write(18, lsn.to_le_bytes());
+        self.write(22, lsn.to_le_bytes());
     }
 
-    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
-        self.write(26, reserved);
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 2]) {
+        self.write(30, reserved);
     }
 
     pub fn init_leaf(
@@ -729,12 +781,14 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.set_page_type();
         self.set_level(level);
         self.set_slot_count(0);
+        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_high_key_len(0);
         self.set_right_sibling_block(right_sibling.unwrap_or(u32::MAX));
         self.set_overflow_block(overflow_block.unwrap_or(u32::MAX));
         self.set_crc32(0);
         self.set_lsn(0);
-        self.set_reserved_bytes([0; 6]);
+        self.set_reserved_bytes([0; 2]);
     }
 }
 
@@ -757,8 +811,32 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         }
     }
 
+    pub fn level(&self) -> u8 {
+        self.bytes[1]
+    }
+
     pub fn slot_count(&self) -> u16 {
         u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+
+    pub fn free_lower(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
+    }
+
+    pub fn free_upper(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
+    }
+
+    pub fn free_space(&self) -> u16 {
+        self.free_upper().saturating_sub(self.free_lower())
+    }
+
+    pub fn rightmost_child_block(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
+    }
+
+    pub fn high_key_len(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
 }
 
@@ -788,28 +866,56 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         self.bytes[1] = level;
     }
 
+    pub fn level(&self) -> u8 {
+        self.bytes[1]
+    }
+
     pub fn set_slot_count(&mut self, slot_count: u16) {
         self.bytes[2..4].copy_from_slice(&slot_count.to_le_bytes());
     }
 
+    pub fn set_free_lower(&mut self, lower: u16) {
+        self.write(4, lower.to_le_bytes());
+    }
+
+    pub fn set_free_upper(&mut self, upper: u16) {
+        self.write(6, upper.to_le_bytes());
+    }
+
+    pub fn free_lower(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
+    }
+
+    pub fn free_upper(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
+    }
+
+    pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
+        debug_assert!(lower >= PAGE_HEADER_SIZE_BYTES);
+        debug_assert!(upper <= PAGE_SIZE_BYTES);
+        debug_assert!(lower <= upper);
+        self.set_free_lower(lower);
+        self.set_free_upper(upper);
+    }
+
     pub fn set_rightmost_child_block(&mut self, block: u32) {
-        self.write(4, block.to_le_bytes());
+        self.write(8, block.to_le_bytes());
     }
 
     pub fn set_high_key_len(&mut self, len: u16) {
-        self.write(8, len.to_le_bytes());
+        self.write(12, len.to_le_bytes());
     }
 
     pub fn set_crc32(&mut self, crc32: u32) {
-        self.write(10, crc32.to_le_bytes());
+        self.write(14, crc32.to_le_bytes());
     }
 
     pub fn set_lsn(&mut self, lsn: u64) {
-        self.write(14, lsn.to_le_bytes());
+        self.write(18, lsn.to_le_bytes());
     }
 
-    pub fn set_reserved_bytes(&mut self, reserved: [u8; 10]) {
-        self.write(22, reserved);
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
+        self.write(26, reserved);
     }
 
     pub fn init_internal(&mut self, level: u8, rightmost_child: Option<u32>) {
@@ -817,11 +923,13 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         self.set_page_type();
         self.set_level(level);
         self.set_slot_count(0);
+        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_rightmost_child_block(rightmost_child.unwrap_or(u32::MAX));
         self.set_high_key_len(0);
         self.set_crc32(0);
         self.set_lsn(0);
-        self.set_reserved_bytes([0; 10]);
+        self.set_reserved_bytes([0; 6]);
     }
 }
 
@@ -1469,7 +1577,7 @@ impl<'a> HeapPageZeroCopy<'a> {
     }
 
     fn slot_count(&self) -> usize {
-        self.line_pointers.len()
+        self.header.slot_count() as usize
     }
 
     fn line_ptr(&self, slot: SlotId) -> Option<LinePtr> {
@@ -2940,7 +3048,7 @@ impl<'a> PageReadGuard<'a> {
     }
 
     /// Converts to a typed heap page view with schema access.
-    pub fn into_heap_view(self, layout: &'a Layout) -> Result<HeapPageView<'a>, Box<dyn Error>> {
+    pub fn into_heap_view(self, layout: &'a Layout) -> SimpleDBResult<HeapPageView<'a>> {
         HeapPageView::new(self, layout)
     }
 
@@ -2948,7 +3056,7 @@ impl<'a> PageReadGuard<'a> {
     pub fn into_btree_leaf_page_view(
         self,
         layout: &'a Layout,
-    ) -> Result<BTreeLeafPageView<'a>, Box<dyn Error>> {
+    ) -> SimpleDBResult<BTreeLeafPageView<'a>> {
         BTreeLeafPageView::new(self, layout)
     }
 
@@ -2956,7 +3064,7 @@ impl<'a> PageReadGuard<'a> {
     pub fn into_btree_internal_page_view(
         self,
         layout: &'a Layout,
-    ) -> Result<BTreeInternalPageView<'a>, Box<dyn Error>> {
+    ) -> SimpleDBResult<BTreeInternalPageView<'a>> {
         BTreeInternalPageView::new(self, layout)
     }
 }
@@ -3044,7 +3152,7 @@ impl<'a> PageWriteGuard<'a> {
     pub fn into_btree_leaf_page_view_mut(
         self,
         layout: &'a Layout,
-    ) -> Result<BTreeLeafPageViewMut<'a>, Box<dyn Error>> {
+    ) -> SimpleDBResult<BTreeLeafPageViewMut<'a>> {
         BTreeLeafPageViewMut::new(self, layout)
     }
 
@@ -3052,7 +3160,7 @@ impl<'a> PageWriteGuard<'a> {
     pub fn into_btree_internal_page_view_mut(
         self,
         layout: &'a Layout,
-    ) -> Result<BTreeInternalPageViewMut<'a>, Box<dyn Error>> {
+    ) -> SimpleDBResult<BTreeInternalPageViewMut<'a>> {
         BTreeInternalPageViewMut::new(self, layout)
     }
 }
@@ -4155,36 +4263,42 @@ impl<'a> BTreeLeafPageView<'a> {
         Ok(Self { guard, layout })
     }
 
-    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
-        self.guard
-            .as_btree_leaf_page()?
-            .get_leaf_entry(self.layout, slot)
+    fn build_view(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+        BTreeLeafPageZeroCopy::new(self.guard.bytes())
+    }
+
+    fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
+        self.build_view()
+            .expect("BTreeLeafPageView constructed with valid leaf page")
+    }
+
+    pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeLeafEntry> {
+        let view = self.build_view()?;
+        let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
+        BTreeLeafEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.guard
-            .as_btree_leaf_page()
-            .unwrap()
-            .find_slot_before(self.layout, search_key)
+        self.view().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.guard.as_btree_leaf_page().unwrap().slot_count()
+        self.view().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.guard.as_btree_leaf_page().unwrap().is_slot_live(slot)
+        self.view()
+            .line_ptr(slot)
+            .map(|lp| lp.is_live())
+            .unwrap_or(false)
     }
 
     pub fn is_full(&self) -> bool {
-        self.guard
-            .as_btree_leaf_page()
-            .unwrap()
-            .is_full(self.layout)
+        self.view().is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.guard.as_btree_leaf_page().unwrap().overflow_block()
+        self.view().overflow_block()
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
@@ -4207,7 +4321,7 @@ pub struct BTreeLeafPageViewMut<'a> {
 }
 
 impl<'a> BTreeLeafPageViewMut<'a> {
-    pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
         BTreeLeafPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
@@ -4216,37 +4330,48 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         })
     }
 
+    fn build_view(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+        BTreeLeafPageZeroCopy::new(self.guard.bytes())
+    }
+
+    fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
+        self.build_view()
+            .expect("BTreeLeafPageViewMut constructed with valid leaf page")
+    }
+
+    #[allow(dead_code)]
+    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeLeafPageZeroCopyMut<'_>> {
+        BTreeLeafPageZeroCopyMut::new(self.guard.bytes_mut())
+    }
+
     // Read operations
-    pub fn get_entry(&self, slot: SlotId) -> Result<BTreeLeafEntry, Box<dyn Error>> {
-        self.guard
-            .as_btree_leaf_page()?
-            .get_leaf_entry(self.layout, slot)
+    pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeLeafEntry> {
+        let view = self.build_view()?;
+        let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
+        BTreeLeafEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.guard
-            .as_btree_leaf_page()
-            .unwrap()
-            .find_slot_before(self.layout, search_key)
+        self.view().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.guard.as_btree_leaf_page().unwrap().slot_count()
+        self.view().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.guard.as_btree_leaf_page().unwrap().is_slot_live(slot)
+        self.view()
+            .line_ptr(slot)
+            .map(|lp| lp.is_live())
+            .unwrap_or(false)
     }
 
     pub fn is_full(&self) -> bool {
-        self.guard
-            .as_btree_leaf_page()
-            .unwrap()
-            .is_full(self.layout)
+        self.view().is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.guard.as_btree_leaf_page().unwrap().overflow_block()
+        self.view().overflow_block()
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
@@ -4258,7 +4383,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 
     // Write operations
-    pub fn insert_entry(&mut self, key: Constant, rid: RID) -> Result<SlotId, Box<dyn Error>> {
+    pub fn insert_entry(&mut self, key: Constant, rid: RID) -> SimpleDBResult<SlotId> {
         let slot =
             self.guard
                 .as_btree_leaf_page_mut()?
@@ -4267,7 +4392,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         Ok(slot)
     }
 
-    pub fn delete_entry(&mut self, slot: SlotId) -> Result<(), Box<dyn Error>> {
+    pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
         self.guard
             .as_btree_leaf_page_mut()?
             .delete_leaf_entry(slot, self.layout)?;
@@ -4356,7 +4481,7 @@ pub struct BTreeInternalPageViewMut<'a> {
 }
 
 impl<'a> BTreeInternalPageViewMut<'a> {
-    pub fn new(guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
+    pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> Result<Self, Box<dyn Error>> {
         BTreeInternalPageZeroCopyMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
@@ -5991,6 +6116,58 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
 
     fn slot_count(&self) -> usize {
         self.line_pointers.len()
+    }
+
+    fn line_ptr(&self, slot: SlotId) -> Option<LinePtr> {
+        if slot >= self.line_pointers.len() {
+            None
+        } else {
+            Some(self.line_pointers.get(slot))
+        }
+    }
+
+    fn entry_bytes(&self, slot: SlotId) -> Option<&'a [u8]> {
+        let lp = self.line_ptr(slot)?;
+        self.record_space.entry_bytes(lp)
+    }
+
+    fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
+        let mut left = 0;
+        let mut right = self.slot_count();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            match self
+                .entry_bytes(mid)
+                .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
+            {
+                Some(entry) if entry.key < *search_key => left = mid + 1,
+                Some(_) => right = mid,
+                None => left = mid + 1,
+            }
+        }
+
+        if left == 0 {
+            None
+        } else {
+            Some(left - 1)
+        }
+    }
+
+    fn is_full(&self, layout: &Layout) -> bool {
+        let lower = self.header.free_lower();
+        let upper = self.header.free_upper();
+        let needed = layout.slot_size as u16 + 4;
+        lower + needed > upper
+    }
+
+    fn overflow_block(&self) -> Option<usize> {
+        let raw = self.header.overflow_block();
+        if raw == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(raw as usize)
+        }
     }
 }
 
