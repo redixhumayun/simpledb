@@ -8429,17 +8429,18 @@ pub struct Layout {
 }
 
 impl Layout {
+    const INT_BYTES: usize = 4;
     pub fn new(schema: Schema) -> Self {
         let mut offsets = HashMap::new();
         let mut column_index = HashMap::new();
-        let mut offset = Page::INT_BYTES;
+        let mut offset = Self::INT_BYTES;
         for (idx, field) in schema.fields.iter().enumerate() {
             let field_info = schema.info.get(field).unwrap();
             column_index.insert(field.clone(), idx);
             offsets.insert(field.clone(), offset);
             match field_info.field_type {
                 FieldType::Int => offset += field_info.length,
-                FieldType::String => offset += Page::INT_BYTES + field_info.length,
+                FieldType::String => offset += Self::INT_BYTES + field_info.length,
             }
         }
 
@@ -8536,6 +8537,7 @@ impl Default for Schema {
 }
 
 impl Schema {
+    const INT_BYTES: usize = 4;
     pub fn new() -> Self {
         Schema {
             fields: Vec::new(),
@@ -8552,7 +8554,7 @@ impl Schema {
     }
 
     fn add_int_field(&mut self, field_name: &str) {
-        self.add_field(field_name, FieldType::Int, Page::INT_BYTES);
+        self.add_field(field_name, FieldType::Int, Self::INT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
@@ -8816,25 +8818,88 @@ mod transaction_tests {
     use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
 
     use crate::{
+        page::{PageReadGuard, PageWriteGuard},
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, BufferHandle, LogRecord, Lsn, SimpleDB, Transaction,
+        BlockId, BufferHandle, Constant, Layout, LogRecord, Lsn, Schema, SimpleDB, Transaction,
     };
+
+    const TXN_INT_FIELD: &str = "txn_int";
+    const TXN_STR_FIELD: &str = "txn_str";
+    const TXN_STR_LEN: usize = 64;
+    const TXN_SLOT: usize = 0;
+
+    fn txn_test_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(TXN_INT_FIELD);
+        schema.add_string_field(TXN_STR_FIELD, TXN_STR_LEN);
+        Layout::new(schema)
+    }
+
+    struct TxnRowSnapshot {
+        int_val: i32,
+        str_val: String,
+        int_offset: usize,
+        str_offset: usize,
+    }
+
+    fn overwrite_txn_row(
+        mut guard: PageWriteGuard<'_>,
+        layout: &Layout,
+        int_val: i32,
+        str_val: &str,
+    ) {
+        guard.format_as_heap();
+        let mut view = guard
+            .into_heap_view_mut(layout)
+            .expect("heap page view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("allocate txn row");
+        assert_eq!(slot, TXN_SLOT);
+        row_mut
+            .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
+            .expect("set txn int");
+        row_mut
+            .set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
+            .expect("set txn string");
+    }
+
+    fn maybe_snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> Option<TxnRowSnapshot> {
+        let view = guard.into_heap_view(layout).ok()?;
+        let row = view.row(TXN_SLOT)?;
+        let int_val = match row.get_column(TXN_INT_FIELD)? {
+            Constant::Int(v) => v,
+            _ => return None,
+        };
+        let str_val = match row.get_column(TXN_STR_FIELD)? {
+            Constant::String(s) => s,
+            _ => return None,
+        };
+        let int_offset = view.column_page_offset(TXN_SLOT, TXN_INT_FIELD)?;
+        let str_offset = view.column_page_offset(TXN_SLOT, TXN_STR_FIELD)?;
+        Some(TxnRowSnapshot {
+            int_val,
+            str_val,
+            int_offset,
+            str_offset,
+        })
+    }
+
+    fn snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> TxnRowSnapshot {
+        maybe_snapshot_txn_row(guard, layout).expect("txn row must exist")
+    }
 
     #[test]
     fn test_transaction_single_threaded() {
         let file = generate_filename();
 
         let (test_db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = txn_test_layout();
 
         //  Start a transaction t1 that will set an int and a string
         let t1 = test_db.new_tx();
         let block_id = t1.append(&file);
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 1);
-            guard.set_string(40, "one");
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 1, "one");
         }
         t1.commit().unwrap();
 
@@ -8842,52 +8907,41 @@ mod transaction_tests {
         //  Set new values in this transaction
         let t2 = test_db.new_tx();
         {
-            let guard = t2.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 1);
-            assert_eq!(guard.get_string(40), "one");
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 1);
+            assert_eq!(snapshot.str_val, "one");
         }
         {
-            let mut guard = t2.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 2);
-            guard.set_string(40, "two");
-            guard.mark_modified(t2.id(), Lsn::MAX);
+            let guard = t2.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 2, "two");
         }
         t2.commit().unwrap();
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
         let t3 = test_db.new_tx();
-        let (old_int, old_str) = {
-            let guard = t3.pin_read_guard(&block_id);
-            let val = guard.get_int(80);
-            let s = guard.get_string(40);
-            assert_eq!(val, 2);
-            assert_eq!(s, "two");
-            (val, s)
-        };
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        assert_eq!(snapshot.int_val, 2);
+        assert_eq!(snapshot.str_val, "two");
         LogRecord::SetInt {
             txnum: t3.id(),
             block_id: block_id.clone(),
-            offset: 80,
-            old_val: old_int,
+            offset: snapshot.int_offset,
+            old_val: snapshot.int_val,
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         LogRecord::SetString {
             txnum: t3.id(),
             block_id: block_id.clone(),
-            offset: 40,
-            old_val: old_str.clone(),
+            offset: snapshot.str_offset,
+            old_val: snapshot.str_val.clone(),
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         {
-            let mut guard = t3.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 3);
-            guard.set_string(40, "three");
-            guard.mark_modified(t3.id(), Lsn::MAX);
+            let guard = t3.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 3, "three");
         }
         t3.rollback().unwrap();
 
@@ -8895,9 +8949,9 @@ mod transaction_tests {
         //  This will be a read only transaction that commits
         let t4 = test_db.new_tx();
         {
-            let guard = t4.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 2);
-            assert_eq!(guard.get_string(40), "two");
+            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 2);
+            assert_eq!(snapshot.str_val, "two");
         }
         t4.commit().unwrap();
     }
@@ -8911,6 +8965,15 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = Arc::new(txn_test_layout());
+
+        // Initialize page so readers always see a formatted heap page.
+        {
+            let init_txn = test_db.new_tx();
+            let guard = init_txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "");
+            init_txn.commit().unwrap();
+        }
 
         let fm1 = Arc::clone(&test_db.file_manager);
         let lm1 = Arc::clone(&test_db.log_manager);
@@ -8925,23 +8988,20 @@ mod transaction_tests {
         let bid2 = block_id.clone();
 
         //  Create a read only transasction
+        let layout_reader = Arc::clone(&layout);
         let t1 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
-            let guard = txn.pin_read_guard(&bid1);
-            guard.get_int(80);
-            guard.get_string(40);
+            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1), layout_reader.as_ref());
             txn.commit().unwrap();
         });
 
         //  Create a write only transaction
+        let layout_writer = Arc::clone(&layout);
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
-                let mut guard = txn.pin_write_guard(&bid2);
-                guard.format_as_heap();
-                guard.set_int(80, 1);
-                guard.set_string(40, "Hello");
-                guard.mark_modified(txn.id(), Lsn::MAX);
+                let guard = txn.pin_write_guard(&bid2);
+                overwrite_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
             //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
             //  The related GitHub issue is https://github.com/redixhumayun/simpledb/issues/63
@@ -8957,9 +9017,9 @@ mod transaction_tests {
             test_db.buffer_manager,
             test_db.lock_table,
         ));
-        let guard = txn.pin_read_guard(&block_id);
-        assert_eq!(guard.get_int(80), 1);
-        assert_eq!(guard.get_string(40), "Hello");
+        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id), layout.as_ref());
+        assert_eq!(snapshot.int_val, 1);
+        assert_eq!(snapshot.str_val, "Hello");
     }
 
     #[test]
@@ -8971,6 +9031,7 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = Arc::new(txn_test_layout());
 
         // Initialize data before spawning threads
         let init_txn = Arc::new(Transaction::new(
@@ -8980,11 +9041,8 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let mut guard = init_txn.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 0);
-            guard.set_string(40, "initial");
-            guard.mark_modified(init_txn.id(), Lsn::MAX);
+            let guard = init_txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "initial");
         }
         init_txn.commit().unwrap();
 
@@ -8997,14 +9055,15 @@ mod transaction_tests {
             let lt = Arc::clone(&test_db.lock_table);
             let bid = block_id.clone();
 
+            let layout_reader = Arc::clone(&layout);
             handles.push(std::thread::spawn(move || {
                 let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
 
-                let guard = txn.pin_read_guard(&bid);
-                let val = guard.get_int(80);
+                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid), layout_reader.as_ref());
+                let val = snapshot.int_val;
                 assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
 
-                let s = guard.get_string(40);
+                let s = snapshot.str_val;
                 assert!(
                     s == "initial" || s == "final",
                     "Read invalid string value: {}",
@@ -9022,11 +9081,8 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 42);
-            guard.set_string(40, "final");
-            guard.mark_modified(txn.id(), Lsn::MAX);
+            let guard = txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 42, "final");
         }
         txn.commit().unwrap();
 
@@ -9042,9 +9098,9 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = final_txn.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 42);
-            assert_eq!(guard.get_string(40), "final");
+            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id), layout.as_ref());
+            assert_eq!(snapshot.int_val, 42);
+            assert_eq!(snapshot.str_val, "final");
         }
         final_txn.commit().unwrap();
     }
@@ -9057,6 +9113,7 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = txn_test_layout();
 
         // Setup initial state
         let t1 = Arc::new(Transaction::new(
@@ -9066,11 +9123,8 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 100);
-            guard.set_string(40, "initial");
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 100, "initial");
         }
         t1.commit().unwrap();
 
@@ -9081,32 +9135,26 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let (orig_int, orig_str) = {
-            let guard = t2.pin_read_guard(&block_id);
-            (guard.get_int(80), guard.get_string(40))
-        };
+        let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
         LogRecord::SetInt {
             txnum: t2.id(),
             block_id: block_id.clone(),
-            offset: 80,
-            old_val: orig_int,
+            offset: snapshot.int_offset,
+            old_val: snapshot.int_val,
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         LogRecord::SetString {
             txnum: t2.id(),
             block_id: block_id.clone(),
-            offset: 40,
-            old_val: orig_str.clone(),
+            offset: snapshot.str_offset,
+            old_val: snapshot.str_val.clone(),
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         {
-            let mut guard = t2.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 200);
-            guard.set_string(40, "modified");
-            guard.mark_modified(t2.id(), Lsn::MAX);
+            let guard = t2.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
         t2.rollback().unwrap();
@@ -9118,9 +9166,9 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let guard = t3.pin_read_guard(&block_id);
-        assert_eq!(guard.get_int(80), 100);
-        assert_eq!(guard.get_string(40), "initial");
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        assert_eq!(snapshot.int_val, 100);
+        assert_eq!(snapshot.str_val, "initial");
     }
 
     /// Tests that concurrent read-modify-write transactions can succeed via retry logic under high lock contention.
@@ -9145,6 +9193,7 @@ mod transaction_tests {
         };
         let num_of_txns = 2;
         let max_retry_count = 150;
+        let layout = Arc::new(txn_test_layout());
 
         // Initialize data
         let t1 = Arc::new(Transaction::new(
@@ -9154,10 +9203,8 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 0);
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "");
         }
         t1.commit().unwrap();
 
@@ -9174,6 +9221,7 @@ mod transaction_tests {
             let bid = block_id.clone();
             let tx = tx.clone();
 
+            let layout_clone = Arc::clone(&layout);
             handles.push(std::thread::spawn(move || {
                 let mut retry_count = 0;
                 let txn = Arc::new(Transaction::new(
@@ -9190,16 +9238,14 @@ mod transaction_tests {
                     match (|| -> Result<(), Box<dyn Error>> {
                         let val = {
                             let guard = txn.pin_read_guard(&bid);
-                            guard.get_int(80)
+                            snapshot_txn_row(guard, layout_clone.as_ref()).int_val
                         };
                         // Short sleep to increase chance of conflicts
                         std::thread::sleep(Duration::from_millis(10));
 
                         {
-                            let mut guard = txn.pin_write_guard(&bid);
-                            guard.format_as_heap();
-                            guard.set_int(80, val + 1);
-                            guard.mark_modified(txn.id(), Lsn::MAX);
+                            let guard = txn.pin_write_guard(&bid);
+                            overwrite_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
                         txn.commit()?;
                         tx.send(format!(
@@ -9271,14 +9317,15 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let guard = t_final.pin_read_guard(&block_id);
-        assert!(guard.get_int(80) == num_of_txns);
+        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id), layout.as_ref());
+        assert_eq!(snapshot.int_val, num_of_txns as i32);
     }
 
     #[test]
     fn test_transaction_durability() {
         let file = generate_filename();
         let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = txn_test_layout();
 
         //  Phase 1: Create and populate database and then drop it
         let block_id = {
@@ -9291,10 +9338,8 @@ mod transaction_tests {
             ));
             let block_id = t1.append(&file);
             {
-                let mut guard = t1.pin_write_guard(&block_id);
-                guard.format_as_heap();
-                guard.set_int(80, 100);
-                guard.mark_modified(t1.id(), Lsn::MAX);
+                let guard = t1.pin_write_guard(&block_id);
+                overwrite_txn_row(guard, &layout, 100, "");
             }
             t1.commit().unwrap();
             block_id
@@ -9311,8 +9356,8 @@ mod transaction_tests {
             ));
             t2.recover().unwrap();
 
-            let guard = t2.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 100);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 100);
         }
     }
 
@@ -10966,9 +11011,42 @@ impl BufferManager {
 
 #[cfg(test)]
 mod buffer_manager_tests {
-    use std::thread;
+    use std::{sync::Arc, thread};
 
-    use crate::{BlockId, Page, SimpleDB};
+    use crate::{BlockId, Constant, Layout, Schema, SimpleDB, Transaction};
+
+    const BUFFER_FIELD: &str = "val";
+
+    fn buffer_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(BUFFER_FIELD);
+        Layout::new(schema)
+    }
+
+    fn write_block_value(txn: &Arc<Transaction>, block_id: &BlockId, layout: &Layout, value: i32) {
+        let mut guard = txn.pin_write_guard(block_id);
+        guard.format_as_heap();
+        {
+            let mut view = guard
+                .into_heap_view_mut(layout)
+                .expect("heap page view mut");
+            let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+            assert_eq!(slot, 0);
+            row_mut
+                .set_column(BUFFER_FIELD, &Constant::Int(value))
+                .expect("set row value");
+        }
+    }
+
+    fn read_block_value(txn: &Arc<Transaction>, block_id: &BlockId, layout: &Layout) -> i32 {
+        let guard = txn.pin_read_guard(block_id);
+        let view = guard.into_heap_view(layout).expect("heap page view");
+        let row = view.row(0).expect("row 0 present");
+        match row.get_column(BUFFER_FIELD) {
+            Some(Constant::Int(v)) => v,
+            other => panic!("expected int column value, got {:?}", other),
+        }
+    }
 
     /// This test will assert that when the buffer pool swaps out a page from the buffer pool, it properly flushes those contents to disk
     /// and can then correctly read them back later
@@ -10976,58 +11054,44 @@ mod buffer_manager_tests {
     fn test_buffer_replacement() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let buffer_manager = db.buffer_manager;
+        let layout = buffer_layout();
+        let file = "testfile".to_string();
 
-        //  Initialize the file with enough data
-        let block_id = BlockId::new("testfile".to_string(), 1);
-        let mut page = Page::new();
-        page.set_int(80, 1);
-        db.file_manager.lock().unwrap().write(&block_id, &mut page);
+        // Initialize four heap-formatted blocks with deterministic data.
+        let seed_txn = db.new_tx();
+        let mut block_ids = Vec::new();
+        for i in 0..4 {
+            let block = seed_txn.append(&file);
+            write_block_value(&seed_txn, &block, &layout, i as i32);
+            block_ids.push(block);
+        }
+        // Ensure block 0 starts with value 1 so we can detect the later update to 100.
+        write_block_value(&seed_txn, &block_ids[0], &layout, 1);
+        seed_txn.commit().unwrap();
+
+        // Modify block 0 but keep the transaction uncommitted so eviction must flush it.
+        let writer_txn = db.new_tx();
+        write_block_value(&writer_txn, &block_ids[0], &layout, 100);
 
         let buffer_manager_guard = &buffer_manager;
 
-        //  Create a buffer for block 1 and modify it
-        let buffer_1 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 1))
-            .unwrap();
-        {
-            let mut page = buffer_1.write_page();
-            page.set_int(80, 100);
-        }
-        buffer_1.set_modified(1, 0);
-        buffer_manager_guard.unpin(buffer_1);
-
-        //  materialize blocks 2-4 before pinning so they have valid heap headers
-        // TODO: once RecordPage/TableScan use PageView, rewrite this test to insert via logical rows
-        for blk in 2..=4 {
-            let block_id = BlockId::new("testfile".to_string(), blk);
-            let mut empty_page = Page::new();
-            db.file_manager
-                .lock()
-                .unwrap()
-                .write(&block_id, &mut empty_page);
-        }
-
-        //  force buffer replacement by pinning 3 new blocks
-        let buffer_2 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 2))
-            .unwrap();
-        buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 3))
-            .unwrap();
-        buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 4))
-            .unwrap();
+        // Force buffer replacement by pinning three additional blocks.
+        let buffer_2 = buffer_manager_guard.pin(&block_ids[1]).unwrap();
+        let buffer_3 = buffer_manager_guard.pin(&block_ids[2]).unwrap();
+        let buffer_4 = buffer_manager_guard.pin(&block_ids[3]).unwrap();
 
         //  remove one of the buffers so block 1 can be read back in
         buffer_manager_guard.unpin(buffer_2);
+        buffer_manager_guard.unpin(buffer_3);
+        buffer_manager_guard.unpin(buffer_4);
 
-        //  Read block 1 back from disk and verify it is the same
-        let buffer_2 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 1))
-            .unwrap();
-        let page = buffer_2.read_page();
-        assert_eq!(page.get_int(80), 100);
-        drop(page);
+        //  Read block 0 back via a transaction and verify the updated value persisted.
+        let reader_txn = db.new_tx();
+        let observed = read_block_value(&reader_txn, &block_ids[0], &layout);
+        assert_eq!(observed, 100);
+        reader_txn.commit().unwrap();
+
+        writer_txn.commit().unwrap();
         assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
 
@@ -11048,40 +11112,45 @@ mod buffer_manager_tests {
         let num_threads = 8;
         let ops_per_thread = 100;
 
-        // Pre-create blocks on disk
-        let seed_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        // TODO: remove this offset hack and write via LogicalRow once the buffer layer uses PageView
+        // Pre-create heap-formatted blocks with deterministic payloads.
+        let layout = Arc::new(buffer_layout());
+        let file = "stressfile".to_string();
+        let seed_txn = db.new_tx();
+        let mut block_ids = Vec::new();
         for i in 0..num_blocks {
-            let block_id = BlockId::new("stressfile".to_string(), i);
-            let mut page = Page::new();
-            page.set_int(seed_offset, i as i32);
-            db.file_manager.lock().unwrap().write(&block_id, &mut page);
+            let block = seed_txn.append(&file);
+            write_block_value(&seed_txn, &block, layout.as_ref(), i as i32);
+            block_ids.push(block);
         }
+        seed_txn.commit().unwrap();
+        let block_ids = Arc::new(block_ids);
 
         // Spawn threads that all hammer the same small working set
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
-                let buffer_manager = db.buffer_manager.clone();
+                let fm = Arc::clone(&db.file_manager);
+                let lm = Arc::clone(&db.log_manager);
+                let bm = Arc::clone(&db.buffer_manager);
+                let lt = Arc::clone(&db.lock_table);
+                let blocks = Arc::clone(&block_ids);
+                let layout = Arc::clone(&layout);
                 thread::spawn(move || {
+                    let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
                     for op in 0..ops_per_thread {
                         // Each thread accesses all blocks in round-robin
                         // This creates maximum contention on buffer slots
                         let block_num = (thread_id + op) % num_blocks;
-                        let block_id = BlockId::new("stressfile".to_string(), block_num);
-
-                        // Pin block
-                        let buffer = buffer_manager.pin(&block_id).unwrap();
-
-                        // Verify we got the right block
-                        assert_eq!(buffer.block_id_owned().unwrap(), block_id);
-                        {
-                            let page = buffer.read_page();
-                            assert_eq!(page.get_int(seed_offset), block_num as i32);
-                        }
-
-                        // Unpin immediately to maximize churn
-                        buffer_manager.unpin(buffer);
+                        let block_id = blocks[block_num].clone();
+                        let guard = txn.pin_read_guard(&block_id);
+                        let view = guard.into_heap_view(layout.as_ref()).expect("heap view");
+                        let row = view.row(0).expect("row 0 present");
+                        let val = match row.get_column(BUFFER_FIELD) {
+                            Some(Constant::Int(v)) => v,
+                            other => panic!("expected int value, got {:?}", other),
+                        };
+                        assert_eq!(val, block_num as i32);
                     }
+                    txn.commit().unwrap();
                 })
             })
             .collect();

@@ -1380,11 +1380,11 @@ impl HeaderCodec for DummyRawPageHeader {
         Self::PAGE_TYPE
     }
 
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
+    fn from_bytes(_bytes: &[u8]) -> SimpleDBResult<Self> {
         todo!()
     }
 
-    fn write_bytes(&self, dest: &mut [u8]) {
+    fn write_bytes(&self, _dest: &mut [u8]) {
         todo!()
     }
 }
@@ -1891,16 +1891,36 @@ pub struct BTreeInternalPage;
 
 /// Iterator over entries in a B-tree leaf page.
 pub struct BTreeLeafIterator<'a> {
-    page: &'a Page<BTreeLeafPage>,
+    page: BTreeLeafPageZeroCopy<'a>,
     layout: &'a Layout,
     current_slot: SlotId,
 }
 
+impl<'a> BTreeLeafIterator<'a> {
+    fn new(page: BTreeLeafPageZeroCopy<'a>, layout: &'a Layout) -> Self {
+        Self {
+            page,
+            layout,
+            current_slot: 0,
+        }
+    }
+}
+
 /// Iterator over entries in a B-tree internal page.
 pub struct BTreeInternalIterator<'a> {
-    page: &'a Page<BTreeInternalPage>,
+    page: BTreeInternalPageZeroCopy<'a>,
     layout: &'a Layout,
     current_slot: SlotId,
+}
+
+impl<'a> BTreeInternalIterator<'a> {
+    fn new(page: BTreeInternalPageZeroCopy<'a>, layout: &'a Layout) -> Self {
+        Self {
+            page,
+            layout,
+            current_slot: 0,
+        }
+    }
 }
 
 impl Iterator for BTreeLeafIterator<'_> {
@@ -1911,10 +1931,8 @@ impl Iterator for BTreeLeafIterator<'_> {
             let slot = self.current_slot;
             self.current_slot += 1;
 
-            if let Some(bytes) = self.page.tuple_bytes(slot) {
-                if let Ok(entry) = BTreeLeafEntry::decode(self.layout, bytes) {
-                    return Some(entry);
-                }
+            if let Some(bytes) = self.page.entry_bytes(slot) {
+                return BTreeLeafEntry::decode(self.layout, bytes).ok();
             }
         }
         None
@@ -1929,10 +1947,8 @@ impl Iterator for BTreeInternalIterator<'_> {
             let slot = self.current_slot;
             self.current_slot += 1;
 
-            if let Some(bytes) = self.page.tuple_bytes(slot) {
-                if let Ok(entry) = BTreeInternalEntry::decode(self.layout, bytes) {
-                    return Some(entry);
-                }
+            if let Some(bytes) = self.page.entry_bytes(slot) {
+                return BTreeInternalEntry::decode(self.layout, bytes).ok();
             }
         }
         None
@@ -3165,6 +3181,10 @@ impl<'a> PageWriteGuard<'a> {
         header.init_internal(level, None);
     }
 
+    pub fn into_heap_view_mut(self, layout: &'a Layout) -> SimpleDBResult<HeapPageViewMut<'a>> {
+        HeapPageViewMut::new(self, layout)
+    }
+
     /// Converts to a mutable B-tree leaf page view.
     pub fn into_btree_leaf_page_view_mut(
         self,
@@ -3929,6 +3949,20 @@ impl<'a> HeapPageView<'a> {
         }
     }
 
+    /// Returns the absolute page offset for the given column within the tuple at `slot`.
+    ///
+    /// Useful for WAL logging that still expects byte offsets.
+    pub fn column_page_offset(&self, slot: SlotId, column_name: &str) -> Option<usize> {
+        let payload_offset = self.layout.offset(column_name)?;
+        let page = self.build_page();
+        let line_ptr = page.line_ptr(slot)?;
+        if !line_ptr.is_live() {
+            return None;
+        }
+        let tuple_start = line_ptr.offset() as usize;
+        Some(tuple_start + HEAP_TUPLE_HEADER_BYTES + payload_offset)
+    }
+
     pub fn slot_count(&self) -> usize {
         self.build_page().slot_count()
     }
@@ -3981,6 +4015,18 @@ impl<'a> HeapPageViewMut<'a> {
             TupleRef::Live(tuple) => Some(LogicalRow::new(tuple, self.layout)),
             TupleRef::Redirect(_) | TupleRef::Free | TupleRef::Dead => None,
         }
+    }
+
+    /// Returns the absolute page offset for the given column within `slot`.
+    pub fn column_page_offset(&self, slot: SlotId, column_name: &str) -> Option<usize> {
+        let payload_offset = self.layout.offset(column_name)?;
+        let page = self.build_page();
+        let line_ptr = page.line_ptr(slot)?;
+        if !line_ptr.is_live() {
+            return None;
+        }
+        let tuple_start = line_ptr.offset() as usize;
+        Some(tuple_start + HEAP_TUPLE_HEADER_BYTES + payload_offset)
     }
 
     /// Returns a mutable logical row for a live slot, following redirect chains.
@@ -4154,7 +4200,7 @@ impl BTreeLeafEntry {
     }
 
     /// Decodes an entry from bytes using the given layout.
-    pub fn decode(layout: &Layout, bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
+    pub fn decode(layout: &Layout, bytes: &[u8]) -> SimpleDBResult<Self> {
         // Decode key from "dataval" offset
         let key_offset = layout
             .offset(BTREE_DATA_FIELD)
@@ -4319,11 +4365,11 @@ impl<'a> BTreeLeafPageView<'a> {
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
-        BTreeLeafIterator {
-            page: self.guard.as_btree_leaf_page().unwrap(),
-            layout: self.layout,
-            current_slot: 0,
-        }
+        BTreeLeafIterator::new(
+            self.build_view()
+                .expect("BTreeLeafPageView constructed with valid leaf page"),
+            self.layout,
+        )
     }
 }
 
@@ -4391,11 +4437,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
-        BTreeLeafIterator {
-            page: self.guard.as_btree_leaf_page().unwrap(),
-            layout: self.layout,
-            current_slot: 0,
-        }
+        BTreeLeafIterator::new(self.view(), self.layout)
     }
 
     // Write operations
@@ -4408,9 +4450,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
-        let layout = self.layout;
         let mut page = self.build_mut_page()?;
-        page.delete_entry(slot, layout)?;
+        page.delete_entry(slot)?;
         self.dirty = true;
         Ok(())
     }
@@ -4479,11 +4520,7 @@ impl<'a> BTreeInternalPageView<'a> {
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
-        BTreeInternalIterator {
-            page: self.guard.as_btree_internal_page().unwrap(),
-            layout: self.layout,
-            current_slot: 0,
-        }
+        BTreeInternalIterator::new(self.view(), self.layout)
     }
 }
 
@@ -4544,11 +4581,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     }
 
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
-        BTreeInternalIterator {
-            page: self.guard.as_btree_internal_page().unwrap(),
-            layout: self.layout,
-            current_slot: 0,
-        }
+        BTreeInternalIterator::new(self.view(), self.layout)
     }
 
     // Write operations
@@ -4812,6 +4845,51 @@ mod btree_page_tests {
     use super::*;
     use crate::Schema;
 
+    #[allow(dead_code)]
+    fn zeroed_page_bytes() -> Vec<u8> {
+        vec![0u8; PAGE_SIZE_BYTES as usize]
+    }
+
+    fn init_btree_leaf_bytes(
+        level: u8,
+        right_sibling: Option<u32>,
+        overflow_block: Option<u32>,
+    ) -> Vec<u8> {
+        let mut bytes = zeroed_page_bytes();
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let mut header = BTreeLeafHeaderMut::new(header_bytes);
+            header.init_leaf(level, right_sibling, overflow_block);
+        }
+        bytes
+    }
+
+    fn init_btree_internal_bytes(level: u8, rightmost_child: Option<u32>) -> Vec<u8> {
+        let mut bytes = zeroed_page_bytes();
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let mut header = BTreeInternalHeaderMut::new(header_bytes);
+            header.init_internal(level, rightmost_child);
+        }
+        bytes
+    }
+
+    fn leaf_view_from_bytes(bytes: &[u8]) -> BTreeLeafPageZeroCopy<'_> {
+        BTreeLeafPageZeroCopy::new(bytes).expect("leaf page view")
+    }
+
+    fn leaf_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeLeafPageZeroCopyMut<'_> {
+        BTreeLeafPageZeroCopyMut::new(bytes).expect("leaf page mut view")
+    }
+
+    fn internal_view_from_bytes(bytes: &[u8]) -> BTreeInternalPageZeroCopy<'_> {
+        BTreeInternalPageZeroCopy::new(bytes).expect("internal page view")
+    }
+
+    fn internal_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeInternalPageZeroCopyMut<'_> {
+        BTreeInternalPageZeroCopyMut::new(bytes).expect("internal page mut view")
+    }
+
     // Helper: Create a layout for BTree leaf entries with INT key
     fn btree_leaf_layout_int() -> Layout {
         let mut schema = Schema::new();
@@ -4844,6 +4922,14 @@ mod btree_page_tests {
         schema.add_string_field(BTREE_DATA_FIELD, 20);
         schema.add_int_field(BTREE_BLOCK_FIELD);
         Layout::new(schema)
+    }
+
+    fn format_btree_internal(guard: &mut PageWriteGuard) {
+        guard.format_as_btree_internal(0);
+    }
+
+    fn format_btree_leaf(guard: &mut PageWriteGuard) {
+        guard.format_as_btree_leaf(None);
     }
 
     // ========== Phase 1: Entry Encoding/Decoding Tests ==========
@@ -5644,19 +5730,19 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_iterator_yields_sorted_order() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut bytes = init_btree_leaf_bytes(0, None, None);
+        let mut page = leaf_view_mut_from_bytes(&mut bytes);
 
         // Insert in random order
         let keys = [42, 10, 99, 5, 77, 33];
         for &key in &keys {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(key as usize, 0))
+            page.insert_entry(&layout, Constant::Int(key), RID::new(key as usize, 0))
                 .unwrap();
         }
 
         // Iterate and collect
         let iter = BTreeLeafIterator {
-            page: &page,
+            page: page.as_read().unwrap(),
             layout: &layout,
             current_slot: 0,
         };
@@ -5675,22 +5761,21 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_iterator_skips_deleted_entries() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut bytes = init_btree_leaf_bytes(0, None, None);
+        let mut page = leaf_view_mut_from_bytes(&mut bytes);
 
         // Insert 5 entries
         for i in 0..5 {
-            page.insert_leaf_entry(&layout, &Constant::Int(i * 10), &RID::new(i as usize, 0))
+            page.insert_entry(&layout, Constant::Int(i * 10), RID::new(i as usize, 0))
                 .unwrap();
         }
 
         // Delete slot 2 (key=20)
-        page.delete_leaf_entry(2, &layout)
-            .expect("delete should succeed");
+        page.delete_entry(2).unwrap();
 
         // Iterate
         let iter = BTreeLeafIterator {
-            page: &page,
+            page: page.as_read().unwrap(),
             layout: &layout,
             current_slot: 0,
         };
@@ -5709,10 +5794,11 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_iterator_empty_page() {
         let layout = btree_leaf_layout_int();
-        let page = Page::<BTreeLeafPage>::new();
+        let mut bytes = init_btree_leaf_bytes(0, None, None);
+        let page = leaf_view_mut_from_bytes(&mut bytes);
 
         let mut iter = BTreeLeafIterator {
-            page: &page,
+            page: page.as_read().unwrap(),
             layout: &layout,
             current_slot: 0,
         };
@@ -5723,17 +5809,17 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_iterator_yields_sorted_order() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(1);
+        let mut bytes = init_btree_internal_bytes(1, None);
+        let mut page = internal_view_mut_from_bytes(&mut bytes);
 
         let keys = [50, 20, 80, 10, 90];
         for (i, &key) in keys.iter().enumerate() {
-            page.insert_internal_entry(&layout, &Constant::Int(key), i * 100)
+            page.insert_entry(&layout, Constant::Int(key), i * 100)
                 .unwrap();
         }
 
         let iter = BTreeInternalIterator {
-            page: &page,
+            page: page.as_read().unwrap(),
             layout: &layout,
             current_slot: 0,
         };
@@ -6302,7 +6388,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         Ok(slot)
     }
 
-    fn delete_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
+    fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
         let mut parts = self.split()?;
         let free_upper = {
             let header = parts.header();
