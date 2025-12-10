@@ -35,7 +35,10 @@ mod intrusive_dll;
 mod page;
 mod parser;
 mod replacement;
-use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{
+    BTreeInternalHeaderMut, BTreeInternalPage, BTreeLeafHeaderMut, BTreeLeafPage, HeapHeaderMut,
+    HeapPage, PageKind, PageReadGuard, PageType, PageWriteGuard, WalPage,
+};
 
 use replacement::PolicyState;
 
@@ -10088,12 +10091,13 @@ impl TryFrom<Vec<u8>> for LogRecord {
 }
 
 impl LogRecord {
+    const INT_BYTES: usize = 4;
     // Size constants for different components
-    const DISCRIMINANT_SIZE: usize = Page::INT_BYTES;
-    const TXNUM_SIZE: usize = Page::INT_BYTES;
-    const OFFSET_SIZE: usize = Page::INT_BYTES;
-    const BLOCK_NUM_SIZE: usize = Page::INT_BYTES;
-    const STR_LEN_SIZE: usize = Page::INT_BYTES;
+    const DISCRIMINANT_SIZE: usize = Self::INT_BYTES;
+    const TXNUM_SIZE: usize = Self::INT_BYTES;
+    const OFFSET_SIZE: usize = Self::INT_BYTES;
+    const BLOCK_NUM_SIZE: usize = Self::INT_BYTES;
+    const STR_LEN_SIZE: usize = Self::INT_BYTES;
 
     fn calculate_size(&self) -> usize {
         let base_size = Self::DISCRIMINANT_SIZE; // Every record has a discriminant
@@ -10166,7 +10170,7 @@ impl LogRecord {
                 ..
             } => {
                 let mut guard = txn.pin_write_guard(block_id);
-                guard.set_int(*offset, *old_val);
+                Self::write_legacy_int(&mut guard, *offset, *old_val);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::SetString {
@@ -10176,10 +10180,27 @@ impl LogRecord {
                 ..
             } => {
                 let mut guard = txn.pin_write_guard(block_id);
-                guard.set_string(*offset, old_val);
+                Self::write_legacy_string(&mut guard, *offset, old_val);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
         }
+    }
+
+    fn write_legacy_int(guard: &mut PageWriteGuard<'_>, offset: usize, value: i32) {
+        let bytes = guard.bytes_mut();
+        let end = offset + Self::INT_BYTES;
+        bytes[offset..end].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_legacy_string(guard: &mut PageWriteGuard<'_>, offset: usize, value: &str) {
+        let bytes = guard.bytes_mut();
+        let len = value.len() as u32;
+        let len_bytes = len.to_be_bytes();
+        let len_end = offset + Self::INT_BYTES;
+        bytes[offset..len_end].copy_from_slice(&len_bytes);
+        let start = len_end;
+        let end = start + value.len();
+        bytes[start..end].copy_from_slice(value.as_bytes());
     }
 
     /// Serialize the log record to bytes and write it to the log file
@@ -10248,7 +10269,7 @@ mod recovery_manager_tests {
     }
 
     fn write_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
-        let mut guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row_mut = view.row_mut(0).expect("row 0 exists");
         row_mut
@@ -10257,7 +10278,7 @@ mod recovery_manager_tests {
     }
 
     fn write_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
-        let mut guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row_mut = view.row_mut(0).expect("row 0 exists");
         row_mut
@@ -10646,12 +10667,34 @@ impl BufferFrame {
         if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
             self.log_manager.lock().unwrap().flush_lsn(lsn);
             let mut page_guard = self.page.write().unwrap();
-            if cfg!(debug_assertions) {
-                page_guard.assert_layout_valid("buffer_flush_pre_write");
+            //  TODO: Get rid of pattern matching by bringing back compile time polymorphism on the Page type
+            match page_guard.peek_page_type().unwrap() {
+                PageType::Heap => {
+                    let (header, body) = page_guard.bytes_mut().split_at_mut(HeapPage::HEADER_SIZE);
+                    let mut header = HeapHeaderMut::new(header);
+                    header.update_crc32(body);
+                }
+                PageType::IndexLeaf => {
+                    let (header, body) = page_guard
+                        .bytes_mut()
+                        .split_at_mut(BTreeLeafPage::HEADER_SIZE);
+                    let mut header = BTreeLeafHeaderMut::new(header);
+                    header.update_crc32(body);
+                }
+                PageType::IndexInternal => {
+                    let (header, body) = page_guard
+                        .bytes_mut()
+                        .split_at_mut(BTreeInternalPage::HEADER_SIZE);
+                    let mut header = BTreeInternalHeaderMut::new(header);
+                    header.update_crc32(body);
+                }
+                PageType::Overflow => todo!(),
+                PageType::Meta => todo!(),
+                PageType::Free => todo!(),
             }
-            page_guard
-                .compute_crc32()
-                .expect("failure while computing crc32");
+            // if cfg!(debug_assertions) {
+            //     page_guard.assert_layout_valid("buffer_flush_pre_write");
+            // }
             self.file_manager
                 .lock()
                 .unwrap()
@@ -10671,15 +10714,52 @@ impl BufferFrame {
             .lock()
             .unwrap()
             .read(block_id, &mut page_guard);
-        if cfg!(debug_assertions) {
-            page_guard.assert_layout_valid("buffer_assign_post_read");
+        // if cfg!(debug_assertions) {
+        //     page_guard.assert_layout_valid("buffer_assign_post_read");
+        // }
+        match page_guard.peek_page_type().unwrap() {
+            PageType::Heap => {
+                let (header, body) = page_guard.bytes_mut().split_at_mut(HeapPage::HEADER_SIZE);
+                let mut header = HeapHeaderMut::new(header);
+                if !header.verify_crc32(body) {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::Heap
+                    );
+                }
+            }
+            PageType::IndexLeaf => {
+                let (header, body) = page_guard
+                    .bytes_mut()
+                    .split_at_mut(BTreeLeafPage::HEADER_SIZE);
+                let mut header = BTreeLeafHeaderMut::new(header);
+                if !header.verify_crc32(body) {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::IndexLeaf
+                    );
+                }
+            }
+            PageType::IndexInternal => {
+                let (header, body) = page_guard
+                    .bytes_mut()
+                    .split_at_mut(BTreeInternalPage::HEADER_SIZE);
+                let mut header = BTreeInternalHeaderMut::new(header);
+                if !header.verify_crc32(body) {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::IndexInternal
+                    );
+                }
+            }
+            PageType::Overflow => todo!(),
+            PageType::Meta => todo!(),
+            PageType::Free => todo!(),
         }
-        if !page_guard
-            .verify_crc32()
-            .expect("failure while verifying checksum")
-        {
-            panic!("crc mistmatch for {:?}", block_id);
-        }
+
         meta.reset_pins();
         meta.txn = None;
         meta.lsn = None;
@@ -11418,16 +11498,17 @@ impl IntoIterator for LogManager {
 
 #[cfg(test)]
 mod log_manager_tests {
+    const INT_BYTES: usize = 4;
     use std::{
         io::Write,
         sync::{Arc, Mutex},
     };
 
-    use crate::{LogManager, Page, SimpleDB};
+    use crate::{LogManager, SimpleDB};
 
     fn create_log_record(s: &str, n: usize) -> Vec<u8> {
         let string_bytes = s.as_bytes();
-        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
+        let total_size = INT_BYTES + string_bytes.len() + INT_BYTES;
         let mut record = Vec::with_capacity(total_size);
 
         record
@@ -11711,11 +11792,7 @@ mod mock_file_manager {
         }
 
         fn fresh_page_bytes() -> Vec<u8> {
-            let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-            Page::new()
-                .write_bytes(&mut buf)
-                .expect("serialize empty page");
-            buf
+            vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]
         }
 
         /// Simulate a system crash - discards all unsynced data
