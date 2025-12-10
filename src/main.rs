@@ -10199,23 +10199,103 @@ impl LogRecord {
 mod recovery_manager_tests {
     use std::sync::Arc;
 
-    use crate::{LogRecord, RecoveryManager, SimpleDB};
+    use crate::{
+        BlockId, Constant, Layout, LogRecord, RecoveryManager, Schema, SimpleDB, Transaction,
+    };
+
+    const INT_FIELD: &str = "int_val";
+    const STR_FIELD: &str = "text_val";
+
+    fn recovery_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(INT_FIELD);
+        schema.add_string_field(STR_FIELD, 32);
+        Layout::new(schema)
+    }
+
+    fn init_row_with_int(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+        let mut guard = txn.pin_write_guard(block);
+        guard.format_as_heap();
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+        assert_eq!(slot, 0);
+        row_mut
+            .set_column(INT_FIELD, &Constant::Int(value))
+            .expect("set int value");
+    }
+
+    fn init_row_with_string(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
+        let mut guard = txn.pin_write_guard(block);
+        guard.format_as_heap();
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+        assert_eq!(slot, 0);
+        row_mut
+            .set_column(STR_FIELD, &Constant::String(value.to_string()))
+            .expect("set string value");
+    }
+
+    fn column_offset(
+        txn: &Arc<Transaction>,
+        block: &BlockId,
+        layout: &Layout,
+        field: &str,
+    ) -> usize {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        view.column_page_offset(0, field)
+            .expect("column offset available")
+    }
+
+    fn write_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+        let mut guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        row_mut
+            .set_column(INT_FIELD, &Constant::Int(value))
+            .expect("write int field");
+    }
+
+    fn write_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
+        let mut guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        row_mut
+            .set_column(STR_FIELD, &Constant::String(value.to_string()))
+            .expect("write string field");
+    }
+
+    fn read_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> i32 {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        let row = view.row(0).expect("row 0 exists");
+        match row.get_column(INT_FIELD) {
+            Some(Constant::Int(value)) => value,
+            other => panic!("expected int value, got {other:?}"),
+        }
+    }
+
+    fn read_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> String {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        let row = view.row(0).expect("row 0 exists");
+        match row.get_column(STR_FIELD) {
+            Some(Constant::String(value)) => value,
+            other => panic!("expected string value, got {other:?}"),
+        }
+    }
 
     #[test]
     fn rollback_restores_int_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
+        let layout = recovery_layout();
 
         let filename = "recovery_int_test".to_string();
         let block = txn.append(&filename);
-        let offset = 0;
         let original = 1234;
-
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_int(offset, original);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        init_row_with_int(&txn, &block, &layout, original);
+        let offset = column_offset(&txn, &block, &layout, INT_FIELD);
 
         let recovery_manager = RecoveryManager::new(
             txn.id(),
@@ -10232,33 +10312,24 @@ mod recovery_manager_tests {
         .write_log_record(Arc::clone(&db.log_manager))
         .unwrap();
 
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_int(offset, 9999);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        write_int_field(&txn, &block, &layout, 9999);
 
         recovery_manager.rollback(&txn).unwrap();
 
-        let guard = txn.pin_read_guard(&block);
-        assert_eq!(guard.get_int(offset), original);
+        assert_eq!(read_int_field(&txn, &block, &layout), original);
     }
 
     #[test]
     fn rollback_restores_string_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
+        let layout = recovery_layout();
 
         let filename = "recovery_string_test".to_string();
         let block = txn.append(&filename);
-        let offset = 0;
         let original = "hello recovery".to_string();
-
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_string(offset, &original);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        init_row_with_string(&txn, &block, &layout, &original);
+        let offset = column_offset(&txn, &block, &layout, STR_FIELD);
 
         let recovery_manager = RecoveryManager::new(
             txn.id(),
@@ -10275,16 +10346,11 @@ mod recovery_manager_tests {
         .write_log_record(Arc::clone(&db.log_manager))
         .unwrap();
 
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_string(offset, "corrupted value");
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        write_string_field(&txn, &block, &layout, "corrupted value");
 
         recovery_manager.rollback(&txn).unwrap();
 
-        let guard = txn.pin_read_guard(&block);
-        assert_eq!(guard.get_string(offset), original);
+        assert_eq!(read_string_field(&txn, &block, &layout), original);
     }
 }
 
