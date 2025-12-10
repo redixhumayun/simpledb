@@ -89,227 +89,6 @@ pub const PAGE_HEADER_SIZE_BYTES: u16 = 32;
 /// Sentinel value indicating no free slots in the free list.
 pub const NO_FREE_SLOT: u16 = 0xFFFF;
 
-/// 32-byte fixed-size page header tracking page metadata and free space.
-///
-/// See `docs/record_management.md` for detailed layout specification.
-struct PageHeader {
-    /// Page type discriminator
-    page_type: PageType,
-    /// Reserved flags for future use
-    reserved_flags: u8,
-    /// Number of slots in the line pointer array
-    slot_count: u16,
-    /// Offset to end of line pointer array (grows downward)
-    free_lower: u16,
-    /// Offset to start of tuple heap (grows upward)
-    free_upper: u16,
-    /// Pointer to free space boundary
-    free_ptr: u32,
-    /// CRC32 checksum for corruption detection
-    crc32: u32,
-    /// Reserved for future latch/lock word
-    latch_word: u64,
-    /// Head of free slot linked list
-    free_head: u16,
-    /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 6],
-}
-
-impl PageHeader {
-    /// Create a new, empty page header for the given page type.
-    ///
-    /// Invariants:
-    /// - Slot directory is empty (`slot_count = 0`)
-    /// - `free_lower` starts just after the fixed-size header
-    /// - `free_upper` / `free_ptr` start at the end of the 4KB page
-    /// - `free_head` uses a sentinel to indicate "no free slots"
-    fn new(page_type: PageType) -> Self {
-        PageHeader {
-            page_type,
-            reserved_flags: 0,
-            slot_count: 0,
-            free_lower: PAGE_HEADER_SIZE_BYTES,
-            free_upper: PAGE_SIZE_BYTES,
-            free_ptr: PAGE_SIZE_BYTES as u32,
-            crc32: 0,
-            latch_word: 0,
-            free_head: NO_FREE_SLOT,
-            reserved: [0; 6],
-        }
-    }
-
-    /// Returns the page type discriminator.
-    fn page_type(&self) -> PageType {
-        self.page_type
-    }
-
-    /// Sets the page type.
-    fn set_page_type(&mut self, page_type: PageType) {
-        self.page_type = page_type;
-    }
-
-    /// Returns the number of slots in the line pointer array.
-    fn slot_count(&self) -> u16 {
-        self.slot_count
-    }
-
-    /// Sets the slot count.
-    fn set_slot_count(&mut self, slot_count: u16) {
-        self.slot_count = slot_count;
-    }
-
-    /// Return the current free-space bounds (line pointers down, heap up).
-    fn free_bounds(&self) -> (u16, u16) {
-        (self.free_lower, self.free_upper)
-    }
-
-    /// Set the free-space bounds, keeping basic invariants.
-    fn set_free_bounds(&mut self, lower: u16, upper: u16) {
-        debug_assert!(lower >= PAGE_HEADER_SIZE_BYTES);
-        debug_assert!(upper <= PAGE_SIZE_BYTES);
-        debug_assert!(lower <= upper);
-        self.free_lower = lower;
-        self.free_upper = upper;
-    }
-
-    /// Number of contiguous free bytes between the slot array and the heap.
-    fn free_space(&self) -> u16 {
-        self.free_upper.saturating_sub(self.free_lower)
-    }
-
-    /// Sets the free space boundary pointer.
-    fn set_free_ptr(&mut self, free_ptr: u32) {
-        self.free_ptr = free_ptr;
-    }
-
-    /// Returns the stored CRC32 checksum.
-    fn crc32(&self) -> u32 {
-        self.crc32
-    }
-
-    /// Sets the CRC32 checksum.
-    fn set_crc32(&mut self, crc: u32) {
-        self.crc32 = crc;
-    }
-
-    /// Returns the head of the free slot linked list.
-    fn free_head(&self) -> u16 {
-        self.free_head
-    }
-
-    /// Sets the free slot list head.
-    fn set_free_head(&mut self, head: u16) {
-        self.free_head = head;
-    }
-
-    /// Checks if there are any free slots in the free list.
-    fn has_free_slot(&self) -> bool {
-        self.free_head != NO_FREE_SLOT
-    }
-
-    /// Returns the reserved metadata bytes.
-    fn reserved(&self) -> &[u8; 6] {
-        &self.reserved
-    }
-
-    /// Get the B-tree level for internal nodes (uses reserved bytes 0-1)
-    fn btree_level(&self) -> u16 {
-        u16::from_le_bytes([self.reserved()[0], self.reserved()[1]])
-    }
-
-    /// Set the B-tree level for internal nodes (uses reserved bytes 0-1)
-    fn set_btree_level(&mut self, level: u16) {
-        let bytes = level.to_le_bytes();
-        self.reserved[0] = bytes[0];
-        self.reserved[1] = bytes[1];
-    }
-
-    /// Get the overflow block number for leaf nodes (uses reserved bytes 2-5)
-    /// Returns None if no overflow block (0xFFFFFFFF sentinel)
-    fn overflow_block(&self) -> Option<usize> {
-        let val = u32::from_le_bytes([
-            self.reserved[2],
-            self.reserved[3],
-            self.reserved[4],
-            self.reserved[5],
-        ]);
-        if val == 0xFFFFFFFF {
-            None
-        } else {
-            Some(val as usize)
-        }
-    }
-
-    /// Set the overflow block number for leaf nodes (uses reserved bytes 2-5)
-    /// Use None to clear (sets to 0xFFFFFFFF sentinel)
-    fn set_overflow_block(&mut self, block: Option<usize>) {
-        let val = block.map(|b| b as u32).unwrap_or(0xFFFFFFFF);
-        let bytes = val.to_le_bytes();
-        self.reserved[2..6].copy_from_slice(&bytes);
-    }
-
-    /// Serialize the header into the provided 32-byte buffer using the documented layout.
-    fn write_to_bytes(&self, dst: &mut [u8]) {
-        assert_eq!(
-            dst.len(),
-            PAGE_HEADER_SIZE_BYTES as usize,
-            "header buffer must be 32 bytes"
-        );
-
-        dst.fill(0);
-        dst[0] = self.page_type as u8;
-        dst[1] = self.reserved_flags;
-        dst[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        dst[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
-        dst[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
-        dst[8..12].copy_from_slice(&self.free_ptr.to_le_bytes());
-        dst[12..16].copy_from_slice(&self.crc32.to_le_bytes());
-        dst[16..24].copy_from_slice(&self.latch_word.to_le_bytes());
-        dst[24..26].copy_from_slice(&self.free_head.to_le_bytes());
-        dst[26..32].copy_from_slice(&self.reserved);
-    }
-
-    /// Parse a header from a 32-byte buffer.
-    fn read_from_bytes(src: &[u8]) -> Result<Self, Box<dyn Error>> {
-        if src.len() != PAGE_HEADER_SIZE_BYTES as usize {
-            return Err("header buffer must be 32 bytes".into());
-        }
-
-        let page_type = match src[0] {
-            0 => PageType::Heap,
-            1 => PageType::IndexLeaf,
-            2 => PageType::IndexInternal,
-            3 => PageType::Overflow,
-            4 => PageType::Meta,
-            255 => PageType::Free,
-            _ => return Err("invalid page type byte".into()),
-        };
-
-        let slot_count = u16::from_le_bytes(src[2..4].try_into().unwrap());
-        let free_lower = u16::from_le_bytes(src[4..6].try_into().unwrap());
-        let free_upper = u16::from_le_bytes(src[6..8].try_into().unwrap());
-        let free_ptr = u32::from_le_bytes(src[8..12].try_into().unwrap());
-        let crc32 = u32::from_le_bytes(src[12..16].try_into().unwrap());
-        let latch_word = u64::from_le_bytes(src[16..24].try_into().unwrap());
-        let free_head = u16::from_le_bytes(src[24..26].try_into().unwrap());
-        let mut reserved = [0u8; 6];
-        reserved.copy_from_slice(&src[26..32]);
-
-        Ok(PageHeader {
-            page_type,
-            reserved_flags: src[1],
-            slot_count,
-            free_lower,
-            free_upper,
-            free_ptr,
-            crc32,
-            latch_word,
-            free_head,
-            reserved,
-        })
-    }
-}
-
 /// The trait that must be implemented by all headers
 pub trait HeaderCodec: Sized {
     /// Defines the [PageType] this codec is implemented for
@@ -431,6 +210,7 @@ impl<'a> HeapHeaderRef<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reserved_flags(&self) -> u8 {
         self.bytes[1]
     }
@@ -447,6 +227,7 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(6))
     }
 
+    #[allow(dead_code)]
     pub fn free_ptr(&self) -> u32 {
         u32::from_le_bytes(self.range::<4>(8))
     }
@@ -455,6 +236,7 @@ impl<'a> HeapHeaderRef<'a> {
         u32::from_le_bytes(self.range::<4>(12))
     }
 
+    #[allow(dead_code)]
     pub fn latch_word(&self) -> u64 {
         u64::from_le_bytes(self.range::<8>(16))
     }
@@ -463,6 +245,7 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(24))
     }
 
+    #[allow(dead_code)]
     pub fn reserved_bytes(&self) -> [u8; 6] {
         self.range::<6>(26)
     }
@@ -769,6 +552,7 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn level(&self) -> u8 {
         self.bytes[1]
     }
@@ -785,14 +569,17 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
     }
 
+    #[allow(dead_code)]
     pub fn free_space(&self) -> u16 {
         self.free_upper().saturating_sub(self.free_lower())
     }
 
+    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[8..10].try_into().unwrap())
     }
 
+    #[allow(dead_code)]
     pub fn right_sibling(&self) -> u32 {
         u32::from_le_bytes(self.bytes[10..14].try_into().unwrap())
     }
@@ -1020,10 +807,12 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         self.free_upper().saturating_sub(self.free_lower())
     }
 
+    #[allow(dead_code)]
     pub fn rightmost_child_block(&self) -> u32 {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
+    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
@@ -1047,6 +836,10 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         BTreeInternalHeaderRef::new(&self.bytes[..])
     }
 
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
         self.bytes[start..start + N].copy_from_slice(&value);
     }
@@ -1057,10 +850,6 @@ impl<'a> BTreeInternalHeaderMut<'a> {
 
     pub fn set_level(&mut self, level: u8) {
         self.bytes[1] = level;
-    }
-
-    pub fn level(&self) -> u8 {
-        self.bytes[1]
     }
 
     pub fn set_slot_count(&mut self, slot_count: u16) {
@@ -1383,16 +1172,19 @@ impl LinePtr {
         self.0 = (self.0 & 0xFFFF_FFF0) | (state_bits);
     }
 
+    #[cfg(test)]
     fn with_offset(mut self, offset: u16) -> Self {
         self.set_offset(offset);
         self
     }
 
+    #[cfg(test)]
     fn with_length(mut self, length: u16) -> Self {
         self.set_length(length);
         self
     }
 
+    #[cfg(test)]
     fn with_state(mut self, state: LineState) -> Self {
         self.set_state(state);
         self
@@ -1536,6 +1328,7 @@ mod line_ptr_tests {
 
 /// Marker trait associating a compile-time page kind with its runtime PageType.
 pub trait PageKind: Sized {
+    #[allow(dead_code)]
     const PAGE_TYPE: PageType;
     const HEADER_SIZE: usize;
     type Header: HeaderCodec;
@@ -1573,33 +1366,6 @@ impl PageBytes {
     }
 }
 
-pub struct DummyRawPageHeader {}
-
-impl HeaderCodec for DummyRawPageHeader {
-    const PAGE_TYPE: PageType = PageType::Free;
-
-    fn page_type_byte(&self) -> PageType {
-        Self::PAGE_TYPE
-    }
-
-    fn from_bytes(_bytes: &[u8]) -> SimpleDBResult<Self> {
-        todo!()
-    }
-
-    fn write_bytes(&self, _dest: &mut [u8]) {
-        todo!()
-    }
-}
-
-/// Raw page with unknown type, used at I/O boundaries.
-pub struct RawPage;
-
-impl PageKind for RawPage {
-    const PAGE_TYPE: PageType = PageType::Free;
-    const HEADER_SIZE: usize = 0;
-    type Header = DummyRawPageHeader;
-}
-
 struct HeapRecordSpace<'a> {
     bytes: &'a [u8],
     base_offset: usize,
@@ -1622,8 +1388,8 @@ impl<'a> HeapRecordSpace<'a> {
         if !ptr.is_live() {
             return None;
         }
-        let offset = ptr.offset() as usize;
-        let length = ptr.length() as usize;
+
+        let (offset, length) = ptr.offset_and_length();
         let relative = offset.checked_sub(self.base_offset)?;
         self.bytes.get(relative..relative + length)
     }
@@ -1693,14 +1459,6 @@ impl<'a> BTreeRecordSpaceMut<'a> {
         Self { bytes, base_offset }
     }
 
-    #[allow(dead_code)]
-    fn entry_bytes(&self, ptr: LinePtr) -> Option<&[u8]> {
-        let offset = ptr.offset() as usize;
-        let length = ptr.length() as usize;
-        let relative = offset.checked_sub(self.base_offset)?;
-        Some(&self.bytes[relative..relative + length])
-    }
-
     fn write_entry(&mut self, offset: usize, bytes: &[u8]) {
         let relative = offset
             .checked_sub(self.base_offset)
@@ -1721,23 +1479,6 @@ impl<'a> BTreeRecordSpaceMut<'a> {
             .expect("destination offset precedes record space");
         let src_end = src_relative + len;
         self.bytes.copy_within(src_relative..src_end, dst_relative);
-    }
-
-    fn insert(&mut self, offset: usize, bytes: &[u8]) {
-        let relative = offset
-            .checked_sub(self.base_offset)
-            .expect("offset before record space");
-        self.bytes
-            .copy_within(relative..self.bytes.len(), relative + bytes.len());
-        self.bytes[relative..relative + bytes.len()].copy_from_slice(bytes);
-    }
-
-    fn remove(&mut self, offset: usize, len: usize) {
-        let relative = offset
-            .checked_sub(self.base_offset)
-            .expect("offset before record space");
-        let end = relative + len;
-        self.bytes.copy_within(end..self.bytes.len(), relative);
     }
 }
 
@@ -1785,10 +1526,6 @@ impl<'a> HeapPageZeroCopy<'a> {
         }
     }
 
-    fn header(&self) -> HeapHeaderRef<'a> {
-        self.header
-    }
-
     fn slot_count(&self) -> usize {
         self.header.slot_count() as usize
     }
@@ -1819,15 +1556,20 @@ impl<'a> HeapPageZeroCopy<'a> {
     }
 }
 
-struct HeapPageZeroCopyMut<'a> {
+pub struct HeapPageZeroCopyMut<'a> {
     header: HeapHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
+impl<'a> PageKind for HeapPageZeroCopyMut<'a> {
+    const PAGE_TYPE: PageType = PageType::Heap;
+    const HEADER_SIZE: usize = 32;
+    type Header = HeapHeader;
+}
+
 impl<'a> HeapPageZeroCopyMut<'a> {
-    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+    pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-        // let header = HeapHeaderRef::new(header_bytes);
         let header = HeapHeaderMut::new(header_bytes);
         if header.as_ref().page_type() != PageType::Heap {
             return Err("not a heap page".into());
@@ -1835,14 +1577,14 @@ impl<'a> HeapPageZeroCopyMut<'a> {
         Ok(Self { header, body_bytes })
     }
 
+    #[allow(dead_code)]
     fn as_read(&self) -> SimpleDBResult<HeapPageZeroCopy<'_>> {
-        // let header = self.header();
         let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = (&self.body_bytes[..]).split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let base_offset = Self::HEADER_SIZE as usize + slot_len;
         let page = HeapPageZeroCopy::from_parts(
             self.header.as_ref(),
             line_ptr_bytes,
@@ -1857,11 +1599,11 @@ impl<'a> HeapPageZeroCopyMut<'a> {
         Ok(page)
     }
 
-    fn update_crc32(&mut self) {
+    pub fn update_crc32(&mut self) {
         self.header.update_crc32(&self.body_bytes);
     }
 
-    fn verify_crc32(&mut self) -> bool {
+    pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(&self.body_bytes)
     }
 
@@ -1870,13 +1612,12 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     /// boundary always reflects the latest `slot_count`. Dropping the guard releases the borrows,
     /// forcing the next operation to resplit.
     fn split(&mut self) -> SimpleDBResult<HeapPageParts<'_>> {
-        // let header_view = HeapHeaderRef::new(self.header_bytes);
         let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let base_offset = Self::HEADER_SIZE as usize + slot_len;
         let parts = HeapPageParts {
             header: HeapHeaderMut::new(self.header.bytes_mut()),
             line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
@@ -4070,7 +3811,7 @@ mod btree_page_tests {
     ) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPage::HEADER_SIZE as usize);
+            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPageZeroCopy::HEADER_SIZE as usize);
             let mut header = BTreeLeafHeaderMut::new(header_bytes);
             header.init_leaf(level, right_sibling, overflow_block);
         }
@@ -4080,11 +3821,170 @@ mod btree_page_tests {
     fn init_btree_internal_bytes(level: u8, rightmost_child: Option<u32>) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) = bytes.split_at_mut(BTreeInternalPage::HEADER_SIZE as usize);
+            let (header_bytes, _) =
+                bytes.split_at_mut(BTreeInternalPageZeroCopy::HEADER_SIZE as usize);
             let mut header = BTreeInternalHeaderMut::new(header_bytes);
             header.init_internal(level, rightmost_child);
         }
         bytes
+    }
+
+    struct LeafTestPage {
+        bytes: Vec<u8>,
+    }
+
+    impl LeafTestPage {
+        fn new() -> Self {
+            Self::with_params(0, None, None)
+        }
+
+        fn with_overflow(overflow_block: Option<u32>) -> Self {
+            Self::with_params(0, None, overflow_block)
+        }
+
+        fn with_params(level: u8, right_sibling: Option<u32>, overflow_block: Option<u32>) -> Self {
+            Self {
+                bytes: init_btree_leaf_bytes(level, right_sibling, overflow_block),
+            }
+        }
+
+        fn from_bytes(bytes: Vec<u8>) -> Self {
+            BTreeLeafPageZeroCopy::new(&bytes).expect("valid leaf page bytes");
+            Self { bytes }
+        }
+
+        fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
+            BTreeLeafPageZeroCopy::new(&self.bytes).expect("leaf view")
+        }
+
+        fn view_mut(&mut self) -> BTreeLeafPageZeroCopyMut<'_> {
+            BTreeLeafPageZeroCopyMut::new(&mut self.bytes).expect("leaf view mut")
+        }
+
+        fn slot_count(&self) -> usize {
+            self.view().slot_count()
+        }
+
+        fn overflow_block(&self) -> Option<usize> {
+            self.view().overflow_block()
+        }
+
+        fn set_overflow_block(&mut self, block: Option<usize>) {
+            self.view_mut()
+                .set_overflow_block(block)
+                .expect("set overflow");
+        }
+
+        fn insert_leaf_entry(
+            &mut self,
+            layout: &Layout,
+            key: Constant,
+            rid: RID,
+        ) -> SimpleDBResult<SlotId> {
+            self.view_mut().insert_entry(layout, key, rid)
+        }
+
+        fn get_leaf_entry(&self, layout: &Layout, slot: SlotId) -> SimpleDBResult<BTreeLeafEntry> {
+            self.view()
+                .entry_bytes(slot)
+                .map(|bytes| BTreeLeafEntry::decode(layout, bytes))
+                .unwrap()
+        }
+
+        fn delete_leaf_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
+            self.view_mut().delete_entry(slot)
+        }
+
+        fn find_insertion_slot(&self, layout: &Layout, key: &Constant) -> SlotId {
+            self.view().find_insertion_slot(layout, key)
+        }
+
+        fn find_slot_before(&self, layout: &Layout, key: &Constant) -> Option<SlotId> {
+            self.view().find_slot_before(layout, key)
+        }
+
+        fn is_full(&self, layout: &Layout) -> bool {
+            self.view().is_full(layout)
+        }
+
+        fn tuple_bytes(&self, slot: SlotId) -> Option<Vec<u8>> {
+            self.view().entry_bytes(slot).map(|bytes| bytes.to_vec())
+        }
+
+        fn write_bytes(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(&self.bytes);
+        }
+    }
+
+    struct InternalTestPage {
+        bytes: Vec<u8>,
+    }
+
+    impl InternalTestPage {
+        fn new(level: u8) -> Self {
+            Self {
+                bytes: init_btree_internal_bytes(level, None),
+            }
+        }
+
+        fn from_bytes(bytes: Vec<u8>) -> Self {
+            BTreeInternalPageZeroCopy::new(&bytes).expect("valid internal page bytes");
+            Self { bytes }
+        }
+
+        fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
+            BTreeInternalPageZeroCopy::new(&self.bytes).expect("internal view")
+        }
+
+        fn view_mut(&mut self) -> BTreeInternalPageZeroCopyMut<'_> {
+            BTreeInternalPageZeroCopyMut::new(&mut self.bytes).expect("internal view mut")
+        }
+
+        fn slot_count(&self) -> usize {
+            self.view().slot_count()
+        }
+
+        fn btree_level(&self) -> u8 {
+            self.view().btree_level()
+        }
+
+        fn set_btree_level(&mut self, level: u8) {
+            self.view_mut()
+                .set_btree_level(level)
+                .expect("set btree level");
+        }
+
+        fn insert_internal_entry(
+            &mut self,
+            layout: &Layout,
+            key: Constant,
+            child_block: usize,
+        ) -> SimpleDBResult<SlotId> {
+            self.view_mut().insert_entry(layout, key, child_block)
+        }
+
+        fn get_internal_entry(
+            &self,
+            layout: &Layout,
+            slot: SlotId,
+        ) -> SimpleDBResult<BTreeInternalEntry> {
+            self.view()
+                .entry_bytes(slot)
+                .map(|bytes| BTreeInternalEntry::decode(layout, bytes))
+                .unwrap()
+        }
+
+        fn delete_internal_entry(&mut self, slot: SlotId, layout: &Layout) -> SimpleDBResult<()> {
+            self.view_mut().delete_entry(slot, layout)
+        }
+
+        fn is_full(&self, layout: &Layout) -> bool {
+            self.view().is_full(layout)
+        }
+
+        fn write_bytes(&self, dst: &mut [u8]) {
+            dst.copy_from_slice(&self.bytes);
+        }
     }
 
     fn leaf_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeLeafPageZeroCopyMut<'_> {
@@ -4214,33 +4114,29 @@ mod btree_page_tests {
 
     #[test]
     fn btree_leaf_page_init() {
-        // let mut page = Page::<BTreeLeafPage>::new();
-
-        page.init(None);
-
-        assert_eq!(page.header.page_type(), PageType::IndexLeaf);
-        assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.overflow_block(), None);
+        let page = LeafTestPage::new();
+        let view = page.view();
+        assert_eq!(view.header.page_type(), PageType::IndexLeaf);
+        assert_eq!(view.slot_count(), 0);
+        assert_eq!(view.overflow_block(), None);
     }
 
     #[test]
     fn btree_leaf_page_init_with_overflow() {
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(Some(42));
-
-        assert_eq!(page.header.page_type(), PageType::IndexLeaf);
-        assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.overflow_block(), Some(42));
+        let page = LeafTestPage::with_overflow(Some(42));
+        let view = page.view();
+        assert_eq!(view.header.page_type(), PageType::IndexLeaf);
+        assert_eq!(view.slot_count(), 0);
+        assert_eq!(view.overflow_block(), Some(42));
     }
 
     #[test]
     fn btree_internal_page_init() {
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(3);
-
-        assert_eq!(page.header.page_type(), PageType::IndexInternal);
-        assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.btree_level(), 3);
+        let page = InternalTestPage::new(3);
+        let view = page.view();
+        assert_eq!(view.header.page_type(), PageType::IndexInternal);
+        assert_eq!(view.slot_count(), 0);
+        assert_eq!(view.btree_level(), 3);
     }
 
     // ========== Phase 1: Sorted Insertion Tests ==========
@@ -4248,14 +4144,13 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_sorted_insertion_random_order() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Insert in random order
         let keys = [42, 1, 99, 17, 55, 3, 88];
         for (i, &key) in keys.iter().enumerate() {
             let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
                 .expect("insert should succeed");
         }
 
@@ -4270,13 +4165,12 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_sorted_insertion_ascending() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         let keys = [1, 2, 3, 4, 5];
         for (i, &key) in keys.iter().enumerate() {
             let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
                 .expect("insert should succeed");
         }
 
@@ -4290,13 +4184,12 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_sorted_insertion_descending() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         let keys = [5, 4, 3, 2, 1];
         for (i, &key) in keys.iter().enumerate() {
             let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &rid)
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
                 .expect("insert should succeed");
         }
 
@@ -4311,13 +4204,12 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_varchar_sorted_insertion() {
         let layout = btree_leaf_layout_varchar();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         let keys = ["dog", "apple", "zebra", "banana", "cat"];
         for (i, &key) in keys.iter().enumerate() {
             let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, &Constant::String(key.to_string()), &rid)
+            page.insert_leaf_entry(&layout, Constant::String(key.to_string()), rid)
                 .expect("insert should succeed");
         }
 
@@ -4332,12 +4224,11 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_sorted_insertion() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(1);
+        let mut page = InternalTestPage::new(1);
 
         let keys = [50, 10, 90, 30, 70];
         for (i, &key) in keys.iter().enumerate() {
-            page.insert_internal_entry(&layout, &Constant::Int(key), i * 10)
+            page.insert_internal_entry(&layout, Constant::Int(key), i * 10)
                 .expect("insert should succeed");
         }
 
@@ -4354,7 +4245,7 @@ mod btree_page_tests {
     #[test]
     fn find_insertion_slot_empty_page() {
         let layout = btree_leaf_layout_int();
-        let page = Page::<BTreeLeafPage>::new();
+        let page = LeafTestPage::new();
 
         let slot = page.find_insertion_slot(&layout, &Constant::Int(42));
         assert_eq!(slot, 0);
@@ -4363,12 +4254,11 @@ mod btree_page_tests {
     #[test]
     fn find_insertion_slot_middle() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Insert [10, 30, 50]
         for &key in &[10, 30, 50] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4380,11 +4270,10 @@ mod btree_page_tests {
     #[test]
     fn find_insertion_slot_beginning() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4396,11 +4285,10 @@ mod btree_page_tests {
     #[test]
     fn find_insertion_slot_end() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4412,7 +4300,7 @@ mod btree_page_tests {
     #[test]
     fn find_slot_before_empty_page() {
         let layout = btree_leaf_layout_int();
-        let page = Page::<BTreeLeafPage>::new();
+        let page = LeafTestPage::new();
 
         let slot = page.find_slot_before(&layout, &Constant::Int(42));
         assert_eq!(slot, None);
@@ -4421,11 +4309,10 @@ mod btree_page_tests {
     #[test]
     fn find_slot_before_key_less_than_all() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4436,11 +4323,10 @@ mod btree_page_tests {
     #[test]
     fn find_slot_before_key_greater_than_all() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4451,11 +4337,10 @@ mod btree_page_tests {
     #[test]
     fn find_slot_before_key_in_middle() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30, 40] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4467,11 +4352,10 @@ mod btree_page_tests {
     #[test]
     fn find_slot_before_exact_match() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         for &key in &[10, 20, 30, 40] {
-            page.insert_leaf_entry(&layout, &Constant::Int(key), &RID::new(0, 0))
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
@@ -4485,12 +4369,11 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_insert_get_verify() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         let rid = RID::new(100, 50);
         let slot = page
-            .insert_leaf_entry(&layout, &Constant::Int(42), &rid)
+            .insert_leaf_entry(&layout, Constant::Int(42), rid)
             .expect("insert should succeed");
 
         let entry = page
@@ -4503,13 +4386,12 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_insert_delete_verify() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Insert two entries - they will be sorted by key (10, 20)
-        page.insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1))
+        page.insert_leaf_entry(&layout, Constant::Int(10), RID::new(1, 1))
             .unwrap();
-        page.insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2))
+        page.insert_leaf_entry(&layout, Constant::Int(20), RID::new(2, 2))
             .unwrap();
 
         // Verify both entries exist at expected positions
@@ -4541,7 +4423,7 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_get_invalid_slot() {
         let layout = btree_leaf_layout_int();
-        let page = Page::<BTreeLeafPage>::new();
+        let page = LeafTestPage::new();
 
         let result = page.get_leaf_entry(&layout, 999);
         assert!(result.is_err());
@@ -4550,8 +4432,7 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_delete_invalid_slot() {
         let _layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         let result = page.delete_leaf_entry(999, &_layout);
         assert!(result.is_err());
@@ -4560,11 +4441,10 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_insert_get_verify() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(2);
+        let mut page = InternalTestPage::new(2);
 
         let slot = page
-            .insert_internal_entry(&layout, &Constant::Int(50), 123)
+            .insert_internal_entry(&layout, Constant::Int(50), 123)
             .expect("insert should succeed");
 
         let entry = page
@@ -4577,13 +4457,12 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_insert_delete_verify() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(1);
+        let mut page = InternalTestPage::new(1);
 
         // Insert two entries - they will be sorted by key (10, 20)
-        page.insert_internal_entry(&layout, &Constant::Int(10), 100)
+        page.insert_internal_entry(&layout, Constant::Int(10), 100)
             .unwrap();
-        page.insert_internal_entry(&layout, &Constant::Int(20), 200)
+        page.insert_internal_entry(&layout, Constant::Int(20), 200)
             .unwrap();
 
         // Verify both entries exist at expected positions
@@ -4617,8 +4496,7 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_is_full_detection() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Initially not full
         assert!(!page.is_full(&layout));
@@ -4631,8 +4509,8 @@ mod btree_page_tests {
             }
             let result = page.insert_leaf_entry(
                 &layout,
-                &Constant::Int(count),
-                &RID::new(count as usize, count as usize),
+                Constant::Int(count),
+                RID::new(count as usize, count as usize),
             );
             if result.is_err() {
                 break;
@@ -4648,16 +4526,15 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_fill_to_capacity_then_fail() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Fill page completely
         let mut inserted = 0;
         loop {
             let result = page.insert_leaf_entry(
                 &layout,
-                &Constant::Int(inserted),
-                &RID::new(inserted as usize, inserted as usize),
+                Constant::Int(inserted),
+                RID::new(inserted as usize, inserted as usize),
             );
             if result.is_err() {
                 break;
@@ -4669,7 +4546,7 @@ mod btree_page_tests {
         }
 
         // One more insert should fail
-        let result = page.insert_leaf_entry(&layout, &Constant::Int(9999), &RID::new(9999, 9999));
+        let result = page.insert_leaf_entry(&layout, Constant::Int(9999), RID::new(9999, 9999));
         assert!(result.is_err(), "insert should fail on full page");
 
         // Verify all previously inserted entries are still accessible and sorted
@@ -4684,16 +4561,15 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_delete_then_insert_more() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Fill page
         let mut inserted = 0;
         loop {
             let result = page.insert_leaf_entry(
                 &layout,
-                &Constant::Int(inserted),
-                &RID::new(inserted as usize, inserted as usize),
+                Constant::Int(inserted),
+                RID::new(inserted as usize, inserted as usize),
             );
             if result.is_err() {
                 break;
@@ -4718,7 +4594,7 @@ mod btree_page_tests {
         let was_full_after_delete = page.is_full(&layout);
 
         // Try inserting again - should succeed now that we've freed space
-        let result = page.insert_leaf_entry(&layout, &Constant::Int(8888), &RID::new(8888, 8888));
+        let result = page.insert_leaf_entry(&layout, Constant::Int(8888), RID::new(8888, 8888));
         assert!(
             result.is_ok() || was_full_after_delete,
             "either insert succeeds or page was still full after deletes"
@@ -4728,8 +4604,7 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_is_full_detection() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(1);
+        let mut page = InternalTestPage::new(1);
 
         assert!(!page.is_full(&layout));
 
@@ -4739,7 +4614,7 @@ mod btree_page_tests {
                 break;
             }
             let result =
-                page.insert_internal_entry(&layout, &Constant::Int(count), count as usize * 100);
+                page.insert_internal_entry(&layout, Constant::Int(count), count as usize * 100);
             if result.is_err() {
                 break;
             }
@@ -4754,7 +4629,7 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_operations_on_empty_page() {
         let layout = btree_leaf_layout_int();
-        let page = Page::<BTreeLeafPage>::new();
+        let page = LeafTestPage::new();
 
         // Empty page operations
         assert_eq!(page.slot_count(), 0);
@@ -4766,12 +4641,11 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_single_entry_operations() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Insert single entry
         let slot = page
-            .insert_leaf_entry(&layout, &Constant::Int(50), &RID::new(10, 5))
+            .insert_leaf_entry(&layout, Constant::Int(50), RID::new(10, 5))
             .expect("insert should succeed");
         assert_eq!(slot, 0);
         assert_eq!(page.slot_count(), 1);
@@ -4798,11 +4672,10 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_single_entry_operations() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(2);
+        let mut page = InternalTestPage::new(2);
 
         let slot = page
-            .insert_internal_entry(&layout, &Constant::Int(100), 500)
+            .insert_internal_entry(&layout, Constant::Int(100), 500)
             .expect("insert should succeed");
         assert_eq!(slot, 0);
 
@@ -4814,15 +4687,13 @@ mod btree_page_tests {
 
         page.delete_internal_entry(slot, &layout)
             .expect("delete should succeed");
-        assert!(page.tuple_bytes(slot).is_none());
     }
 
     // ========== Phase 2: Metadata Persistence Tests ==========
 
     #[test]
     fn btree_leaf_overflow_block_roundtrip() {
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(None);
+        let mut page = LeafTestPage::new();
 
         // Initially None
         assert_eq!(page.overflow_block(), None);
@@ -4842,8 +4713,7 @@ mod btree_page_tests {
 
     #[test]
     fn btree_internal_level_roundtrip() {
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(0);
+        let mut page = InternalTestPage::new(0);
 
         assert_eq!(page.btree_level(), 0);
 
@@ -4857,22 +4727,20 @@ mod btree_page_tests {
     #[test]
     fn btree_leaf_metadata_persists_across_serialization() {
         let layout = btree_leaf_layout_int();
-        let mut page = Page::<BTreeLeafPage>::new();
-        page.init(Some(123));
+        let mut page = LeafTestPage::with_overflow(Some(123));
 
         // Insert some entries
-        page.insert_leaf_entry(&layout, &Constant::Int(10), &RID::new(1, 1))
+        page.insert_leaf_entry(&layout, Constant::Int(10), RID::new(1, 1))
             .unwrap();
-        page.insert_leaf_entry(&layout, &Constant::Int(20), &RID::new(2, 2))
+        page.insert_leaf_entry(&layout, Constant::Int(20), RID::new(2, 2))
             .unwrap();
 
         // Serialize
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
-        page.write_bytes(&mut buf)
-            .expect("serialize should succeed");
+        page.write_bytes(&mut buf);
 
         // Deserialize
-        let restored = Page::<BTreeLeafPage>::from_bytes(&buf).expect("deserialize should succeed");
+        let restored = LeafTestPage::from_bytes(buf);
 
         // Verify metadata preserved
         assert_eq!(restored.overflow_block(), Some(123));
@@ -4893,23 +4761,20 @@ mod btree_page_tests {
     #[test]
     fn btree_internal_metadata_persists_across_serialization() {
         let layout = btree_internal_layout_int();
-        let mut page = Page::<BTreeInternalPage>::new();
-        page.init(7);
+        let mut page = InternalTestPage::new(7);
 
         // Insert entries
-        page.insert_internal_entry(&layout, &Constant::Int(30), 300)
+        page.insert_internal_entry(&layout, Constant::Int(30), 300)
             .unwrap();
-        page.insert_internal_entry(&layout, &Constant::Int(60), 600)
+        page.insert_internal_entry(&layout, Constant::Int(60), 600)
             .unwrap();
 
         // Serialize
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
-        page.write_bytes(&mut buf)
-            .expect("serialize should succeed");
+        page.write_bytes(&mut buf);
 
         // Deserialize
-        let restored =
-            Page::<BTreeInternalPage>::from_bytes(&buf).expect("deserialize should succeed");
+        let restored = InternalTestPage::from_bytes(buf);
 
         // Verify metadata
         assert_eq!(restored.btree_level(), 7);
@@ -5493,13 +5358,19 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
     }
 }
 
-struct BTreeLeafPageZeroCopyMut<'a> {
+pub struct BTreeLeafPageZeroCopyMut<'a> {
     header: BTreeLeafHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
+impl<'a> PageKind for BTreeLeafPageZeroCopyMut<'a> {
+    const PAGE_TYPE: PageType = PageType::IndexLeaf;
+    const HEADER_SIZE: usize = 32;
+    type Header = BTreeLeafHeader;
+}
+
 impl<'a> BTreeLeafPageZeroCopyMut<'a> {
-    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+    pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
         let header = BTreeLeafHeaderMut::new(header_bytes);
         if header.as_ref().page_type() != PageType::IndexLeaf {
@@ -5575,8 +5446,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
                 .write_entry(new_upper as usize, &entry_bytes);
             {
                 let header = parts.header();
-                header.set_free_lower(free_lower + slot_bytes);
-                header.set_free_upper(new_upper);
+                header.set_free_bounds(free_lower + slot_bytes, new_upper);
                 let slot_count = header.as_ref().slot_count();
                 header.set_slot_count(slot_count + 1);
             }
@@ -5639,16 +5509,13 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             let header = parts.header();
             let current_lower = header.free_lower();
             let current_upper = header.free_upper();
-            header.set_free_lower(
-                current_lower
-                    .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
-                    .expect("free_lower underflow during delete"),
-            );
-            header.set_free_upper(
-                current_upper
-                    .checked_add(deleted_len_u16)
-                    .expect("free_upper overflow during delete"),
-            );
+            let new_lower = current_lower
+                .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower underflow during delete");
+            let new_upper = current_upper
+                .checked_add(deleted_len_u16)
+                .expect("free_upper overflow during delete");
+            header.set_free_bounds(new_lower, new_upper);
             let slot_count = header.as_ref().slot_count();
             header.set_slot_count(
                 slot_count
@@ -5665,6 +5532,14 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         let value = block.map(|b| b as u32).unwrap_or(u32::MAX);
         parts.header().set_overflow_block(value);
         Ok(())
+    }
+
+    pub fn update_crc32(&mut self) {
+        self.header.update_crc32(&self.body_bytes);
+    }
+
+    pub fn verify_crc32(&mut self) -> bool {
+        self.header.verify_crc32(&self.body_bytes)
     }
 }
 
@@ -5795,34 +5670,36 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
     }
 }
 
-struct BTreeInternalPageZeroCopyMut<'a> {
-    header_bytes: &'a mut [u8],
+pub struct BTreeInternalPageZeroCopyMut<'a> {
+    header: BTreeInternalHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
+impl<'a> PageKind for BTreeInternalPageZeroCopyMut<'a> {
+    const PAGE_TYPE: PageType = PageType::IndexInternal;
+    const HEADER_SIZE: usize = 32;
+    type Header = BTreeInternalHeader;
+}
+
 impl<'a> BTreeInternalPageZeroCopyMut<'a> {
-    fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+    pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-        let header = BTreeInternalHeaderRef::new(header_bytes);
-        if header.page_type() != PageType::IndexInternal {
+        let header = BTreeInternalHeaderMut::new(header_bytes);
+        if header.as_ref().page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
         }
-        Ok(Self {
-            header_bytes,
-            body_bytes,
-        })
+        Ok(Self { header, body_bytes })
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeInternalPageParts<'_>> {
-        let header_ref = BTreeInternalHeaderRef::new(self.header_bytes);
-        let slot_len = header_ref.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
         let parts = BTreeInternalPageParts {
-            header: BTreeInternalHeaderMut::new(self.header_bytes),
+            header: BTreeInternalHeaderMut::new(self.header.bytes_mut()),
             line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
             record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
         };
@@ -5835,20 +5712,18 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     }
 
     fn as_read(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
-        let header_bytes: &[u8] = &self.header_bytes[..];
         let body_bytes: &[u8] = &self.body_bytes[..];
-        let header = BTreeInternalHeaderRef::new(header_bytes);
-        if header.page_type() != PageType::IndexInternal {
+        if self.header.as_ref().page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
         }
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
+        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
         let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
         let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
         Ok(BTreeInternalPageZeroCopy {
-            header,
+            header: self.header.as_ref(),
             line_pointers: LinePtrArray::new(line_ptr_bytes),
             record_space: BTreeRecordSpace::new(record_bytes, base_offset),
         })
@@ -5875,27 +5750,24 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
 
         let line_ptr = {
             let mut parts = self.split()?;
+            let needed = slot_bytes + entry_len;
             let (free_lower, free_upper, slot_count) = {
                 let header = parts.header();
-                (
-                    header.free_lower(),
-                    header.free_upper(),
-                    header.as_ref().slot_count(),
-                )
+                let view = header.as_ref();
+                if view.free_space() < needed {
+                    return Err("page full".into());
+                }
+                (header.free_lower(), header.free_upper(), view.slot_count())
             };
-            if free_lower + slot_bytes + entry_len > free_upper {
-                return Err("page full".into());
-            }
-            let new_upper = free_upper - entry_len;
-            {
-                parts
-                    .record_space()
-                    .write_entry(new_upper as usize, &entry_bytes);
-            }
+            let new_upper = free_upper
+                .checked_sub(entry_len)
+                .expect("free_upper underflow during insert");
+            parts
+                .record_space()
+                .write_entry(new_upper as usize, &entry_bytes);
             {
                 let header = parts.header();
-                header.set_free_lower(free_lower + slot_bytes);
-                header.set_free_upper(new_upper);
+                header.set_free_bounds(free_lower + slot_bytes, new_upper);
                 header.set_slot_count(slot_count + 1);
             }
             LinePtr::new(new_upper, entry_len, LineState::Live)
@@ -5907,10 +5779,6 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     }
 
     fn delete_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
-        let (free_lower, free_upper) = {
-            let header = BTreeInternalHeaderRef::new(self.header_bytes);
-            (header.free_lower(), header.free_upper())
-        };
         let mut parts = self.split()?;
         let (deleted_offset, deleted_len_u16) = {
             let line_ptrs = parts.line_ptrs();
@@ -5927,7 +5795,7 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
             (offset, len_u16)
         };
         let deleted_len = deleted_len_u16 as usize;
-        let free_upper_usize = free_upper as usize;
+        let free_upper_usize = parts.header().free_upper() as usize;
 
         if deleted_offset > free_upper_usize {
             let shift_len = deleted_offset - free_upper_usize;
@@ -5955,29 +5823,39 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         }
 
         {
-            let new_lower = free_lower
-                .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
-                .expect("free_lower underflow during delete");
-            let new_upper = free_upper
-                .checked_add(deleted_len_u16)
-                .expect("free_upper overflow during delete");
-            let new_slot_count = {
-                let line_ptrs = parts.line_ptrs();
-                line_ptrs.len() as u16
+            let slot_len = parts.line_ptrs().len() as u16;
+            let (new_lower, new_upper) = {
+                let header = parts.header();
+                (
+                    header
+                        .free_lower()
+                        .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                        .expect("free_lower underflow during delete"),
+                    header
+                        .free_upper()
+                        .checked_add(deleted_len_u16)
+                        .expect("free_upper overflow during delete"),
+                )
             };
             let header = parts.header();
-            header.set_free_lower(new_lower);
-            header.set_free_upper(new_upper);
-            header.set_slot_count(new_slot_count);
+            header.set_free_bounds(new_lower, new_upper);
+            header.set_slot_count(slot_len);
         }
 
         Ok(())
     }
 
     fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
-        let mut header = BTreeInternalHeaderMut::new(self.header_bytes);
-        header.set_level(level);
+        self.header.set_level(level);
         Ok(())
+    }
+
+    pub fn update_crc32(&mut self) {
+        self.header.update_crc32(&self.body_bytes);
+    }
+
+    pub fn verify_crc32(&mut self) -> bool {
+        self.header.verify_crc32(&self.body_bytes)
     }
 }
 

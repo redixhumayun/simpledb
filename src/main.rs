@@ -36,8 +36,8 @@ mod page;
 mod parser;
 mod replacement;
 use crate::page::{
-    BTreeInternalHeaderMut, BTreeInternalPage, BTreeLeafHeaderMut, BTreeLeafPage, HeapHeaderMut,
-    HeapPage, PageKind, PageReadGuard, PageType, PageWriteGuard, WalPage,
+    BTreeInternalPageZeroCopyMut, BTreeLeafPageZeroCopyMut, HeapPageZeroCopyMut, PageReadGuard,
+    PageType, PageWriteGuard, WalPage,
 };
 
 use replacement::PolicyState;
@@ -10670,23 +10670,17 @@ impl BufferFrame {
             //  TODO: Get rid of pattern matching by bringing back compile time polymorphism on the Page type
             match page_guard.peek_page_type().unwrap() {
                 PageType::Heap => {
-                    let (header, body) = page_guard.bytes_mut().split_at_mut(HeapPage::HEADER_SIZE);
-                    let mut header = HeapHeaderMut::new(header);
-                    header.update_crc32(body);
+                    let mut page = HeapPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
                 }
                 PageType::IndexLeaf => {
-                    let (header, body) = page_guard
-                        .bytes_mut()
-                        .split_at_mut(BTreeLeafPage::HEADER_SIZE);
-                    let mut header = BTreeLeafHeaderMut::new(header);
-                    header.update_crc32(body);
+                    let mut page = BTreeLeafPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
                 }
                 PageType::IndexInternal => {
-                    let (header, body) = page_guard
-                        .bytes_mut()
-                        .split_at_mut(BTreeInternalPage::HEADER_SIZE);
-                    let mut header = BTreeInternalHeaderMut::new(header);
-                    header.update_crc32(body);
+                    let mut page =
+                        BTreeInternalPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
                 }
                 PageType::Overflow => todo!(),
                 PageType::Meta => todo!(),
@@ -10719,9 +10713,8 @@ impl BufferFrame {
         // }
         match page_guard.peek_page_type().unwrap() {
             PageType::Heap => {
-                let (header, body) = page_guard.bytes_mut().split_at_mut(HeapPage::HEADER_SIZE);
-                let mut header = HeapHeaderMut::new(header);
-                if !header.verify_crc32(body) {
+                let mut page = HeapPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
                         block_id,
@@ -10730,11 +10723,8 @@ impl BufferFrame {
                 }
             }
             PageType::IndexLeaf => {
-                let (header, body) = page_guard
-                    .bytes_mut()
-                    .split_at_mut(BTreeLeafPage::HEADER_SIZE);
-                let mut header = BTreeLeafHeaderMut::new(header);
-                if !header.verify_crc32(body) {
+                let mut page = BTreeLeafPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
                         block_id,
@@ -10743,11 +10733,8 @@ impl BufferFrame {
                 }
             }
             PageType::IndexInternal => {
-                let (header, body) = page_guard
-                    .bytes_mut()
-                    .split_at_mut(BTreeInternalPage::HEADER_SIZE);
-                let mut header = BTreeInternalHeaderMut::new(header);
-                if !header.verify_crc32(body) {
+                let mut page = BTreeInternalPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
                         block_id,
