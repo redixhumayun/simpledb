@@ -522,6 +522,27 @@ impl<'a> HeapHeaderMut<'a> {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    pub fn init_heap_page_with_row<F>(
+        page: &mut PageBytes,
+        layout: &Layout,
+        builder: F,
+    ) -> SimpleDBResult<()>
+    where
+        F: FnOnce(&mut LogicalRowMut<'_>),
+    {
+        let bytes = page.bytes_mut();
+        bytes.fill(0);
+        let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let mut header = HeapHeaderMut::new(header_bytes);
+        header.init_heap();
+
+        let tuple_bytes = build_tuple_bytes(layout, builder)?;
+        insert_tuple_bytes(bytes, &tuple_bytes).map(|slot| {
+            assert_eq!(slot, 0, "test helper expects first inserted slot to be 0");
+        })
+    }
 
     pub fn init_heap_page_with_int(
         page: &mut PageBytes,
@@ -529,12 +550,10 @@ pub(crate) mod test_helpers {
         field: &str,
         value: i32,
     ) -> SimpleDBResult<()> {
-        let bytes = page.bytes_mut();
-        bytes.fill(0);
-        let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-        let mut header = HeapHeaderMut::new(header_bytes);
-        header.init_heap();
-        insert_single_int_row(bytes, layout, field, value)
+        init_heap_page_with_row(page, layout, |row| {
+            row.set_column(field, &Constant::Int(value))
+                .expect("set int column");
+        })
     }
 
     pub fn read_single_int_field(
@@ -542,56 +561,80 @@ pub(crate) mod test_helpers {
         layout: &Layout,
         field: &str,
     ) -> SimpleDBResult<i32> {
-        let view = HeapPageZeroCopy::new(page.bytes())?;
-        let tuple = match view.tuple_ref(0).ok_or_else(|| "slot 0 missing".into())? {
-            TupleRef::Live(tuple) => tuple,
-            _ => return Err("slot 0 not live".into()),
-        };
-        let offset = layout
-            .offset(field)
-            .ok_or_else(|| format!("field {field} not found in layout"))?;
-        let bytes = tuple.payload_slice(offset, 4);
-        Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+        let row = read_single_row(page, layout)?;
+        match row.get_column(field) {
+            Some(Constant::Int(v)) => Ok(v),
+            Some(_) => Err(format!("field {field} is not an int").into()),
+            None => Err(format!("field {field} is null").into()),
+        }
     }
 
-    fn insert_single_int_row(
-        bytes: &mut [u8],
+    pub fn read_single_string_field(
+        page: &PageBytes,
         layout: &Layout,
         field: &str,
-        value: i32,
-    ) -> SimpleDBResult<()> {
-        let tuple_bytes = build_single_int_tuple(layout, field, value)?;
+    ) -> SimpleDBResult<String> {
+        let row = read_single_row(page, layout)?;
+        match row.get_column(field) {
+            Some(Constant::String(s)) => Ok(s),
+            Some(_) => Err(format!("field {field} is not a string").into()),
+            None => Err(format!("field {field} is null").into()),
+        }
+    }
+
+    fn build_tuple_bytes<F>(layout: &Layout, builder: F) -> SimpleDBResult<Vec<u8>>
+    where
+        F: FnOnce(&mut LogicalRowMut<'_>),
+    {
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + layout.slot_size];
+        {
+            let (header_bytes, payload_bytes) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
+            let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
+            let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
+            header.set_xmin(0);
+            header.set_xmax(0);
+            header.set_payload_len(layout.slot_size as u32);
+            header.set_flags(0);
+            header.set_nullmap_ptr(0);
+            payload_bytes.fill(0);
+        }
+        {
+            let tuple_mut = HeapTupleMut::from_bytes(buf.as_mut_slice());
+            let layout_clone = layout.clone();
+            let dirty = Rc::new(Cell::new(false));
+            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, dirty);
+            builder(&mut row_mut);
+        }
+        Ok(buf)
+    }
+
+    fn insert_tuple_bytes(bytes: &mut [u8], tuple: &[u8]) -> SimpleDBResult<SlotId> {
         let mut page = HeapPageZeroCopyMut::new(bytes)?;
         let mut split_guard = page.split()?;
-        let slot = match split_guard.insert_tuple_fast(&tuple_bytes)? {
+        let slot = match split_guard.insert_tuple_fast(tuple)? {
             HeapInsert::Done(slot) => slot,
             HeapInsert::Reserved(reservation) => {
                 drop(split_guard);
                 let mut split_guard = page.split()?;
-                split_guard.insert_tuple_slow(reservation, &tuple_bytes)?
+                split_guard.insert_tuple_slow(reservation, tuple)?
             }
         };
-        assert_eq!(slot, 0, "test helper expects writes to slot 0");
-        Ok(())
+        Ok(slot)
     }
 
-    fn build_single_int_tuple(layout: &Layout, field: &str, value: i32) -> SimpleDBResult<Vec<u8>> {
-        let offset = layout
-            .offset(field)
-            .ok_or_else(|| format!("field {field} not found in layout"))?;
-        let mut payload = vec![0u8; layout.slot_size];
-        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload.len()];
-        let (header_bytes, body_bytes) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
-        let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
-        let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
-        header.set_xmin(0);
-        header.set_xmax(0);
-        header.set_payload_len(payload.len() as u32);
-        header.set_flags(0);
-        header.set_nullmap_ptr(0);
-        body_bytes.copy_from_slice(&payload);
-        Ok(buf)
+    fn read_single_row<'a>(
+        page: &'a PageBytes,
+        layout: &'a Layout,
+    ) -> SimpleDBResult<LogicalRow<'a>> {
+        let view = HeapPageZeroCopy::new(page.bytes())?;
+        let tuple = match view
+            .tuple_ref(0)
+            .ok_or_else(|| -> Box<dyn Error> { "slot 0 missing".into() })?
+        {
+            TupleRef::Live(tuple) => tuple,
+            _ => return Err("slot 0 not live".into()),
+        };
+        Ok(LogicalRow::new(tuple, layout))
     }
 }
 

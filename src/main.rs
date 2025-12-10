@@ -8820,7 +8820,7 @@ mod transaction_tests {
     use crate::{
         page::{PageReadGuard, PageWriteGuard},
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, BufferHandle, Constant, Layout, LogRecord, Lsn, Schema, SimpleDB, Transaction,
+        BlockId, BufferHandle, Constant, Layout, LogRecord, Schema, SimpleDB, Transaction,
     };
 
     const TXN_INT_FIELD: &str = "txn_int";
@@ -11023,46 +11023,22 @@ mod buffer_manager_tests {
         Layout::new(schema)
     }
 
-    struct HeapPageTestHarness {
-        buffer_manager: Arc<BufferManager>,
-        layout: Layout,
-    }
-
-    impl HeapPageTestHarness {
-        fn new(buffer_manager: Arc<BufferManager>, layout: Layout) -> Self {
-            Self {
-                buffer_manager,
-                layout,
-            }
+    fn write_row(
+        buffer_manager: &Arc<BufferManager>,
+        layout: &Layout,
+        block_id: &BlockId,
+        value: i32,
+    ) {
+        let buffer = buffer_manager
+            .pin(block_id)
+            .expect("pin block for overwrite");
+        {
+            let mut page = buffer.write_page();
+            test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
+                .expect("initialize heap page");
         }
-
-        fn overwrite_row(&self, block_id: &BlockId, value: i32) {
-            let buffer = self
-                .buffer_manager
-                .pin(block_id)
-                .expect("pin block for overwrite");
-            {
-                let mut page = buffer.write_page();
-                test_helpers::init_heap_page_with_int(&mut page, &self.layout, BUFFER_FIELD, value)
-                    .expect("initialize heap page");
-            }
-            buffer.set_modified(0, Lsn::MAX);
-            self.buffer_manager.unpin(buffer);
-        }
-
-        fn read_row(&self, block_id: &BlockId) -> i32 {
-            let buffer = self
-                .buffer_manager
-                .pin(block_id)
-                .expect("pin block for read");
-            let value = {
-                let page = buffer.read_page();
-                test_helpers::read_single_int_field(&page, &self.layout, BUFFER_FIELD)
-                    .expect("read heap row")
-            };
-            self.buffer_manager.unpin(buffer);
-            value
-        }
+        buffer.set_modified(0, Lsn::MAX);
+        buffer_manager.unpin(buffer);
     }
 
     #[test]
@@ -11070,7 +11046,7 @@ mod buffer_manager_tests {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let file_manager = Arc::clone(&db.file_manager);
         let buffer_manager = db.buffer_manager;
-        let harness = HeapPageTestHarness::new(Arc::clone(&buffer_manager), buffer_layout());
+        let layout = buffer_layout();
         let file = "testfile".to_string();
 
         let mut block_ids = Vec::new();
@@ -11079,12 +11055,12 @@ mod buffer_manager_tests {
             block_ids.push(block);
         }
 
-        harness.overwrite_row(&block_ids[0], 1);
+        write_row(&buffer_manager, &layout, &block_ids[0], 1);
         for idx in 1..block_ids.len() {
-            harness.overwrite_row(&block_ids[idx], idx as i32);
+            write_row(&buffer_manager, &layout, &block_ids[idx], idx as i32);
         }
 
-        harness.overwrite_row(&block_ids[0], 100);
+        write_row(&buffer_manager, &layout, &block_ids[0], 100);
 
         let buffer_2 = buffer_manager.pin(&block_ids[1]).unwrap();
         let buffer_3 = buffer_manager.pin(&block_ids[2]).unwrap();
@@ -11094,7 +11070,16 @@ mod buffer_manager_tests {
         buffer_manager.unpin(buffer_3);
         buffer_manager.unpin(buffer_4);
 
-        let observed = harness.read_row(&block_ids[0]);
+        let observed = {
+            let buffer = buffer_manager.pin(&block_ids[0]).unwrap();
+            let value = {
+                let page = buffer.read_page();
+                test_helpers::read_single_int_field(&page, &layout, BUFFER_FIELD)
+                    .expect("read heap row")
+            };
+            buffer_manager.unpin(buffer);
+            value
+        };
         assert_eq!(observed, 100);
         assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
@@ -11105,10 +11090,7 @@ mod buffer_manager_tests {
         db.buffer_manager.enable_stats();
         let buffer_manager = db.buffer_manager;
         let file_manager = Arc::clone(&db.file_manager);
-        let harness = Arc::new(HeapPageTestHarness::new(
-            Arc::clone(&buffer_manager),
-            buffer_layout(),
-        ));
+        let layout = Arc::new(buffer_layout());
 
         let num_blocks = 6;
         let num_threads = 8;
@@ -11120,7 +11102,7 @@ mod buffer_manager_tests {
                     .lock()
                     .unwrap()
                     .append("stressfile".to_string());
-                harness.overwrite_row(&block, i as i32);
+                write_row(&buffer_manager, layout.as_ref(), &block, i as i32);
                 block
             })
             .collect();
@@ -11128,12 +11110,23 @@ mod buffer_manager_tests {
 
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
-                let harness = Arc::clone(&harness);
+                let buffer_manager = Arc::clone(&buffer_manager);
                 let blocks = Arc::clone(&blocks);
+                let layout = Arc::clone(&layout);
                 thread::spawn(move || {
                     for op in 0..ops_per_thread {
                         let block_num = (thread_id + op) % num_blocks;
-                        let value = harness.read_row(&blocks[block_num]);
+                        let buffer = buffer_manager.pin(&blocks[block_num]).unwrap();
+                        let value = {
+                            let page = buffer.read_page();
+                            test_helpers::read_single_int_field(
+                                &page,
+                                layout.as_ref(),
+                                BUFFER_FIELD,
+                            )
+                            .expect("read heap row")
+                        };
+                        buffer_manager.unpin(buffer);
                         assert_eq!(value, block_num as i32);
                     }
                 })
@@ -11887,17 +11880,33 @@ mod file_manager_tests {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+    use crate::page::test_helpers;
+    use crate::{Constant, Layout, Schema};
     use mock_file_manager::MockFileManager;
+
+    const FIELD_INT: &str = "num";
+    const FIELD_STR: &str = "txt";
+
+    fn durability_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(FIELD_INT);
+        schema.add_string_field(FIELD_STR, 32);
+        Layout::new(schema)
+    }
 
     #[test]
     fn test_mock_filesystem_demonstrates_durability_flaw() {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        // TODO: once logical rows are wired up in durability tests, use the real tuple API instead of fixed offsets
-        page.set_int(base, 42);
-        page.set_string(base + Page::INT_BYTES, "durability");
+        let layout = durability_layout();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
+            row.set_column(FIELD_INT, &Constant::Int(42))
+                .expect("set durability int");
+            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
+                .expect("set durability string");
+        })
+        .expect("initialize heap row");
 
         // Phase 1: Write data without sync and simulate a crash which will discard all unsynced data
         mock_fs.write(&block_id, &mut page);
@@ -11909,8 +11918,11 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(base);
-        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
+        let recovered_int =
+            test_helpers::read_single_int_field(&read_page, &layout, FIELD_INT).unwrap_or(0);
+        let recovered_string =
+            test_helpers::read_single_string_field(&read_page, &layout, FIELD_STR)
+                .unwrap_or_else(|_| "".to_string());
 
         assert_eq!(
             recovered_int, 0,
@@ -11927,9 +11939,14 @@ mod durability_tests {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        page.set_int(base, 42);
-        page.set_string(base + Page::INT_BYTES, "durability");
+        let layout = durability_layout();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
+            row.set_column(FIELD_INT, &Constant::Int(42))
+                .expect("set durability int");
+            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
+                .expect("set durability string");
+        })
+        .expect("initialize heap row");
 
         // Phase 1: Write data AND sync
         mock_fs.write(&block_id, &mut page);
@@ -11943,8 +11960,11 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(base);
-        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
+        let recovered_int =
+            test_helpers::read_single_int_field(&read_page, &layout, FIELD_INT).expect("int read");
+        let recovered_string =
+            test_helpers::read_single_string_field(&read_page, &layout, FIELD_STR)
+                .expect("string read");
 
         assert_eq!(
             recovered_int, 42,
