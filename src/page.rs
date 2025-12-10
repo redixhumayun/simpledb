@@ -89,18 +89,6 @@ pub const PAGE_HEADER_SIZE_BYTES: u16 = 32;
 /// Sentinel value indicating no free slots in the free list.
 pub const NO_FREE_SLOT: u16 = 0xFFFF;
 
-/// The trait that must be implemented by all headers
-pub trait HeaderCodec: Sized {
-    /// Defines the [PageType] this codec is implemented for
-    const PAGE_TYPE: PageType;
-    /// Returns the page type discriminator
-    fn page_type_byte(&self) -> PageType;
-    /// Parses the header from a byte slice
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self>;
-    /// Writes the header to a byte slice
-    fn write_bytes(&self, dest: &mut [u8]);
-}
-
 mod crc {
     pub fn crc32<I>(bytes: I) -> u32
     where
@@ -116,67 +104,6 @@ mod crc {
             }
         }
         !crc
-    }
-}
-
-pub struct HeapHeader {
-    /// Page type discriminator
-    page_type: PageType,
-    /// Reserved flags for future use
-    reserved_flags: u8,
-    /// Number of slots in the line pointer array
-    slot_count: u16,
-    /// Offset to end of line pointer array (grows downward)
-    free_lower: u16,
-    /// Offset to start of tuple heap (grows upward)
-    free_upper: u16,
-    /// Pointer to free space boundary
-    free_ptr: u32,
-    /// CRC32 checksum for corruption detection
-    crc32: u32,
-    /// Reserved for future latch/lock word
-    latch_word: u64,
-    /// Head of free slot linked list
-    free_head: u16,
-    /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 6],
-}
-
-impl HeaderCodec for HeapHeader {
-    const PAGE_TYPE: PageType = PageType::Heap;
-
-    fn page_type_byte(&self) -> PageType {
-        Self::PAGE_TYPE
-    }
-
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
-        let view = HeapHeaderRef::new(bytes);
-        Ok(Self {
-            page_type: PageType::Heap,
-            reserved_flags: view.reserved_flags(),
-            slot_count: view.slot_count(),
-            free_lower: view.free_lower(),
-            free_upper: view.free_upper(),
-            free_ptr: view.free_ptr(),
-            crc32: view.crc32(),
-            latch_word: view.latch_word(),
-            free_head: view.free_head(),
-            reserved: view.reserved_bytes(),
-        })
-    }
-
-    fn write_bytes(&self, dest: &mut [u8]) {
-        let mut view = HeapHeaderMut::new(dest);
-        view.set_page_type(self.page_type);
-        view.set_reserved_flags(self.reserved_flags);
-        view.set_slot_count(self.slot_count);
-        view.set_free_lower(self.free_lower);
-        view.set_free_upper(self.free_upper);
-        view.set_free_ptr(self.free_ptr);
-        view.set_crc32(self.crc32);
-        view.set_latch_word(self.latch_word);
-        view.set_free_head(self.free_head);
-        view.set_reserved_bytes(self.reserved);
     }
 }
 
@@ -470,69 +397,6 @@ pub(crate) mod test_helpers {
     }
 }
 
-pub struct BTreeLeafHeader {
-    /// Page type discriminator
-    page_type: PageType,
-    /// B-tree level
-    level: u8,
-    /// Number of slots in the line pointer array
-    slot_count: u16,
-    /// Offset to end of line pointer array (grows downward)
-    free_lower: u16,
-    /// Offset to start of entry payload (grows upward)
-    free_upper: u16,
-    /// Length of optional high-key payload
-    high_key_len: u16,
-    /// Right sibling block number
-    right_sibling_block: u32,
-    /// Overflow block number
-    overflow_block: u32,
-    /// CRC32 checksum for corruption detection
-    crc32: u32,
-    /// Last modified LSN
-    lsn: u64,
-    /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 2],
-}
-
-impl HeaderCodec for BTreeLeafHeader {
-    const PAGE_TYPE: PageType = PageType::IndexLeaf;
-
-    fn page_type_byte(&self) -> PageType {
-        Self::PAGE_TYPE
-    }
-
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
-        Ok(Self {
-            page_type: PageType::IndexLeaf,
-            level: bytes[1],
-            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
-            free_lower: u16::from_le_bytes(bytes[4..6].try_into()?),
-            free_upper: u16::from_le_bytes(bytes[6..8].try_into()?),
-            high_key_len: u16::from_le_bytes(bytes[8..10].try_into()?),
-            right_sibling_block: u32::from_le_bytes(bytes[10..14].try_into()?),
-            overflow_block: u32::from_le_bytes(bytes[14..18].try_into()?),
-            crc32: u32::from_le_bytes(bytes[18..22].try_into()?),
-            lsn: u64::from_le_bytes(bytes[22..30].try_into()?),
-            reserved: bytes[30..32].try_into()?,
-        })
-    }
-
-    fn write_bytes(&self, dest: &mut [u8]) {
-        dest[0] = self.page_type as u8;
-        dest[1] = self.level;
-        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        dest[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
-        dest[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
-        dest[8..10].copy_from_slice(&self.high_key_len.to_le_bytes());
-        dest[10..14].copy_from_slice(&self.right_sibling_block.to_le_bytes());
-        dest[14..18].copy_from_slice(&self.overflow_block.to_le_bytes());
-        dest[18..22].copy_from_slice(&self.crc32.to_le_bytes());
-        dest[22..30].copy_from_slice(&self.lsn.to_le_bytes());
-        dest[30..32].copy_from_slice(&self.reserved);
-    }
-}
-
 /// Read-only view over a B-tree leaf header.
 #[derive(Clone, Copy)]
 pub struct BTreeLeafHeaderRef<'a> {
@@ -706,65 +570,6 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         let crc32 = crc::crc32(self.bytes.iter().copied().chain(body_bytes.iter().copied()));
         self.set_crc32(stored_crc32);
         crc32 == stored_crc32
-    }
-}
-
-pub struct BTreeInternalHeader {
-    /// Page type discriminator
-    page_type: PageType,
-    /// B-tree level
-    level: u8,
-    /// Number of slots in the line pointer array
-    slot_count: u16,
-    /// Offset to end of line pointer array
-    free_lower: u16,
-    /// Offset to start of payload region
-    free_upper: u16,
-    /// Rightmost child block number
-    rightmost_child_block: u32,
-    /// Length of optional high-key payload
-    high_key_len: u16,
-    /// CRC32 checksum for corruption detection
-    crc32: u32,
-    /// Last modified LSN
-    lsn: u64,
-    /// Reserved bytes for page-type-specific metadata
-    reserved: [u8; 6],
-}
-
-impl HeaderCodec for BTreeInternalHeader {
-    const PAGE_TYPE: PageType = PageType::IndexInternal;
-
-    fn page_type_byte(&self) -> PageType {
-        Self::PAGE_TYPE
-    }
-
-    fn from_bytes(bytes: &[u8]) -> SimpleDBResult<Self> {
-        Ok(Self {
-            page_type: PageType::IndexInternal,
-            level: bytes[1],
-            slot_count: u16::from_le_bytes(bytes[2..4].try_into()?),
-            free_lower: u16::from_le_bytes(bytes[4..6].try_into()?),
-            free_upper: u16::from_le_bytes(bytes[6..8].try_into()?),
-            rightmost_child_block: u32::from_le_bytes(bytes[8..12].try_into()?),
-            high_key_len: u16::from_le_bytes(bytes[12..14].try_into()?),
-            crc32: u32::from_le_bytes(bytes[14..18].try_into()?),
-            lsn: u64::from_le_bytes(bytes[18..26].try_into()?),
-            reserved: bytes[26..32].try_into()?,
-        })
-    }
-
-    fn write_bytes(&self, dest: &mut [u8]) {
-        dest[0] = self.page_type as u8;
-        dest[1] = self.level;
-        dest[2..4].copy_from_slice(&self.slot_count.to_le_bytes());
-        dest[4..6].copy_from_slice(&self.free_lower.to_le_bytes());
-        dest[6..8].copy_from_slice(&self.free_upper.to_le_bytes());
-        dest[8..12].copy_from_slice(&self.rightmost_child_block.to_le_bytes());
-        dest[12..14].copy_from_slice(&self.high_key_len.to_le_bytes());
-        dest[14..18].copy_from_slice(&self.crc32.to_le_bytes());
-        dest[18..26].copy_from_slice(&self.lsn.to_le_bytes());
-        dest[26..32].copy_from_slice(&self.reserved);
     }
 }
 
@@ -1331,7 +1136,7 @@ pub trait PageKind: Sized {
     #[allow(dead_code)]
     const PAGE_TYPE: PageType;
     const HEADER_SIZE: usize;
-    type Header: HeaderCodec;
+    type Header;
 }
 
 /// Slot identifier within a page.
@@ -1491,7 +1296,7 @@ struct HeapPageZeroCopy<'a> {
 impl<'a> PageKind for HeapPageZeroCopy<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
     const HEADER_SIZE: usize = 32;
-    type Header = HeapHeader;
+    type Header = HeapHeaderRef<'a>;
 }
 
 impl<'a> HeapPageZeroCopy<'a> {
@@ -1564,7 +1369,7 @@ pub struct HeapPageZeroCopyMut<'a> {
 impl<'a> PageKind for HeapPageZeroCopyMut<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
     const HEADER_SIZE: usize = 32;
-    type Header = HeapHeader;
+    type Header = HeapHeaderMut<'a>;
 }
 
 impl<'a> HeapPageZeroCopyMut<'a> {
@@ -5253,7 +5058,7 @@ struct BTreeLeafPageZeroCopy<'a> {
 impl<'a> PageKind for BTreeLeafPageZeroCopy<'a> {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
     const HEADER_SIZE: usize = 32;
-    type Header = BTreeLeafHeader;
+    type Header = BTreeLeafHeaderRef<'a>;
 }
 
 impl<'a> BTreeLeafPageZeroCopy<'a> {
@@ -5366,7 +5171,7 @@ pub struct BTreeLeafPageZeroCopyMut<'a> {
 impl<'a> PageKind for BTreeLeafPageZeroCopyMut<'a> {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
     const HEADER_SIZE: usize = 32;
-    type Header = BTreeLeafHeader;
+    type Header = BTreeLeafHeaderMut<'a>;
 }
 
 impl<'a> BTreeLeafPageZeroCopyMut<'a> {
@@ -5572,7 +5377,7 @@ struct BTreeInternalPageZeroCopy<'a> {
 impl<'a> PageKind for BTreeInternalPageZeroCopy<'a> {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
     const HEADER_SIZE: usize = 32;
-    type Header = BTreeInternalHeader;
+    type Header = BTreeInternalHeaderRef<'a>;
 }
 
 impl<'a> BTreeInternalPageZeroCopy<'a> {
@@ -5678,7 +5483,7 @@ pub struct BTreeInternalPageZeroCopyMut<'a> {
 impl<'a> PageKind for BTreeInternalPageZeroCopyMut<'a> {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
     const HEADER_SIZE: usize = 32;
-    type Header = BTreeInternalHeader;
+    type Header = BTreeInternalHeaderMut<'a>;
 }
 
 impl<'a> BTreeInternalPageZeroCopyMut<'a> {
