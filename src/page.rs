@@ -775,13 +775,16 @@ impl<'a> LinePtrBytesMut<'a> {
     }
 
     pub fn shift_left(&mut self, start: usize, end: usize) {
-        assert!(start > 0, "cannot shift left starting at the beginning");
         assert!(
-            start < end,
-            "cannot call shift_left with start <= end - {} >= {}",
+            start <= end,
+            "cannot call shift_left with start > end - {} > {}",
             start,
             end
         );
+        if start == end {
+            return;
+        }
+        assert!(start > 0, "cannot shift left starting at the beginning");
         let head = start * LinePtrBytes::LINE_PTR_BYTES;
         let tail = end * LinePtrBytes::LINE_PTR_BYTES;
         self.bytes.copy_within(head..tail, head - 4);
@@ -789,11 +792,14 @@ impl<'a> LinePtrBytesMut<'a> {
 
     pub fn shift_right(&mut self, start: usize, end: usize) {
         assert!(
-            start < end,
-            "cannot call shift_right with start <= end - {} >= {}",
+            start <= end,
+            "cannot call shift_right with start > end - {} > {}",
             start,
             end
         );
+        if start == end {
+            return;
+        }
         let head = start * LinePtrBytes::LINE_PTR_BYTES;
         let tail = end * LinePtrBytes::LINE_PTR_BYTES;
         self.bytes.copy_within(head..tail, head + 4);
@@ -903,7 +909,10 @@ impl<'a> LinePtrArrayMut<'a> {
 
     fn insert(&mut self, index: usize, line_ptr: LinePtr) {
         assert!(self.len < self.capacity, "line pointer array is full");
-        self.bytes.shift_right(index, self.len);
+        assert!(index <= self.len, "insert index out of bounds");
+        if index < self.len {
+            self.bytes.shift_right(index, self.len);
+        }
         self.set(index, line_ptr);
         self.len += 1;
     }
