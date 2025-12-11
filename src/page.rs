@@ -2033,6 +2033,10 @@ mod page_tests {
     #[test]
     fn allocate_tuple_exposes_bytes_and_tuple_ref() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            HeapHeaderMut::new(header_bytes).init_heap();
+        }
         let payload = vec![1u8, 2, 3, 4];
         let tuple = heap_tuple_bytes(&payload);
 
@@ -2056,6 +2060,10 @@ mod page_tests {
     #[test]
     fn delete_frees_slot_and_allocation_reuses_it() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            HeapHeaderMut::new(header_bytes).init_heap();
+        }
         let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
         let tuple_a = heap_tuple_bytes(&[10]);
         let tuple_b = heap_tuple_bytes(&[20, 30]);
@@ -2112,6 +2120,10 @@ mod page_tests {
     #[test]
     fn pack_and_unpack_preserves_tuples() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            HeapHeaderMut::new(header_bytes).init_heap();
+        }
         let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
         let payload = vec![42u8, 43, 44, 45];
         let slot = insert_tuple_bytes(&mut page, &heap_tuple_bytes(&payload)).unwrap();
