@@ -11239,6 +11239,7 @@ mod buffer_manager_tests {
                 block
             })
             .collect();
+        buffer_manager.flush_all(0);
         let blocks = Arc::new(blocks);
 
         let handles: Vec<_> = (0..num_threads)
