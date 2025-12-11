@@ -2086,6 +2086,10 @@ mod page_tests {
     #[test]
     fn crc32_detects_corruption() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            HeapHeaderMut::new(header_bytes).init_heap();
+        }
         let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
         let payload = vec![7u8; 16];
 
