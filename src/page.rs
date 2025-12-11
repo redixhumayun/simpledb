@@ -3755,7 +3755,8 @@ mod btree_page_tests {
             self.view()
                 .entry_bytes(slot)
                 .map(|bytes| BTreeLeafEntry::decode(layout, bytes))
-                .unwrap()
+                .transpose()?
+                .ok_or_else(|| "missing enrty bytes".into())
         }
 
         fn delete_leaf_entry(&mut self, slot: SlotId, _layout: &Layout) -> SimpleDBResult<()> {
