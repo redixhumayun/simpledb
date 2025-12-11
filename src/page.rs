@@ -410,10 +410,7 @@ impl<'a> BTreeLeafHeaderRef<'a> {
     }
 
     pub fn page_type(&self) -> PageType {
-        match self.bytes[0] {
-            1 => PageType::IndexLeaf,
-            _ => panic!("invalid B-tree leaf page type byte"),
-        }
+        PageType::try_from(self.bytes[0]).expect("invalid page type byte")
     }
 
     #[allow(dead_code)]
@@ -585,10 +582,7 @@ impl<'a> BTreeInternalHeaderRef<'a> {
     }
 
     pub fn page_type(&self) -> PageType {
-        match self.bytes[0] {
-            2 => PageType::IndexInternal,
-            _ => panic!("invalid B-tree internal page type byte"),
-        }
+        PageType::try_from(self.bytes[0]).expect("invalid page type byte")
     }
 
     pub fn level(&self) -> u8 {
