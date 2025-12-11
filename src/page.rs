@@ -1948,7 +1948,7 @@ impl<'a> PageWriteGuard<'a> {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
-        let mut header = HeapHeaderMut::new(bytes);
+        let mut header = HeapHeaderMut::new(&mut bytes[0..HeapPageZeroCopyMut::HEADER_SIZE]);
         header.init_heap();
     }
 
@@ -1957,7 +1957,8 @@ impl<'a> PageWriteGuard<'a> {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
-        let mut header = BTreeLeafHeaderMut::new(bytes);
+        let mut header =
+            BTreeLeafHeaderMut::new(&mut bytes[0..BTreeLeafPageZeroCopyMut::HEADER_SIZE]);
         header.init_leaf(0, None, overflow_block.map(|b| b as u32));
     }
 
@@ -1966,7 +1967,8 @@ impl<'a> PageWriteGuard<'a> {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
-        let mut header = BTreeInternalHeaderMut::new(bytes);
+        let mut header =
+            BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageZeroCopyMut::HEADER_SIZE]);
         header.init_internal(level, None);
     }
 
@@ -2741,8 +2743,11 @@ impl<'a> HeapPageView<'a> {
     }
 
     pub fn live_slot_iter(&self) -> HeapIterator<'_> {
-        todo!()
-        // HeapPage::live_iterator(self.guard.as_heap_page().unwrap())
+        HeapIterator {
+            page: self.build_page(),
+            current_slot: 0,
+            match_state: Some(LineState::Live),
+        }
     }
 }
 
