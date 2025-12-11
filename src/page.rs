@@ -433,7 +433,10 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
+    pub fn free_bounds(&self) -> (u16, u16) {
+        (self.free_lower(), self.free_upper())
+    }
+
     pub fn free_space(&self) -> u16 {
         self.free_upper().saturating_sub(self.free_lower())
     }
@@ -471,6 +474,10 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         BTreeLeafHeaderRef::new(&self.bytes[..])
     }
 
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
         self.bytes[start..start + N].copy_from_slice(&value);
     }
@@ -493,14 +500,6 @@ impl<'a> BTreeLeafHeaderMut<'a> {
 
     pub fn set_free_upper(&mut self, upper: u16) {
         self.write(6, upper.to_le_bytes());
-    }
-
-    pub fn free_lower(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
-    }
-
-    pub fn free_upper(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
     }
 
     pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
@@ -608,6 +607,10 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
     }
 
+    pub fn free_bounds(&self) -> (u16, u16) {
+        (self.free_lower(), self.free_upper())
+    }
+
     pub fn free_space(&self) -> u16 {
         self.free_upper().saturating_sub(self.free_lower())
     }
@@ -667,14 +670,6 @@ impl<'a> BTreeInternalHeaderMut<'a> {
 
     pub fn set_free_upper(&mut self, upper: u16) {
         self.write(6, upper.to_le_bytes());
-    }
-
-    pub fn free_lower(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[4..6].try_into().unwrap())
-    }
-
-    pub fn free_upper(&self) -> u16 {
-        u16::from_le_bytes(self.bytes[6..8].try_into().unwrap())
     }
 
     pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
@@ -795,7 +790,7 @@ impl<'a> LinePtrBytesMut<'a> {
     pub fn shift_right(&mut self, start: usize, end: usize) {
         assert!(
             start < end,
-            "cannot call shift_left with start <= end - {} >= {}",
+            "cannot call shift_right with start <= end - {} >= {}",
             start,
             end
         );
@@ -815,68 +810,111 @@ impl<'a> Deref for LinePtrBytesMut<'a> {
 
 struct LinePtrArray<'a> {
     bytes: LinePtrBytes<'a>,
-    slot_count: usize,
+    len: usize,
+    capacity: usize,
 }
 
 impl<'a> LinePtrArray<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    fn new(bytes: &'a [u8], len: usize, capacity: usize) -> Self {
         assert!(
             bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
-        let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        assert!(
+            len <= capacity,
+            "len must be less than or equal to capacity"
+        );
         let bytes = LinePtrBytes::new(bytes);
-        Self { bytes, slot_count }
+        Self {
+            bytes,
+            len,
+            capacity,
+        }
+    }
+
+    fn with_len(bytes: &'a [u8], len: usize) -> Self {
+        assert!(
+            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            "line pointer region must be multiple of {} bytes",
+            LinePtrBytes::LINE_PTR_BYTES
+        );
+        let capacity = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        Self::new(bytes, len, capacity)
     }
 
     fn len(&self) -> usize {
-        self.slot_count
+        self.len
     }
 
     fn get(&self, index: usize) -> LinePtr {
+        assert!(index < self.len, "index out of bounds");
+        assert_eq!(
+            self.bytes.as_slice().len(),
+            self.capacity * LinePtrBytes::LINE_PTR_BYTES
+        );
         LinePtr::from_bytes(&self.bytes.read(index))
     }
 }
 
 struct LinePtrArrayMut<'a> {
     bytes: LinePtrBytesMut<'a>,
-    slot_count: usize,
+    len: usize,
+    capacity: usize,
 }
 
 impl<'a> LinePtrArrayMut<'a> {
-    fn new(bytes: &'a mut [u8]) -> Self {
+    fn new(bytes: &'a mut [u8], len: usize, capacity: usize) -> Self {
         assert!(
             bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
-        let slot_count = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        assert!(
+            len <= capacity,
+            "len must be less than or equal to capacity"
+        );
         let bytes = LinePtrBytesMut::new(bytes);
-        Self { bytes, slot_count }
+        Self {
+            bytes,
+            len,
+            capacity,
+        }
+    }
+
+    fn with_len(bytes: &'a mut [u8], len: usize) -> Self {
+        assert!(
+            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            "line pointer region must be multiple of {} bytes",
+            LinePtrBytes::LINE_PTR_BYTES
+        );
+        let capacity = bytes.len() / LinePtrBytes::LINE_PTR_BYTES;
+        Self::new(bytes, len, capacity)
     }
 
     fn as_ref(&self) -> LinePtrArray<'_> {
-        LinePtrArray::new(self.bytes.as_ref().as_slice())
+        LinePtrArray::new(self.bytes.as_ref().as_slice(), self.len, self.capacity)
     }
 
     fn set(&mut self, index: usize, line_ptr: LinePtr) {
+        assert!(index < self.capacity, "index out of bounds");
         self.bytes.write(index, line_ptr);
     }
 
     fn insert(&mut self, index: usize, line_ptr: LinePtr) {
-        self.bytes.shift_right(index, self.slot_count);
+        assert!(self.len < self.capacity, "line pointer array is full");
+        self.bytes.shift_right(index, self.len);
         self.set(index, line_ptr);
-        self.slot_count += 1;
+        self.len += 1;
     }
 
     fn delete(&mut self, index: usize) {
-        self.bytes.shift_left(index + 1, self.slot_count);
-        self.slot_count -= 1;
+        self.bytes.shift_left(index + 1, self.len);
+        self.len -= 1;
     }
 
     fn len(&self) -> usize {
-        self.slot_count
+        self.len
     }
 }
 
@@ -1306,9 +1344,12 @@ impl<'a> HeapPageZeroCopy<'a> {
         if header.page_type() != PageType::Heap {
             return Err("not a heap page".into());
         }
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        let (line_ptr_bytes, record_space_bytes) = rest.split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let lp_capacity = header.free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > rest.len() {
+            return Err("slot directory exceeds page body".into());
+        }
+        let (line_ptr_bytes, record_space_bytes) = rest.split_at(lp_capacity);
+        let base_offset = Self::HEADER_SIZE as usize + lp_capacity;
         let page = Self::from_parts(header, line_ptr_bytes, record_space_bytes, base_offset);
         assert_eq!(
             page.slot_count(),
@@ -1326,7 +1367,7 @@ impl<'a> HeapPageZeroCopy<'a> {
     ) -> Self {
         Self {
             header,
-            line_pointers: LinePtrArray::new(line_ptr_bytes),
+            line_pointers: LinePtrArray::with_len(line_ptr_bytes, header.slot_count() as usize),
             record_space: HeapRecordSpace::new(record_space_bytes, base_offset),
         }
     }
@@ -1417,16 +1458,27 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     /// boundary always reflects the latest `slot_count`. Dropping the guard releases the borrows,
     /// forcing the next operation to resplit.
     fn split(&mut self) -> SimpleDBResult<HeapPageParts<'_>> {
-        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > self.body_bytes.len() {
+        let lp_capacity = self.header.as_ref().free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
-        let base_offset = Self::HEADER_SIZE as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(lp_capacity);
+        let base_offset = self.header.as_ref().free_lower() as usize;
+
+        assert_eq!(
+            self.header.as_ref().free_lower() as usize,
+            Self::HEADER_SIZE + lp_capacity
+        );
+        assert_eq!(
+            Self::HEADER_SIZE + lp_capacity + record_space_bytes.len(),
+            PAGE_SIZE_BYTES as usize
+        );
+
+        let slot_count = self.header.as_ref().slot_count() as usize;
         let parts = HeapPageParts {
             header: HeapHeaderMut::new(self.header.bytes_mut()),
-            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
-            record_space: HeapRecordSpaceMut::new(record_bytes, base_offset),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
+            record_space: HeapRecordSpaceMut::new(record_space_bytes, base_offset),
         };
         assert_eq!(
             parts.line_ptrs.as_ref().len(),
@@ -2878,20 +2930,21 @@ impl<'a> HeapPageViewMut<'a> {
         if current >= header.slot_count() as usize {
             return None;
         }
-        let slot_bytes = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        let (lp_bytes, record_bytes) = body_bytes.split_at_mut(slot_bytes);
-        let line_ptr = {
-            let lp_array = LinePtrArrayMut::new(lp_bytes);
-            lp_array.as_ref().get(current)
-        };
+        let lp_capacity = header.free_lower() as usize - HeapPageZeroCopy::HEADER_SIZE;
+        if lp_capacity > body_bytes.len() {
+            return None;
+        }
+        let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at_mut(lp_capacity);
+        let base_offset = header.free_lower() as usize;
+        let line_ptr =
+            LinePtrArray::with_len(line_ptr_bytes, header.slot_count() as usize).get(current);
         if !line_ptr.is_live() {
             return None;
         }
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_bytes;
-        let offset = line_ptr.offset() as usize;
-        let length = line_ptr.length() as usize;
+
+        let (offset, length) = line_ptr.offset_and_length();
         let relative = offset.checked_sub(base_offset)?;
-        let tuple_bytes = record_bytes.get_mut(relative..relative + length)?;
+        let tuple_bytes = record_space_bytes.get_mut(relative..relative + length)?;
         Some(HeapTupleMut::from_bytes(tuple_bytes))
     }
 
@@ -4950,22 +5003,17 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
         if header.page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
         }
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > rest.len() {
+        let lp_capacity = header.free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > rest.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = rest.split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = rest.split_at(lp_capacity);
+        let base_offset = Self::HEADER_SIZE as usize + lp_capacity;
         let page = Self {
             header,
-            line_pointers: LinePtrArray::new(line_ptr_bytes),
-            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+            line_pointers: LinePtrArray::with_len(line_ptr_bytes, header.slot_count() as usize),
+            record_space: BTreeRecordSpace::new(record_space_bytes, base_offset),
         };
-        assert_eq!(
-            page.line_pointers.len(),
-            header.slot_count() as usize,
-            "slot directory must match header slot_count"
-        );
         Ok(page)
     }
 
@@ -5067,22 +5115,28 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeLeafPageParts<'_>> {
-        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > self.body_bytes.len() {
+        let lp_capacity = self.header.as_ref().free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
-        let parts = BTreeLeafPageParts {
-            header: BTreeLeafHeaderMut::new(self.header.bytes),
-            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
-            record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
-        };
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(lp_capacity);
+        let base_offset = self.header.as_ref().free_lower() as usize;
+
         assert_eq!(
-            parts.line_ptrs.len(),
-            parts.header.as_ref().slot_count() as usize,
-            "slot directory must match header slot_count"
+            self.header.as_ref().free_lower() as usize,
+            Self::HEADER_SIZE + lp_capacity
         );
+        assert_eq!(
+            Self::HEADER_SIZE + lp_capacity + record_space_bytes.len(),
+            PAGE_SIZE_BYTES as usize
+        );
+
+        let slot_count = self.header.as_ref().slot_count() as usize;
+        let parts = BTreeLeafPageParts {
+            header: BTreeLeafHeaderMut::new(self.header.bytes_mut()),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
+            record_space: BTreeRecordSpaceMut::new(record_space_bytes, base_offset),
+        };
         Ok(parts)
     }
 
@@ -5091,16 +5145,19 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         if self.header.as_ref().page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
         }
-        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > body_bytes.len() {
+        let lp_capacity = self.header.as_ref().free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at(lp_capacity);
+        let base_offset = Self::HEADER_SIZE as usize + lp_capacity;
         Ok(BTreeLeafPageZeroCopy {
             header: self.header.as_ref(),
-            line_pointers: LinePtrArray::new(line_ptr_bytes),
-            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+            line_pointers: LinePtrArray::with_len(
+                line_ptr_bytes,
+                self.header.as_ref().slot_count() as usize,
+            ),
+            record_space: BTreeRecordSpace::new(record_space_bytes, base_offset),
         })
     }
 
@@ -5122,11 +5179,12 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             let mut parts = self.split()?;
             let (free_lower, free_upper) = {
                 let header = parts.header();
-                (header.free_lower(), header.free_upper())
+                let view = header.as_ref();
+                if view.free_space() < slot_bytes + entry_len {
+                    return Err("page full".into());
+                }
+                view.free_bounds()
             };
-            if free_lower + slot_bytes + entry_len > free_upper {
-                return Err("page full".into());
-            }
             let new_upper = free_upper - entry_len;
             parts
                 .record_space()
@@ -5134,14 +5192,14 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             {
                 let header = parts.header();
                 header.set_free_bounds(free_lower + slot_bytes, new_upper);
-                let slot_count = header.as_ref().slot_count();
-                header.set_slot_count(slot_count + 1);
             }
             LinePtr::new(new_upper, entry_len, LineState::Live)
         };
 
         let mut parts = self.split()?;
         parts.line_ptrs().insert(slot, line_ptr);
+        let slot_count = parts.header().as_ref().slot_count();
+        parts.header().set_slot_count(slot_count + 1);
         Ok(slot)
     }
 
@@ -5149,7 +5207,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         let mut parts = self.split()?;
         let free_upper = {
             let header = parts.header();
-            header.free_upper() as usize
+            header.as_ref().free_upper() as usize
         };
         let (deleted_offset, deleted_len) = {
             let line_ptrs = parts.line_ptrs();
@@ -5194,8 +5252,8 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
 
         {
             let header = parts.header();
-            let current_lower = header.free_lower();
-            let current_upper = header.free_upper();
+            let current_lower = header.as_ref().free_lower();
+            let current_upper = header.as_ref().free_upper();
             let new_lower = current_lower
                 .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
                 .expect("free_lower underflow during delete");
@@ -5269,22 +5327,17 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
         if header.page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
         }
-        let slot_len = header.slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > rest.len() {
+        let lp_capacity = header.free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > rest.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = rest.split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = rest.split_at(lp_capacity);
+        let base_offset = Self::HEADER_SIZE as usize + lp_capacity;
         let page = Self {
             header,
-            line_pointers: LinePtrArray::new(line_ptr_bytes),
-            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+            line_pointers: LinePtrArray::with_len(line_ptr_bytes, header.slot_count() as usize),
+            record_space: BTreeRecordSpace::new(record_space_bytes, base_offset),
         };
-        assert_eq!(
-            page.line_pointers.len(),
-            header.slot_count() as usize,
-            "slot directory must match header slot_count"
-        );
         Ok(page)
     }
 
@@ -5379,22 +5432,28 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeInternalPageParts<'_>> {
-        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > self.body_bytes.len() {
+        let lp_capacity = self.header.as_ref().free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = self.body_bytes.split_at_mut(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(lp_capacity);
+        let base_offset = self.header.as_ref().free_lower() as usize;
+
+        assert_eq!(
+            self.header.as_ref().free_lower() as usize,
+            Self::HEADER_SIZE + lp_capacity
+        );
+        assert_eq!(
+            Self::HEADER_SIZE + lp_capacity + record_space_bytes.len(),
+            PAGE_SIZE_BYTES as usize
+        );
+
+        let slot_count = self.header.as_ref().slot_count() as usize;
         let parts = BTreeInternalPageParts {
             header: BTreeInternalHeaderMut::new(self.header.bytes_mut()),
-            line_ptrs: LinePtrArrayMut::new(line_ptr_bytes),
-            record_space: BTreeRecordSpaceMut::new(record_bytes, base_offset),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
+            record_space: BTreeRecordSpaceMut::new(record_space_bytes, base_offset),
         };
-        assert_eq!(
-            parts.line_ptrs.len(),
-            parts.header.as_ref().slot_count() as usize,
-            "slot directory must match header slot_count"
-        );
         Ok(parts)
     }
 
@@ -5403,16 +5462,19 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         if self.header.as_ref().page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
         }
-        let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
-        if slot_len > body_bytes.len() {
+        let lp_capacity = self.header.as_ref().free_lower() as usize - Self::HEADER_SIZE;
+        if lp_capacity > body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = body_bytes.split_at(slot_len);
-        let base_offset = PAGE_HEADER_SIZE_BYTES as usize + slot_len;
+        let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at(lp_capacity);
+        let base_offset = Self::HEADER_SIZE as usize + lp_capacity;
         Ok(BTreeInternalPageZeroCopy {
             header: self.header.as_ref(),
-            line_pointers: LinePtrArray::new(line_ptr_bytes),
-            record_space: BTreeRecordSpace::new(record_bytes, base_offset),
+            line_pointers: LinePtrArray::with_len(
+                line_ptr_bytes,
+                self.header.as_ref().slot_count() as usize,
+            ),
+            record_space: BTreeRecordSpace::new(record_space_bytes, base_offset),
         })
     }
 
@@ -5438,13 +5500,13 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         let line_ptr = {
             let mut parts = self.split()?;
             let needed = slot_bytes + entry_len;
-            let (free_lower, free_upper, slot_count) = {
+            let (free_lower, free_upper) = {
                 let header = parts.header();
                 let view = header.as_ref();
                 if view.free_space() < needed {
                     return Err("page full".into());
                 }
-                (header.free_lower(), header.free_upper(), view.slot_count())
+                view.free_bounds()
             };
             let new_upper = free_upper
                 .checked_sub(entry_len)
@@ -5455,13 +5517,14 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
             {
                 let header = parts.header();
                 header.set_free_bounds(free_lower + slot_bytes, new_upper);
-                header.set_slot_count(slot_count + 1);
             }
             LinePtr::new(new_upper, entry_len, LineState::Live)
         };
 
         let mut parts = self.split()?;
         parts.line_ptrs().insert(slot, line_ptr);
+        let slot_count = parts.header().as_ref().slot_count();
+        parts.header().set_slot_count(slot_count + 1);
         Ok(slot)
     }
 
@@ -5482,7 +5545,7 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
             (offset, len_u16)
         };
         let deleted_len = deleted_len_u16 as usize;
-        let free_upper_usize = parts.header().free_upper() as usize;
+        let free_upper_usize = parts.header().as_ref().free_upper() as usize;
 
         if deleted_offset > free_upper_usize {
             let shift_len = deleted_offset - free_upper_usize;
@@ -5515,10 +5578,12 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
                 let header = parts.header();
                 (
                     header
+                        .as_ref()
                         .free_lower()
                         .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
                         .expect("free_lower underflow during delete"),
                     header
+                        .as_ref()
                         .free_upper()
                         .checked_add(deleted_len_u16)
                         .expect("free_upper overflow during delete"),
