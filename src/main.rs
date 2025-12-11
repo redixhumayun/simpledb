@@ -10189,13 +10189,13 @@ impl LogRecord {
     fn write_legacy_int(guard: &mut PageWriteGuard<'_>, offset: usize, value: i32) {
         let bytes = guard.bytes_mut();
         let end = offset + Self::INT_BYTES;
-        bytes[offset..end].copy_from_slice(&value.to_be_bytes());
+        bytes[offset..end].copy_from_slice(&value.to_le_bytes());
     }
 
     fn write_legacy_string(guard: &mut PageWriteGuard<'_>, offset: usize, value: &str) {
         let bytes = guard.bytes_mut();
         let len = value.len() as u32;
-        let len_bytes = len.to_be_bytes();
+        let len_bytes = len.to_le_bytes();
         let len_end = offset + Self::INT_BYTES;
         bytes[offset..len_end].copy_from_slice(&len_bytes);
         let start = len_end;
