@@ -234,3 +234,14 @@ B-Tree leaf/internal headers follow the same pattern: each defines a struct that
 - **Typed views**: internal logic rewrites to use per-kind headers; public APIs (`row`, `insert_entry`, etc.) remain stable, so higher layers (RecordPage, TableScan, executor) stay untouched.
 - **Formatting / catalog**: page-formatting functions and index creation code change to write/expect the new headers; removing `{index}leaf`/`{index}internal` tables simplifies the metadata layer.
 - **Higher layers**: Record management, planner/executor nodes, and tests continue using the same view APIs, so no application-level rewrite is required. Once headers are in place, future work (lock/latch separation, concurrency, prefix compression) can build on top without reshaping the public interfaces.
+
+## Next Steps: Textbook Internal Separator Layout
+- Drop the sentinel min-key entry: when formatting an internal/root page, set `rightmost_child_block` in the header and leave `slot_count == 0` if there are no separators.
+  - Sketch: `guard.format_as_btree_internal(level, Some(initial_child)); // no min entry insert`
+- Expose `rightmost_child_block` accessors on `BTreeInternalPageView{,Mut}` and wire them to the header field.
+- Rewrite descent (`BTreeInternal::find_child_block`) to binary-search separator keys and fall back to the header’s `rightmost_child_block` for the final branch; no `unwrap_or(0)` sentinel path.
+- Update `format_as_btree_internal` to accept an optional `rightmost_child_block` argument and initialize it; keep `slot_count` zero on empty nodes.
+- Adjust internal inserts/splits to maintain header rightmost child after redistribution:
+  - Left header rightmost = left’s final child; right header rightmost = right’s final child.
+  - Median key pushed up separates those child sets.
+- Refresh tests: root-init asserts zero slots plus set `rightmost_child_block`; add search coverage where `search_key` exceeds all separators; post-split asserts both sibling headers carry correct rightmost children.
