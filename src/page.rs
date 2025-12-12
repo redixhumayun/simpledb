@@ -3537,6 +3537,29 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         Ok(())
     }
 
+    pub fn set_right_sibling_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.set_right_sibling_block(block.map(|b| b as u32).unwrap_or(u32::MAX));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Writes a high key payload (exclusive upper bound). Caller supplies encoded key bytes.
+    pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.write_high_key(key_bytes)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Clears the high key (sets +∞ sentinel).
+    pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.clear_high_key();
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
         self.guard.mark_modified(txn_id, lsn);
     }
@@ -3693,6 +3716,22 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn set_rightmost_child_block(&mut self, block: usize) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_rightmost_child_block(block);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Writes a high key payload (exclusive upper bound). Compacts first.
+    pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.write_high_key(key_bytes)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Clears the high key (sets +∞ sentinel).
+    pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.clear_high_key();
         self.dirty = true;
         Ok(())
     }
@@ -5586,6 +5625,41 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         Ok(())
     }
 
+    fn set_right_sibling_block(&mut self, block: u32) {
+        self.header.set_right_sibling_block(block);
+    }
+
+    /// Writes a new high key payload; compacts first.
+    fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
+        let len: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "high key too large".to_string())?;
+        let free_upper = self.header.as_ref().free_upper();
+        if free_upper < len {
+            return Err("insufficient space for high key".into());
+        }
+        let off = free_upper - len;
+        let base = BTreeLeafPageZeroCopy::HEADER_SIZE as usize;
+        let start = off as usize - base;
+        self.body_bytes
+            .get_mut(start..start + bytes.len())
+            .ok_or("high key write OOB")?
+            .copy_from_slice(bytes);
+
+        let mut hdr = BTreeLeafHeaderMut::new(self.header.bytes_mut());
+        hdr.set_high_key_len(len);
+        hdr.set_high_key_off(off);
+        hdr.set_free_upper(off);
+        Ok(())
+    }
+
+    fn clear_high_key(&mut self) {
+        let mut hdr = BTreeLeafHeaderMut::new(self.header.bytes_mut());
+        hdr.set_high_key_len(0);
+        hdr.set_high_key_off(0);
+    }
+
     pub fn update_crc32(&mut self) {
         self.header.update_crc32(self.body_bytes);
     }
@@ -5982,6 +6056,39 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
         self.header.set_level(level);
         Ok(())
+    }
+
+    /// Writes a new high key payload; compacts first.
+    fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
+        let len: u16 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| "high key too large".to_string())?;
+        let mut parts = self.split()?;
+        let free_upper = parts.header().as_ref().free_upper();
+        if free_upper < len {
+            return Err("insufficient space for high key".into());
+        }
+        let off = free_upper - len;
+        let start = off as usize - parts.record_space.base_offset;
+        parts
+            .record_space
+            .bytes
+            .get_mut(start..start + bytes.len())
+            .ok_or("high key write OOB")?
+            .copy_from_slice(bytes);
+
+        let hdr = parts.header();
+        hdr.set_high_key_len(len);
+        hdr.set_high_key_off(off);
+        hdr.set_free_upper(off);
+        Ok(())
+    }
+
+    fn clear_high_key(&mut self) {
+        let mut hdr = BTreeInternalHeaderMut::new(self.header.bytes_mut());
+        hdr.set_high_key_len(0);
+        hdr.set_high_key_off(0);
     }
 
     fn set_rightmost_child_block(&mut self, block: usize) {
