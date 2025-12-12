@@ -653,7 +653,6 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         self.free_upper().saturating_sub(self.free_lower())
     }
 
-    #[allow(dead_code)]
     pub fn rightmost_child_block(&self) -> u32 {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
@@ -1521,6 +1520,14 @@ impl<'a> BTreeRecordSpaceMut<'a> {
         let src_end = src_relative + len;
         self.bytes.copy_within(src_relative..src_end, dst_relative);
     }
+
+    fn entry_bytes_mut(&mut self, ptr: LinePtr) -> Option<&mut [u8]> {
+        let offset = ptr.offset() as usize;
+        let length = ptr.length() as usize;
+        let relative = offset.checked_sub(self.base_offset)?;
+        let end = relative + length;
+        self.bytes.get_mut(relative..end)
+    }
 }
 
 struct HeapPageZeroCopy<'a> {
@@ -2166,13 +2173,14 @@ impl<'a> PageWriteGuard<'a> {
     }
 
     /// Formats the page as an empty B-tree internal page.
-    pub fn format_as_btree_internal(&mut self, level: u8) {
+    /// `rightmost_child` seeds the only child when the node has zero separators.
+    pub fn format_as_btree_internal(&mut self, level: u8, rightmost_child: Option<usize>) {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
         let mut header =
             BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageZeroCopyMut::HEADER_SIZE]);
-        header.init_internal(level, None);
+        header.init_internal(level, rightmost_child.map(|c| c as u32));
     }
 
     pub fn into_heap_view_mut(self, layout: &'a Layout) -> SimpleDBResult<HeapPageViewMut<'a>> {
@@ -3567,6 +3575,10 @@ impl<'a> BTreeInternalPageView<'a> {
         self.view().btree_level()
     }
 
+    pub fn rightmost_child_block(&self) -> Option<usize> {
+        self.view().rightmost_child_block()
+    }
+
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
         BTreeInternalIterator::new(self.view(), self.layout)
     }
@@ -3628,6 +3640,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         self.view().btree_level()
     }
 
+    pub fn rightmost_child_block(&self) -> Option<usize> {
+        self.view().rightmost_child_block()
+    }
+
     pub fn iter(&self) -> BTreeInternalIterator<'_> {
         BTreeInternalIterator::new(self.view(), self.layout)
     }
@@ -3652,6 +3668,13 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_btree_level(level)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn set_rightmost_child_block(&mut self, block: usize) -> SimpleDBResult<()> {
+        let mut page = self.build_mut_page()?;
+        page.set_rightmost_child_block(block);
         self.dirty = true;
         Ok(())
     }
@@ -4019,7 +4042,7 @@ mod btree_page_tests {
     impl InternalTestPage {
         fn new(level: u8) -> Self {
             Self {
-                bytes: init_btree_internal_bytes(level, None),
+                bytes: init_btree_internal_bytes(level, Some(0)),
             }
         }
 
@@ -4048,6 +4071,10 @@ mod btree_page_tests {
             self.view_mut()
                 .set_btree_level(level)
                 .expect("set btree level");
+        }
+
+        fn rightmost_child(&self) -> Option<usize> {
+            self.view().rightmost_child_block()
         }
 
         fn insert_internal_entry(
@@ -4430,7 +4457,9 @@ mod btree_page_tests {
             .get_internal_entry(&layout, slot)
             .expect("get should succeed");
         assert_eq!(entry.key, Constant::Int(50));
-        assert_eq!(entry.child_block, 123);
+        // entry.child_block is left child; right child sits in header
+        assert_eq!(entry.child_block, 0);
+        assert_eq!(page.rightmost_child().unwrap(), 123);
     }
 
     #[test]
@@ -4448,11 +4477,14 @@ mod btree_page_tests {
         assert_eq!(page.slot_count(), 2);
         let entry0 = page.get_internal_entry(&layout, 0).unwrap();
         assert_eq!(entry0.key, Constant::Int(10));
-        assert_eq!(entry0.child_block, 100);
+        // entry0 child is left of 10 (initial C0 = 0)
+        assert_eq!(entry0.child_block, 0);
 
         let entry1 = page.get_internal_entry(&layout, 1).unwrap();
         assert_eq!(entry1.key, Constant::Int(20));
-        assert_eq!(entry1.child_block, 200);
+        // entry1 child is left of 20 (which is previous right child)
+        assert_eq!(entry1.child_block, 100);
+        assert_eq!(page.rightmost_child().unwrap(), 200);
 
         // Delete the first entry (slot 0, key=10)
         page.delete_internal_entry(0, &layout)
@@ -4464,7 +4496,8 @@ mod btree_page_tests {
         // The entry that was at slot 1 is now at slot 0 due to dense array maintenance
         let remaining = page.get_internal_entry(&layout, 0).unwrap();
         assert_eq!(remaining.key, Constant::Int(20));
-        assert_eq!(remaining.child_block, 200);
+        assert_eq!(remaining.child_block, 100);
+        assert_eq!(page.rightmost_child().unwrap(), 200);
 
         // Verify slot 1 no longer exists (out of bounds)
         assert!(page.get_internal_entry(&layout, 1).is_err());
@@ -4662,7 +4695,9 @@ mod btree_page_tests {
             .get_internal_entry(&layout, slot)
             .expect("get should succeed");
         assert_eq!(entry.key, Constant::Int(100));
-        assert_eq!(entry.child_block, 500);
+        // Entry child is the left child; rightmost child holds the right side
+        assert_eq!(entry.child_block, 0);
+        assert_eq!(page.rightmost_child().unwrap(), 500);
 
         page.delete_internal_entry(slot, &layout)
             .expect("delete should succeed");
@@ -4764,7 +4799,9 @@ mod btree_page_tests {
             .get_internal_entry(&layout, 0)
             .expect("entry should exist");
         assert_eq!(entry1.key, Constant::Int(30));
-        assert_eq!(entry1.child_block, 300);
+        // child is left child; rightmost child holds the final right pointer
+        assert_eq!(entry1.child_block, 0);
+        assert_eq!(restored.rightmost_child().unwrap(), 600);
     }
 
     // ========== Phase 3: Iterator Tests ==========
@@ -5179,7 +5216,7 @@ mod btree_page_tests {
 
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_internal(2);
+            guard.format_as_btree_internal(2, Some(0));
 
             let mut view =
                 BTreeInternalPageViewMut::new(guard, &layout).expect("create internal view");
@@ -5612,22 +5649,22 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
         self.record_space.entry_bytes(lp)
     }
 
+    /// Returns the insertion slot for `search_key` using separator semantics:
+    /// first key > search_key yields that slot; otherwise returns slot_count (append/rightmost).
     fn find_insertion_slot(&self, layout: &Layout, search_key: &Constant) -> SlotId {
         let mut left = 0;
         let mut right = self.slot_count();
-
         while left < right {
             let mid = (left + right) / 2;
-            match self
+            let entry = self
                 .entry_bytes(mid)
-                .and_then(|bytes| BTreeInternalEntry::decode(layout, bytes).ok())
-            {
-                Some(entry) if entry.key <= *search_key => left = mid + 1,
-                Some(_) => right = mid,
+                .and_then(|bytes| BTreeInternalEntry::decode(layout, bytes).ok());
+            match entry {
+                Some(e) if e.key > *search_key => right = mid,
+                Some(_) => left = mid + 1,
                 None => left = mid + 1,
             }
         }
-
         left
     }
 
@@ -5661,6 +5698,28 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
 
     fn btree_level(&self) -> u8 {
         self.header.level()
+    }
+
+    fn child_at(&self, layout: &Layout, idx: usize) -> Option<usize> {
+        if idx < self.slot_count() {
+            let lp = self.line_ptr(idx)?;
+            let bytes = self.record_space.entry_bytes(lp)?;
+            let entry = BTreeInternalEntry::decode(layout, bytes).ok()?;
+            Some(entry.child_block)
+        } else if idx == self.slot_count() {
+            self.rightmost_child_block()
+        } else {
+            None
+        }
+    }
+
+    fn rightmost_child_block(&self) -> Option<usize> {
+        let raw = self.header.rightmost_child_block();
+        if raw == u32::MAX {
+            None
+        } else {
+            Some(raw as usize)
+        }
     }
 }
 
@@ -5750,14 +5809,40 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         &mut self,
         layout: &Layout,
         key: Constant,
-        child_block: usize,
+        right_child: usize,
     ) -> SimpleDBResult<SlotId> {
+        // find upper bound position (first key > new key)
         let slot = {
             let view = self.as_read()?;
             view.find_insertion_slot(layout, &key)
         };
 
-        let entry = BTreeInternalEntry { key, child_block };
+        // snapshot existing children (slot_count + 1)
+        let slot_count = self.header.as_ref().slot_count() as usize;
+        let mut children = Vec::with_capacity(slot_count + 2);
+        {
+            let view = self.as_read()?;
+            for i in 0..slot_count {
+                let child = view.child_at(layout, i).ok_or("missing child pointer")?;
+                children.push(child);
+            }
+            if let Some(last) = view.rightmost_child_block() {
+                children.push(last);
+            } else {
+                // seed C0 as 0 when uninitialized
+                children.push(right_child);
+            }
+        }
+
+        // compute new children array after insertion
+        let left_child = children[slot];
+        children.insert(slot + 1, right_child);
+
+        // insert entry payload with left_child
+        let entry = BTreeInternalEntry {
+            key,
+            child_block: left_child,
+        };
         let entry_bytes = entry.encode(layout);
         let entry_len: u16 = entry_bytes
             .len()
@@ -5791,8 +5876,19 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
 
         let mut parts = self.split()?;
         parts.line_ptrs().insert(slot, line_ptr);
-        let slot_count = parts.header().as_ref().slot_count();
-        parts.header().set_slot_count(slot_count + 1);
+        let new_slot_count = parts.header().as_ref().slot_count() + 1;
+        parts.header().set_slot_count(new_slot_count);
+
+        // rewrite children to match new array
+        for idx in 0..(new_slot_count as usize) {
+            self.set_child_at(layout, idx, children[idx])?;
+        }
+        self.set_child_at(
+            layout,
+            new_slot_count as usize,
+            children[new_slot_count as usize],
+        )?;
+
         Ok(slot)
     }
 
@@ -5867,6 +5963,33 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
 
     fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
         self.header.set_level(level);
+        Ok(())
+    }
+
+    fn set_rightmost_child_block(&mut self, block: usize) {
+        self.header.set_rightmost_child_block(block as u32);
+    }
+
+    fn set_child_at(&mut self, layout: &Layout, idx: usize, child: usize) -> SimpleDBResult<()> {
+        let slot_count = self.header.as_ref().slot_count() as usize;
+        if idx < slot_count {
+            // update entry payload
+            let mut parts = self.split()?;
+            let lp = parts.line_ptrs().as_ref().get(idx);
+            let entry_bytes = parts
+                .record_space()
+                .entry_bytes_mut(lp)
+                .ok_or("entry bytes not found")?;
+            let block_offset = layout
+                .offset(BTREE_BLOCK_FIELD)
+                .ok_or("block field not found")?;
+            entry_bytes[block_offset..block_offset + 4]
+                .copy_from_slice(&(child as i32).to_le_bytes());
+        } else if idx == slot_count {
+            self.set_rightmost_child_block(child);
+        } else {
+            return Err("child index out of bounds".into());
+        }
         Ok(())
     }
 

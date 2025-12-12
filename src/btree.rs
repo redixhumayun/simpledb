@@ -3,8 +3,16 @@ use std::{error::Error, sync::Arc};
 use crate::{
     debug,
     page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
-    BlockId, Constant, FieldType, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
+    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
 };
+
+/// Separator promoted from a child split.
+#[derive(Debug, Clone)]
+struct SplitResult {
+    sep_key: Constant,
+    left_block: usize,
+    right_block: usize,
+}
 
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
@@ -46,20 +54,9 @@ impl BTreeIndex {
         if txn.size(&internal_table_name) == 0 {
             let block_id = txn.append(&internal_table_name);
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_internal(0);
+            // root has no separators yet; point rightmost child to first leaf block (0)
+            guard.format_as_btree_internal(0, Some(0));
             guard.mark_modified(txn.id(), Lsn::MAX);
-
-            let mut view = guard.into_btree_internal_page_view_mut(&internal_layout)?;
-            let field_type = internal_schema
-                .info
-                .get(IndexInfo::DATA_FIELD)
-                .unwrap()
-                .field_type;
-            let min_val = match field_type {
-                FieldType::Int => Constant::Int(i32::MIN),
-                FieldType::String => Constant::String("".to_string()),
-            };
-            view.insert_entry(min_val, 0)?;
         }
         Ok(Self {
             txn,
@@ -125,25 +122,30 @@ impl Index for BTreeIndex {
             data_val, data_rid
         );
         self.before_first(data_val);
-        let int_node_id = self.leaf.as_mut().unwrap().insert(*data_rid).unwrap();
-        if int_node_id.is_none() {
+        let split = self.leaf.as_mut().unwrap().insert(*data_rid).unwrap();
+        if split.is_none() {
             return;
         }
         debug!("Insert in index caused a split");
-        let int_node_id = int_node_id.unwrap();
+        let split = split.unwrap();
         let root = BTreeInternal::new(
             Arc::clone(&self.txn),
             self.root_block.clone(),
             self.internal_layout.clone(),
             self.root_block.filename.clone(),
         );
-        let root_split_entry = root.insert_entry(int_node_id).unwrap();
-        if root_split_entry.is_none() {
+        let root_split = root
+            .insert_entry(BTreeInternalEntry {
+                key: split.sep_key.clone(),
+                child_block: split.right_block,
+            })
+            .unwrap();
+        if root_split.is_none() {
             return;
         }
         debug!("Insert in index caused a root split");
-        let root_split_entry = root_split_entry.unwrap();
-        root.make_new_root(root_split_entry).unwrap();
+        let root_split = root_split.unwrap();
+        root.make_new_root(root_split).unwrap();
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
@@ -156,8 +158,6 @@ impl Index for BTreeIndex {
 
 #[cfg(test)]
 mod btree_index_tests {
-    use std::i32;
-
     use super::*;
     use crate::{test_utils::generate_filename, Schema, SimpleDB};
 
@@ -181,7 +181,7 @@ mod btree_index_tests {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let index = setup_index(&db);
 
-        // Verify internal node file exists with minimum value entry
+        // Verify internal node file exists with empty root and rightmost child set
         let root = BTreeInternal::new(
             Arc::clone(&index.txn),
             index.root_block.clone(),
@@ -190,8 +190,8 @@ mod btree_index_tests {
         );
         let guard = index.txn.pin_read_guard(&root.block_id);
         let view = BTreeInternalPageView::new(guard, &root.layout).unwrap();
-        assert_eq!(view.slot_count(), 1);
-        assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(i32::MIN));
+        assert_eq!(view.slot_count(), 0);
+        assert_eq!(view.rightmost_child_block(), Some(0));
     }
 
     #[test]
@@ -327,14 +327,53 @@ impl BTreeInternal {
 
         let new_block_id = self.txn.append(&self.file_name);
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
-        new_guard.format_as_btree_internal(orig_view.btree_level());
+        // rightmost will be set after we compute child partitions
+        new_guard.format_as_btree_internal(orig_view.btree_level(), None);
         new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
 
-        while split_slot < orig_view.slot_count() {
-            let entry = orig_view.get_entry(split_slot)?;
-            new_view.insert_entry(entry.key, entry.child_block)?;
+        // Snapshot children array C0..Ck
+        let orig_slot_count = orig_view.slot_count();
+        let mut children = Vec::with_capacity(orig_slot_count + 1);
+        for i in 0..orig_slot_count {
+            let child = orig_view.get_entry(i)?.child_block;
+            children.push(child);
+        }
+        children.push(
+            orig_view
+                .rightmost_child_block()
+                .ok_or("missing rightmost child")?,
+        );
+
+        let (left_children, right_children) = children.split_at(split_slot);
+
+        // Collect entries to move with corresponding right_child pointers
+        let mut moved = Vec::new();
+        for rel_idx in split_slot..orig_slot_count {
+            let entry = orig_view.get_entry(rel_idx)?;
+            let rc = right_children
+                .get(rel_idx - split_slot + 1)
+                .copied()
+                .ok_or("right child missing for moved entry")?;
+            moved.push((entry.key.clone(), rc));
+        }
+
+        // Delete moved entries from original page
+        for _ in split_slot..orig_slot_count {
             orig_view.delete_entry(split_slot)?;
+        }
+
+        // Set left page rightmost child
+        if let Some(&last_left) = left_children.last() {
+            orig_view.set_rightmost_child_block(last_left)?;
+        }
+
+        // Set right page rightmost and insert moved entries
+        if let Some(&last_right) = right_children.last() {
+            new_view.set_rightmost_child_block(last_right)?;
+        }
+        for (_i, (k, right_child)) in moved.into_iter().enumerate() {
+            new_view.insert_entry(k, right_child)?;
         }
 
         Ok(new_block_id)
@@ -355,39 +394,33 @@ impl BTreeInternal {
         Ok(child_block.block_num)
     }
 
-    /// This method will create a new root for the BTree
-    /// It will take the entry that needs to be inserted after the split, move its existing
-    /// entries into a new block and then insert both the newly created block with its old entries and the new block
-    /// This is done so that the root is always at block 0 of the file
-    fn make_new_root(&self, entry: BTreeInternalEntry) -> Result<(), Box<dyn Error>> {
-        let (first_value, level) = {
+    /// Create a new root above current root after a split.
+    fn make_new_root(&self, split: SplitResult) -> Result<(), Box<dyn Error>> {
+        // read current level
+        let level = {
             let guard = self.txn.pin_read_guard(&self.block_id);
-            let view = BTreeInternalPageView::new(guard, &self.layout)?;
-            (view.get_entry(0)?.key, view.btree_level())
+            let view = guard.into_btree_internal_page_view(&self.layout)?;
+            view.btree_level()
         };
-        let new_block_id = self.split_page(0)?;
 
-        let new_block_entry = BTreeInternalEntry {
-            key: first_value,
-            child_block: new_block_id.block_num,
-        };
-        self.insert_entry(new_block_entry)?;
-        self.insert_entry(entry)?;
-
-        let guard = self.txn.pin_write_guard(&self.block_id);
-        let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
-        view.set_btree_level(level.checked_add(1).unwrap())?;
+        // Reformat current page as empty internal at level+1, pointing rightmost to LEFT child for upcoming insert.
+        let mut guard = self.txn.pin_write_guard(&self.block_id);
+        guard.format_as_btree_internal(level + 1, Some(split.left_block));
+        {
+            let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
+            // insert separator with right child = split.right_block
+            view.insert_entry(split.sep_key, split.right_block)?;
+        }
         Ok(())
     }
 
-    /// This method will insert a new entry into the [BTreeInternal] node
-    /// It works in conjunction with [BTreeInternal::insert_internal_node_entry] to do the insertion
-    /// This method will find the correct child block to insert it into and the [BTreeInternal::insert_internal_node_entry] will do the actual
-    /// insertion into the specific block
+    /// Insert a separator into this internal node, returning an optional split to bubble up.
+    /// This is the public entry point used by callers and tests; it delegates to the
+    /// new split-aware flow.
     fn insert_entry(
         &self,
         entry: BTreeInternalEntry,
-    ) -> Result<Option<BTreeInternalEntry>, Box<dyn Error>> {
+    ) -> Result<Option<SplitResult>, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.block_id);
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
         if view.btree_level() == 0 {
@@ -404,7 +437,10 @@ impl BTreeInternal {
         );
         let new_entry = child_internal_node.insert_entry(entry)?;
         match new_entry {
-            Some(entry) => self.insert_internal_node_entry(entry),
+            Some(split) => self.insert_internal_node_entry(BTreeInternalEntry {
+                key: split.sep_key,
+                child_block: split.right_block,
+            }),
             None => Ok(None),
         }
     }
@@ -415,33 +451,59 @@ impl BTreeInternal {
     fn insert_internal_node_entry(
         &self,
         entry: BTreeInternalEntry,
-    ) -> Result<Option<BTreeInternalEntry>, Box<dyn Error>> {
-        let (split_point, split_key) = {
+    ) -> Result<Option<SplitResult>, Box<dyn Error>> {
+        let split_point_opt = {
             let guard = self.txn.pin_write_guard(&self.block_id);
             let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
             view.insert_entry(entry.key, entry.child_block)?;
-            if !view.is_full() {
-                return Ok(None);
+            if view.is_full() {
+                Some(view.slot_count() / 2)
+            } else {
+                None
             }
-            let split_point = view.slot_count() / 2;
-            let split_key = view.get_entry(split_point)?.key;
-            (split_point, split_key)
         };
+        let Some(split_point) = split_point_opt else {
+            return Ok(None);
+        };
+
         let new_block_id = self.split_page(split_point)?;
-        Ok(Some(BTreeInternalEntry {
-            key: split_key,
-            child_block: new_block_id.block_num,
+
+        let guard = self.txn.pin_read_guard(&new_block_id);
+        let right_view = guard.into_btree_internal_page_view(&self.layout)?;
+        let sep_key = right_view.get_entry(0)?.key.clone();
+
+        Ok(Some(SplitResult {
+            sep_key,
+            left_block: self.block_id.block_num,
+            right_block: new_block_id.block_num,
         }))
     }
 
     /// This method will find the child block for a given search key in a [BTreeInternal] node
-    /// It will find the rightmost slot where key <= search_key and return that slot's child
+    /// It uses textbook separator search: first key > search_key => take that entry's child; otherwise take header.rightmost_child.
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.block_id);
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
-        let slot = view.find_slot_before(search_key).unwrap_or(0);
-        let block_num = view.get_entry(slot)?.child_block;
-        Ok(BlockId::new(self.file_name.clone(), block_num))
+        let mut left = 0;
+        let mut right = view.slot_count();
+        while left < right {
+            let mid = (left + right) / 2;
+            let key_mid = view.get_entry(mid)?.key;
+            if key_mid > *search_key {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+        if left < view.slot_count() {
+            let block_num = view.get_entry(left)?.child_block;
+            Ok(BlockId::new(self.file_name.clone(), block_num))
+        } else {
+            let block_num = view
+                .rightmost_child_block()
+                .ok_or("missing rightmost child")?;
+            Ok(BlockId::new(self.file_name.clone(), block_num))
+        }
     }
 }
 
@@ -462,11 +524,12 @@ mod btree_internal_tests {
         let tx = db.new_tx();
         let filename = generate_filename();
         let block = tx.append(&filename);
+        let dummy_child = tx.append(&filename);
         let layout = create_test_layout();
 
         // Format the page as internal node
         let mut guard = tx.pin_write_guard(&block);
-        guard.format_as_btree_internal(0);
+        guard.format_as_btree_internal(0, Some(dummy_child.block_num));
         guard.mark_modified(tx.id(), Lsn::MAX);
         drop(guard);
 
@@ -517,7 +580,7 @@ mod btree_internal_tests {
         }
         let split_entry = split_entry.unwrap();
         let mid_val = block_num / 2;
-        assert_eq!(split_entry.key, Constant::Int(mid_val));
+        assert_eq!(split_entry.sep_key, Constant::Int(mid_val));
     }
 
     #[test]
@@ -534,24 +597,28 @@ mod btree_internal_tests {
         }
 
         // Create a new entry that will be part of new root
-        let new_entry = BTreeInternalEntry {
-            key: Constant::Int(30),
-            child_block: 4,
+        let split = SplitResult {
+            sep_key: Constant::Int(30),
+            left_block: internal.block_id.block_num,
+            right_block: 4,
         };
 
         // Make new root
-        internal.make_new_root(new_entry).unwrap();
+        internal.make_new_root(split).unwrap();
 
         // Verify root structure
         let guard = txn.pin_read_guard(&internal.block_id);
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
         assert!(matches!(view.btree_level(), 1));
-        assert_eq!(view.slot_count(), 2);
+        assert_eq!(view.slot_count(), 1);
 
-        // First entry should point to block with original entries
-        assert!(view.get_entry(0).unwrap().child_block > 0);
-        // Second entry should be our new entry
-        assert_eq!(view.get_entry(1).unwrap().child_block, 4);
+        // Separator points to left child
+        assert_eq!(
+            view.get_entry(0).unwrap().child_block,
+            internal.block_id.block_num
+        );
+        // Rightmost points to right child
+        assert_eq!(view.rightmost_child_block().unwrap(), 4);
     }
 
     #[test]
@@ -752,7 +819,7 @@ impl BTreeLeaf {
     /// This method will attempt to insert an entry into a [BTreeLeaf] page
     /// If the leaf page has an overflow page, and the new entry is smaller than the first key, split the page
     /// If the page splits, return the [InternalNodeEntry] identifier to the new page
-    fn insert(&mut self, rid: RID) -> Result<Option<BTreeInternalEntry>, Box<dyn Error>> {
+    fn insert(&mut self, rid: RID) -> Result<Option<SplitResult>, Box<dyn Error>> {
         //  If this page has an overflow page, and the key being inserted is less than the first key force a split
         //  This is done to ensure that overflow pages are linked to a page with the first key the same as entries in overflow pages
         debug!("Inserting rid {:?} into BTreeLeaf", rid);
@@ -779,9 +846,10 @@ impl BTreeLeaf {
 
                     self.current_slot = Some(0);
 
-                    return Ok(Some(BTreeInternalEntry {
-                        key: first_key,
-                        child_block: new_block_id.block_num,
+                    return Ok(Some(SplitResult {
+                        sep_key: first_key,
+                        left_block: self.current_block_id.block_num,
+                        right_block: new_block_id.block_num,
                     }));
                 }
             }
@@ -865,9 +933,10 @@ impl BTreeLeaf {
 
         let new_block_id = self.split_page(split_point, None)?;
 
-        Ok(Some(BTreeInternalEntry {
-            key: split_record,
-            child_block: new_block_id.block_num,
+        Ok(Some(SplitResult {
+            sep_key: split_record,
+            left_block: self.current_block_id.block_num,
+            right_block: new_block_id.block_num,
         }))
     }
 
@@ -986,8 +1055,8 @@ mod btree_leaf_tests {
         // Verify split occurred
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
-        assert_eq!(entry.child_block, 1); //  this is a new file that has just added a new block
-        assert_eq!(entry.key, Constant::Int(counter / 2)); // Middle key. Adding 1 to slot because slot is 0-based
+        assert_eq!(entry.right_block, 1); // new sibling block id
+        assert_eq!(entry.sep_key, Constant::Int(counter / 2)); // Middle key
     }
 
     #[test]
@@ -1042,6 +1111,6 @@ mod btree_leaf_tests {
 
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
-        assert_eq!(entry.key, Constant::Int(20));
+        assert_eq!(entry.sep_key, Constant::Int(20));
     }
 }
