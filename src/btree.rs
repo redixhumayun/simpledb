@@ -3,7 +3,7 @@ use std::{error::Error, sync::Arc};
 use crate::{
     debug,
     page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
-    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
+    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, SimpleDBResult, Transaction, RID,
 };
 
 /// Separator promoted from a child split.
@@ -680,6 +680,23 @@ mod btree_internal_tests {
     }
 }
 
+/// Serialize only the key bytes using the leaf layout's dataval encoding.
+fn encode_leaf_key(_layout: &Layout, key: &Constant) -> SimpleDBResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    match key {
+        Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Constant::String(s) => {
+            let len: u32 = s
+                .len()
+                .try_into()
+                .map_err(|_| "string too long to encode as high key".to_string())?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+    Ok(buf)
+}
+
 /// The [BTreeLeaf] struct. This is the page that contains all the actual pointers to [RID] in the heap tables
 /// It can have an overflow pointer to an overflow page, but overflow pages are special in that they have entries with the same value for the dataval field
 /// A [BTreeLeaf] that has an overflow page must have its first entry have the same dataval as all entries in the overflow block
@@ -723,11 +740,26 @@ impl BTreeLeaf {
         new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
+        // Move entries split_slot..end to new page
         while split_slot < orig_view.slot_count() {
             let entry = orig_view.get_entry(split_slot)?.clone();
-            new_view.insert_entry(entry.key, entry.rid)?;
+            new_view.insert_entry(entry.key.clone(), entry.rid)?;
             orig_view.delete_entry(split_slot)?;
         }
+
+        // Set high keys and right sibling
+        let sep_key = new_view.get_entry(0)?.key.clone();
+        let sep_bytes = encode_leaf_key(&self.layout, &sep_key)?;
+        // Left high key = separator, right link = new page
+        {
+            drop(orig_view); // release original guard before re-pinning
+            let left_guard = self.txn.pin_write_guard(&self.current_block_id);
+            let mut left_view = left_guard.into_btree_leaf_page_view_mut(&self.layout)?;
+            left_view.set_high_key(&sep_bytes)?;
+            left_view.set_right_sibling_block(Some(new_block_id.block_num))?;
+        }
+        // Right high key = +inf sentinel
+        new_view.clear_high_key()?;
 
         Ok(new_block_id)
     }
