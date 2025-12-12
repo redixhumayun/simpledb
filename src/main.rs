@@ -8196,10 +8196,12 @@ impl Constant {
             _ => panic!("Expected a string constant"),
         }
     }
+}
 
-    /// Encode the value in the same layout used for B-tree keys: i32 little-endian
-    /// or length-prefixed UTF-8 string.
-    pub fn encode_bytes(&self) -> SimpleDBResult<Vec<u8>> {
+impl TryInto<Vec<u8>> for Constant {
+    type Error = Box<dyn Error>;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         let mut buf = Vec::new();
         match self {
             Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
@@ -8213,14 +8215,6 @@ impl Constant {
             }
         }
         Ok(buf)
-    }
-}
-
-impl TryInto<Vec<u8>> for Constant {
-    type Error = Box<dyn Error>;
-
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        self.encode_bytes().map_err(|e| e.into())
     }
 }
 
