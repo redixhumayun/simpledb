@@ -8196,6 +8196,32 @@ impl Constant {
             _ => panic!("Expected a string constant"),
         }
     }
+
+    /// Encode the value in the same layout used for B-tree keys: i32 little-endian
+    /// or length-prefixed UTF-8 string.
+    pub fn encode_bytes(&self) -> SimpleDBResult<Vec<u8>> {
+        let mut buf = Vec::new();
+        match self {
+            Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            Constant::String(s) => {
+                let len: u32 = s
+                    .len()
+                    .try_into()
+                    .map_err(|_| "string too long to encode as high key".to_string())?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+        }
+        Ok(buf)
+    }
+}
+
+impl TryInto<Vec<u8>> for Constant {
+    type Error = Box<dyn Error>;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        self.encode_bytes().map_err(|e| e.into())
+    }
 }
 
 pub type RowValues = Vec<Constant>;
