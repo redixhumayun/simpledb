@@ -194,6 +194,14 @@ impl<'a> HeaderReader<'a> for HeapHeaderRef<'a> {
     fn free_lower(&self) -> u16 {
         self.free_lower()
     }
+
+    fn free_upper(&self) -> u16 {
+        self.free_upper()
+    }
+
+    fn slot_count(&self) -> u16 {
+        self.slot_count()
+    }
 }
 
 /// Mutable view over a heap header stored inline in `PageBytes`.
@@ -483,6 +491,14 @@ impl<'a> HeaderReader<'a> for BTreeLeafHeaderRef<'a> {
     fn free_lower(&self) -> u16 {
         self.free_lower()
     }
+
+    fn free_upper(&self) -> u16 {
+        self.free_upper()
+    }
+
+    fn slot_count(&self) -> u16 {
+        self.slot_count()
+    }
 }
 
 pub struct BTreeLeafHeaderMut<'a> {
@@ -500,7 +516,7 @@ impl<'a> BTreeLeafHeaderMut<'a> {
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        self.bytes
     }
 
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
@@ -664,6 +680,14 @@ impl<'a> HeaderReader<'a> for BTreeInternalHeaderRef<'a> {
     fn free_lower(&self) -> u16 {
         self.free_lower()
     }
+
+    fn free_upper(&self) -> u16 {
+        self.free_upper()
+    }
+
+    fn slot_count(&self) -> u16 {
+        self.slot_count()
+    }
 }
 
 pub struct BTreeInternalHeaderMut<'a> {
@@ -681,7 +705,7 @@ impl<'a> BTreeInternalHeaderMut<'a> {
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        self.bytes
     }
 
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
@@ -859,7 +883,7 @@ struct LinePtrArray<'a> {
 impl<'a> LinePtrArray<'a> {
     fn new(bytes: &'a [u8], len: usize, capacity: usize) -> Self {
         assert!(
-            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            bytes.len().is_multiple_of(LinePtrBytes::LINE_PTR_BYTES),
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
@@ -877,7 +901,7 @@ impl<'a> LinePtrArray<'a> {
 
     fn with_len(bytes: &'a [u8], len: usize) -> Self {
         assert!(
-            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            bytes.len().is_multiple_of(LinePtrBytes::LINE_PTR_BYTES),
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
@@ -908,7 +932,7 @@ struct LinePtrArrayMut<'a> {
 impl<'a> LinePtrArrayMut<'a> {
     fn new(bytes: &'a mut [u8], len: usize, capacity: usize) -> Self {
         assert!(
-            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            bytes.len().is_multiple_of(LinePtrBytes::LINE_PTR_BYTES),
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
@@ -926,7 +950,7 @@ impl<'a> LinePtrArrayMut<'a> {
 
     fn with_len(bytes: &'a mut [u8], len: usize) -> Self {
         assert!(
-            bytes.len() % LinePtrBytes::LINE_PTR_BYTES == 0,
+            bytes.len().is_multiple_of(LinePtrBytes::LINE_PTR_BYTES),
             "line pointer region must be multiple of {} bytes",
             LinePtrBytes::LINE_PTR_BYTES
         );
@@ -1227,23 +1251,31 @@ pub struct SplitOffsets {
     pub lp_capacity: usize,
 }
 
+/// Result of preparing split with all validated components
+pub struct SplitPreparation {
+    pub lp_capacity: usize,
+    pub base_offset: usize,
+    pub slot_count: usize,
+}
+
 /// Trait for read-only header views - only methods used by generic PageKind code
 pub trait HeaderReader<'a> {
     fn new(bytes: &'a [u8]) -> Self;
     fn page_type(&self) -> PageType;
     fn free_lower(&self) -> u16;
+    fn free_upper(&self) -> u16;
+    fn slot_count(&self) -> u16;
 }
 
 /// Marker trait associating a compile-time page kind with its runtime PageType.
 pub trait PageKind: Sized {
-    #[allow(dead_code)]
     const PAGE_TYPE: PageType;
     const HEADER_SIZE: usize;
     type Header;
     type HeaderRef<'a>: HeaderReader<'a>;
 
     /// Parse page layout from raw bytes (shared implementation)
-    fn parse_layout(bytes: &[u8]) -> Result<ParsedLayout<'_>, Box<dyn Error>> {
+    fn parse_layout(bytes: &[u8]) -> SimpleDBResult<ParsedLayout<'_>> {
         if bytes.len() < Self::HEADER_SIZE {
             return Err("page too small".into());
         }
@@ -1288,7 +1320,7 @@ pub trait PageKind: Sized {
     }
 
     /// Calculate offsets for splitting page body (shared implementation)
-    fn calculate_split_offsets(free_lower: u16) -> Result<SplitOffsets, Box<dyn Error>> {
+    fn calculate_split_offsets(free_lower: u16) -> SimpleDBResult<SplitOffsets> {
         if free_lower < Self::HEADER_SIZE as u16 {
             return Err("invalid free_lower".into());
         }
@@ -1296,6 +1328,44 @@ pub trait PageKind: Sized {
         let lp_capacity = free_lower as usize - Self::HEADER_SIZE;
 
         Ok(SplitOffsets { lp_capacity })
+    }
+
+    /// Prepare split by validating bounds and calculating split points
+    ///
+    /// This shared implementation handles all the common validation logic for split operations.
+    fn prepare_split<'a, H>(
+        header: &H,
+        body_bytes_len: usize,
+        page_type_name: &str,
+    ) -> SimpleDBResult<SplitPreparation>
+    where
+        H: HeaderReader<'a>,
+    {
+        let free_lower = header.free_lower();
+        let free_upper = header.free_upper() as usize;
+        let page_size = PAGE_SIZE_BYTES as usize;
+
+        // Use shared offset calculation
+        let offsets = Self::calculate_split_offsets(free_lower)?;
+
+        // Validate free_upper bounds - identical across all page types
+        if free_upper < free_lower as usize || free_upper > page_size {
+            return Err(format!("{} free_upper out of bounds", page_type_name).into());
+        }
+
+        // Validate slot directory bounds - identical across all page types
+        if offsets.lp_capacity > body_bytes_len {
+            return Err(format!("{} slot directory exceeds page body", page_type_name).into());
+        }
+
+        let base_offset = free_lower as usize;
+        let slot_count = header.slot_count() as usize;
+
+        Ok(SplitPreparation {
+            lp_capacity: offsets.lp_capacity,
+            base_offset,
+            slot_count,
+        })
     }
 }
 
@@ -1305,6 +1375,12 @@ type SlotId = usize;
 #[derive(Debug)]
 pub struct PageBytes {
     bytes: [u8; PAGE_SIZE_BYTES as usize],
+}
+
+impl Default for PageBytes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PageBytes {
@@ -1322,11 +1398,11 @@ impl PageBytes {
         self.bytes[0].try_into()
     }
 
-    pub fn bytes<'a>(&'a self) -> &'a [u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    pub fn bytes_mut<'a>(&'a mut self) -> &'a mut [u8] {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
 }
@@ -1580,11 +1656,11 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     }
 
     pub fn update_crc32(&mut self) {
-        self.header.update_crc32(&self.body_bytes);
+        self.header.update_crc32(self.body_bytes);
     }
 
     pub fn verify_crc32(&mut self) -> bool {
-        self.header.verify_crc32(&self.body_bytes)
+        self.header.verify_crc32(self.body_bytes)
     }
 
     /// Splits the mutable page into header/slot-dir/record-space views tied together by a guard.
@@ -1592,38 +1668,30 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     /// boundary always reflects the latest `slot_count`. Dropping the guard releases the borrows,
     /// forcing the next operation to resplit.
     fn split(&mut self) -> SimpleDBResult<HeapPageParts<'_>> {
-        let free_lower = self.header.as_ref().free_lower();
-        let free_upper = self.header.as_ref().free_upper() as usize;
-        let page_size = PAGE_SIZE_BYTES as usize;
+        // Use shared validation and preparation logic from PageKind trait
+        let prep = Self::prepare_split(&self.header.as_ref(), self.body_bytes.len(), "heap page")?;
 
-        // Use shared offset calculation from trait
-        let offsets = Self::calculate_split_offsets(free_lower)?;
+        // Split body_bytes at calculated offset
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(prep.lp_capacity);
 
-        if free_upper < free_lower as usize || free_upper > page_size {
-            return Err("heap page free_upper out of bounds".into());
-        }
-        if offsets.lp_capacity > self.body_bytes.len() {
-            return Err("slot directory exceeds page body".into());
-        }
-        let (line_ptr_bytes, record_space_bytes) =
-            self.body_bytes.split_at_mut(offsets.lp_capacity);
-        let base_offset = free_lower as usize;
-
+        // Shared assertions - identical across all page types
         assert_eq!(
             self.header.as_ref().free_lower() as usize,
-            Self::HEADER_SIZE + offsets.lp_capacity
+            Self::HEADER_SIZE + prep.lp_capacity
         );
         assert_eq!(
-            Self::HEADER_SIZE + offsets.lp_capacity + record_space_bytes.len(),
+            Self::HEADER_SIZE + prep.lp_capacity + record_space_bytes.len(),
             PAGE_SIZE_BYTES as usize
         );
 
-        let slot_count = self.header.as_ref().slot_count() as usize;
+        // Construct page-specific Parts struct
         let parts = HeapPageParts {
             header: HeapHeaderMut::new(self.header.bytes_mut()),
-            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
-            record_space: HeapRecordSpaceMut::new(record_space_bytes, base_offset),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, prep.slot_count),
+            record_space: HeapRecordSpaceMut::new(record_space_bytes, prep.base_offset),
         };
+
+        // Heap-specific assertion
         assert_eq!(
             parts.line_ptrs.as_ref().len(),
             parts.header.as_ref().slot_count() as usize,
@@ -2975,14 +3043,14 @@ impl<'a> HeapPageViewMut<'a> {
             HeapInsert::Done(slot) => {
                 drop(split_guard);
                 self.dirty.set(true);
-                return Ok(slot);
+                Ok(slot)
             }
             HeapInsert::Reserved(reservation) => {
                 drop(split_guard);
                 let mut split_guard = page.split()?;
                 let slot = split_guard.insert_tuple_slow(reservation, bytes)?;
                 self.dirty.set(true);
-                return Ok(slot);
+                Ok(slot)
             }
         }
     }
@@ -3090,7 +3158,7 @@ impl<'a> HeapPageViewMut<'a> {
         //  If we were to build page and then operate on that, the lifetime of the underlying bytes cannot be proven by the compiler
         //  since the compiler has no idea that page aliases the same underlying bytes
         let bytes = self.guard.bytes_mut();
-        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPageZeroCopy::HEADER_SIZE as usize);
+        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPageZeroCopy::HEADER_SIZE);
         let header = HeapHeaderRef::new(header_bytes);
         if current >= header.slot_count() as usize {
             return None;
@@ -5289,37 +5357,28 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeLeafPageParts<'_>> {
-        let free_lower = self.header.as_ref().free_lower();
-        let free_upper = self.header.as_ref().free_upper() as usize;
-        let page_size = PAGE_SIZE_BYTES as usize;
+        // Use shared validation and preparation logic from PageKind trait
+        let prep =
+            Self::prepare_split(&self.header.as_ref(), self.body_bytes.len(), "B-tree leaf")?;
 
-        // Use shared offset calculation from trait
-        let offsets = Self::calculate_split_offsets(free_lower)?;
+        // Split body_bytes at calculated offset
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(prep.lp_capacity);
 
-        if free_upper < free_lower as usize || free_upper > page_size {
-            return Err("B-tree leaf free_upper out of bounds".into());
-        }
-        if offsets.lp_capacity > self.body_bytes.len() {
-            return Err("slot directory exceeds page body".into());
-        }
-        let (line_ptr_bytes, record_space_bytes) =
-            self.body_bytes.split_at_mut(offsets.lp_capacity);
-        let base_offset = free_lower as usize;
-
+        // Shared assertions - identical across all page types
         assert_eq!(
             self.header.as_ref().free_lower() as usize,
-            Self::HEADER_SIZE + offsets.lp_capacity
+            Self::HEADER_SIZE + prep.lp_capacity
         );
         assert_eq!(
-            Self::HEADER_SIZE + offsets.lp_capacity + record_space_bytes.len(),
+            Self::HEADER_SIZE + prep.lp_capacity + record_space_bytes.len(),
             PAGE_SIZE_BYTES as usize
         );
 
-        let slot_count = self.header.as_ref().slot_count() as usize;
+        // Construct page-specific Parts struct
         let parts = BTreeLeafPageParts {
             header: BTreeLeafHeaderMut::new(self.header.bytes_mut()),
-            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
-            record_space: BTreeRecordSpaceMut::new(record_space_bytes, base_offset),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, prep.slot_count),
+            record_space: BTreeRecordSpaceMut::new(record_space_bytes, prep.base_offset),
         };
         Ok(parts)
     }
@@ -5473,11 +5532,11 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
     }
 
     pub fn update_crc32(&mut self) {
-        self.header.update_crc32(&self.body_bytes);
+        self.header.update_crc32(self.body_bytes);
     }
 
     pub fn verify_crc32(&mut self) -> bool {
-        self.header.verify_crc32(&self.body_bytes)
+        self.header.verify_crc32(self.body_bytes)
     }
 }
 
@@ -5628,37 +5687,31 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     }
 
     fn split(&mut self) -> SimpleDBResult<BTreeInternalPageParts<'_>> {
-        let free_lower = self.header.as_ref().free_lower();
-        let free_upper = self.header.as_ref().free_upper() as usize;
-        let page_size = PAGE_SIZE_BYTES as usize;
+        // Use shared validation and preparation logic from PageKind trait
+        let prep = Self::prepare_split(
+            &self.header.as_ref(),
+            self.body_bytes.len(),
+            "B-tree internal",
+        )?;
 
-        // Use shared offset calculation from trait
-        let offsets = Self::calculate_split_offsets(free_lower)?;
+        // Split body_bytes at calculated offset
+        let (line_ptr_bytes, record_space_bytes) = self.body_bytes.split_at_mut(prep.lp_capacity);
 
-        if free_upper < free_lower as usize || free_upper > page_size {
-            return Err("B-tree internal free_upper out of bounds".into());
-        }
-        if offsets.lp_capacity > self.body_bytes.len() {
-            return Err("slot directory exceeds page body".into());
-        }
-        let (line_ptr_bytes, record_space_bytes) =
-            self.body_bytes.split_at_mut(offsets.lp_capacity);
-        let base_offset = free_lower as usize;
-
+        // Shared assertions - identical across all page types
         assert_eq!(
             self.header.as_ref().free_lower() as usize,
-            Self::HEADER_SIZE + offsets.lp_capacity
+            Self::HEADER_SIZE + prep.lp_capacity
         );
         assert_eq!(
-            Self::HEADER_SIZE + offsets.lp_capacity + record_space_bytes.len(),
+            Self::HEADER_SIZE + prep.lp_capacity + record_space_bytes.len(),
             PAGE_SIZE_BYTES as usize
         );
 
-        let slot_count = self.header.as_ref().slot_count() as usize;
+        // Construct page-specific Parts struct
         let parts = BTreeInternalPageParts {
             header: BTreeInternalHeaderMut::new(self.header.bytes_mut()),
-            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, slot_count),
-            record_space: BTreeRecordSpaceMut::new(record_space_bytes, base_offset),
+            line_ptrs: LinePtrArrayMut::with_len(line_ptr_bytes, prep.slot_count),
+            record_space: BTreeRecordSpaceMut::new(record_space_bytes, prep.base_offset),
         };
         Ok(parts)
     }
@@ -5818,11 +5871,11 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
     }
 
     pub fn update_crc32(&mut self) {
-        self.header.update_crc32(&self.body_bytes);
+        self.header.update_crc32(self.body_bytes);
     }
 
     pub fn verify_crc32(&mut self) -> bool {
-        self.header.verify_crc32(&self.body_bytes)
+        self.header.verify_crc32(self.body_bytes)
     }
 }
 
