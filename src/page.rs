@@ -465,17 +465,21 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[8..10].try_into().unwrap())
     }
 
+    pub fn high_key_off(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[10..12].try_into().unwrap())
+    }
+
     #[allow(dead_code)]
     pub fn right_sibling(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[10..14].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[12..16].try_into().unwrap())
     }
 
     pub fn overflow_block(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[14..18].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[16..20].try_into().unwrap())
     }
 
     pub fn crc32(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[18..22].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
     }
 }
 
@@ -555,20 +559,24 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.write(8, len.to_le_bytes());
     }
 
+    pub fn set_high_key_off(&mut self, off: u16) {
+        self.write(10, off.to_le_bytes());
+    }
+
     pub fn set_right_sibling_block(&mut self, block: u32) {
-        self.write(10, block.to_le_bytes());
+        self.write(12, block.to_le_bytes());
     }
 
     pub fn set_overflow_block(&mut self, block: u32) {
-        self.write(14, block.to_le_bytes());
+        self.write(16, block.to_le_bytes());
     }
 
     pub fn set_crc32(&mut self, crc32: u32) {
-        self.write(18, crc32.to_le_bytes());
+        self.write(20, crc32.to_le_bytes());
     }
 
     pub fn set_lsn(&mut self, lsn: u64) {
-        self.write(22, lsn.to_le_bytes());
+        self.write(24, lsn.to_le_bytes());
     }
 
     pub fn set_reserved_bytes(&mut self, reserved: [u8; 2]) {
@@ -588,6 +596,7 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
         self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_high_key_len(0);
+        self.set_high_key_off(0);
         self.set_right_sibling_block(right_sibling.unwrap_or(u32::MAX));
         self.set_overflow_block(overflow_block.unwrap_or(u32::MAX));
         self.set_crc32(0);
@@ -662,8 +671,12 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
 
+    pub fn high_key_off(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[14..16].try_into().unwrap())
+    }
+
     pub fn crc32(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[14..18].try_into().unwrap())
+        u32::from_le_bytes(self.bytes[16..20].try_into().unwrap())
     }
 }
 
@@ -747,16 +760,20 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         self.write(12, len.to_le_bytes());
     }
 
+    pub fn set_high_key_off(&mut self, off: u16) {
+        self.write(14, off.to_le_bytes());
+    }
+
     pub fn set_crc32(&mut self, crc32: u32) {
-        self.write(14, crc32.to_le_bytes());
+        self.write(16, crc32.to_le_bytes());
     }
 
     pub fn set_lsn(&mut self, lsn: u64) {
-        self.write(18, lsn.to_le_bytes());
+        self.write(20, lsn.to_le_bytes());
     }
 
-    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
-        self.write(26, reserved);
+    pub fn set_reserved_bytes(&mut self, reserved: [u8; 4]) {
+        self.write(28, reserved);
     }
 
     pub fn init_internal(&mut self, level: u8, rightmost_child: Option<u32>) {
@@ -768,9 +785,10 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_rightmost_child_block(rightmost_child.unwrap_or(u32::MAX));
         self.set_high_key_len(0);
+        self.set_high_key_off(0);
         self.set_crc32(0);
         self.set_lsn(0);
-        self.set_reserved_bytes([0; 6]);
+        self.set_reserved_bytes([0; 4]);
     }
 
     pub fn update_crc32(&mut self, body_bytes: &[u8]) {
