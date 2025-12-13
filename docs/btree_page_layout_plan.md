@@ -235,13 +235,70 @@ B-Tree leaf/internal headers follow the same pattern: each defines a struct that
 - **Formatting / catalog**: page-formatting functions and index creation code change to write/expect the new headers; removing `{index}leaf`/`{index}internal` tables simplifies the metadata layer.
 - **Higher layers**: Record management, planner/executor nodes, and tests continue using the same view APIs, so no application-level rewrite is required. Once headers are in place, future work (lock/latch separation, concurrency, prefix compression) can build on top without reshaping the public interfaces.
 
-## Next Steps: Textbook Internal Separator Layout
-- Drop the sentinel min-key entry: when formatting an internal/root page, set `rightmost_child_block` in the header and leave `slot_count == 0` if there are no separators.
-  - Sketch: `guard.format_as_btree_internal(level, Some(initial_child)); // no min entry insert`
-- Expose `rightmost_child_block` accessors on `BTreeInternalPageView{,Mut}` and wire them to the header field.
-- Rewrite descent (`BTreeInternal::find_child_block`) to binary-search separator keys and fall back to the header’s `rightmost_child_block` for the final branch; no `unwrap_or(0)` sentinel path.
-- Update `format_as_btree_internal` to accept an optional `rightmost_child_block` argument and initialize it; keep `slot_count` zero on empty nodes.
-- Adjust internal inserts/splits to maintain header rightmost child after redistribution:
-  - Left header rightmost = left’s final child; right header rightmost = right’s final child.
-  - Median key pushed up separates those child sets.
-- Refresh tests: root-init asserts zero slots plus set `rightmost_child_block`; add search coverage where `search_key` exceeds all separators; post-split asserts both sibling headers carry correct rightmost children.
+## Next Steps: Textbook Internal Separator Layout (agreed design)
+
+Invariants (left-closed, right-open): with separator keys `K0..Kk-1` and children `C0..Ck`:
+- `C0` holds keys < `K0`
+- For `1 <= i < k`: `Ci` holds keys >= `K{i-1}` and < `Ki`
+- `Ck` holds keys >= `K{k-1}`
+
+On-page mapping:
+- Internal entry payload stays `(key, child_left)`. Entry `i` stores `Ki` and `child_left = Ci`.
+- Header stores `rightmost_child_block = Ck`.
+- Implicit children array: `[entry[0].child, entry[1].child, ..., entry[k-1].child, header.rightmost]`.
+- No dummy min-key entry; empty node has `slot_count = 0` and `rightmost_child_block` set to its only child.
+
+Split contract:
+- Child split returns `SplitResult { sep_key, left_block, right_block }`.
+- Parent inserts `sep_key` where it belongs; the separator’s *left* child is `left_block`; the child immediately to the right of the separator becomes `right_block`.
+
+Insert rewiring inside an internal page:
+- API: `insert_separator(key, right_child)` on `BTreeInternalPageZeroCopyMut` rewires children:
+  - Insert separator key at position `i` (binary search).
+  - Let `right_child` be the new child for the range >= key (from split sibling).
+  - If inserting at end: set header.rightmost = `right_child`.
+  - Else: swap `right_child` with the child currently at position `i` (the child to the right of the previous key), then shift subsequent entry.child values right by one; header.rightmost shifts if we insert before the end.
+- Search becomes: first key > target -> descend to that entry.child; else header.rightmost.
+
+Root/init:
+- `format_as_btree_internal(level, rightmost_child)` sets header.rightmost and leaves `slot_count = 0`; no sentinel entry.
+
+Planned code changes
+- `src/page.rs`
+  - Expose `rightmost_child_block` getters/setters through `BTreeInternalPageView{,Mut}`.
+  - Update `format_as_btree_internal(level, rightmost_child)` signature and call sites.
+  - Add `insert_separator(key, right_child)` (and helper to read/write child at position i and header rightmost) to maintain the implicit children array.
+- `src/btree.rs`
+  - Drop dummy min-entry on root creation; pass initial child via formatter.
+  - Update `find_child_block` to textbook search (no sentinel).
+  - Change leaf/internal split results to `SplitResult { sep_key, left_block, right_block }`; parent insert uses `insert_separator`.
+  - Update tests to reflect zero-slot root, rightmost-child header, and search > last key.
+
+## High Key + Right Sibling Plan (to be implemented)
+
+- Header changes
+  - Add `high_key_len: u16` and `high_key_off: u16` to leaf/internal headers (reuse reserved bytes; header size may grow).
+  - Keep `right_sibling_block` (`u32::MAX` sentinel = none).
+
+- Storage of high key
+  - High key = exclusive upper bound for the page.
+  - Store bytes at `high_key_off`, length `high_key_len`.
+  - When setting a new high key: compact payload first (so free space is contiguous), compute `off = free_upper - len`, write bytes there, set `high_key_off/len`, then set `free_upper = off`.
+  - Rightmost page: `high_key_len = 0`, `high_key_off = 0` (means +∞).
+
+- Split wiring
+  - `sep` = first key of right sibling after split.
+  - Left page: `high_key = sep`, `right_sibling_block = new_sibling`.
+  - Right page: `high_key = previous upper bound` (or +∞ if rightmost), `right_sibling_block = old right link`.
+  - Parent already uses `sep` as separator; children array unchanged.
+
+- Search/iteration usage
+  - Add view helpers to decode high key; during search, if `high_key_len > 0` and `search_key >= high_key`, follow `right_sibling_block`.
+  - Leaf iterator/range scan: on end of page, follow `right_sibling_block` when present.
+
+- Tests needed
+  - Split tests: left high key = separator, left right_sibling set, right high key = +∞ when rightmost.
+  - Serialization round-trip of `high_key_len/off` and right_sibling.
+  - Search test where `search_key == high_key` hops right and finds the key.
+  - Iterator test that traverses across sibling link.
+
