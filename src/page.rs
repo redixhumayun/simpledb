@@ -4822,6 +4822,13 @@ mod btree_page_tests {
             .unwrap();
         page.insert_leaf_entry(&layout, Constant::Int(20), RID::new(2, 2))
             .unwrap();
+        // Set high key and right sibling metadata
+        {
+            let mut view = page.view_mut();
+            let hk: Vec<u8> = Constant::Int(25).try_into().unwrap();
+            view.write_high_key(&hk).unwrap();
+            view.set_right_sibling_block(7);
+        }
 
         // Serialize
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
@@ -4832,6 +4839,8 @@ mod btree_page_tests {
 
         // Verify metadata preserved
         assert_eq!(restored.overflow_block(), Some(123));
+        assert_eq!(restored.view().right_sibling(), Some(7));
+        assert_eq!(restored.view().high_key(&layout), Some(Constant::Int(25)));
         assert_eq!(restored.slot_count(), 2);
 
         // Verify entries preserved
@@ -4856,6 +4865,12 @@ mod btree_page_tests {
             .unwrap();
         page.insert_internal_entry(&layout, Constant::Int(60), 600)
             .unwrap();
+        // Set high key
+        {
+            let mut view = page.view_mut();
+            let hk: Vec<u8> = Constant::Int(90).try_into().unwrap();
+            view.write_high_key(&hk).unwrap();
+        }
 
         // Serialize
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
@@ -4867,6 +4882,7 @@ mod btree_page_tests {
         // Verify metadata
         assert_eq!(restored.btree_level(), 7);
         assert_eq!(restored.slot_count(), 2);
+        assert_eq!(restored.view().high_key(&layout), Some(Constant::Int(90)));
 
         // Verify entries
         let entry1 = restored
@@ -5779,6 +5795,33 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
             record_space: BTreeRecordSpace::new(layout.records, layout.base_offset),
         };
         Ok(page)
+    }
+
+    fn high_key_bytes(&self) -> Option<&[u8]> {
+        let len = self.header.high_key_len() as usize;
+        if len == 0 {
+            return None;
+        }
+        let off = self.header.high_key_off() as usize;
+        let start = off.checked_sub(self.record_space.base_offset)?;
+        self.record_space.bytes.get(start..start + len)
+    }
+
+    fn high_key(&self, _layout: &Layout) -> Option<Constant> {
+        let bytes = self.high_key_bytes()?;
+        if bytes.len() == 4 {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(bytes);
+            return Some(Constant::Int(i32::from_le_bytes(buf)));
+        }
+        if bytes.len() >= 4 {
+            let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+            let sbytes = bytes.get(4..4 + len)?;
+            if let Ok(s) = std::str::from_utf8(sbytes) {
+                return Some(Constant::String(s.to_string()));
+            }
+        }
+        None
     }
 
     fn slot_count(&self) -> usize {
