@@ -671,6 +671,7 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
 
+    #[allow(dead_code)]
     pub fn high_key_off(&self) -> u16 {
         u16::from_le_bytes(self.bytes[14..16].try_into().unwrap())
     }
@@ -3400,47 +3401,55 @@ impl<'a> BTreeLeafPageView<'a> {
         Ok(Self { guard, layout })
     }
 
-    fn build_view(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+    fn build_page(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
         BTreeLeafPageZeroCopy::new(self.guard.bytes())
     }
 
-    fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
-        self.build_view()
+    fn page(&self) -> BTreeLeafPageZeroCopy<'_> {
+        self.build_page()
             .expect("BTreeLeafPageView constructed with valid leaf page")
     }
 
     pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeLeafEntry> {
-        let view = self.build_view()?;
+        let view = self.build_page()?;
         let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
         BTreeLeafEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.view().find_slot_before(self.layout, search_key)
+        self.page().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.view().slot_count()
+        self.page().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.view()
+        self.page()
             .line_ptr(slot)
             .map(|lp| lp.is_live())
             .unwrap_or(false)
     }
 
     pub fn is_full(&self) -> bool {
-        self.view().is_full(self.layout)
+        self.page().is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.view().overflow_block()
+        self.page().overflow_block()
+    }
+
+    pub fn right_sibling_block(&self) -> Option<usize> {
+        self.page().right_sibling()
+    }
+
+    pub fn high_key(&self) -> Option<Constant> {
+        self.page().high_key(self.layout)
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
         BTreeLeafIterator::new(
-            self.build_view()
+            self.build_page()
                 .expect("BTreeLeafPageView constructed with valid leaf page"),
             self.layout,
         )
@@ -3512,6 +3521,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     pub fn right_sibling_block(&self) -> Option<usize> {
         self.page().right_sibling()
+    }
+
+    pub fn high_key(&self) -> Option<Constant> {
+        self.page().high_key(self.layout)
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
@@ -5336,12 +5349,10 @@ impl<'a> PageKind for BTreeLeafPageZeroCopy<'a> {
 
 impl<'a> BTreeLeafPageZeroCopy<'a> {
     fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
-        // Use shared parsing logic from PageKind trait
         let layout = Self::parse_layout(bytes)?;
 
         let header = BTreeLeafHeaderRef::new(layout.header);
 
-        // Additional B-tree-specific validation
         let free_upper = header.free_upper() as usize;
         let page_size = PAGE_SIZE_BYTES as usize;
         if free_upper < header.free_lower() as usize || free_upper > page_size {
@@ -5371,6 +5382,44 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
     fn entry_bytes(&self, slot: SlotId) -> Option<&'a [u8]> {
         let lp = self.line_ptr(slot)?;
         self.record_space.entry_bytes(lp)
+    }
+
+    fn right_sibling(&self) -> Option<usize> {
+        let raw = self.header.right_sibling();
+        if raw == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(raw as usize)
+        }
+    }
+
+    /// Raw high-key bytes if present.
+    fn high_key_bytes(&self) -> Option<&[u8]> {
+        let len = self.header.high_key_len() as usize;
+        if len == 0 {
+            return None;
+        }
+        let off = self.header.high_key_off() as usize;
+        let start = off.checked_sub(Self::HEADER_SIZE)?;
+        self.record_space.bytes.get(start..start + len)
+    }
+
+    /// Decode high key using leaf encoding (int or len+utf8 string).
+    fn high_key(&self, _layout: &Layout) -> Option<Constant> {
+        let bytes = self.high_key_bytes()?;
+        if bytes.len() == 4 {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(bytes);
+            return Some(Constant::Int(i32::from_le_bytes(buf)));
+        }
+        if bytes.len() >= 4 {
+            let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
+            let sbytes = bytes.get(4..4 + len)?;
+            if let Ok(s) = std::str::from_utf8(sbytes) {
+                return Some(Constant::String(s.to_string()));
+            }
+        }
+        None
     }
 
     fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
@@ -5424,15 +5473,6 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
 
     fn overflow_block(&self) -> Option<usize> {
         let raw = self.header.overflow_block();
-        if raw == 0xFFFF_FFFF {
-            None
-        } else {
-            Some(raw as usize)
-        }
-    }
-
-    fn right_sibling(&self) -> Option<usize> {
-        let raw = self.header.right_sibling();
         if raw == 0xFFFF_FFFF {
             None
         } else {

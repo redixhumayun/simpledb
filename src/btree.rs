@@ -767,14 +767,40 @@ impl BTreeLeaf {
             view.find_slot_before(&search_key)
         };
 
-        Ok(Self {
+        let mut leaf = Self {
             txn,
             layout,
             search_key,
             current_block_id: block_id,
             current_slot,
             file_name,
-        })
+        };
+        leaf.hop_right_if_needed()?;
+        Ok(leaf)
+    }
+
+    /// Follow right siblings while search_key is >= this page's high key.
+    fn hop_right_if_needed(&mut self) -> Result<(), Box<dyn Error>> {
+        loop {
+            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let view = guard.into_btree_leaf_page_view(&self.layout)?;
+            let Some(hk) = view.high_key() else {
+                break;
+            };
+            if self.search_key < hk {
+                break;
+            }
+            let Some(rsib) = view.right_sibling_block() else {
+                break;
+            };
+            // move to sibling and recompute slot
+            self.current_block_id = BlockId::new(self.file_name.clone(), rsib);
+            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let view = guard.into_btree_leaf_page_view(&self.layout)?;
+            self.current_slot = view.find_slot_before(&self.search_key);
+            continue;
+        }
+        Ok(())
     }
 
     /// Advances to the next record that matches the search key
