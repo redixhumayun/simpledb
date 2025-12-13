@@ -3467,51 +3467,55 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         })
     }
 
-    fn build_view(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+    fn build_page(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
         BTreeLeafPageZeroCopy::new(self.guard.bytes())
-    }
-
-    fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
-        self.build_view()
-            .expect("BTreeLeafPageViewMut constructed with valid leaf page")
     }
 
     fn build_mut_page(&mut self) -> SimpleDBResult<BTreeLeafPageZeroCopyMut<'_>> {
         BTreeLeafPageZeroCopyMut::new(self.guard.bytes_mut())
     }
 
+    fn page(&self) -> BTreeLeafPageZeroCopy<'_> {
+        self.build_page()
+            .expect("BTreeLeafPageViewMut constructed with valid leaf page")
+    }
+
     // Read operations
     pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeLeafEntry> {
-        let view = self.build_view()?;
+        let view = self.build_page()?;
         let bytes = view.entry_bytes(slot).ok_or("slot not found or not live")?;
         BTreeLeafEntry::decode(self.layout, bytes)
     }
 
     pub fn find_slot_before(&self, search_key: &Constant) -> Option<SlotId> {
-        self.view().find_slot_before(self.layout, search_key)
+        self.page().find_slot_before(self.layout, search_key)
     }
 
     pub fn slot_count(&self) -> usize {
-        self.view().slot_count()
+        self.page().slot_count()
     }
 
     pub fn is_slot_live(&self, slot: SlotId) -> bool {
-        self.view()
+        self.page()
             .line_ptr(slot)
             .map(|lp| lp.is_live())
             .unwrap_or(false)
     }
 
     pub fn is_full(&self) -> bool {
-        self.view().is_full(self.layout)
+        self.page().is_full(self.layout)
     }
 
     pub fn overflow_block(&self) -> Option<usize> {
-        self.view().overflow_block()
+        self.page().overflow_block()
+    }
+
+    pub fn right_sibling_block(&self) -> Option<usize> {
+        self.page().right_sibling()
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
-        BTreeLeafIterator::new(self.view(), self.layout)
+        BTreeLeafIterator::new(self.page(), self.layout)
     }
 
     // Write operations
@@ -5420,6 +5424,15 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
 
     fn overflow_block(&self) -> Option<usize> {
         let raw = self.header.overflow_block();
+        if raw == 0xFFFF_FFFF {
+            None
+        } else {
+            Some(raw as usize)
+        }
+    }
+
+    fn right_sibling(&self) -> Option<usize> {
+        let raw = self.header.right_sibling();
         if raw == 0xFFFF_FFFF {
             None
         } else {

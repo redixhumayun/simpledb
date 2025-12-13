@@ -729,6 +729,9 @@ impl BTreeLeaf {
         new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
+        // Preserve old right sibling so we can re-chain after the split.
+        let old_right = orig_view.right_sibling_block();
+
         // Move entries split_slot..end to new page
         while split_slot < orig_view.slot_count() {
             let entry = orig_view.get_entry(split_slot)?.clone();
@@ -742,7 +745,7 @@ impl BTreeLeaf {
         // Left high key = separator, right link = new page (reuse existing guard)
         orig_view.set_high_key(&sep_bytes)?;
         orig_view.set_right_sibling_block(Some(new_block_id.block_num))?;
-        // Right high key = +inf sentinel
+        new_view.set_right_sibling_block(old_right.map(|b| b as usize))?;
         new_view.clear_high_key()?;
 
         Ok(new_block_id)
