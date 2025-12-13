@@ -376,6 +376,12 @@ impl BTreeInternal {
             new_view.insert_entry(k, right_child)?;
         }
 
+        // Set high keys: left gets separator (first key of right), right = +∞ sentinel
+        let sep_key = new_view.get_entry(0)?.key.clone();
+        let sep_bytes: Vec<u8> = sep_key.try_into()?;
+        orig_view.set_high_key(&sep_bytes)?;
+        new_view.clear_high_key()?;
+
         Ok(new_block_id)
     }
 
