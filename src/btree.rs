@@ -998,6 +998,116 @@ mod btree_internal_tests {
         let result = internal.find_child_block(&Constant::Int(15)).unwrap();
         assert_eq!(result.block_num, 2); // Rightmost entry
     }
+
+    #[test]
+    fn test_internal_split_preserves_child_invariants() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let (txn, internal) = setup_internal_node(&db);
+
+        // Insert entries until split occurs
+        // Use predictable pattern: key=i*10, child=i*100
+        let mut entries_inserted = 0;
+        let split = loop {
+            let key = Constant::Int(entries_inserted * 10);
+            let child = (entries_inserted * 100) as usize;
+            let entry = BTreeInternalEntry {
+                key: key.clone(),
+                child_block: child,
+            };
+
+            let split_result = internal.insert_entry(entry).unwrap();
+            entries_inserted += 1;
+
+            if let Some(s) = split_result {
+                break s;
+            }
+
+            assert!(entries_inserted < 1000, "should split before 1000 entries");
+        };
+
+        // Verify the split result structure
+        assert_eq!(split.left_block, internal.block_id.block_num);
+        assert!(split.right_block > split.left_block);
+
+        // Read left page and verify child invariants
+        let left_guard = txn.pin_read_guard(&internal.block_id);
+        let left_view = BTreeInternalPageView::new(left_guard, &internal.layout).unwrap();
+
+        // Verify left page structure
+        assert!(left_view.slot_count() > 0, "left page should have entries");
+        let left_count = left_view.slot_count();
+
+        // Check each entry in left page
+        for i in 0..left_count {
+            let entry = left_view.get_entry(i).unwrap();
+            // Verify entry exists
+            assert!(
+                matches!(entry.key, Constant::Int(_)),
+                "left entry {} should have int key",
+                i
+            );
+        }
+
+        // Verify left has rightmost child
+        assert!(
+            left_view.rightmost_child_block().is_some(),
+            "left page must have rightmost child"
+        );
+
+        // Read right page and verify child invariants
+        let right_block = BlockId::new(internal.file_name.clone(), split.right_block);
+        let right_guard = txn.pin_read_guard(&right_block);
+        let right_view = BTreeInternalPageView::new(right_guard, &internal.layout).unwrap();
+
+        // Verify right page structure
+        assert!(right_view.slot_count() > 0, "right page should have entries");
+        let right_count = right_view.slot_count();
+
+        // Verify first key of right page equals separator
+        let right_first = right_view.get_entry(0).unwrap();
+        assert_eq!(
+            right_first.key, split.sep_key,
+            "right page first key should equal separator"
+        );
+
+        // Check each entry in right page
+        for i in 0..right_count {
+            let entry = right_view.get_entry(i).unwrap();
+            assert!(
+                matches!(entry.key, Constant::Int(_)),
+                "right entry {} should have int key",
+                i
+            );
+        }
+
+        // Verify right has rightmost child
+        assert!(
+            right_view.rightmost_child_block().is_some(),
+            "right page must have rightmost child"
+        );
+
+        // Verify pages have reasonable distribution
+        assert!(left_count > 0 && right_count > 0, "both pages should have entries after split");
+
+        // Verify total entry count is preserved (all entries plus separator should equal original)
+        // Note: The separator IS the first key of right page, not a separate entry
+        let total_entries_after = left_count + right_count;
+        assert_eq!(
+            total_entries_after, entries_inserted as usize,
+            "total entry count should be preserved (separator is first key of right page)"
+        );
+
+        // Verify separator is a valid key from the original set
+        if let Constant::Int(sep_val) = split.sep_key {
+            assert_eq!(
+                sep_val % 10,
+                0,
+                "separator should be a multiple of 10 from our test data"
+            );
+        } else {
+            panic!("separator should be an int");
+        }
+    }
 }
 
 /// The [BTreeLeaf] struct. This is the page that contains all the actual pointers to [RID] in the heap tables
