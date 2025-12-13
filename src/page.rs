@@ -5797,6 +5797,7 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
         Ok(page)
     }
 
+    #[cfg(test)]
     fn high_key_bytes(&self) -> Option<&[u8]> {
         let len = self.header.high_key_len() as usize;
         if len == 0 {
@@ -5807,6 +5808,7 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
         self.record_space.bytes.get(start..start + len)
     }
 
+    #[cfg(test)]
     fn high_key(&self, _layout: &Layout) -> Option<Constant> {
         let bytes = self.high_key_bytes()?;
         if bytes.len() == 4 {

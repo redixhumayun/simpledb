@@ -1,8 +1,10 @@
 use std::{error::Error, sync::Arc};
 
+#[cfg(test)]
+use crate::page::BTreeLeafEntry;
 use crate::{
     debug,
-    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeLeafEntry},
+    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
     BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
 };
 
@@ -82,6 +84,7 @@ impl BTreeIndex {
 }
 
 /// Range iterator that walks leaf pages via right-sibling links.
+#[cfg(test)]
 pub struct BTreeRangeIter<'a> {
     txn: Arc<Transaction>,
     layout: &'a Layout,
@@ -92,6 +95,7 @@ pub struct BTreeRangeIter<'a> {
     upper: Option<&'a Constant>,
 }
 
+#[cfg(test)]
 impl<'a> BTreeRangeIter<'a> {
     /// Start at the leaf/block/slot computed by caller; `start_slot` is typically
     /// `find_slot_before(lower)` result (or None to start at first live slot).
@@ -116,6 +120,7 @@ impl<'a> BTreeRangeIter<'a> {
     }
 }
 
+#[cfg(test)]
 impl<'a> Iterator for BTreeRangeIter<'a> {
     type Item = BTreeLeafEntry;
 
@@ -137,7 +142,10 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
 
             let slot_start = match self.current_slot {
                 Some(s) => s,
-                None => view.find_slot_before(self.lower).map(|s| s + 1).unwrap_or(0),
+                None => view
+                    .find_slot_before(self.lower)
+                    .map(|s| s + 1)
+                    .unwrap_or(0),
             };
 
             for slot in slot_start..view.slot_count() {
@@ -259,6 +267,26 @@ mod btree_index_tests {
         BTreeIndex::new(Arc::clone(&tx), &index_name, layout).unwrap()
     }
 
+    /// Insert ascending keys until the leaf file reaches `target_blocks` size.
+    /// Returns the next key that would be inserted after completion.
+    fn insert_until_leaf_blocks(
+        index: &mut BTreeIndex,
+        target_blocks: usize,
+        mut next_key: i32,
+    ) -> i32 {
+        let cap = 10_000;
+        while index.txn.size(&index.leaf_table_name) < target_blocks {
+            index.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
+            next_key += 1;
+            assert!(
+                next_key < cap,
+                "insert_until_leaf_blocks exceeded safety cap without reaching {} blocks",
+                target_blocks
+            );
+        }
+        next_key
+    }
+
     #[test]
     fn test_btree_index_construction() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
@@ -352,9 +380,7 @@ mod btree_index_tests {
         let mut index = setup_index(&db);
 
         // Insert enough values to force splits
-        for i in 0..24 {
-            index.insert(&Constant::Int(i), &RID::new(1, i as usize));
-        }
+        let _ = insert_until_leaf_blocks(&mut index, 2, 0);
 
         // Verify we can still find values after splits
         for i in 0..24 {
@@ -362,6 +388,90 @@ mod btree_index_tests {
             assert!(index.next());
             assert_eq!(index.get_data_rid(), RID::new(1, i as usize));
         }
+    }
+
+    #[test]
+    fn test_range_iterator_across_siblings() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let mut index = setup_index(&db);
+
+        // Force multiple splits (aim for 4 leaf blocks)
+        let next_key = insert_until_leaf_blocks(&mut index, 4, 0);
+
+        // Unbounded range
+        let lower = Constant::Int(0);
+        let start = {
+            let mut root = BTreeInternal::new(
+                Arc::clone(&index.txn),
+                index.root_block.clone(),
+                index.internal_layout.clone(),
+                index.root_block.filename.clone(),
+            );
+            let blk = root.search(&lower).unwrap();
+            let block_id = BlockId::new(index.leaf_table_name.clone(), blk);
+            let slot = {
+                let guard = index.txn.pin_read_guard(&block_id);
+                let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
+                view.find_slot_before(&lower)
+            };
+            (block_id, slot)
+        };
+        let iter = BTreeRangeIter::new(
+            Arc::clone(&index.txn),
+            &index.leaf_layout,
+            &index.leaf_table_name,
+            start.0.clone(),
+            start.1,
+            &lower,
+            None,
+        );
+        let collected: Vec<i32> = iter
+            .map(|e| match e.key {
+                Constant::Int(v) => v,
+                _ => panic!("expected int keys"),
+            })
+            .collect();
+        let expected: Vec<i32> = (0..next_key).collect();
+        assert_eq!(collected, expected);
+
+        // Bounded range [10,50)
+        let lower_b = Constant::Int(10);
+        let upper_b = Constant::Int(50);
+        let start_b = {
+            let mut root = BTreeInternal::new(
+                Arc::clone(&index.txn),
+                index.root_block.clone(),
+                index.internal_layout.clone(),
+                index.root_block.filename.clone(),
+            );
+            let blk = root.search(&lower_b).unwrap();
+            let block_id = BlockId::new(index.leaf_table_name.clone(), blk);
+            let slot = {
+                let guard = index.txn.pin_read_guard(&block_id);
+                let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
+                view.find_slot_before(&lower_b)
+            };
+            (block_id, slot)
+        };
+        let iter_b = BTreeRangeIter::new(
+            Arc::clone(&index.txn),
+            &index.leaf_layout,
+            &index.leaf_table_name,
+            start_b.0,
+            start_b.1,
+            &lower_b,
+            Some(&upper_b),
+        );
+        let collected_b: Vec<i32> = iter_b
+            .map(|e| match e.key {
+                Constant::Int(v) => v,
+                _ => panic!("expected int keys"),
+            })
+            .collect();
+        assert!(collected_b.iter().all(|&v| v >= 10 && v < 50));
+        let mut sorted_b = collected_b.clone();
+        sorted_b.sort();
+        assert_eq!(collected_b, sorted_b);
     }
 
     #[test]
