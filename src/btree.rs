@@ -2,7 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use crate::{
     debug,
-    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
+    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeLeafEntry},
     BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
 };
 
@@ -78,6 +78,89 @@ impl BTreeIndex {
     /// Returns the name of this index
     pub fn index_name(&self) -> &str {
         &self.index_name
+    }
+}
+
+/// Range iterator that walks leaf pages via right-sibling links.
+pub struct BTreeRangeIter<'a> {
+    txn: Arc<Transaction>,
+    layout: &'a Layout,
+    file_name: &'a str,
+    current_block: Option<BlockId>,
+    current_slot: Option<usize>,
+    lower: &'a Constant,
+    upper: Option<&'a Constant>,
+}
+
+impl<'a> BTreeRangeIter<'a> {
+    /// Start at the leaf/block/slot computed by caller; `start_slot` is typically
+    /// `find_slot_before(lower)` result (or None to start at first live slot).
+    pub fn new(
+        txn: Arc<Transaction>,
+        layout: &'a Layout,
+        file_name: &'a str,
+        start_block: BlockId,
+        start_slot: Option<usize>,
+        lower: &'a Constant,
+        upper: Option<&'a Constant>,
+    ) -> Self {
+        Self {
+            txn,
+            layout,
+            file_name,
+            current_block: Some(start_block),
+            current_slot: start_slot,
+            lower,
+            upper,
+        }
+    }
+}
+
+impl<'a> Iterator for BTreeRangeIter<'a> {
+    type Item = BTreeLeafEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let block = self.current_block.clone()?;
+            let guard = self.txn.pin_read_guard(&block);
+            let view = guard.into_btree_leaf_page_view(&self.layout).ok()?;
+
+            // Hop right if we’re past this page’s high key
+            if let Some(hk) = view.high_key() {
+                if *self.lower >= hk {
+                    let rsib = view.right_sibling_block()?;
+                    self.current_block = Some(BlockId::new(self.file_name.to_string(), rsib));
+                    self.current_slot = None;
+                    continue;
+                }
+            }
+
+            let slot_start = match self.current_slot {
+                Some(s) => s,
+                None => view.find_slot_before(self.lower).map(|s| s + 1).unwrap_or(0),
+            };
+
+            for slot in slot_start..view.slot_count() {
+                if let Ok(entry) = view.get_entry(slot) {
+                    if entry.key < *self.lower {
+                        continue;
+                    }
+                    if let Some(ref up) = self.upper {
+                        if entry.key >= **up {
+                            self.current_block = None;
+                            return None;
+                        }
+                    }
+                    self.current_slot = Some(slot + 1);
+                    return Some(entry);
+                }
+            }
+
+            // end of page: follow sibling
+            let rsib = view.right_sibling_block()?;
+            self.current_block = Some(BlockId::new(self.file_name.to_string(), rsib));
+            self.current_slot = None;
+        }
     }
 }
 
