@@ -363,6 +363,127 @@ mod btree_index_tests {
             assert_eq!(index.get_data_rid(), RID::new(1, i as usize));
         }
     }
+
+    #[test]
+    fn test_leaf_split_headers_and_sibling_chain() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let mut index = setup_index(&db);
+
+        // Grow until first split (two leaf pages exist)
+        let mut i = 0;
+        while index.txn.size(&index.leaf_table_name) < 2 && i < 1000 {
+            index.insert(&Constant::Int(i as i32), &RID::new(1, i));
+            i += 1;
+        }
+        assert!(
+            index.txn.size(&index.leaf_table_name) >= 2,
+            "expected at least one split to create a second leaf"
+        );
+
+        // Read both leaves
+        let left_id = BlockId::new(index.leaf_table_name.clone(), 0);
+        {
+            let left_view = index
+                .txn
+                .pin_read_guard(&left_id)
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .unwrap();
+            let rsib = left_view
+                .right_sibling_block()
+                .expect("left page should link to split sibling");
+            let right_id = BlockId::new(index.leaf_table_name.clone(), rsib);
+            let right_view = index
+                .txn
+                .pin_read_guard(&right_id)
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .unwrap();
+            let right_first = right_view.get_entry(0).unwrap().key;
+
+            assert_eq!(rsib, 1, "first split should append sibling at block 1");
+            assert_eq!(
+                left_view.high_key(),
+                Some(right_first.clone()),
+                "left high key should equal right's first key"
+            );
+            assert_eq!(left_view.right_sibling_block(), Some(rsib));
+            assert_eq!(right_view.high_key(), None);
+            assert_eq!(right_view.right_sibling_block(), None);
+        }
+
+        // Continue inserting until a second split creates a third leaf
+        while index.txn.size(&index.leaf_table_name) < 3 && i < 2000 {
+            index.insert(&Constant::Int(i as i32), &RID::new(1, i));
+            i += 1;
+        }
+        assert!(
+            index.txn.size(&index.leaf_table_name) >= 3,
+            "expected a second split to create a third leaf"
+        );
+
+        {
+            // Follow sibling pointers from block 0 to gather the chain
+            let mut blocks = vec![0usize];
+            let mut current = 0usize;
+            while blocks.len() < 5 {
+                let view = index
+                    .txn
+                    .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), current))
+                    .into_btree_leaf_page_view(&index.leaf_layout)
+                    .unwrap();
+                if let Some(rs) = view.right_sibling_block() {
+                    blocks.push(rs);
+                    current = rs;
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(
+                blocks.len(),
+                3,
+                "expected two splits to yield a chain of three leaves, got {:?}",
+                blocks
+            );
+
+            let l0 = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[0]))
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .unwrap();
+            let l1 = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[1]))
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .unwrap();
+            let l2 = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[2]))
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .unwrap();
+
+            let l1_first = l1.get_entry(0).unwrap().key;
+            let l2_first = l2.get_entry(0).unwrap().key;
+
+            assert_eq!(
+                l0.high_key(),
+                Some(l1_first.clone()),
+                "leftmost high key should match l1 first key"
+            );
+            assert_eq!(l0.right_sibling_block(), Some(blocks[1]));
+            assert_eq!(
+                l1.high_key(),
+                Some(l2_first.clone()),
+                "middle high key should match l2 first key"
+            );
+            assert_eq!(l1.right_sibling_block(), Some(blocks[2]));
+            assert_eq!(l2.high_key(), None);
+            assert_eq!(l2.right_sibling_block(), None);
+
+            // All pages should have at least one entry, ensuring splits distributed records
+            assert!(l0.slot_count() > 0);
+            assert!(l1.slot_count() > 0);
+            assert!(l2.slot_count() > 0);
+        }
+    }
 }
 
 /// The general format of the BTreePage

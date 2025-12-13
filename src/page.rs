@@ -5400,7 +5400,11 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
             return None;
         }
         let off = self.header.high_key_off() as usize;
-        let start = off.checked_sub(Self::HEADER_SIZE)?;
+        assert!(
+            off >= self.record_space.base_offset,
+            "high key offset must be within record space"
+        );
+        let start = off.checked_sub(self.record_space.base_offset)?;
         self.record_space.bytes.get(start..start + len)
     }
 
