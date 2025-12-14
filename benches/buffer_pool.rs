@@ -29,9 +29,14 @@ fn precreate_blocks(db: &SimpleDB, file: &str, count: usize) {
 
     for block_num in 0..count {
         let mut page = Page::new();
-        page.set_int(0, block_num as i32);
+        write_i32_at(page.bytes_mut(), 60, block_num as i32);
         file_manager.write(&BlockId::new(file.clone(), block_num), &mut page);
     }
+}
+
+fn write_i32_at(bytes: &mut [u8], offset: usize, value: i32) {
+    let le = value.to_le_bytes();
+    bytes[offset..offset + 4].copy_from_slice(&le);
 }
 
 fn partition_work(total: usize, workers: usize) -> Vec<usize> {
@@ -399,7 +404,7 @@ fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> Bench
         let block_id = BlockId::new(test_file.clone(), i);
         // Pin the block first, then modify it
         let mut guard = txn.pin_write_guard(&block_id);
-        guard.set_int(0, 999);
+        write_i32_at(guard.bytes_mut(), 60, 999);
         guard.mark_modified(txn.id(), Lsn::MAX);
     }
     // Don't commit - keeps buffers dirty and pinned by this transaction
@@ -776,7 +781,7 @@ fn run_fixed_workload_with_pool_size(
     for i in 0..working_set_size {
         let block_id = BlockId::new(test_file.clone(), i);
         let mut page = Page::new();
-        page.set_int(0, i as i32);
+        write_i32_at(page.bytes_mut(), 60, i as i32);
         db.file_manager.lock().unwrap().write(&block_id, &mut page);
     }
 

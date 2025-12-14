@@ -35,7 +35,10 @@ mod intrusive_dll;
 mod page;
 mod parser;
 mod replacement;
-use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{
+    BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut, PageReadGuard, PageType,
+    PageWriteGuard, WalPage,
+};
 
 use replacement::PolicyState;
 
@@ -8195,6 +8198,26 @@ impl Constant {
     }
 }
 
+impl TryInto<Vec<u8>> for Constant {
+    type Error = Box<dyn Error>;
+
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        let mut buf = Vec::new();
+        match self {
+            Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            Constant::String(s) => {
+                let len: u32 = s
+                    .len()
+                    .try_into()
+                    .map_err(|_| "string too long to encode as high key".to_string())?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+        }
+        Ok(buf)
+    }
+}
+
 pub type RowValues = Vec<Constant>;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -8429,17 +8452,18 @@ pub struct Layout {
 }
 
 impl Layout {
+    const INT_BYTES: usize = 4;
     pub fn new(schema: Schema) -> Self {
         let mut offsets = HashMap::new();
         let mut column_index = HashMap::new();
-        let mut offset = Page::INT_BYTES;
+        let mut offset = Self::INT_BYTES;
         for (idx, field) in schema.fields.iter().enumerate() {
             let field_info = schema.info.get(field).unwrap();
             column_index.insert(field.clone(), idx);
             offsets.insert(field.clone(), offset);
             match field_info.field_type {
                 FieldType::Int => offset += field_info.length,
-                FieldType::String => offset += Page::INT_BYTES + field_info.length,
+                FieldType::String => offset += Self::INT_BYTES + field_info.length,
             }
         }
 
@@ -8536,6 +8560,7 @@ impl Default for Schema {
 }
 
 impl Schema {
+    const INT_BYTES: usize = 4;
     pub fn new() -> Self {
         Schema {
             fields: Vec::new(),
@@ -8552,7 +8577,7 @@ impl Schema {
     }
 
     fn add_int_field(&mut self, field_name: &str) {
-        self.add_field(field_name, FieldType::Int, Page::INT_BYTES);
+        self.add_field(field_name, FieldType::Int, Self::INT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
@@ -8816,25 +8841,88 @@ mod transaction_tests {
     use std::{error::Error, sync::Arc, thread::JoinHandle, time::Duration};
 
     use crate::{
+        page::{PageReadGuard, PageWriteGuard},
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, BufferHandle, LogRecord, Lsn, SimpleDB, Transaction,
+        BlockId, BufferHandle, Constant, Layout, LogRecord, Schema, SimpleDB, Transaction,
     };
+
+    const TXN_INT_FIELD: &str = "txn_int";
+    const TXN_STR_FIELD: &str = "txn_str";
+    const TXN_STR_LEN: usize = 64;
+    const TXN_SLOT: usize = 0;
+
+    fn txn_test_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(TXN_INT_FIELD);
+        schema.add_string_field(TXN_STR_FIELD, TXN_STR_LEN);
+        Layout::new(schema)
+    }
+
+    struct TxnRowSnapshot {
+        int_val: i32,
+        str_val: String,
+        int_offset: usize,
+        str_offset: usize,
+    }
+
+    fn overwrite_txn_row(
+        mut guard: PageWriteGuard<'_>,
+        layout: &Layout,
+        int_val: i32,
+        str_val: &str,
+    ) {
+        guard.format_as_heap();
+        let mut view = guard
+            .into_heap_view_mut(layout)
+            .expect("heap page view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("allocate txn row");
+        assert_eq!(slot, TXN_SLOT);
+        row_mut
+            .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
+            .expect("set txn int");
+        row_mut
+            .set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
+            .expect("set txn string");
+    }
+
+    fn maybe_snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> Option<TxnRowSnapshot> {
+        let view = guard.into_heap_view(layout).ok()?;
+        let row = view.row(TXN_SLOT)?;
+        let int_val = match row.get_column(TXN_INT_FIELD)? {
+            Constant::Int(v) => v,
+            _ => return None,
+        };
+        let str_val = match row.get_column(TXN_STR_FIELD)? {
+            Constant::String(s) => s,
+            _ => return None,
+        };
+        let int_offset = view.column_page_offset(TXN_SLOT, TXN_INT_FIELD)?;
+        let str_offset = view.column_page_offset(TXN_SLOT, TXN_STR_FIELD)?;
+        Some(TxnRowSnapshot {
+            int_val,
+            str_val,
+            int_offset,
+            str_offset,
+        })
+    }
+
+    fn snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> TxnRowSnapshot {
+        maybe_snapshot_txn_row(guard, layout).expect("txn row must exist")
+    }
 
     #[test]
     fn test_transaction_single_threaded() {
         let file = generate_filename();
 
         let (test_db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = txn_test_layout();
 
         //  Start a transaction t1 that will set an int and a string
         let t1 = test_db.new_tx();
         let block_id = t1.append(&file);
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 1);
-            guard.set_string(40, "one");
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 1, "one");
         }
         t1.commit().unwrap();
 
@@ -8842,52 +8930,41 @@ mod transaction_tests {
         //  Set new values in this transaction
         let t2 = test_db.new_tx();
         {
-            let guard = t2.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 1);
-            assert_eq!(guard.get_string(40), "one");
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 1);
+            assert_eq!(snapshot.str_val, "one");
         }
         {
-            let mut guard = t2.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 2);
-            guard.set_string(40, "two");
-            guard.mark_modified(t2.id(), Lsn::MAX);
+            let guard = t2.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 2, "two");
         }
         t2.commit().unwrap();
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
         let t3 = test_db.new_tx();
-        let (old_int, old_str) = {
-            let guard = t3.pin_read_guard(&block_id);
-            let val = guard.get_int(80);
-            let s = guard.get_string(40);
-            assert_eq!(val, 2);
-            assert_eq!(s, "two");
-            (val, s)
-        };
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        assert_eq!(snapshot.int_val, 2);
+        assert_eq!(snapshot.str_val, "two");
         LogRecord::SetInt {
             txnum: t3.id(),
             block_id: block_id.clone(),
-            offset: 80,
-            old_val: old_int,
+            offset: snapshot.int_offset,
+            old_val: snapshot.int_val,
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         LogRecord::SetString {
             txnum: t3.id(),
             block_id: block_id.clone(),
-            offset: 40,
-            old_val: old_str.clone(),
+            offset: snapshot.str_offset,
+            old_val: snapshot.str_val.clone(),
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         {
-            let mut guard = t3.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 3);
-            guard.set_string(40, "three");
-            guard.mark_modified(t3.id(), Lsn::MAX);
+            let guard = t3.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 3, "three");
         }
         t3.rollback().unwrap();
 
@@ -8895,9 +8972,9 @@ mod transaction_tests {
         //  This will be a read only transaction that commits
         let t4 = test_db.new_tx();
         {
-            let guard = t4.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 2);
-            assert_eq!(guard.get_string(40), "two");
+            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 2);
+            assert_eq!(snapshot.str_val, "two");
         }
         t4.commit().unwrap();
     }
@@ -8911,6 +8988,15 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = Arc::new(txn_test_layout());
+
+        // Initialize page so readers always see a formatted heap page.
+        {
+            let init_txn = test_db.new_tx();
+            let guard = init_txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "");
+            init_txn.commit().unwrap();
+        }
 
         let fm1 = Arc::clone(&test_db.file_manager);
         let lm1 = Arc::clone(&test_db.log_manager);
@@ -8925,23 +9011,20 @@ mod transaction_tests {
         let bid2 = block_id.clone();
 
         //  Create a read only transasction
+        let layout_reader = Arc::clone(&layout);
         let t1 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
-            let guard = txn.pin_read_guard(&bid1);
-            guard.get_int(80);
-            guard.get_string(40);
+            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1), layout_reader.as_ref());
             txn.commit().unwrap();
         });
 
         //  Create a write only transaction
+        let layout_writer = Arc::clone(&layout);
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
-                let mut guard = txn.pin_write_guard(&bid2);
-                guard.format_as_heap();
-                guard.set_int(80, 1);
-                guard.set_string(40, "Hello");
-                guard.mark_modified(txn.id(), Lsn::MAX);
+                let guard = txn.pin_write_guard(&bid2);
+                overwrite_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
             //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
             //  The related GitHub issue is https://github.com/redixhumayun/simpledb/issues/63
@@ -8957,9 +9040,9 @@ mod transaction_tests {
             test_db.buffer_manager,
             test_db.lock_table,
         ));
-        let guard = txn.pin_read_guard(&block_id);
-        assert_eq!(guard.get_int(80), 1);
-        assert_eq!(guard.get_string(40), "Hello");
+        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id), layout.as_ref());
+        assert_eq!(snapshot.int_val, 1);
+        assert_eq!(snapshot.str_val, "Hello");
     }
 
     #[test]
@@ -8971,6 +9054,7 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = Arc::new(txn_test_layout());
 
         // Initialize data before spawning threads
         let init_txn = Arc::new(Transaction::new(
@@ -8980,11 +9064,8 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let mut guard = init_txn.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 0);
-            guard.set_string(40, "initial");
-            guard.mark_modified(init_txn.id(), Lsn::MAX);
+            let guard = init_txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "initial");
         }
         init_txn.commit().unwrap();
 
@@ -8997,14 +9078,15 @@ mod transaction_tests {
             let lt = Arc::clone(&test_db.lock_table);
             let bid = block_id.clone();
 
+            let layout_reader = Arc::clone(&layout);
             handles.push(std::thread::spawn(move || {
                 let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
 
-                let guard = txn.pin_read_guard(&bid);
-                let val = guard.get_int(80);
+                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid), layout_reader.as_ref());
+                let val = snapshot.int_val;
                 assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
 
-                let s = guard.get_string(40);
+                let s = snapshot.str_val;
                 assert!(
                     s == "initial" || s == "final",
                     "Read invalid string value: {}",
@@ -9022,11 +9104,8 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 42);
-            guard.set_string(40, "final");
-            guard.mark_modified(txn.id(), Lsn::MAX);
+            let guard = txn.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 42, "final");
         }
         txn.commit().unwrap();
 
@@ -9042,9 +9121,9 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = final_txn.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 42);
-            assert_eq!(guard.get_string(40), "final");
+            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id), layout.as_ref());
+            assert_eq!(snapshot.int_val, 42);
+            assert_eq!(snapshot.str_val, "final");
         }
         final_txn.commit().unwrap();
     }
@@ -9057,6 +9136,7 @@ mod transaction_tests {
             let txn = test_db.new_tx();
             txn.append(&file)
         };
+        let layout = txn_test_layout();
 
         // Setup initial state
         let t1 = Arc::new(Transaction::new(
@@ -9066,11 +9146,8 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 100);
-            guard.set_string(40, "initial");
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 100, "initial");
         }
         t1.commit().unwrap();
 
@@ -9081,32 +9158,26 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let (orig_int, orig_str) = {
-            let guard = t2.pin_read_guard(&block_id);
-            (guard.get_int(80), guard.get_string(40))
-        };
+        let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
         LogRecord::SetInt {
             txnum: t2.id(),
             block_id: block_id.clone(),
-            offset: 80,
-            old_val: orig_int,
+            offset: snapshot.int_offset,
+            old_val: snapshot.int_val,
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         LogRecord::SetString {
             txnum: t2.id(),
             block_id: block_id.clone(),
-            offset: 40,
-            old_val: orig_str.clone(),
+            offset: snapshot.str_offset,
+            old_val: snapshot.str_val.clone(),
         }
         .write_log_record(Arc::clone(&test_db.log_manager))
         .unwrap();
         {
-            let mut guard = t2.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 200);
-            guard.set_string(40, "modified");
-            guard.mark_modified(t2.id(), Lsn::MAX);
+            let guard = t2.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
         t2.rollback().unwrap();
@@ -9118,9 +9189,9 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let guard = t3.pin_read_guard(&block_id);
-        assert_eq!(guard.get_int(80), 100);
-        assert_eq!(guard.get_string(40), "initial");
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        assert_eq!(snapshot.int_val, 100);
+        assert_eq!(snapshot.str_val, "initial");
     }
 
     /// Tests that concurrent read-modify-write transactions can succeed via retry logic under high lock contention.
@@ -9145,6 +9216,7 @@ mod transaction_tests {
         };
         let num_of_txns = 2;
         let max_retry_count = 150;
+        let layout = Arc::new(txn_test_layout());
 
         // Initialize data
         let t1 = Arc::new(Transaction::new(
@@ -9154,10 +9226,8 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let mut guard = t1.pin_write_guard(&block_id);
-            guard.format_as_heap();
-            guard.set_int(80, 0);
-            guard.mark_modified(t1.id(), Lsn::MAX);
+            let guard = t1.pin_write_guard(&block_id);
+            overwrite_txn_row(guard, layout.as_ref(), 0, "");
         }
         t1.commit().unwrap();
 
@@ -9174,6 +9244,7 @@ mod transaction_tests {
             let bid = block_id.clone();
             let tx = tx.clone();
 
+            let layout_clone = Arc::clone(&layout);
             handles.push(std::thread::spawn(move || {
                 let mut retry_count = 0;
                 let txn = Arc::new(Transaction::new(
@@ -9190,16 +9261,14 @@ mod transaction_tests {
                     match (|| -> Result<(), Box<dyn Error>> {
                         let val = {
                             let guard = txn.pin_read_guard(&bid);
-                            guard.get_int(80)
+                            snapshot_txn_row(guard, layout_clone.as_ref()).int_val
                         };
                         // Short sleep to increase chance of conflicts
                         std::thread::sleep(Duration::from_millis(10));
 
                         {
-                            let mut guard = txn.pin_write_guard(&bid);
-                            guard.format_as_heap();
-                            guard.set_int(80, val + 1);
-                            guard.mark_modified(txn.id(), Lsn::MAX);
+                            let guard = txn.pin_write_guard(&bid);
+                            overwrite_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
                         txn.commit()?;
                         tx.send(format!(
@@ -9271,14 +9340,15 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let guard = t_final.pin_read_guard(&block_id);
-        assert!(guard.get_int(80) == num_of_txns);
+        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id), layout.as_ref());
+        assert_eq!(snapshot.int_val, num_of_txns as i32);
     }
 
     #[test]
     fn test_transaction_durability() {
         let file = generate_filename();
         let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = txn_test_layout();
 
         //  Phase 1: Create and populate database and then drop it
         let block_id = {
@@ -9291,10 +9361,8 @@ mod transaction_tests {
             ));
             let block_id = t1.append(&file);
             {
-                let mut guard = t1.pin_write_guard(&block_id);
-                guard.format_as_heap();
-                guard.set_int(80, 100);
-                guard.mark_modified(t1.id(), Lsn::MAX);
+                let guard = t1.pin_write_guard(&block_id);
+                overwrite_txn_row(guard, &layout, 100, "");
             }
             t1.commit().unwrap();
             block_id
@@ -9311,8 +9379,8 @@ mod transaction_tests {
             ));
             t2.recover().unwrap();
 
-            let guard = t2.pin_read_guard(&block_id);
-            assert_eq!(guard.get_int(80), 100);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            assert_eq!(snapshot.int_val, 100);
         }
     }
 
@@ -10043,12 +10111,13 @@ impl TryFrom<Vec<u8>> for LogRecord {
 }
 
 impl LogRecord {
+    const INT_BYTES: usize = 4;
     // Size constants for different components
-    const DISCRIMINANT_SIZE: usize = Page::INT_BYTES;
-    const TXNUM_SIZE: usize = Page::INT_BYTES;
-    const OFFSET_SIZE: usize = Page::INT_BYTES;
-    const BLOCK_NUM_SIZE: usize = Page::INT_BYTES;
-    const STR_LEN_SIZE: usize = Page::INT_BYTES;
+    const DISCRIMINANT_SIZE: usize = Self::INT_BYTES;
+    const TXNUM_SIZE: usize = Self::INT_BYTES;
+    const OFFSET_SIZE: usize = Self::INT_BYTES;
+    const BLOCK_NUM_SIZE: usize = Self::INT_BYTES;
+    const STR_LEN_SIZE: usize = Self::INT_BYTES;
 
     fn calculate_size(&self) -> usize {
         let base_size = Self::DISCRIMINANT_SIZE; // Every record has a discriminant
@@ -10121,7 +10190,7 @@ impl LogRecord {
                 ..
             } => {
                 let mut guard = txn.pin_write_guard(block_id);
-                guard.set_int(*offset, *old_val);
+                Self::write_legacy_int(&mut guard, *offset, *old_val);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::SetString {
@@ -10131,10 +10200,27 @@ impl LogRecord {
                 ..
             } => {
                 let mut guard = txn.pin_write_guard(block_id);
-                guard.set_string(*offset, old_val);
+                Self::write_legacy_string(&mut guard, *offset, old_val);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
         }
+    }
+
+    fn write_legacy_int(guard: &mut PageWriteGuard<'_>, offset: usize, value: i32) {
+        let bytes = guard.bytes_mut();
+        let end = offset + Self::INT_BYTES;
+        bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_legacy_string(guard: &mut PageWriteGuard<'_>, offset: usize, value: &str) {
+        let bytes = guard.bytes_mut();
+        let len = value.len() as u32;
+        let len_bytes = len.to_le_bytes();
+        let len_end = offset + Self::INT_BYTES;
+        bytes[offset..len_end].copy_from_slice(&len_bytes);
+        let start = len_end;
+        let end = start + value.len();
+        bytes[start..end].copy_from_slice(value.as_bytes());
     }
 
     /// Serialize the log record to bytes and write it to the log file
@@ -10154,23 +10240,103 @@ impl LogRecord {
 mod recovery_manager_tests {
     use std::sync::Arc;
 
-    use crate::{LogRecord, RecoveryManager, SimpleDB};
+    use crate::{
+        BlockId, Constant, Layout, LogRecord, RecoveryManager, Schema, SimpleDB, Transaction,
+    };
+
+    const INT_FIELD: &str = "int_val";
+    const STR_FIELD: &str = "text_val";
+
+    fn recovery_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(INT_FIELD);
+        schema.add_string_field(STR_FIELD, 32);
+        Layout::new(schema)
+    }
+
+    fn init_row_with_int(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+        let mut guard = txn.pin_write_guard(block);
+        guard.format_as_heap();
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+        assert_eq!(slot, 0);
+        row_mut
+            .set_column(INT_FIELD, &Constant::Int(value))
+            .expect("set int value");
+    }
+
+    fn init_row_with_string(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
+        let mut guard = txn.pin_write_guard(block);
+        guard.format_as_heap();
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+        assert_eq!(slot, 0);
+        row_mut
+            .set_column(STR_FIELD, &Constant::String(value.to_string()))
+            .expect("set string value");
+    }
+
+    fn column_offset(
+        txn: &Arc<Transaction>,
+        block: &BlockId,
+        layout: &Layout,
+        field: &str,
+    ) -> usize {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        view.column_page_offset(0, field)
+            .expect("column offset available")
+    }
+
+    fn write_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+        let guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        row_mut
+            .set_column(INT_FIELD, &Constant::Int(value))
+            .expect("write int field");
+    }
+
+    fn write_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
+        let guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        row_mut
+            .set_column(STR_FIELD, &Constant::String(value.to_string()))
+            .expect("write string field");
+    }
+
+    fn read_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> i32 {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        let row = view.row(0).expect("row 0 exists");
+        match row.get_column(INT_FIELD) {
+            Some(Constant::Int(value)) => value,
+            other => panic!("expected int value, got {other:?}"),
+        }
+    }
+
+    fn read_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> String {
+        let guard = txn.pin_read_guard(block);
+        let view = guard.into_heap_view(layout).expect("heap view");
+        let row = view.row(0).expect("row 0 exists");
+        match row.get_column(STR_FIELD) {
+            Some(Constant::String(value)) => value,
+            other => panic!("expected string value, got {other:?}"),
+        }
+    }
 
     #[test]
     fn rollback_restores_int_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
+        let layout = recovery_layout();
 
         let filename = "recovery_int_test".to_string();
         let block = txn.append(&filename);
-        let offset = 0;
         let original = 1234;
-
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_int(offset, original);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        init_row_with_int(&txn, &block, &layout, original);
+        let offset = column_offset(&txn, &block, &layout, INT_FIELD);
 
         let recovery_manager = RecoveryManager::new(
             txn.id(),
@@ -10187,33 +10353,24 @@ mod recovery_manager_tests {
         .write_log_record(Arc::clone(&db.log_manager))
         .unwrap();
 
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_int(offset, 9999);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        write_int_field(&txn, &block, &layout, 9999);
 
         recovery_manager.rollback(&txn).unwrap();
 
-        let guard = txn.pin_read_guard(&block);
-        assert_eq!(guard.get_int(offset), original);
+        assert_eq!(read_int_field(&txn, &block, &layout), original);
     }
 
     #[test]
     fn rollback_restores_string_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
+        let layout = recovery_layout();
 
         let filename = "recovery_string_test".to_string();
         let block = txn.append(&filename);
-        let offset = 0;
         let original = "hello recovery".to_string();
-
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_string(offset, &original);
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        init_row_with_string(&txn, &block, &layout, &original);
+        let offset = column_offset(&txn, &block, &layout, STR_FIELD);
 
         let recovery_manager = RecoveryManager::new(
             txn.id(),
@@ -10230,16 +10387,11 @@ mod recovery_manager_tests {
         .write_log_record(Arc::clone(&db.log_manager))
         .unwrap();
 
-        {
-            let mut guard = txn.pin_write_guard(&block);
-            guard.set_string(offset, "corrupted value");
-            guard.mark_modified(txn.id(), crate::Lsn::MAX);
-        }
+        write_string_field(&txn, &block, &layout, "corrupted value");
 
         recovery_manager.rollback(&txn).unwrap();
 
-        let guard = txn.pin_read_guard(&block);
-        assert_eq!(guard.get_string(offset), original);
+        assert_eq!(read_string_field(&txn, &block, &layout), original);
     }
 }
 
@@ -10535,12 +10687,34 @@ impl BufferFrame {
         if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
             self.log_manager.lock().unwrap().flush_lsn(lsn);
             let mut page_guard = self.page.write().unwrap();
-            if cfg!(debug_assertions) {
-                page_guard.assert_layout_valid("buffer_flush_pre_write");
+            //  TODO: Get rid of pattern matching by bringing back compile time polymorphism on the Page type
+            match page_guard.peek_page_type().unwrap() {
+                PageType::Heap => {
+                    let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
+                }
+                PageType::IndexLeaf => {
+                    let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
+                }
+                PageType::IndexInternal => {
+                    let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
+                }
+                PageType::Overflow => {
+                    // CRC for overflow pages not implemented.
+                }
+                PageType::Meta => {
+                    let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
+                }
+                PageType::Free => {
+                    // Free pages are not flushed with CRC.
+                }
             }
-            page_guard
-                .compute_crc32()
-                .expect("failure while computing crc32");
+            // if cfg!(debug_assertions) {
+            //     page_guard.assert_layout_valid("buffer_flush_pre_write");
+            // }
             self.file_manager
                 .lock()
                 .unwrap()
@@ -10560,15 +10734,58 @@ impl BufferFrame {
             .lock()
             .unwrap()
             .read(block_id, &mut page_guard);
-        if cfg!(debug_assertions) {
-            page_guard.assert_layout_valid("buffer_assign_post_read");
+        // if cfg!(debug_assertions) {
+        //     page_guard.assert_layout_valid("buffer_assign_post_read");
+        // }
+        match page_guard.peek_page_type().unwrap() {
+            PageType::Heap => {
+                let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::Heap
+                    );
+                }
+            }
+            PageType::IndexLeaf => {
+                let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::IndexLeaf
+                    );
+                }
+            }
+            PageType::IndexInternal => {
+                let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
+                    panic!(
+                        "crc mistmatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::IndexInternal
+                    );
+                }
+            }
+            PageType::Overflow => {
+                // Overflow pages are not CRC-verified yet; accept as-is.
+            }
+            PageType::Meta => {
+                let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
+                    panic!(
+                        "crc mismatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::Meta
+                    );
+                }
+            }
+            PageType::Free => {
+                // Free pages are treated as uninitialized payload.
+            }
         }
-        if !page_guard
-            .verify_crc32()
-            .expect("failure while verifying checksum")
-        {
-            panic!("crc mistmatch for {:?}", block_id);
-        }
+
         meta.reset_pins();
         meta.txn = None;
         meta.lsn = None;
@@ -10966,135 +11183,134 @@ impl BufferManager {
 
 #[cfg(test)]
 mod buffer_manager_tests {
-    use std::thread;
+    use std::{sync::Arc, thread};
 
-    use crate::{BlockId, Page, SimpleDB};
+    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Schema, SimpleDB};
 
-    /// This test will assert that when the buffer pool swaps out a page from the buffer pool, it properly flushes those contents to disk
-    /// and can then correctly read them back later
+    const BUFFER_FIELD: &str = "val";
+
+    fn buffer_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(BUFFER_FIELD);
+        Layout::new(schema)
+    }
+
+    fn write_row(
+        buffer_manager: &Arc<BufferManager>,
+        layout: &Layout,
+        block_id: &BlockId,
+        value: i32,
+    ) {
+        let buffer = buffer_manager
+            .pin(block_id)
+            .expect("pin block for overwrite");
+        {
+            let mut page = buffer.write_page();
+            test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
+                .expect("initialize heap page");
+        }
+        buffer.set_modified(0, Lsn::MAX);
+        buffer_manager.unpin(buffer);
+    }
+
     #[test]
     fn test_buffer_replacement() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        let file_manager = Arc::clone(&db.file_manager);
         let buffer_manager = db.buffer_manager;
+        let layout = buffer_layout();
+        let file = "testfile".to_string();
 
-        //  Initialize the file with enough data
-        let block_id = BlockId::new("testfile".to_string(), 1);
-        let mut page = Page::new();
-        page.set_int(80, 1);
-        db.file_manager.lock().unwrap().write(&block_id, &mut page);
-
-        let buffer_manager_guard = &buffer_manager;
-
-        //  Create a buffer for block 1 and modify it
-        let buffer_1 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 1))
-            .unwrap();
-        {
-            let mut page = buffer_1.write_page();
-            page.set_int(80, 100);
-        }
-        buffer_1.set_modified(1, 0);
-        buffer_manager_guard.unpin(buffer_1);
-
-        //  materialize blocks 2-4 before pinning so they have valid heap headers
-        // TODO: once RecordPage/TableScan use PageView, rewrite this test to insert via logical rows
-        for blk in 2..=4 {
-            let block_id = BlockId::new("testfile".to_string(), blk);
-            let mut empty_page = Page::new();
-            db.file_manager
-                .lock()
-                .unwrap()
-                .write(&block_id, &mut empty_page);
+        let mut block_ids = Vec::new();
+        for _ in 0..4 {
+            let block = file_manager.lock().unwrap().append(file.clone());
+            block_ids.push(block);
         }
 
-        //  force buffer replacement by pinning 3 new blocks
-        let buffer_2 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 2))
-            .unwrap();
-        buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 3))
-            .unwrap();
-        buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 4))
-            .unwrap();
+        write_row(&buffer_manager, &layout, &block_ids[0], 1);
+        for idx in 1..block_ids.len() {
+            write_row(&buffer_manager, &layout, &block_ids[idx], idx as i32);
+        }
 
-        //  remove one of the buffers so block 1 can be read back in
-        buffer_manager_guard.unpin(buffer_2);
+        write_row(&buffer_manager, &layout, &block_ids[0], 100);
 
-        //  Read block 1 back from disk and verify it is the same
-        let buffer_2 = buffer_manager_guard
-            .pin(&BlockId::new("testfile".to_string(), 1))
-            .unwrap();
-        let page = buffer_2.read_page();
-        assert_eq!(page.get_int(80), 100);
-        drop(page);
+        let buffer_2 = buffer_manager.pin(&block_ids[1]).unwrap();
+        let buffer_3 = buffer_manager.pin(&block_ids[2]).unwrap();
+        let buffer_4 = buffer_manager.pin(&block_ids[3]).unwrap();
+
+        buffer_manager.unpin(buffer_2);
+        buffer_manager.unpin(buffer_3);
+        buffer_manager.unpin(buffer_4);
+
+        let observed = {
+            let buffer = buffer_manager.pin(&block_ids[0]).unwrap();
+            let value = {
+                let page = buffer.read_page();
+                test_helpers::read_single_int_field(&page, &layout, BUFFER_FIELD)
+                    .expect("read heap row")
+            };
+            buffer_manager.unpin(buffer);
+            value
+        };
+        assert_eq!(observed, 100);
         assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
     }
 
-    /// Concurrent stress test: multiple threads hammering same small working set
-    /// Tests for:
-    /// 1. Concurrent eviction races (multiple threads evicting/pinning same buffer slots)
-    /// 2. Pin count correctness (concurrent pin/unpin on same BlockId)
-    /// 3. Stats counter accuracy (AtomicUsize under concurrent updates)
-    /// 4. No panics/deadlocks under high contention
     #[test]
     fn test_concurrent_buffer_pool_stress() {
-        // Small buffer pool (4 buffers) with small working set (6 blocks)
-        // Forces evictions and contention
         let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
         db.buffer_manager.enable_stats();
+        let buffer_manager = db.buffer_manager;
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = Arc::new(buffer_layout());
 
         let num_blocks = 6;
         let num_threads = 8;
         let ops_per_thread = 100;
 
-        // Pre-create blocks on disk
-        let seed_offset = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        // TODO: remove this offset hack and write via LogicalRow once the buffer layer uses PageView
-        for i in 0..num_blocks {
-            let block_id = BlockId::new("stressfile".to_string(), i);
-            let mut page = Page::new();
-            page.set_int(seed_offset, i as i32);
-            db.file_manager.lock().unwrap().write(&block_id, &mut page);
-        }
+        let blocks: Vec<BlockId> = (0..num_blocks)
+            .map(|i| {
+                let block = file_manager
+                    .lock()
+                    .unwrap()
+                    .append("stressfile".to_string());
+                write_row(&buffer_manager, layout.as_ref(), &block, i as i32);
+                block
+            })
+            .collect();
+        buffer_manager.flush_all(0);
+        let blocks = Arc::new(blocks);
 
-        // Spawn threads that all hammer the same small working set
         let handles: Vec<_> = (0..num_threads)
             .map(|thread_id| {
-                let buffer_manager = db.buffer_manager.clone();
+                let buffer_manager = Arc::clone(&buffer_manager);
+                let blocks = Arc::clone(&blocks);
+                let layout = Arc::clone(&layout);
                 thread::spawn(move || {
                     for op in 0..ops_per_thread {
-                        // Each thread accesses all blocks in round-robin
-                        // This creates maximum contention on buffer slots
                         let block_num = (thread_id + op) % num_blocks;
-                        let block_id = BlockId::new("stressfile".to_string(), block_num);
-
-                        // Pin block
-                        let buffer = buffer_manager.pin(&block_id).unwrap();
-
-                        // Verify we got the right block
-                        assert_eq!(buffer.block_id_owned().unwrap(), block_id);
-                        {
+                        let buffer = buffer_manager.pin(&blocks[block_num]).unwrap();
+                        let value = {
                             let page = buffer.read_page();
-                            assert_eq!(page.get_int(seed_offset), block_num as i32);
-                        }
-
-                        // Unpin immediately to maximize churn
+                            test_helpers::read_single_int_field(
+                                &page,
+                                layout.as_ref(),
+                                BUFFER_FIELD,
+                            )
+                            .expect("read heap row")
+                        };
                         buffer_manager.unpin(buffer);
+                        assert_eq!(value, block_num as i32);
                     }
                 })
             })
             .collect();
 
-        // Wait for all threads to complete
         for handle in handles {
             handle.join().expect("Thread panicked during stress test");
         }
 
-        // Verify stats counters are consistent with deterministic lower bounds
-        // Note: Total may exceed num_threads * ops_per_thread because pin() can call
-        // try_to_pin() multiple times (retries when waiting for buffers)
-        if let Some(stats) = db.buffer_manager.stats() {
+        if let Some(stats) = buffer_manager.stats() {
             let (hits, misses) = stats.get();
             let total = hits + misses;
             let min_expected = num_threads * ops_per_thread;
@@ -11104,23 +11320,19 @@ mod buffer_manager_tests {
                 "Stats counter sanity check failed: got {total} total accesses (hits={hits}, misses={misses}), expected at least {min_expected}"
             );
 
-            // Misses: Must miss on first access to each unique block (6 blocks)
             assert!(
                 misses >= num_blocks,
                 "Expected at least {num_blocks} misses (cold start for {num_blocks} blocks), got {misses}"
             );
 
-            // Hits: With 4 buffers for 6 blocks, even with thrashing, expect some hits
-            // Conservative lower bound: ~12% hit rate under worst-case thrashing
             let min_hits = 100;
             if hits < min_hits {
                 eprintln!(
-                    "[buffer_manager_tests::stress] warning: expected >= {min_hits} hits under contention, got {hits}. This heuristic is noisy on contended CI hardware—verify manually if this regresses further."
+                    "[buffer_manager_tests::stress] warning: expected >= {min_hits} hits, got {hits}"
                 );
             }
 
-            // Verify buffer pool is consistent (all buffers unpinned)
-            let available = db.buffer_manager.available();
+            let available = buffer_manager.available();
             assert_eq!(
                 available, 4,
                 "Buffer pool inconsistent: expected 4 available buffers, got {available}"
@@ -11313,16 +11525,17 @@ impl IntoIterator for LogManager {
 
 #[cfg(test)]
 mod log_manager_tests {
+    const INT_BYTES: usize = 4;
     use std::{
         io::Write,
         sync::{Arc, Mutex},
     };
 
-    use crate::{LogManager, Page, SimpleDB};
+    use crate::{LogManager, SimpleDB};
 
     fn create_log_record(s: &str, n: usize) -> Vec<u8> {
         let string_bytes = s.as_bytes();
-        let total_size = Page::INT_BYTES + string_bytes.len() + Page::INT_BYTES;
+        let total_size = INT_BYTES + string_bytes.len() + INT_BYTES;
         let mut record = Vec::with_capacity(total_size);
 
         record
@@ -11398,33 +11611,6 @@ impl BlockId {
 
 /// Page backed by the new layout; alias to the RawPage bytes type.
 pub type Page = crate::page::PageBytes;
-
-#[cfg(test)]
-mod page_tests {
-    use super::*;
-    #[test]
-    fn test_page_int_operations() {
-        let mut page = Page::new();
-        page.set_int(100, 4000);
-        assert_eq!(page.get_int(100), 4000);
-
-        page.set_int(200, -67890);
-        assert_eq!(page.get_int(200), -67890);
-
-        page.set_int(200, 1);
-        assert_eq!(page.get_int(200), 1);
-    }
-
-    #[test]
-    fn test_page_string_operations() {
-        let mut page = Page::new();
-        page.set_string(100, "Hello");
-        assert_eq!(page.get_string(100), "Hello");
-
-        page.set_string(200, "World");
-        assert_eq!(page.get_string(200), "World");
-    }
-}
 
 /// Trait defining the file system interface for database operations
 pub trait FileSystemInterface: std::fmt::Debug {
@@ -11515,7 +11701,8 @@ impl FileSystemInterface for FileManager {
             }
             Err(e) => panic!("Failed to read from file {e}"),
         }
-        *page = Page::from_bytes(&buf).expect("deserialize page");
+        let buf: &[u8; 4096] = buf.as_slice().try_into().unwrap();
+        *page = Page::from_bytes(*buf);
     }
 
     fn write(&mut self, block_id: &BlockId, page: &Page) {
@@ -11523,7 +11710,7 @@ impl FileSystemInterface for FileManager {
         let offset = block_offset(block_id.block_num);
         file.seek(io::SeekFrom::Start(offset)).unwrap();
         let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        page.write_bytes(&mut buf).expect("serialize page");
+        buf.copy_from_slice(page.bytes());
         file.write_all(&buf).unwrap();
     }
 
@@ -11632,11 +11819,7 @@ mod mock_file_manager {
         }
 
         fn fresh_page_bytes() -> Vec<u8> {
-            let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-            Page::new()
-                .write_bytes(&mut buf)
-                .expect("serialize empty page");
-            buf
+            vec![0u8; crate::page::PAGE_SIZE_BYTES as usize]
         }
 
         /// Simulate a system crash - discards all unsynced data
@@ -11710,7 +11893,9 @@ mod mock_file_manager {
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
-                *page = Page::from_bytes(&block.data).unwrap();
+                let arr: [u8; crate::page::PAGE_SIZE_BYTES as usize] =
+                    block.data.as_slice().try_into().unwrap();
+                *page = Page::from_bytes(arr);
             } else {
                 *page = Page::new();
             }
@@ -11724,7 +11909,7 @@ mod mock_file_manager {
             self.ensure_block_exists(&block_id.filename, block_id.block_num);
             let file = self.files.get_mut(&block_id.filename).unwrap();
             let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-            page.write_bytes(&mut buf).expect("serialize page");
+            buf.copy_from_slice(page.bytes());
 
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf,
@@ -11865,17 +12050,33 @@ mod file_manager_tests {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+    use crate::page::test_helpers;
+    use crate::{Constant, Layout, Schema};
     use mock_file_manager::MockFileManager;
+
+    const FIELD_INT: &str = "num";
+    const FIELD_STR: &str = "txt";
+
+    fn durability_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field(FIELD_INT);
+        schema.add_string_field(FIELD_STR, 32);
+        Layout::new(schema)
+    }
 
     #[test]
     fn test_mock_filesystem_demonstrates_durability_flaw() {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        // TODO: once logical rows are wired up in durability tests, use the real tuple API instead of fixed offsets
-        page.set_int(base, 42);
-        page.set_string(base + Page::INT_BYTES, "durability");
+        let layout = durability_layout();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
+            row.set_column(FIELD_INT, &Constant::Int(42))
+                .expect("set durability int");
+            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
+                .expect("set durability string");
+        })
+        .expect("initialize heap row");
 
         // Phase 1: Write data without sync and simulate a crash which will discard all unsynced data
         mock_fs.write(&block_id, &mut page);
@@ -11887,8 +12088,11 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(base);
-        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
+        let recovered_int =
+            test_helpers::read_single_int_field(&read_page, &layout, FIELD_INT).unwrap_or(0);
+        let recovered_string =
+            test_helpers::read_single_string_field(&read_page, &layout, FIELD_STR)
+                .unwrap_or_else(|_| "".to_string());
 
         assert_eq!(
             recovered_int, 0,
@@ -11905,9 +12109,14 @@ mod durability_tests {
         let mut mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
-        let base = crate::page::PAGE_HEADER_SIZE_BYTES as usize;
-        page.set_int(base, 42);
-        page.set_string(base + Page::INT_BYTES, "durability");
+        let layout = durability_layout();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
+            row.set_column(FIELD_INT, &Constant::Int(42))
+                .expect("set durability int");
+            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
+                .expect("set durability string");
+        })
+        .expect("initialize heap row");
 
         // Phase 1: Write data AND sync
         mock_fs.write(&block_id, &mut page);
@@ -11921,8 +12130,11 @@ mod durability_tests {
         let mut read_page = Page::new();
         mock_fs.read(&block_id, &mut read_page);
 
-        let recovered_int = read_page.get_int(base);
-        let recovered_string = read_page.get_string(base + Page::INT_BYTES);
+        let recovered_int =
+            test_helpers::read_single_int_field(&read_page, &layout, FIELD_INT).expect("int read");
+        let recovered_string =
+            test_helpers::read_single_string_field(&read_page, &layout, FIELD_STR)
+                .expect("string read");
 
         assert_eq!(
             recovered_int, 42,
@@ -11932,49 +12144,5 @@ mod durability_tests {
             recovered_string, "durability",
             "Data preserved: string should survive crash with sync"
         );
-    }
-}
-
-// Orphaned main function removed - CLI binary is in src/bin/simpledb-cli.rs
-
-#[cfg(test)]
-mod offset_smoke_tests {
-    use super::*;
-
-    #[test]
-    fn prints_buffer_manager_num_available_offset() {
-        let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
-        let bm = Arc::clone(&db.buffer_manager);
-
-        println!(
-            "num_available offset: 0x{:X}",
-            core::mem::offset_of!(BufferManager, num_available)
-        );
-
-        // Get pointer to the actual BufferManager inside the Arc
-        let bm_ptr = Arc::as_ptr(&bm);
-        let bm_addr = bm_ptr as usize;
-
-        // Calculate num_available address
-        let num_avail_addr = unsafe { std::ptr::addr_of!((*bm_ptr).num_available) as usize };
-
-        println!("BufferManager base: 0x{:X}", bm_addr);
-        println!("num_available addr: 0x{:X}", num_avail_addr);
-        println!("Offset: 0x{:X}", num_avail_addr - bm_addr);
-
-        // Lock and check data address
-        {
-            let guard = bm.num_available.lock().unwrap();
-            let data_addr = &*guard as *const usize as usize;
-            println!("Data inside mutex:  0x{:X}", data_addr);
-            println!(
-                "Data offset from BufferManager: 0x{:X}",
-                data_addr - bm_addr
-            );
-            println!(
-                "Data offset from num_available: 0x{:X}",
-                data_addr - num_avail_addr
-            );
-        }
     }
 }
