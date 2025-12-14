@@ -1060,7 +1060,7 @@ impl LinePtr {
         Self(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn to_bytes(&self) -> [u8; 4] {
+    fn to_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
 
@@ -3015,12 +3015,10 @@ impl<'a> HeapPageViewMut<'a> {
         let mut split_guard = page.split()?;
         match split_guard.insert_tuple_fast(bytes)? {
             HeapInsert::Done(slot) => {
-                drop(split_guard);
                 self.dirty.set(true);
                 Ok(slot)
             }
             HeapInsert::Reserved(reservation) => {
-                drop(split_guard);
                 let mut split_guard = page.split()?;
                 let slot = split_guard.insert_tuple_slow(reservation, bytes)?;
                 self.dirty.set(true);
@@ -5476,8 +5474,8 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         parts.header().set_slot_count(new_slot_count);
 
         // rewrite children to match new array
-        for idx in 0..(new_slot_count as usize) {
-            self.set_child_at(layout, idx, children[idx])?;
+        for (idx, child) in children.iter().enumerate().take(new_slot_count as usize) {
+            self.set_child_at(layout, idx, *child)?;
         }
         self.set_child_at(
             layout,
