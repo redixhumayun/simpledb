@@ -4,7 +4,10 @@ use std::{error::Error, sync::Arc};
 use crate::page::BTreeLeafEntry;
 use crate::{
     debug,
-    page::{BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut},
+    page::{
+        BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeMetaPageView,
+        BTreeMetaPageViewMut,
+    },
     BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
 };
 
@@ -19,11 +22,13 @@ struct SplitResult {
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
     index_name: String,
+    index_file_name: String,
     internal_layout: Layout,
     leaf_layout: Layout,
-    leaf_table_name: String,
     leaf: Option<BTreeLeaf>,
+    meta_block: BlockId,
     root_block: BlockId,
+    tree_height: u16,
 }
 
 impl std::fmt::Display for BTreeIndex {
@@ -38,36 +43,63 @@ impl BTreeIndex {
         index_name: &str,
         leaf_layout: Layout,
     ) -> Result<Self, Box<dyn Error>> {
-        //  Create the leaf file with the schema provided if it does not exist
-        let leaf_table_name = format!("{index_name}leaf");
-        if txn.size(&leaf_table_name) == 0 {
-            let block_id = txn.append(&leaf_table_name);
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
-            guard.mark_modified(txn.id(), Lsn::MAX);
-        }
-
-        //  Create the internal file with the schema required if it does not exist
-        let internal_table_name = format!("{index_name}internal");
+        let index_file_name = format!("{index_name}.idx");
+        let meta_block = BlockId::new(index_file_name.clone(), 0);
         let mut internal_schema = Schema::new();
         internal_schema.add_from_schema(IndexInfo::BLOCK_NUM_FIELD, &leaf_layout.schema)?;
         internal_schema.add_from_schema(IndexInfo::DATA_FIELD, &leaf_layout.schema)?;
         let internal_layout = Layout::new(internal_schema.clone());
-        if txn.size(&internal_table_name) == 0 {
-            let block_id = txn.append(&internal_table_name);
-            let mut guard = txn.pin_write_guard(&block_id);
-            // root has no separators yet; point rightmost child to first leaf block (0)
-            guard.format_as_btree_internal(0, Some(0));
-            guard.mark_modified(txn.id(), Lsn::MAX);
-        }
+
+        // Bootstrap single-file index if missing.
+        let (root_block, tree_height) = if txn.size(&index_file_name) == 0 {
+            // Block 0: meta
+            let meta_id = txn.append(&index_file_name);
+            assert_eq!(meta_id.block_num, 0);
+            {
+                let mut guard = txn.pin_write_guard(&meta_id);
+                guard.format_as_btree_meta(1, 1, 1, u32::MAX);
+                guard.mark_modified(txn.id(), Lsn::MAX);
+            }
+
+            // Block 1: root internal (level 0 -> children are leaves)
+            let root_id = txn.append(&index_file_name);
+            assert_eq!(root_id.block_num, 1);
+            {
+                let mut guard = txn.pin_write_guard(&root_id);
+                // rightmost child will point to first leaf (block 2)
+                guard.format_as_btree_internal(0, Some(2));
+                guard.mark_modified(txn.id(), Lsn::MAX);
+            }
+
+            // Block 2: first leaf
+            let leaf_id = txn.append(&index_file_name);
+            assert_eq!(leaf_id.block_num, 2);
+            {
+                let mut guard = txn.pin_write_guard(&leaf_id);
+                guard.format_as_btree_leaf(None);
+                guard.mark_modified(txn.id(), Lsn::MAX);
+            }
+            (root_id, 1)
+        } else {
+            // Load meta
+            let guard = txn.pin_read_guard(&meta_block);
+            let meta_view = BTreeMetaPageView::new(guard)?;
+            let root_blk = meta_view.root_block() as usize;
+            let height = meta_view.tree_height();
+            let root_block = BlockId::new(index_file_name.clone(), root_blk);
+            (root_block, height)
+        };
+
         Ok(Self {
             txn,
             index_name: index_name.to_string(),
+            index_file_name,
             internal_layout,
             leaf_layout,
-            leaf_table_name,
+            meta_block,
+            root_block,
             leaf: None,
-            root_block: BlockId::new(internal_table_name, 0),
+            tree_height,
         })
     }
 
@@ -80,6 +112,16 @@ impl BTreeIndex {
     /// Returns the name of this index
     pub fn index_name(&self) -> &str {
         &self.index_name
+    }
+
+    fn update_meta(&mut self) -> Result<(), Box<dyn Error>> {
+        let guard = self.txn.pin_write_guard(&self.meta_block);
+        guard.mark_modified(self.txn.id(), Lsn::MAX);
+        let mut view = BTreeMetaPageViewMut::new(guard)?;
+        view.set_tree_height(self.tree_height);
+        view.set_root_block(self.root_block.block_num as u32);
+        view.update_crc32();
+        Ok(())
     }
 }
 
@@ -178,10 +220,10 @@ impl Index for BTreeIndex {
             Arc::clone(&self.txn),
             self.root_block.clone(),
             self.internal_layout.clone(),
-            self.root_block.filename.clone(),
+            self.index_file_name.clone(),
         );
         let leaf_block_num = root.search(search_key).unwrap();
-        let leaf_block_id = BlockId::new(self.leaf_table_name.clone(), leaf_block_num);
+        let leaf_block_id = BlockId::new(self.index_file_name.clone(), leaf_block_num);
         self.leaf = Some(
             BTreeLeaf::new(
                 Arc::clone(&self.txn),
@@ -223,7 +265,7 @@ impl Index for BTreeIndex {
             Arc::clone(&self.txn),
             self.root_block.clone(),
             self.internal_layout.clone(),
-            self.root_block.filename.clone(),
+            self.index_file_name.clone(),
         );
         let root_split = root
             .insert_entry(BTreeInternalEntry {
@@ -237,6 +279,8 @@ impl Index for BTreeIndex {
         debug!("Insert in index caused a root split");
         let root_split = root_split.unwrap();
         root.make_new_root(root_split).unwrap();
+        self.tree_height = self.tree_height.saturating_add(1);
+        self.update_meta().unwrap();
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
@@ -275,7 +319,7 @@ mod btree_index_tests {
         mut next_key: i32,
     ) -> i32 {
         let cap = 10_000;
-        while index.txn.size(&index.leaf_table_name) < target_blocks {
+        while index.txn.size(&index.index_file_name).saturating_sub(2) < target_blocks {
             index.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
             next_key += 1;
             assert!(
@@ -321,12 +365,12 @@ mod btree_index_tests {
             Arc::clone(&index.txn),
             index.root_block.clone(),
             index.internal_layout.clone(),
-            index.root_block.filename.clone(),
+            index.index_file_name.clone(),
         );
         let guard = index.txn.pin_read_guard(&root.block_id);
         let view = BTreeInternalPageView::new(guard, &root.layout).unwrap();
         assert_eq!(view.slot_count(), 0);
-        assert_eq!(view.rightmost_child_block(), Some(0));
+        assert_eq!(view.rightmost_child_block(), Some(2));
 
         // Test duplicate keys (was test_duplicate_keys)
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
@@ -368,6 +412,55 @@ mod btree_index_tests {
     }
 
     #[test]
+    fn test_single_file_bootstrap_layout() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let index = setup_index(&db);
+
+        // File should contain meta + root + first leaf
+        assert_eq!(index.txn.size(&index.index_file_name), 3);
+
+        // Meta assertions
+        {
+            let guard = index
+                .txn
+                .pin_write_guard(&BlockId::new(index.index_file_name.clone(), 0));
+            let mut meta = BTreeMetaPageViewMut::new(guard).expect("meta page view");
+            assert_eq!(meta.version(), 1);
+            assert_eq!(meta.tree_height(), 1);
+            assert_eq!(meta.root_block(), 1);
+            assert_eq!(meta.first_free_block(), u32::MAX);
+            assert!(meta.verify_crc32());
+        }
+
+        // Root internal assertions
+        {
+            let guard = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 1));
+            let view = guard
+                .into_btree_internal_page_view(&index.internal_layout)
+                .expect("root internal view");
+            assert_eq!(view.slot_count(), 0);
+            assert_eq!(view.btree_level(), 0);
+            assert_eq!(view.rightmost_child_block(), Some(2));
+        }
+
+        // First leaf assertions
+        {
+            let guard = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 2));
+            let view = guard
+                .into_btree_leaf_page_view(&index.leaf_layout)
+                .expect("leaf view");
+            assert_eq!(view.slot_count(), 0);
+            assert_eq!(view.right_sibling_block(), None);
+            assert_eq!(view.overflow_block(), None);
+            assert_eq!(view.high_key(), None);
+        }
+    }
+
+    #[test]
     fn test_btree_split() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
@@ -380,6 +473,16 @@ mod btree_index_tests {
             index.before_first(&Constant::Int(i));
             assert!(index.next());
             assert_eq!(index.get_data_rid(), RID::new(1, i as usize));
+        }
+
+        // Meta should reflect current root and height
+        {
+            let guard = index
+                .txn
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0));
+            let meta = BTreeMetaPageView::new(guard).expect("meta page view");
+            assert_eq!(meta.root_block() as usize, index.root_block.block_num);
+            assert_eq!(meta.tree_height(), index.tree_height);
         }
     }
 
@@ -398,10 +501,10 @@ mod btree_index_tests {
                 Arc::clone(&index.txn),
                 index.root_block.clone(),
                 index.internal_layout.clone(),
-                index.root_block.filename.clone(),
+                index.index_file_name.clone(),
             );
             let blk = root.search(&lower).unwrap();
-            let block_id = BlockId::new(index.leaf_table_name.clone(), blk);
+            let block_id = BlockId::new(index.index_file_name.clone(), blk);
             let slot = {
                 let guard = index.txn.pin_read_guard(&block_id);
                 let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
@@ -412,7 +515,7 @@ mod btree_index_tests {
         let iter = BTreeRangeIter::new(
             Arc::clone(&index.txn),
             &index.leaf_layout,
-            &index.leaf_table_name,
+            &index.index_file_name,
             start.0.clone(),
             start.1,
             &lower,
@@ -435,10 +538,10 @@ mod btree_index_tests {
                 Arc::clone(&index.txn),
                 index.root_block.clone(),
                 index.internal_layout.clone(),
-                index.root_block.filename.clone(),
+                index.index_file_name.clone(),
             );
             let blk = root.search(&lower_b).unwrap();
-            let block_id = BlockId::new(index.leaf_table_name.clone(), blk);
+            let block_id = BlockId::new(index.index_file_name.clone(), blk);
             let slot = {
                 let guard = index.txn.pin_read_guard(&block_id);
                 let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
@@ -449,7 +552,7 @@ mod btree_index_tests {
         let iter_b = BTreeRangeIter::new(
             Arc::clone(&index.txn),
             &index.leaf_layout,
-            &index.leaf_table_name,
+            &index.index_file_name,
             start_b.0,
             start_b.1,
             &lower_b,
@@ -474,17 +577,17 @@ mod btree_index_tests {
 
         // Grow until first split (two leaf pages exist)
         let mut i = 0;
-        while index.txn.size(&index.leaf_table_name) < 2 && i < 1000 {
+        while index.txn.size(&index.index_file_name).saturating_sub(2) < 2 && i < 1000 {
             index.insert(&Constant::Int(i as i32), &RID::new(1, i));
             i += 1;
         }
         assert!(
-            index.txn.size(&index.leaf_table_name) >= 2,
+            index.txn.size(&index.index_file_name).saturating_sub(2) >= 2,
             "expected at least one split to create a second leaf"
         );
 
         // Read both leaves
-        let left_id = BlockId::new(index.leaf_table_name.clone(), 0);
+        let left_id = BlockId::new(index.index_file_name.clone(), 2);
         {
             let left_view = index
                 .txn
@@ -494,7 +597,7 @@ mod btree_index_tests {
             let rsib = left_view
                 .right_sibling_block()
                 .expect("left page should link to split sibling");
-            let right_id = BlockId::new(index.leaf_table_name.clone(), rsib);
+            let right_id = BlockId::new(index.index_file_name.clone(), rsib);
             let right_view = index
                 .txn
                 .pin_read_guard(&right_id)
@@ -502,7 +605,7 @@ mod btree_index_tests {
                 .unwrap();
             let right_first = right_view.get_entry(0).unwrap().key;
 
-            assert_eq!(rsib, 1, "first split should append sibling at block 1");
+            assert_eq!(rsib, 3, "first split should append sibling at block 3");
             assert_eq!(
                 left_view.high_key(),
                 Some(right_first.clone()),
@@ -514,23 +617,23 @@ mod btree_index_tests {
         }
 
         // Continue inserting until a second split creates a third leaf
-        while index.txn.size(&index.leaf_table_name) < 3 && i < 2000 {
+        while index.txn.size(&index.index_file_name).saturating_sub(2) < 3 && i < 2000 {
             index.insert(&Constant::Int(i as i32), &RID::new(1, i));
             i += 1;
         }
         assert!(
-            index.txn.size(&index.leaf_table_name) >= 3,
+            index.txn.size(&index.index_file_name).saturating_sub(2) >= 3,
             "expected a second split to create a third leaf"
         );
 
         {
             // Follow sibling pointers from block 0 to gather the chain
-            let mut blocks = vec![0usize];
-            let mut current = 0usize;
+            let mut blocks = vec![2usize];
+            let mut current = 2usize;
             while blocks.len() < 5 {
                 let view = index
                     .txn
-                    .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), current))
+                    .pin_read_guard(&BlockId::new(index.index_file_name.clone(), current))
                     .into_btree_leaf_page_view(&index.leaf_layout)
                     .unwrap();
                 if let Some(rs) = view.right_sibling_block() {
@@ -549,17 +652,17 @@ mod btree_index_tests {
 
             let l0 = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[0]))
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[0]))
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let l1 = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[1]))
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[1]))
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let l2 = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.leaf_table_name.clone(), blocks[2]))
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[2]))
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
 

@@ -10773,7 +10773,6 @@ impl BufferFrame {
                 // Overflow pages are not CRC-verified yet; accept as-is.
             }
             PageType::Meta => {
-                // let page = BTreeMetaPageZeroCopy::new(page_guard.bytes()).unwrap();
                 let mut page = BTreeMetaPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
                 if !page.verify_crc32() {
                     panic!(

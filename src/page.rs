@@ -1474,7 +1474,7 @@ impl<'a> BTreeMetaHeaderMut<'a> {
 /// Read-only zero-copy view over an entire B-tree meta page (header + body).
 pub struct BTreeMetaPageZeroCopy<'a> {
     header: BTreeMetaHeaderRef<'a>,
-    body_bytes: &'a [u8],
+    _body_bytes: &'a [u8],
 }
 
 impl<'a> BTreeMetaPageZeroCopy<'a> {
@@ -1487,7 +1487,10 @@ impl<'a> BTreeMetaPageZeroCopy<'a> {
         if header.page_type() != PageType::Meta {
             return Err("not a meta page".into());
         }
-        Ok(Self { header, body_bytes })
+        Ok(Self {
+            header,
+            _body_bytes: body_bytes,
+        })
     }
 
     pub fn header(&self) -> BTreeMetaHeaderRef<'_> {
@@ -1639,6 +1642,31 @@ impl<'a> BTreeMetaPageViewMut<'a> {
 
     pub fn update_crc32(&mut self) {
         self.page_mut().update_crc32();
+    }
+
+    pub fn verify_crc32(&mut self) -> bool {
+        self.page_mut().verify_crc32()
+    }
+
+    pub fn version(&self) -> u8 {
+        self.page().version()
+    }
+
+    pub fn tree_height(&self) -> u16 {
+        self.page().tree_height()
+    }
+
+    pub fn root_block(&self) -> u32 {
+        self.page().root_block()
+    }
+
+    pub fn first_free_block(&self) -> u32 {
+        self.page().first_free_block()
+    }
+
+    fn page(&self) -> BTreeMetaPageZeroCopy<'_> {
+        BTreeMetaPageZeroCopy::new(self.guard.bytes())
+            .expect("meta page view constructed with valid meta page")
     }
 
     fn page_mut(&mut self) -> BTreeMetaPageZeroCopyMut<'_> {
