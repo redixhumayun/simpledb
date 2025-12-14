@@ -163,7 +163,7 @@ struct PinCase {
 
 impl PinCase {
     const fn total_ops(&self) -> usize {
-        self.threads * self.ops_per_thread
+        PIN_TOTAL_OPS
     }
 
     fn label(&self) -> String {
@@ -183,7 +183,7 @@ struct HotsetCase {
 
 impl HotsetCase {
     const fn total_ops(&self) -> usize {
-        self.threads * self.ops_per_thread
+        HOTSET_TOTAL_OPS
     }
 
     fn label(&self) -> String {
@@ -194,46 +194,111 @@ impl HotsetCase {
     }
 }
 
+const PIN_TOTAL_OPS: usize = 10_000;
+
 const PIN_CASES: &[PinCase] = &[
+    PinCase {
+        filter_token: "[pin:t1]",
+        threads: 1,
+        ops_per_thread: 10000,
+    },
     PinCase {
         filter_token: "[pin:t2]",
         threads: 2,
-        ops_per_thread: 1000,
+        ops_per_thread: 5000,
     },
     PinCase {
         filter_token: "[pin:t4]",
         threads: 4,
-        ops_per_thread: 1000,
+        ops_per_thread: 2500,
     },
     PinCase {
         filter_token: "[pin:t8]",
         threads: 8,
-        ops_per_thread: 1000,
+        ops_per_thread: 1250,
     },
     PinCase {
         filter_token: "[pin:t16]",
         threads: 16,
-        ops_per_thread: 1000,
+        ops_per_thread: 625,
+    },
+    PinCase {
+        filter_token: "[pin:t32]",
+        threads: 32,
+        ops_per_thread: 312,
+    },
+    PinCase {
+        filter_token: "[pin:t64]",
+        threads: 64,
+        ops_per_thread: 156,
+    },
+    PinCase {
+        filter_token: "[pin:t128]",
+        threads: 128,
+        ops_per_thread: 78,
+    },
+    PinCase {
+        filter_token: "[pin:t256]",
+        threads: 256,
+        ops_per_thread: 39,
     },
 ];
 
+const HOTSET_TOTAL_OPS: usize = 10_000;
+
 const HOTSET_CASES: &[HotsetCase] = &[
+    HotsetCase {
+        filter_token: "[hotset:t1_k4]",
+        threads: 1,
+        ops_per_thread: 10000,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t2_k4]",
+        threads: 2,
+        ops_per_thread: 5000,
+        hot_set_size: 4,
+    },
     HotsetCase {
         filter_token: "[hotset:t4_k4]",
         threads: 4,
-        ops_per_thread: 1000,
+        ops_per_thread: 2500,
         hot_set_size: 4,
     },
     HotsetCase {
         filter_token: "[hotset:t8_k4]",
         threads: 8,
-        ops_per_thread: 1000,
+        ops_per_thread: 1250,
         hot_set_size: 4,
     },
     HotsetCase {
         filter_token: "[hotset:t16_k4]",
         threads: 16,
-        ops_per_thread: 1000,
+        ops_per_thread: 625,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t32_k4]",
+        threads: 32,
+        ops_per_thread: 312,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t64_k4]",
+        threads: 64,
+        ops_per_thread: 156,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t128_k4]",
+        threads: 128,
+        ops_per_thread: 78,
+        hot_set_size: 4,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t256_k4]",
+        threads: 256,
+        ops_per_thread: 39,
         hot_set_size: 4,
     },
 ];
@@ -244,21 +309,59 @@ const ACCESS_CASES: &[AccessCase] = &[
         pattern: AccessPattern::Sequential,
     },
     AccessCase {
-        filter_token: "Seq Scan MT",
+        filter_token: "Seq Scan MT x2",
+        pattern: AccessPattern::SequentialMt { threads: 2 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x4",
         pattern: AccessPattern::SequentialMt { threads: 4 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x8",
+        pattern: AccessPattern::SequentialMt { threads: 8 },
     },
     AccessCase {
         filter_token: "Seq Scan MT x16",
         pattern: AccessPattern::SequentialMt { threads: 16 },
     },
     AccessCase {
+        filter_token: "Seq Scan MT x32",
+        pattern: AccessPattern::SequentialMt { threads: 32 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x64",
+        pattern: AccessPattern::SequentialMt { threads: 64 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x128",
+        pattern: AccessPattern::SequentialMt { threads: 128 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x256",
+        pattern: AccessPattern::SequentialMt { threads: 256 },
+    },
+    AccessCase {
         filter_token: "Repeated Access (1000 ops)",
         pattern: AccessPattern::Repeated { total_ops: 1000 },
     },
     AccessCase {
-        filter_token: "Repeated Access MT",
+        filter_token: "Repeated Access MT x2",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 2,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x4",
         pattern: AccessPattern::RepeatedMt {
             threads: 4,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x8",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 8,
             total_ops: 1000,
         },
     },
@@ -266,6 +369,34 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Repeated Access MT x16",
         pattern: AccessPattern::RepeatedMt {
             threads: 16,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x32",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 32,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x64",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 64,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x128",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 128,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x256",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 256,
             total_ops: 1000,
         },
     },
@@ -291,9 +422,25 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x2 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=10,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 10,
             total_ops: 500,
         },
@@ -307,9 +454,57 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x2 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=50,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 50,
             total_ops: 500,
         },
@@ -323,9 +518,57 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x2 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=100,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 100,
             total_ops: 500,
         },
@@ -339,13 +582,59 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Zipfian (80/20,",
         pattern: AccessPattern::Zipfian { total_ops: 500 },
     },
     AccessCase {
-        filter_token: "Zipfian MT",
+        filter_token: "Zipfian MT x2",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 2,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x4",
         pattern: AccessPattern::ZipfianMt {
             threads: 4,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x8",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 8,
             total_ops: 500,
         },
     },
@@ -353,6 +642,34 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Zipfian MT x16",
         pattern: AccessPattern::ZipfianMt {
             threads: 16,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x32",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 32,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x64",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 64,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x128",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 128,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x256",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 256,
             total_ops: 500,
         },
     },
