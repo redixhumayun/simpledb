@@ -36,8 +36,8 @@ mod page;
 mod parser;
 mod replacement;
 use crate::page::{
-    BTreeInternalPageZeroCopyMut, BTreeLeafPageZeroCopyMut, HeapPageZeroCopyMut, PageReadGuard,
-    PageType, PageWriteGuard, WalPage,
+    BTreeInternalPageZeroCopyMut, BTreeLeafPageZeroCopyMut, BTreeMetaPageZeroCopyMut,
+    HeapPageZeroCopyMut, PageReadGuard, PageType, PageWriteGuard, WalPage,
 };
 
 use replacement::PolicyState;
@@ -10702,9 +10702,16 @@ impl BufferFrame {
                         BTreeInternalPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
                     page.update_crc32();
                 }
-                PageType::Overflow => todo!(),
-                PageType::Meta => todo!(),
-                PageType::Free => todo!(),
+                PageType::Overflow => {
+                    // CRC for overflow pages not implemented.
+                }
+                PageType::Meta => {
+                    let mut page = BTreeMetaPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    page.update_crc32();
+                }
+                PageType::Free => {
+                    // Free pages are not flushed with CRC.
+                }
             }
             // if cfg!(debug_assertions) {
             //     page_guard.assert_layout_valid("buffer_flush_pre_write");
@@ -10762,9 +10769,23 @@ impl BufferFrame {
                     );
                 }
             }
-            PageType::Overflow => todo!(),
-            PageType::Meta => todo!(),
-            PageType::Free => todo!(),
+            PageType::Overflow => {
+                // Overflow pages are not CRC-verified yet; accept as-is.
+            }
+            PageType::Meta => {
+                // let page = BTreeMetaPageZeroCopy::new(page_guard.bytes()).unwrap();
+                let mut page = BTreeMetaPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                if !page.verify_crc32() {
+                    panic!(
+                        "crc mismatch for {:?} on page type {:?}",
+                        block_id,
+                        PageType::Meta
+                    );
+                }
+            }
+            PageType::Free => {
+                // Free pages are treated as uninitialized payload.
+            }
         }
 
         meta.reset_pins();

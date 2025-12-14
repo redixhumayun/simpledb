@@ -1372,6 +1372,281 @@ pub struct PageBytes {
     bytes: [u8; PAGE_SIZE_BYTES as usize],
 }
 
+/// Read-only view over a B-tree meta header.
+#[derive(Clone, Copy)]
+pub struct BTreeMetaHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> BTreeMetaHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn page_type(&self) -> PageType {
+        PageType::try_from(self.bytes[0]).expect("invalid page type byte")
+    }
+
+    #[allow(dead_code)]
+    pub fn version(&self) -> u8 {
+        self.bytes[1]
+    }
+
+    #[allow(dead_code)]
+    pub fn tree_height(&self) -> u16 {
+        u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn root_block(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn first_free_block(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn crc32(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
+    }
+}
+
+/// Mutable view over a B-tree meta header.
+pub struct BTreeMetaHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeMetaHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        Self { bytes }
+    }
+
+    pub fn as_ref(&self) -> BTreeMetaHeaderRef<'_> {
+        BTreeMetaHeaderRef::new(&self.bytes[..])
+    }
+
+    fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
+        self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn init_meta(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
+        self.bytes.fill(0);
+        self.bytes[0] = PageType::Meta as u8;
+        self.bytes[1] = version;
+        self.write(2, tree_height.to_le_bytes());
+        self.write(4, root_block.to_le_bytes());
+        self.write(8, first_free.to_le_bytes());
+        self.write(20, 0u32.to_le_bytes());
+        self.write(24, 0u64.to_le_bytes());
+    }
+
+    pub fn set_crc32(&mut self, crc32: u32) {
+        self.write(20, crc32.to_le_bytes());
+    }
+
+    pub fn update_crc32(&mut self, body_bytes: &[u8]) {
+        self.set_crc32(0);
+        let crc32 = crc::crc32(self.bytes.iter().copied().chain(body_bytes.iter().copied()));
+        self.set_crc32(crc32);
+    }
+
+    pub fn verify_crc32(&mut self, body_bytes: &[u8]) -> bool {
+        let stored_crc32 = self.as_ref().crc32();
+        if stored_crc32 == 0 {
+            return true;
+        }
+        self.set_crc32(0);
+        let crc32 = crc::crc32(self.bytes.iter().copied().chain(body_bytes.iter().copied()));
+        self.set_crc32(stored_crc32);
+        crc32 == stored_crc32
+    }
+}
+
+/// Read-only zero-copy view over an entire B-tree meta page (header + body).
+pub struct BTreeMetaPageZeroCopy<'a> {
+    header: BTreeMetaHeaderRef<'a>,
+    body_bytes: &'a [u8],
+}
+
+impl<'a> BTreeMetaPageZeroCopy<'a> {
+    pub fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
+        if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
+            return Err("meta page too small".into());
+        }
+        let (hdr_bytes, body_bytes) = bytes.split_at(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeMetaHeaderRef::new(hdr_bytes);
+        if header.page_type() != PageType::Meta {
+            return Err("not a meta page".into());
+        }
+        Ok(Self { header, body_bytes })
+    }
+
+    pub fn header(&self) -> BTreeMetaHeaderRef<'_> {
+        self.header
+    }
+
+    pub fn version(&self) -> u8 {
+        self.header.version()
+    }
+
+    pub fn tree_height(&self) -> u16 {
+        self.header.tree_height()
+    }
+
+    pub fn root_block(&self) -> u32 {
+        self.header.root_block()
+    }
+
+    pub fn first_free_block(&self) -> u32 {
+        self.header.first_free_block()
+    }
+
+    pub fn lsn(&self) -> u64 {
+        self.header.lsn()
+    }
+}
+
+/// Mutable zero-copy view over an entire B-tree meta page.
+pub struct BTreeMetaPageZeroCopyMut<'a> {
+    header: BTreeMetaHeaderMut<'a>,
+    body_bytes: &'a mut [u8],
+}
+
+impl<'a> BTreeMetaPageZeroCopyMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
+        if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
+            return Err("meta page too small".into());
+        }
+        let (hdr_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let header = BTreeMetaHeaderMut::new(hdr_bytes);
+        if header.as_ref().page_type() != PageType::Meta {
+            return Err("not a meta page".into());
+        }
+        Ok(Self { header, body_bytes })
+    }
+
+    pub fn header(&self) -> BTreeMetaHeaderRef<'_> {
+        self.header.as_ref()
+    }
+
+    pub fn header_mut(&mut self) -> &mut BTreeMetaHeaderMut<'a> {
+        &mut self.header
+    }
+
+    pub fn init(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
+        self.header
+            .init_meta(version, tree_height, root_block, first_free);
+    }
+
+    pub fn set_root_block(&mut self, root: u32) {
+        self.header.write(4, root.to_le_bytes());
+    }
+
+    pub fn set_tree_height(&mut self, h: u16) {
+        self.header.write(2, h.to_le_bytes());
+    }
+
+    pub fn set_first_free_block(&mut self, blk: u32) {
+        self.header.write(8, blk.to_le_bytes());
+    }
+
+    pub fn update_crc32(&mut self) {
+        self.header.update_crc32(self.body_bytes);
+    }
+
+    pub fn verify_crc32(&mut self) -> bool {
+        self.header.verify_crc32(self.body_bytes)
+    }
+}
+
+/// Read-only view over a meta page (header only).
+pub struct BTreeMetaPageView<'a> {
+    guard: PageReadGuard<'a>,
+}
+
+impl<'a> BTreeMetaPageView<'a> {
+    pub fn new(guard: PageReadGuard<'a>) -> SimpleDBResult<Self> {
+        let hdr = BTreeMetaHeaderRef::new(
+            guard
+                .bytes()
+                .get(..PAGE_HEADER_SIZE_BYTES as usize)
+                .ok_or("meta header slice")?,
+        );
+        if hdr.page_type() != PageType::Meta {
+            return Err("not a meta page".into());
+        }
+        Ok(Self { guard })
+    }
+
+    pub fn version(&self) -> u8 {
+        self.page().version()
+    }
+
+    pub fn tree_height(&self) -> u16 {
+        self.page().tree_height()
+    }
+
+    pub fn root_block(&self) -> u32 {
+        self.page().root_block()
+    }
+
+    pub fn first_free_block(&self) -> u32 {
+        self.page().first_free_block()
+    }
+
+    fn page(&self) -> BTreeMetaPageZeroCopy<'_> {
+        BTreeMetaPageZeroCopy::new(self.guard.bytes())
+            .expect("meta page view constructed with valid meta page")
+    }
+}
+
+/// Mutable view over a meta page (header only).
+pub struct BTreeMetaPageViewMut<'a> {
+    guard: PageWriteGuard<'a>,
+}
+
+impl<'a> BTreeMetaPageViewMut<'a> {
+    pub fn new(mut guard: PageWriteGuard<'a>) -> SimpleDBResult<Self> {
+        BTreeMetaPageZeroCopyMut::new(guard.bytes_mut())?;
+        Ok(Self { guard })
+    }
+
+    pub fn init(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
+        self.page_mut()
+            .init(version, tree_height, root_block, first_free);
+    }
+
+    pub fn set_root_block(&mut self, root: u32) {
+        self.page_mut().set_root_block(root);
+    }
+
+    pub fn set_tree_height(&mut self, h: u16) {
+        self.page_mut().set_tree_height(h);
+    }
+
+    pub fn set_first_free_block(&mut self, blk: u32) {
+        self.page_mut().set_first_free_block(blk);
+    }
+
+    pub fn update_crc32(&mut self) {
+        self.page_mut().update_crc32();
+    }
+
+    fn page_mut(&mut self) -> BTreeMetaPageZeroCopyMut<'_> {
+        BTreeMetaPageZeroCopyMut::new(self.guard.bytes_mut())
+            .expect("meta page view constructed with valid meta page")
+    }
+}
+
 impl Default for PageBytes {
     fn default() -> Self {
         Self::new()
@@ -2177,6 +2452,22 @@ impl<'a> PageWriteGuard<'a> {
         let mut header =
             BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageZeroCopyMut::HEADER_SIZE]);
         header.init_internal(level, rightmost_child.map(|c| c as u32));
+    }
+
+    /// Formats the page as a B-tree meta page (block 0 in single-file layout).
+    pub fn format_as_btree_meta(
+        &mut self,
+        version: u8,
+        tree_height: u16,
+        root_block: u32,
+        first_free_block: u32,
+    ) {
+        let bytes = self.bytes_mut();
+        bytes.fill(0);
+        let (hdr_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let mut header = BTreeMetaHeaderMut::new(hdr_bytes);
+        header.init_meta(version, tree_height, root_block, first_free_block);
+        header.update_crc32(body_bytes);
     }
 
     pub fn into_heap_view_mut(self, layout: &'a Layout) -> SimpleDBResult<HeapPageViewMut<'a>> {
