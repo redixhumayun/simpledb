@@ -390,7 +390,7 @@ pub(crate) mod test_helpers {
     }
 
     fn insert_tuple_bytes(bytes: &mut [u8], tuple: &[u8]) -> SimpleDBResult<SlotId> {
-        let mut page = HeapPageZeroCopyMut::new(bytes)?;
+        let mut page = HeapPageMut::new(bytes)?;
         let mut split_guard = page.split()?;
         let slot = match split_guard.insert_tuple_fast(tuple)? {
             HeapInsert::Done(slot) => slot,
@@ -407,7 +407,7 @@ pub(crate) mod test_helpers {
         page: &'a PageBytes,
         layout: &'a Layout,
     ) -> SimpleDBResult<LogicalRow<'a>> {
-        let view = HeapPageZeroCopy::new(page.bytes())?;
+        let view = HeapPage::new(page.bytes())?;
         let tuple = match view
             .tuple_ref(0)
             .ok_or_else(|| -> Box<dyn Error> { "slot 0 missing".into() })?
@@ -1464,12 +1464,12 @@ impl<'a> BTreeMetaHeaderMut<'a> {
 }
 
 /// Read-only zero-copy view over an entire B-tree meta page (header + body).
-pub struct BTreeMetaPageZeroCopy<'a> {
+pub struct BTreeMetaPage<'a> {
     header: BTreeMetaHeaderRef<'a>,
     _body_bytes: &'a [u8],
 }
 
-impl<'a> BTreeMetaPageZeroCopy<'a> {
+impl<'a> BTreeMetaPage<'a> {
     pub fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
         if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
             return Err("meta page too small".into());
@@ -1505,12 +1505,12 @@ impl<'a> BTreeMetaPageZeroCopy<'a> {
 }
 
 /// Mutable zero-copy view over an entire B-tree meta page.
-pub struct BTreeMetaPageZeroCopyMut<'a> {
+pub struct BTreeMetaPageMut<'a> {
     header: BTreeMetaHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
-impl<'a> BTreeMetaPageZeroCopyMut<'a> {
+impl<'a> BTreeMetaPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
             return Err("meta page too small".into());
@@ -1577,8 +1577,8 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().first_free_block()
     }
 
-    fn page(&self) -> BTreeMetaPageZeroCopy<'_> {
-        BTreeMetaPageZeroCopy::new(self.guard.bytes())
+    fn page(&self) -> BTreeMetaPage<'_> {
+        BTreeMetaPage::new(self.guard.bytes())
             .expect("meta page view constructed with valid meta page")
     }
 }
@@ -1590,7 +1590,7 @@ pub struct BTreeMetaPageViewMut<'a> {
 
 impl<'a> BTreeMetaPageViewMut<'a> {
     pub fn new(mut guard: PageWriteGuard<'a>) -> SimpleDBResult<Self> {
-        BTreeMetaPageZeroCopyMut::new(guard.bytes_mut())?;
+        BTreeMetaPageMut::new(guard.bytes_mut())?;
         Ok(Self { guard })
     }
 
@@ -1606,8 +1606,8 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().update_crc32();
     }
 
-    fn page_mut(&mut self) -> BTreeMetaPageZeroCopyMut<'_> {
-        BTreeMetaPageZeroCopyMut::new(self.guard.bytes_mut())
+    fn page_mut(&mut self) -> BTreeMetaPageMut<'_> {
+        BTreeMetaPageMut::new(self.guard.bytes_mut())
             .expect("meta page view constructed with valid meta page")
     }
 }
@@ -1766,20 +1766,20 @@ impl<'a> BTreeRecordSpaceMut<'a> {
     }
 }
 
-struct HeapPageZeroCopy<'a> {
+struct HeapPage<'a> {
     header: HeapHeaderRef<'a>,
     line_pointers: LinePtrArray<'a>,
     record_space: HeapRecordSpace<'a>,
 }
 
-impl<'a> PageKind for HeapPageZeroCopy<'a> {
+impl<'a> PageKind for HeapPage<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
     const HEADER_SIZE: usize = 32;
     type Header = HeapHeaderRef<'a>;
     type HeaderRef<'b> = HeapHeaderRef<'b>;
 }
 
-impl<'a> HeapPageZeroCopy<'a> {
+impl<'a> HeapPage<'a> {
     fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
         // Use shared parsing logic from PageKind trait
         let layout = Self::parse_layout(bytes)?;
@@ -1845,19 +1845,19 @@ impl<'a> HeapPageZeroCopy<'a> {
     }
 }
 
-pub struct HeapPageZeroCopyMut<'a> {
+pub struct HeapPageMut<'a> {
     header: HeapHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
-impl<'a> PageKind for HeapPageZeroCopyMut<'a> {
+impl<'a> PageKind for HeapPageMut<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
     const HEADER_SIZE: usize = 32;
     type Header = HeapHeaderMut<'a>;
     type HeaderRef<'b> = HeapHeaderRef<'b>;
 }
 
-impl<'a> HeapPageZeroCopyMut<'a> {
+impl<'a> HeapPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
         let header = HeapHeaderMut::new(header_bytes);
@@ -1868,7 +1868,7 @@ impl<'a> HeapPageZeroCopyMut<'a> {
     }
 
     #[cfg(test)]
-    fn as_read(&self) -> SimpleDBResult<HeapPageZeroCopy<'_>> {
+    fn as_read(&self) -> SimpleDBResult<HeapPage<'_>> {
         let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
@@ -1884,7 +1884,7 @@ impl<'a> HeapPageZeroCopyMut<'a> {
             return Err("heap page free_upper out of bounds".into());
         }
         let base_offset = free_lower;
-        let page = HeapPageZeroCopy::from_parts(
+        let page = HeapPage::from_parts(
             self.header.as_ref(),
             line_ptr_bytes,
             record_bytes,
@@ -2098,7 +2098,7 @@ impl<'a> HeapPageParts<'a> {
 
 /// Iterator over tuples in a heap page, optionally filtering by LineState.
 pub struct HeapIterator<'a> {
-    page: HeapPageZeroCopy<'a>,
+    page: HeapPage<'a>,
     current_slot: SlotId,
     match_state: Option<LineState>,
 }
@@ -2126,13 +2126,13 @@ impl<'a> Iterator for HeapIterator<'a> {
 
 /// Iterator over entries in a B-tree leaf page.
 pub struct BTreeLeafIterator<'a> {
-    page: BTreeLeafPageZeroCopy<'a>,
+    page: BTreeLeafPage<'a>,
     layout: &'a Layout,
     current_slot: SlotId,
 }
 
 impl<'a> BTreeLeafIterator<'a> {
-    fn new(page: BTreeLeafPageZeroCopy<'a>, layout: &'a Layout) -> Self {
+    fn new(page: BTreeLeafPage<'a>, layout: &'a Layout) -> Self {
         Self {
             page,
             layout,
@@ -2143,13 +2143,13 @@ impl<'a> BTreeLeafIterator<'a> {
 
 /// Iterator over entries in a B-tree internal page.
 pub struct BTreeInternalIterator<'a> {
-    page: BTreeInternalPageZeroCopy<'a>,
+    page: BTreeInternalPage<'a>,
     layout: &'a Layout,
     current_slot: SlotId,
 }
 
 impl<'a> BTreeInternalIterator<'a> {
-    fn new(page: BTreeInternalPageZeroCopy<'a>, layout: &'a Layout) -> Self {
+    fn new(page: BTreeInternalPage<'a>, layout: &'a Layout) -> Self {
         Self {
             page,
             layout,
@@ -2394,7 +2394,7 @@ impl<'a> PageWriteGuard<'a> {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
-        let mut header = HeapHeaderMut::new(&mut bytes[0..HeapPageZeroCopyMut::HEADER_SIZE]);
+        let mut header = HeapHeaderMut::new(&mut bytes[0..HeapPageMut::HEADER_SIZE]);
         header.init_heap();
     }
 
@@ -2403,8 +2403,7 @@ impl<'a> PageWriteGuard<'a> {
         let bytes = self.bytes_mut();
         bytes.fill(0);
 
-        let mut header =
-            BTreeLeafHeaderMut::new(&mut bytes[0..BTreeLeafPageZeroCopyMut::HEADER_SIZE]);
+        let mut header = BTreeLeafHeaderMut::new(&mut bytes[0..BTreeLeafPageMut::HEADER_SIZE]);
         header.init_leaf(0, None, overflow_block.map(|b| b as u32));
     }
 
@@ -2415,7 +2414,7 @@ impl<'a> PageWriteGuard<'a> {
         bytes.fill(0);
 
         let mut header =
-            BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageZeroCopyMut::HEADER_SIZE]);
+            BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageMut::HEADER_SIZE]);
         header.init_internal(level, rightmost_child.map(|c| c as u32));
     }
 
@@ -2483,10 +2482,7 @@ mod page_tests {
         buf
     }
 
-    fn insert_tuple_bytes(
-        page: &mut HeapPageZeroCopyMut<'_>,
-        tuple: &[u8],
-    ) -> SimpleDBResult<SlotId> {
+    fn insert_tuple_bytes(page: &mut HeapPageMut<'_>, tuple: &[u8]) -> SimpleDBResult<SlotId> {
         let mut split_guard = page.split()?;
         let slot = match split_guard.insert_tuple_fast(tuple)? {
             HeapInsert::Done(slot) => slot,
@@ -2506,7 +2502,7 @@ mod page_tests {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
-        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
+        let mut page = HeapPageMut::new(&mut bytes).unwrap();
         let payload = vec![7u8; 16];
 
         insert_tuple_bytes(&mut page, &heap_tuple_bytes(&payload)).expect("tuple allocation");
@@ -2518,10 +2514,10 @@ mod page_tests {
         let mut corrupted = pristine.clone();
         corrupted[128] ^= 0xFF; // flip a byte to simulate torn write
 
-        let mut ok_page = HeapPageZeroCopyMut::new(&mut pristine).expect("deserialize pristine");
+        let mut ok_page = HeapPageMut::new(&mut pristine).expect("deserialize pristine");
         assert!(ok_page.verify_crc32());
 
-        let mut bad_page = HeapPageZeroCopyMut::new(&mut corrupted).expect("deserialize corrupted");
+        let mut bad_page = HeapPageMut::new(&mut corrupted).expect("deserialize corrupted");
         assert!(!bad_page.verify_crc32());
     }
 
@@ -2549,7 +2545,7 @@ mod page_tests {
         let payload = vec![1u8, 2, 3, 4];
         let tuple = heap_tuple_bytes(&payload);
 
-        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
+        let mut page = HeapPageMut::new(&mut bytes).unwrap();
         let slot = insert_tuple_bytes(&mut page, &tuple).unwrap();
 
         assert_eq!(
@@ -2571,7 +2567,7 @@ mod page_tests {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
-        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
+        let mut page = HeapPageMut::new(&mut bytes).unwrap();
         let tuple_a = heap_tuple_bytes(&[10]);
         let tuple_b = heap_tuple_bytes(&[20, 30]);
         let tuple_c_payload = vec![99, 100, 101];
@@ -2602,14 +2598,14 @@ mod page_tests {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
-        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
+        let mut page = HeapPageMut::new(&mut bytes).unwrap();
         let payload = vec![42u8, 43, 44, 45];
         let slot = insert_tuple_bytes(&mut page, &heap_tuple_bytes(&payload)).unwrap();
 
         let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
         buf.copy_from_slice(&bytes);
 
-        let reconstructed = HeapPageZeroCopy::new(&buf).expect("unpack succeeds");
+        let reconstructed = HeapPage::new(&buf).expect("unpack succeeds");
 
         match reconstructed.tuple_ref(slot).unwrap() {
             TupleRef::Live(tuple) => assert_eq!(tuple.payload(), payload.as_slice()),
@@ -3156,12 +3152,12 @@ pub struct HeapPageView<'a> {
 
 impl<'a> HeapPageView<'a> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        HeapPageZeroCopy::new(guard.bytes())?;
+        HeapPage::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
-    fn build_page(&'a self) -> HeapPageZeroCopy<'a> {
-        HeapPageZeroCopy::new(self.guard.bytes()).unwrap()
+    fn build_page(&'a self) -> HeapPage<'a> {
+        HeapPage::new(self.guard.bytes()).unwrap()
     }
 
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
@@ -3212,7 +3208,7 @@ pub struct HeapPageViewMut<'a> {
 
 impl<'a> HeapPageViewMut<'a> {
     fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        HeapPageZeroCopyMut::new(guard.bytes_mut())?;
+        HeapPageMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
@@ -3220,12 +3216,12 @@ impl<'a> HeapPageViewMut<'a> {
         })
     }
 
-    fn build_page(&'a self) -> HeapPageZeroCopy<'a> {
-        HeapPageZeroCopy::new(self.guard.bytes()).unwrap()
+    fn build_page(&'a self) -> HeapPage<'a> {
+        HeapPage::new(self.guard.bytes()).unwrap()
     }
 
-    fn build_mut_page(&mut self) -> HeapPageZeroCopyMut<'_> {
-        HeapPageZeroCopyMut::new(self.guard.bytes_mut()).unwrap()
+    fn build_mut_page(&mut self) -> HeapPageMut<'_> {
+        HeapPageMut::new(self.guard.bytes_mut()).unwrap()
     }
 
     /// Returns the current [`TupleRef`] at `slot`, including redirect/dead markers.
@@ -3386,16 +3382,16 @@ impl<'a> HeapPageViewMut<'a> {
         //  If we were to build page and then operate on that, the lifetime of the underlying bytes cannot be proven by the compiler
         //  since the compiler has no idea that page aliases the same underlying bytes
         let bytes = self.guard.bytes_mut();
-        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPageZeroCopy::HEADER_SIZE);
+        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
         let header = HeapHeaderRef::new(header_bytes);
         if current >= header.slot_count() as usize {
             return None;
         }
         let free_lower = header.free_lower() as usize;
-        if free_lower < HeapPageZeroCopy::HEADER_SIZE {
+        if free_lower < HeapPage::HEADER_SIZE {
             return None;
         }
-        let lp_capacity = free_lower - HeapPageZeroCopy::HEADER_SIZE;
+        let lp_capacity = free_lower - HeapPage::HEADER_SIZE;
         if lp_capacity > body_bytes.len() {
             return None;
         }
@@ -3598,15 +3594,15 @@ pub struct BTreeLeafPageView<'a> {
 
 impl<'a> BTreeLeafPageView<'a> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        BTreeLeafPageZeroCopy::new(guard.bytes())?;
+        BTreeLeafPage::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
-    fn build_page(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
-        BTreeLeafPageZeroCopy::new(self.guard.bytes())
+    fn build_page(&self) -> SimpleDBResult<BTreeLeafPage<'_>> {
+        BTreeLeafPage::new(self.guard.bytes())
     }
 
-    fn page(&self) -> BTreeLeafPageZeroCopy<'_> {
+    fn page(&self) -> BTreeLeafPage<'_> {
         self.build_page()
             .expect("BTreeLeafPageView constructed with valid leaf page")
     }
@@ -3669,7 +3665,7 @@ pub struct BTreeLeafPageViewMut<'a> {
 
 impl<'a> BTreeLeafPageViewMut<'a> {
     pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        BTreeLeafPageZeroCopyMut::new(guard.bytes_mut())?;
+        BTreeLeafPageMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
@@ -3677,15 +3673,15 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         })
     }
 
-    fn build_page(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
-        BTreeLeafPageZeroCopy::new(self.guard.bytes())
+    fn build_page(&self) -> SimpleDBResult<BTreeLeafPage<'_>> {
+        BTreeLeafPage::new(self.guard.bytes())
     }
 
-    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeLeafPageZeroCopyMut<'_>> {
-        BTreeLeafPageZeroCopyMut::new(self.guard.bytes_mut())
+    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeLeafPageMut<'_>> {
+        BTreeLeafPageMut::new(self.guard.bytes_mut())
     }
 
-    fn page(&self) -> BTreeLeafPageZeroCopy<'_> {
+    fn page(&self) -> BTreeLeafPage<'_> {
         self.build_page()
             .expect("BTreeLeafPageViewMut constructed with valid leaf page")
     }
@@ -3799,15 +3795,15 @@ pub struct BTreeInternalPageView<'a> {
 
 impl<'a> BTreeInternalPageView<'a> {
     pub fn new(guard: PageReadGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        BTreeInternalPageZeroCopy::new(guard.bytes())?;
+        BTreeInternalPage::new(guard.bytes())?;
         Ok(Self { guard, layout })
     }
 
-    fn build_view(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
-        BTreeInternalPageZeroCopy::new(self.guard.bytes())
+    fn build_view(&self) -> SimpleDBResult<BTreeInternalPage<'_>> {
+        BTreeInternalPage::new(self.guard.bytes())
     }
 
-    fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
+    fn view(&self) -> BTreeInternalPage<'_> {
         self.build_view()
             .expect("BTreeInternalPageView constructed with valid internal page")
     }
@@ -3855,7 +3851,7 @@ pub struct BTreeInternalPageViewMut<'a> {
 
 impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn new(mut guard: PageWriteGuard<'a>, layout: &'a Layout) -> SimpleDBResult<Self> {
-        BTreeInternalPageZeroCopyMut::new(guard.bytes_mut())?;
+        BTreeInternalPageMut::new(guard.bytes_mut())?;
         Ok(Self {
             guard,
             layout,
@@ -3863,17 +3859,17 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         })
     }
 
-    fn build_view(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
-        BTreeInternalPageZeroCopy::new(self.guard.bytes())
+    fn build_view(&self) -> SimpleDBResult<BTreeInternalPage<'_>> {
+        BTreeInternalPage::new(self.guard.bytes())
     }
 
-    fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
+    fn view(&self) -> BTreeInternalPage<'_> {
         self.build_view()
             .expect("BTreeInternalPageViewMut constructed with valid internal page")
     }
 
-    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageZeroCopyMut<'_>> {
-        BTreeInternalPageZeroCopyMut::new(self.guard.bytes_mut())
+    fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageMut<'_>> {
+        BTreeInternalPageMut::new(self.guard.bytes_mut())
     }
 
     // Read operations
@@ -4095,7 +4091,7 @@ mod btree_page_tests {
     ) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPageZeroCopy::HEADER_SIZE as usize);
+            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPage::HEADER_SIZE as usize);
             let mut header = BTreeLeafHeaderMut::new(header_bytes);
             header.init_leaf(level, right_sibling, overflow_block);
         }
@@ -4105,8 +4101,7 @@ mod btree_page_tests {
     fn init_btree_internal_bytes(level: u8, rightmost_child: Option<u32>) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) =
-                bytes.split_at_mut(BTreeInternalPageZeroCopy::HEADER_SIZE as usize);
+            let (header_bytes, _) = bytes.split_at_mut(BTreeInternalPage::HEADER_SIZE as usize);
             let mut header = BTreeInternalHeaderMut::new(header_bytes);
             header.init_internal(level, rightmost_child);
         }
@@ -4133,16 +4128,16 @@ mod btree_page_tests {
         }
 
         fn from_bytes(bytes: Vec<u8>) -> Self {
-            BTreeLeafPageZeroCopy::new(&bytes).expect("valid leaf page bytes");
+            BTreeLeafPage::new(&bytes).expect("valid leaf page bytes");
             Self { bytes }
         }
 
-        fn view(&self) -> BTreeLeafPageZeroCopy<'_> {
-            BTreeLeafPageZeroCopy::new(&self.bytes).expect("leaf view")
+        fn view(&self) -> BTreeLeafPage<'_> {
+            BTreeLeafPage::new(&self.bytes).expect("leaf view")
         }
 
-        fn view_mut(&mut self) -> BTreeLeafPageZeroCopyMut<'_> {
-            BTreeLeafPageZeroCopyMut::new(&mut self.bytes).expect("leaf view mut")
+        fn view_mut(&mut self) -> BTreeLeafPageMut<'_> {
+            BTreeLeafPageMut::new(&mut self.bytes).expect("leaf view mut")
         }
 
         fn slot_count(&self) -> usize {
@@ -4203,16 +4198,16 @@ mod btree_page_tests {
         }
 
         fn from_bytes(bytes: Vec<u8>) -> Self {
-            BTreeInternalPageZeroCopy::new(&bytes).expect("valid internal page bytes");
+            BTreeInternalPage::new(&bytes).expect("valid internal page bytes");
             Self { bytes }
         }
 
-        fn view(&self) -> BTreeInternalPageZeroCopy<'_> {
-            BTreeInternalPageZeroCopy::new(&self.bytes).expect("internal view")
+        fn view(&self) -> BTreeInternalPage<'_> {
+            BTreeInternalPage::new(&self.bytes).expect("internal view")
         }
 
-        fn view_mut(&mut self) -> BTreeInternalPageZeroCopyMut<'_> {
-            BTreeInternalPageZeroCopyMut::new(&mut self.bytes).expect("internal view mut")
+        fn view_mut(&mut self) -> BTreeInternalPageMut<'_> {
+            BTreeInternalPageMut::new(&mut self.bytes).expect("internal view mut")
         }
 
         fn slot_count(&self) -> usize {
@@ -4261,12 +4256,12 @@ mod btree_page_tests {
         }
     }
 
-    fn leaf_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeLeafPageZeroCopyMut<'_> {
-        BTreeLeafPageZeroCopyMut::new(bytes).expect("leaf page mut view")
+    fn leaf_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeLeafPageMut<'_> {
+        BTreeLeafPageMut::new(bytes).expect("leaf page mut view")
     }
 
-    fn internal_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeInternalPageZeroCopyMut<'_> {
-        BTreeInternalPageZeroCopyMut::new(bytes).expect("internal page mut view")
+    fn internal_view_mut_from_bytes(bytes: &mut [u8]) -> BTreeInternalPageMut<'_> {
+        BTreeInternalPageMut::new(bytes).expect("internal page mut view")
     }
 
     // Helper: Create a layout for BTree leaf entries with INT key
@@ -5006,20 +5001,20 @@ mod btree_page_tests {
         }
     }
 }
-struct BTreeLeafPageZeroCopy<'a> {
+struct BTreeLeafPage<'a> {
     header: BTreeLeafHeaderRef<'a>,
     line_pointers: LinePtrArray<'a>,
     record_space: BTreeRecordSpace<'a>,
 }
 
-impl<'a> PageKind for BTreeLeafPageZeroCopy<'a> {
+impl<'a> PageKind for BTreeLeafPage<'a> {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
     const HEADER_SIZE: usize = 32;
     type Header = BTreeLeafHeaderRef<'a>;
     type HeaderRef<'b> = BTreeLeafHeaderRef<'b>;
 }
 
-impl<'a> BTreeLeafPageZeroCopy<'a> {
+impl<'a> BTreeLeafPage<'a> {
     fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
         let layout = Self::parse_layout(bytes)?;
 
@@ -5157,19 +5152,19 @@ impl<'a> BTreeLeafPageZeroCopy<'a> {
     }
 }
 
-pub struct BTreeLeafPageZeroCopyMut<'a> {
+pub struct BTreeLeafPageMut<'a> {
     header: BTreeLeafHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
-impl<'a> PageKind for BTreeLeafPageZeroCopyMut<'a> {
+impl<'a> PageKind for BTreeLeafPageMut<'a> {
     const PAGE_TYPE: PageType = PageType::IndexLeaf;
     const HEADER_SIZE: usize = 32;
     type Header = BTreeLeafHeaderMut<'a>;
     type HeaderRef<'b> = BTreeLeafHeaderRef<'b>;
 }
 
-impl<'a> BTreeLeafPageZeroCopyMut<'a> {
+impl<'a> BTreeLeafPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
         let header = BTreeLeafHeaderMut::new(header_bytes);
@@ -5206,7 +5201,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         Ok(parts)
     }
 
-    fn as_read(&self) -> SimpleDBResult<BTreeLeafPageZeroCopy<'_>> {
+    fn as_read(&self) -> SimpleDBResult<BTreeLeafPage<'_>> {
         let body_bytes: &[u8] = &self.body_bytes[..];
         if self.header.as_ref().page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
@@ -5226,7 +5221,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
         }
         let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at(lp_capacity);
         let base_offset = free_lower;
-        Ok(BTreeLeafPageZeroCopy {
+        Ok(BTreeLeafPage {
             header: self.header.as_ref(),
             line_pointers: LinePtrArray::with_len(
                 line_ptr_bytes,
@@ -5369,7 +5364,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             return Err("insufficient space for high key".into());
         }
         let off = free_upper - len;
-        let base = BTreeLeafPageZeroCopy::HEADER_SIZE;
+        let base = BTreeLeafPage::HEADER_SIZE;
         let start = off as usize - base;
         self.body_bytes
             .get_mut(start..start + bytes.len())
@@ -5418,20 +5413,20 @@ impl<'a> BTreeLeafPageParts<'a> {
     }
 }
 
-struct BTreeInternalPageZeroCopy<'a> {
+struct BTreeInternalPage<'a> {
     header: BTreeInternalHeaderRef<'a>,
     line_pointers: LinePtrArray<'a>,
     record_space: BTreeRecordSpace<'a>,
 }
 
-impl<'a> PageKind for BTreeInternalPageZeroCopy<'a> {
+impl<'a> PageKind for BTreeInternalPage<'a> {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
     const HEADER_SIZE: usize = 32;
     type Header = BTreeInternalHeaderRef<'a>;
     type HeaderRef<'b> = BTreeInternalHeaderRef<'b>;
 }
 
-impl<'a> BTreeInternalPageZeroCopy<'a> {
+impl<'a> BTreeInternalPage<'a> {
     fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
         // Use shared parsing logic from PageKind trait
         let layout = Self::parse_layout(bytes)?;
@@ -5573,19 +5568,19 @@ impl<'a> BTreeInternalPageZeroCopy<'a> {
     }
 }
 
-pub struct BTreeInternalPageZeroCopyMut<'a> {
+pub struct BTreeInternalPageMut<'a> {
     header: BTreeInternalHeaderMut<'a>,
     body_bytes: &'a mut [u8],
 }
 
-impl<'a> PageKind for BTreeInternalPageZeroCopyMut<'a> {
+impl<'a> PageKind for BTreeInternalPageMut<'a> {
     const PAGE_TYPE: PageType = PageType::IndexInternal;
     const HEADER_SIZE: usize = 32;
     type Header = BTreeInternalHeaderMut<'a>;
     type HeaderRef<'b> = BTreeInternalHeaderRef<'b>;
 }
 
-impl<'a> BTreeInternalPageZeroCopyMut<'a> {
+impl<'a> BTreeInternalPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
         let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
         let header = BTreeInternalHeaderMut::new(header_bytes);
@@ -5625,7 +5620,7 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         Ok(parts)
     }
 
-    fn as_read(&self) -> SimpleDBResult<BTreeInternalPageZeroCopy<'_>> {
+    fn as_read(&self) -> SimpleDBResult<BTreeInternalPage<'_>> {
         let body_bytes: &[u8] = &self.body_bytes[..];
         if self.header.as_ref().page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
@@ -5645,7 +5640,7 @@ impl<'a> BTreeInternalPageZeroCopyMut<'a> {
         }
         let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at(lp_capacity);
         let base_offset = free_lower;
-        Ok(BTreeInternalPageZeroCopy {
+        Ok(BTreeInternalPage {
             header: self.header.as_ref(),
             line_pointers: LinePtrArray::with_len(
                 line_ptr_bytes,

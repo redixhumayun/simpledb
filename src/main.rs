@@ -36,8 +36,8 @@ mod page;
 mod parser;
 mod replacement;
 use crate::page::{
-    BTreeInternalPageZeroCopyMut, BTreeLeafPageZeroCopyMut, BTreeMetaPageZeroCopyMut,
-    HeapPageZeroCopyMut, PageReadGuard, PageType, PageWriteGuard, WalPage,
+    BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut, PageReadGuard, PageType,
+    PageWriteGuard, WalPage,
 };
 
 use replacement::PolicyState;
@@ -10690,23 +10690,22 @@ impl BufferFrame {
             //  TODO: Get rid of pattern matching by bringing back compile time polymorphism on the Page type
             match page_guard.peek_page_type().unwrap() {
                 PageType::Heap => {
-                    let mut page = HeapPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
                     page.update_crc32();
                 }
                 PageType::IndexLeaf => {
-                    let mut page = BTreeLeafPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
                     page.update_crc32();
                 }
                 PageType::IndexInternal => {
-                    let mut page =
-                        BTreeInternalPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
                     page.update_crc32();
                 }
                 PageType::Overflow => {
                     // CRC for overflow pages not implemented.
                 }
                 PageType::Meta => {
-                    let mut page = BTreeMetaPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                    let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
                     page.update_crc32();
                 }
                 PageType::Free => {
@@ -10740,7 +10739,7 @@ impl BufferFrame {
         // }
         match page_guard.peek_page_type().unwrap() {
             PageType::Heap => {
-                let mut page = HeapPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
                 if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
@@ -10750,7 +10749,7 @@ impl BufferFrame {
                 }
             }
             PageType::IndexLeaf => {
-                let mut page = BTreeLeafPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
                 if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
@@ -10760,7 +10759,7 @@ impl BufferFrame {
                 }
             }
             PageType::IndexInternal => {
-                let mut page = BTreeInternalPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
                 if !page.verify_crc32() {
                     panic!(
                         "crc mistmatch for {:?} on page type {:?}",
@@ -10773,7 +10772,7 @@ impl BufferFrame {
                 // Overflow pages are not CRC-verified yet; accept as-is.
             }
             PageType::Meta => {
-                let mut page = BTreeMetaPageZeroCopyMut::new(page_guard.bytes_mut()).unwrap();
+                let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
                 if !page.verify_crc32() {
                     panic!(
                         "crc mismatch for {:?} on page type {:?}",
