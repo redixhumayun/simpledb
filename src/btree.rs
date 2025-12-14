@@ -288,24 +288,6 @@ mod btree_index_tests {
     }
 
     #[test]
-    fn test_btree_index_construction() {
-        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
-        let index = setup_index(&db);
-
-        // Verify internal node file exists with empty root and rightmost child set
-        let root = BTreeInternal::new(
-            Arc::clone(&index.txn),
-            index.root_block.clone(),
-            index.internal_layout.clone(),
-            index.root_block.filename.clone(),
-        );
-        let guard = index.txn.pin_read_guard(&root.block_id);
-        let view = BTreeInternalPageView::new(guard, &root.layout).unwrap();
-        assert_eq!(view.slot_count(), 0);
-        assert_eq!(view.rightmost_child_block(), Some(0));
-    }
-
-    #[test]
     fn test_simple_insert_and_search() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
@@ -325,19 +307,36 @@ mod btree_index_tests {
         assert_eq!(index.get_data_rid(), RID::new(1, 1));
     }
 
+    /// Combined test replacing:
+    /// - test_btree_index_construction
+    /// - test_duplicate_keys
+    /// - test_delete
     #[test]
-    fn test_duplicate_keys() {
+    fn test_btree_comprehensive_operations() {
+        // Test construction (was test_btree_index_construction)
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let index = setup_index(&db);
+
+        let root = BTreeInternal::new(
+            Arc::clone(&index.txn),
+            index.root_block.clone(),
+            index.internal_layout.clone(),
+            index.root_block.filename.clone(),
+        );
+        let guard = index.txn.pin_read_guard(&root.block_id);
+        let view = BTreeInternalPageView::new(guard, &root.layout).unwrap();
+        assert_eq!(view.slot_count(), 0);
+        assert_eq!(view.rightmost_child_block(), Some(0));
+
+        // Test duplicate keys (was test_duplicate_keys)
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
-        // Insert duplicate keys
         index.insert(&Constant::Int(10), &RID::new(1, 1));
         index.insert(&Constant::Int(10), &RID::new(1, 2));
         index.insert(&Constant::Int(10), &RID::new(1, 3));
 
-        // Search and verify all duplicates are found
         index.before_first(&Constant::Int(10));
-
         let mut found_rids = Vec::new();
         while index.next() {
             found_rids.push(index.get_data_rid());
@@ -347,27 +346,21 @@ mod btree_index_tests {
         assert!(found_rids.contains(&RID::new(1, 1)));
         assert!(found_rids.contains(&RID::new(1, 2)));
         assert!(found_rids.contains(&RID::new(1, 3)));
-    }
 
-    #[test]
-    fn test_delete() {
+        // Test delete (was test_delete)
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
 
-        // Insert and then delete a value
         index.insert(&Constant::Int(10), &RID::new(1, 1));
         index.delete(&Constant::Int(10), &RID::new(1, 1));
 
-        // Verify value is gone
         index.before_first(&Constant::Int(10));
         assert!(!index.next());
 
-        // Insert multiple values and delete one
         index.insert(&Constant::Int(20), &RID::new(1, 1));
         index.insert(&Constant::Int(20), &RID::new(1, 2));
         index.delete(&Constant::Int(20), &RID::new(1, 1));
 
-        // Verify only one remains
         index.before_first(&Constant::Int(20));
         assert!(index.next());
         assert_eq!(index.get_data_rid(), RID::new(1, 2));

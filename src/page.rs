@@ -1170,89 +1170,66 @@ mod line_ptr_tests {
     }
 
     #[test]
-    fn updating_offset_preserves_length_and_state() {
+    fn test_line_ptr_operations() {
+        let mut lp = LinePtr(0);
+        lp.mark_live();
+        assert_eq!(lp.state(), LineState::Live);
+        lp.mark_dead();
+        assert_eq!(lp.state(), LineState::Dead);
+        lp.mark_free();
+        assert_eq!(lp.state(), LineState::Free);
+        lp.mark_redirect(0);
+        assert_eq!(lp.state(), LineState::Redirect);
+
+        // updating_offset_preserves_length_and_state
         let mut lp = LinePtr(0);
         lp.set_offset(0xAAAA);
         lp.set_length(0x0555);
         lp.set_state(LineState::Dead);
-
         lp.set_offset(0xBBBB);
-
         assert_eq!(lp.offset(), 0xBBBB);
         assert_eq!(lp.length(), 0x0555);
         assert_eq!(lp.state(), LineState::Dead);
-    }
 
-    #[test]
-    fn updating_length_preserves_offset_and_state() {
+        // updating_length_preserves_offset_and_state
         let mut lp = LinePtr(0);
         lp.set_offset(0x1111);
         lp.set_length(0x0123);
         lp.set_state(LineState::Live);
-
         lp.set_length(0x0456);
-
         assert_eq!(lp.offset(), 0x1111);
         assert_eq!(lp.length(), 0x0456);
         assert_eq!(lp.state(), LineState::Live);
-    }
 
-    #[test]
-    fn updating_state_preserves_offset_and_length() {
+        // updating_state_preserves_offset_and_length
         let mut lp = LinePtr(0);
         lp.set_offset(0x2222);
         lp.set_length(0x0789);
         lp.set_state(LineState::Free);
-
         lp.set_state(LineState::Redirect);
-
         assert_eq!(lp.offset(), 0x2222);
         assert_eq!(lp.length(), 0x0789);
         assert_eq!(lp.state(), LineState::Redirect);
-    }
 
-    #[test]
-    fn length_is_clamped_to_12_bits() {
-        let mut lp = LinePtr(0);
-        lp.set_length(0xFFFF); // higher than 12 bits
-
-        assert_eq!(lp.length(), 0x0FFF); // only low 12 bits kept
-    }
-
-    #[test]
-    fn with_methods_return_modified_copy() {
+        // Test with methods (was with_methods_return_modified_copy)
         let lp = LinePtr(0);
         let lp2 = lp
             .with_offset(0x3333)
             .with_length(0x0345)
             .with_state(LineState::Live);
-
         // original unchanged
         assert_eq!(lp.offset(), 0);
         assert_eq!(lp.length(), 0);
         assert_eq!(lp.state(), LineState::Free);
-
         // new one has changes
         assert_eq!(lp2.offset(), 0x3333);
         assert_eq!(lp2.length(), 0x0345);
         assert_eq!(lp2.state(), LineState::Live);
-    }
 
-    #[test]
-    fn mark_helpers_update_state() {
+        // Test length clamping (was length_is_clamped_to_12_bits)
         let mut lp = LinePtr(0);
-
-        lp.mark_live();
-        assert_eq!(lp.state(), LineState::Live);
-
-        lp.mark_dead();
-        assert_eq!(lp.state(), LineState::Dead);
-
-        lp.mark_free();
-        assert_eq!(lp.state(), LineState::Free);
-
-        lp.mark_redirect(0);
-        assert_eq!(lp.state(), LineState::Redirect);
+        lp.set_length(0xFFFF); // higher than 12 bits
+        assert_eq!(lp.length(), 0x0FFF); // only low 12 bits kept
     }
 }
 
@@ -2267,7 +2244,47 @@ mod page_tests {
     }
 
     #[test]
-    fn allocate_tuple_exposes_bytes_and_tuple_ref() {
+    fn crc32_detects_corruption() {
+        let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
+        {
+            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            HeapHeaderMut::new(header_bytes).init_heap();
+        }
+        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
+        let payload = vec![7u8; 16];
+
+        insert_tuple_bytes(&mut page, &heap_tuple_bytes(&payload)).expect("tuple allocation");
+        page.update_crc32();
+
+        let mut pristine = vec![0u8; PAGE_SIZE_BYTES as usize];
+        pristine.copy_from_slice(&bytes);
+
+        let mut corrupted = pristine.clone();
+        corrupted[128] ^= 0xFF; // flip a byte to simulate torn write
+
+        let mut ok_page = HeapPageZeroCopyMut::new(&mut pristine).expect("deserialize pristine");
+        assert!(ok_page.verify_crc32());
+
+        let mut bad_page = HeapPageZeroCopyMut::new(&mut corrupted).expect("deserialize corrupted");
+        assert!(!bad_page.verify_crc32());
+    }
+
+    #[test]
+    fn wal_page_round_trip() {
+        let mut wal = WalPage::new();
+        let record = vec![1u8, 2, 3, 4, 5];
+
+        let start = wal.boundary() - (WalPage::HEADER_BYTES + record.len());
+        wal.write_record(start, &record);
+        wal.set_boundary(start);
+
+        let (loaded, next_pos) = wal.read_record(start);
+        assert_eq!(loaded, record);
+        assert_eq!(next_pos, start + WalPage::HEADER_BYTES + record.len());
+    }
+
+    #[test]
+    fn test_page_lifecycle() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
@@ -2291,10 +2308,8 @@ mod page_tests {
             }
             _ => panic!("expected live tuple"),
         }
-    }
 
-    #[test]
-    fn delete_frees_slot_and_allocation_reuses_it() {
+        // Test delete and reuse (was delete_frees_slot_and_allocation_reuses_it)
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
@@ -2325,36 +2340,7 @@ mod page_tests {
             }
             _ => panic!("expected live tuple in reused slot"),
         }
-    }
 
-    #[test]
-    fn crc32_detects_corruption() {
-        let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
-        {
-            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
-            HeapHeaderMut::new(header_bytes).init_heap();
-        }
-        let mut page = HeapPageZeroCopyMut::new(&mut bytes).unwrap();
-        let payload = vec![7u8; 16];
-
-        insert_tuple_bytes(&mut page, &heap_tuple_bytes(&payload)).expect("tuple allocation");
-        page.update_crc32();
-
-        let mut pristine = vec![0u8; PAGE_SIZE_BYTES as usize];
-        pristine.copy_from_slice(&bytes);
-
-        let mut corrupted = pristine.clone();
-        corrupted[128] ^= 0xFF; // flip a byte to simulate torn write
-
-        let mut ok_page = HeapPageZeroCopyMut::new(&mut pristine).expect("deserialize pristine");
-        assert!(ok_page.verify_crc32());
-
-        let mut bad_page = HeapPageZeroCopyMut::new(&mut corrupted).expect("deserialize corrupted");
-        assert!(!bad_page.verify_crc32());
-    }
-
-    #[test]
-    fn pack_and_unpack_preserves_tuples() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
             let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
@@ -2373,20 +2359,6 @@ mod page_tests {
             TupleRef::Live(tuple) => assert_eq!(tuple.payload(), payload.as_slice()),
             _ => panic!("expected live tuple"),
         }
-    }
-
-    #[test]
-    fn wal_page_round_trip() {
-        let mut wal = WalPage::new();
-        let record = vec![1u8, 2, 3, 4, 5];
-
-        let start = wal.boundary() - (WalPage::HEADER_BYTES + record.len());
-        wal.write_record(start, &record);
-        wal.set_boundary(start);
-
-        let (loaded, next_pos) = wal.read_record(start);
-        assert_eq!(loaded, record);
-        assert_eq!(next_pos, start + WalPage::HEADER_BYTES + record.len());
     }
 }
 
@@ -2475,24 +2447,7 @@ mod bitmap_tests {
     use super::*;
 
     #[test]
-    fn null_bitmap_reads_bits_across_bytes() {
-        let bytes = [0b1010_1010u8, 0b0000_0011u8];
-        let bitmap = NullBitmap::new(&bytes);
-        // byte 0 bits
-        assert!(bitmap.is_null(1)); // bit 1 set
-        assert!(bitmap.is_null(3));
-        assert!(bitmap.is_null(5));
-        assert!(bitmap.is_null(7));
-        assert!(!bitmap.is_null(0));
-        assert!(!bitmap.is_null(6));
-        // byte 1 bits (columns 8,9)
-        assert!(bitmap.is_null(8));
-        assert!(bitmap.is_null(9));
-        assert!(!bitmap.is_null(10));
-    }
-
-    #[test]
-    fn null_bitmap_mut_sets_and_clears_bits() {
+    fn test_bitmap_operations() {
         let mut bytes = [0u8; 2];
         {
             let mut bitmap = NullBitmapMut::new(&mut bytes);
@@ -2506,6 +2461,20 @@ mod bitmap_tests {
         assert!(!bitmap.is_null(7));
         assert!(bitmap.is_null(9));
         assert!(!bitmap.is_null(5));
+
+        let bytes = [0b1010_1010u8, 0b0000_0011u8];
+        let bitmap = NullBitmap::new(&bytes);
+        // byte 0 bits
+        assert!(bitmap.is_null(1)); // bit 1 set
+        assert!(bitmap.is_null(3));
+        assert!(bitmap.is_null(5));
+        assert!(bitmap.is_null(7));
+        assert!(!bitmap.is_null(0));
+        assert!(!bitmap.is_null(6));
+        // byte 1 bits (columns 8,9)
+        assert!(bitmap.is_null(8));
+        assert!(bitmap.is_null(9));
+        assert!(!bitmap.is_null(10));
     }
 }
 
@@ -2594,29 +2563,16 @@ mod logical_row_tests {
         payload
     }
 
-    #[test]
-    fn logical_row_reads_typed_columns_and_nulls() {
-        let layout = sample_layout();
-        let payload = base_payload(&layout, 10, "xy", 0, 0b0000_0100);
-        let bytes = build_tuple_bytes(&payload, 0);
-        let tuple = HeapTuple::from_bytes(&bytes);
-        let row = LogicalRow::new(tuple, &layout);
-
-        match row.get_column("a") {
-            Some(Constant::Int(v)) => assert_eq!(v, 10),
-            _ => panic!("expected int value for column a"),
-        }
-
-        match row.get_column("b") {
-            Some(Constant::String(s)) => assert_eq!(s, "xy"),
-            _ => panic!("expected string value for column b"),
-        }
-
-        assert!(row.get_column("c").is_none());
+    fn serialization_layout() -> Layout {
+        let mut schema = Schema::new();
+        schema.add_int_field("num");
+        schema.add_string_field("text", 8);
+        Layout::new(schema)
     }
 
     #[test]
-    fn logical_row_mut_updates_and_nulls_columns() {
+    fn test_logical_row_operations() {
+        // Test updates and nulls
         let layout = sample_layout();
         let payload = base_payload(&layout, 1, "hi", 5, 0);
         let mut bytes = build_tuple_bytes(&payload, 0);
@@ -2648,17 +2604,8 @@ mod logical_row_tests {
         }
 
         assert!(row.get_column("c").is_none());
-    }
 
-    fn serialization_layout() -> Layout {
-        let mut schema = Schema::new();
-        schema.add_int_field("num");
-        schema.add_string_field("text", 8);
-        Layout::new(schema)
-    }
-
-    #[test]
-    fn logical_row_round_trip_serialization_cases() {
+        // Test serialization round trip
         let layout = serialization_layout();
         let cases: Vec<(i32, Option<&str>)> = vec![
             (123, Some("")),
@@ -3876,115 +3823,6 @@ mod heap_page_view_tests {
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
         assert!(row.get_column("score").is_none());
     }
-
-    #[test]
-    fn heap_page_view_mut_reuses_slots_and_serializes() {
-        use super::TupleRef;
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-        let layout = sample_layout();
-
-        let mut guard = txn.pin_write_guard(&block_id);
-        format_heap_page(&mut guard);
-        let mut view =
-            HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
-
-        let slot_a = {
-            let (slot, mut row) = view.insert_row_mut().expect("insert row a");
-            row.set_column("id", &Constant::Int(10)).unwrap();
-            row.set_column("name", &Constant::String("alpha".into()))
-                .unwrap();
-            row.set_column("score", &Constant::Int(1)).unwrap();
-            slot
-        };
-        let slot_b = {
-            let (slot, mut row) = view.insert_row_mut().expect("insert row b");
-            row.set_column("id", &Constant::Int(20)).unwrap();
-            row.set_column("name", &Constant::String("beta".into()))
-                .unwrap();
-            row.set_column("score", &Constant::Int(2)).unwrap();
-            slot
-        };
-        assert_eq!((slot_a, slot_b), (0, 1));
-
-        view.delete_slot(slot_a).expect("delete slot_a");
-        let slot_c = {
-            let (slot, mut row) = view.insert_row_mut().expect("insert row c");
-            row.set_column("id", &Constant::Int(30)).unwrap();
-            row.set_column("name", &Constant::String("gamma".into()))
-                .unwrap();
-            row.set_column("score", &Constant::Int(3)).unwrap();
-            slot
-        };
-        assert_eq!(
-            slot_c, slot_a,
-            "freed slot should be reused for next allocation"
-        );
-
-        let slot_d = {
-            let (slot, mut row) = view.insert_row_mut().expect("insert row d");
-            row.set_column("id", &Constant::Int(40)).unwrap();
-            row.set_column("name", &Constant::String("delta".into()))
-                .unwrap();
-            row.set_column("score", &Constant::Int(4)).unwrap();
-            slot
-        };
-        assert_eq!(slot_d, 2);
-
-        view.redirect_slot(slot_b, slot_d)
-            .expect("redirect slot_b to slot_d");
-
-        // slot_b should now report redirect state (rows returns None)
-        assert!(view.row(slot_b).is_none());
-        let redirected = view
-            .tuple_ref(slot_b)
-            .expect("error while converting to Page<HeapPage>");
-        match redirected {
-            TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
-            _ => panic!("slot_b should be redirect after redirect_slot"),
-        }
-
-        // slot_c and slot_d remain live
-        let row_c = view.row(slot_c).expect("row at slot_c");
-        assert_eq!(row_c.get_column("id"), Some(Constant::Int(30)));
-        let row_d = view.row(slot_d).expect("row at slot_d");
-        assert_eq!(row_d.get_column("id"), Some(Constant::Int(40)));
-
-        // Serialize to bytes and drop the guard
-        let mut buf = vec![0u8; PAGE_SIZE_BYTES as usize];
-        view.write_bytes(&mut buf)
-            .expect("serialize heap page state");
-        drop(view);
-
-        // let rebuilt =
-        //     Page::<HeapPage>::from_bytes(&buf).expect("deserialize heap page after serialization");
-        let rebuilt =
-            HeapPageZeroCopy::new(&buf).expect("deserialize heap page after serialization");
-
-        match rebuilt.tuple_ref(slot_c).expect("slot_c tuple") {
-            TupleRef::Live(tuple) => {
-                let row = LogicalRow::new(tuple, &layout);
-                assert_eq!(row.get_column("id"), Some(Constant::Int(30)));
-            }
-            _ => panic!("slot_c should remain live after serialization"),
-        }
-
-        match rebuilt.tuple_ref(slot_d).expect("slot_d tuple") {
-            TupleRef::Live(tuple) => {
-                let row = LogicalRow::new(tuple, &layout);
-                assert_eq!(row.get_column("id"), Some(Constant::Int(40)));
-            }
-            _ => panic!("slot_d should remain live after serialization"),
-        }
-
-        match rebuilt.tuple_ref(slot_b).expect("slot_b tuple") {
-            TupleRef::Redirect(target) => assert_eq!({ target }, slot_d),
-            _ => panic!("slot_b redirect state not preserved across serialization"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4061,12 +3899,6 @@ mod btree_page_tests {
             self.view().overflow_block()
         }
 
-        fn set_overflow_block(&mut self, block: Option<usize>) {
-            self.view_mut()
-                .set_overflow_block(block)
-                .expect("set overflow");
-        }
-
         fn insert_leaf_entry(
             &mut self,
             layout: &Layout,
@@ -4098,10 +3930,6 @@ mod btree_page_tests {
 
         fn is_full(&self, layout: &Layout) -> bool {
             self.view().is_full(layout)
-        }
-
-        fn tuple_bytes(&self, slot: SlotId) -> Option<Vec<u8>> {
-            self.view().entry_bytes(slot).map(|bytes| bytes.to_vec())
         }
 
         fn write_bytes(&self, dst: &mut [u8]) {
@@ -4139,12 +3967,6 @@ mod btree_page_tests {
 
         fn btree_level(&self) -> u8 {
             self.view().btree_level()
-        }
-
-        fn set_btree_level(&mut self, level: u8) {
-            self.view_mut()
-                .set_btree_level(level)
-                .expect("set btree level");
         }
 
         fn rightmost_child(&self) -> Option<usize> {
@@ -4219,68 +4041,6 @@ mod btree_page_tests {
         Layout::new(schema)
     }
 
-    // ========== Phase 1: Sorted Insertion Tests ==========
-
-    #[test]
-    fn btree_leaf_sorted_insertion_random_order() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        // Insert in random order
-        let keys = [42, 1, 99, 17, 55, 3, 88];
-        for (i, &key) in keys.iter().enumerate() {
-            let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
-                .expect("insert should succeed");
-        }
-
-        // Verify sorted order
-        let expected_sorted = [1, 3, 17, 42, 55, 88, 99];
-        for (slot, &expected_key) in expected_sorted.iter().enumerate() {
-            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
-            assert_eq!(entry.key, Constant::Int(expected_key));
-        }
-    }
-
-    #[test]
-    fn btree_leaf_sorted_insertion_ascending() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        let keys = [1, 2, 3, 4, 5];
-        for (i, &key) in keys.iter().enumerate() {
-            let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
-                .expect("insert should succeed");
-        }
-
-        // Verify order maintained
-        for (slot, &expected_key) in keys.iter().enumerate() {
-            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
-            assert_eq!(entry.key, Constant::Int(expected_key));
-        }
-    }
-
-    #[test]
-    fn btree_leaf_sorted_insertion_descending() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        let keys = [5, 4, 3, 2, 1];
-        for (i, &key) in keys.iter().enumerate() {
-            let rid = RID::new(i, i);
-            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
-                .expect("insert should succeed");
-        }
-
-        // Verify ascending sorted order
-        let expected = [1, 2, 3, 4, 5];
-        for (slot, &expected_key) in expected.iter().enumerate() {
-            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
-            assert_eq!(entry.key, Constant::Int(expected_key));
-        }
-    }
-
     #[test]
     fn btree_leaf_varchar_sorted_insertion() {
         let layout = btree_leaf_layout_varchar();
@@ -4302,17 +4062,57 @@ mod btree_page_tests {
     }
 
     #[test]
-    fn btree_internal_sorted_insertion() {
+    fn test_btree_sorted_insertion_comprehensive() {
+        // Test leaf ascending insertion
+        let layout = btree_leaf_layout_int();
+        let mut page = LeafTestPage::new();
+        let keys = [1, 2, 3, 4, 5];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
+                .expect("insert should succeed");
+        }
+        for (slot, &expected_key) in keys.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+
+        // Test leaf descending insertion
+        let mut page = LeafTestPage::new();
+        let keys = [5, 4, 3, 2, 1];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
+                .expect("insert should succeed");
+        }
+        let expected = [1, 2, 3, 4, 5];
+        for (slot, &expected_key) in expected.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+
+        // Test leaf random order insertion
+        let mut page = LeafTestPage::new();
+        let keys = [42, 1, 99, 17, 55, 3, 88];
+        for (i, &key) in keys.iter().enumerate() {
+            let rid = RID::new(i, i);
+            page.insert_leaf_entry(&layout, Constant::Int(key), rid)
+                .expect("insert should succeed");
+        }
+        let expected_sorted = [1, 3, 17, 42, 55, 88, 99];
+        for (slot, &expected_key) in expected_sorted.iter().enumerate() {
+            let entry = page.get_leaf_entry(&layout, slot).expect("get entry");
+            assert_eq!(entry.key, Constant::Int(expected_key));
+        }
+
+        // Test internal page sorted insertion
         let layout = btree_internal_layout_int();
         let mut page = InternalTestPage::new(1);
-
         let keys = [50, 10, 90, 30, 70];
         for (i, &key) in keys.iter().enumerate() {
             page.insert_internal_entry(&layout, Constant::Int(key), i * 10)
                 .expect("insert should succeed");
         }
-
-        // Verify sorted order
         let expected = [10, 30, 50, 70, 90];
         for (slot, &expected_key) in expected.iter().enumerate() {
             let entry = page.get_internal_entry(&layout, slot).expect("get entry");
@@ -4320,131 +4120,76 @@ mod btree_page_tests {
         }
     }
 
-    // ========== Phase 1: Binary Search Tests ==========
-
     #[test]
-    fn find_insertion_slot_empty_page() {
+    fn test_slot_finding_comprehensive() {
         let layout = btree_leaf_layout_int();
-        let page = LeafTestPage::new();
 
+        // Test find_insertion_slot on empty page
+        let page = LeafTestPage::new();
         let slot = page.find_insertion_slot(&layout, &Constant::Int(42));
         assert_eq!(slot, 0);
-    }
 
-    #[test]
-    fn find_insertion_slot_middle() {
-        let layout = btree_leaf_layout_int();
+        // Setup page with [10, 20, 30]
         let mut page = LeafTestPage::new();
+        for &key in &[10, 20, 30] {
+            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
+                .unwrap();
+        }
 
-        // Insert [10, 30, 50]
+        // Test find_insertion_slot at beginning
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(5));
+        assert_eq!(slot, 0);
+
+        // Test find_insertion_slot at end
+        let slot = page.find_insertion_slot(&layout, &Constant::Int(40));
+        assert_eq!(slot, 3);
+
+        // Setup page with [10, 30, 50] for middle test
+        let mut page = LeafTestPage::new();
         for &key in &[10, 30, 50] {
             page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
-        // Search for 40 should return slot 2 (between 30 and 50)
+        // Test find_insertion_slot in middle (40 between 30 and 50)
         let slot = page.find_insertion_slot(&layout, &Constant::Int(40));
         assert_eq!(slot, 2);
-    }
 
-    #[test]
-    fn find_insertion_slot_beginning() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
-                .unwrap();
-        }
-
-        // Search for 5 should return slot 0
-        let slot = page.find_insertion_slot(&layout, &Constant::Int(5));
-        assert_eq!(slot, 0);
-    }
-
-    #[test]
-    fn find_insertion_slot_end() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
-                .unwrap();
-        }
-
-        // Search for 40 should return slot 3 (end)
-        let slot = page.find_insertion_slot(&layout, &Constant::Int(40));
-        assert_eq!(slot, 3);
-    }
-
-    #[test]
-    fn find_slot_before_empty_page() {
-        let layout = btree_leaf_layout_int();
+        // Test find_slot_before on empty page
         let page = LeafTestPage::new();
-
         let slot = page.find_slot_before(&layout, &Constant::Int(42));
         assert_eq!(slot, None);
-    }
 
-    #[test]
-    fn find_slot_before_key_less_than_all() {
-        let layout = btree_leaf_layout_int();
+        // Setup page with [10, 20, 30]
         let mut page = LeafTestPage::new();
-
         for &key in &[10, 20, 30] {
             page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
+        // Test find_slot_before key less than all
         let slot = page.find_slot_before(&layout, &Constant::Int(5));
         assert_eq!(slot, None);
-    }
 
-    #[test]
-    fn find_slot_before_key_greater_than_all() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        for &key in &[10, 20, 30] {
-            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
-                .unwrap();
-        }
-
+        // Test find_slot_before key greater than all
         let slot = page.find_slot_before(&layout, &Constant::Int(100));
         assert_eq!(slot, Some(2)); // Last slot
-    }
 
-    #[test]
-    fn find_slot_before_key_in_middle() {
-        let layout = btree_leaf_layout_int();
+        // Setup page with [10, 20, 30, 40]
         let mut page = LeafTestPage::new();
-
         for &key in &[10, 20, 30, 40] {
             page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
                 .unwrap();
         }
 
-        // Search for 25 should return slot 1 (20 is before 25)
+        // Test find_slot_before key in middle (25 returns 20)
         let slot = page.find_slot_before(&layout, &Constant::Int(25));
         assert_eq!(slot, Some(1));
-    }
 
-    #[test]
-    fn find_slot_before_exact_match() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        for &key in &[10, 20, 30, 40] {
-            page.insert_leaf_entry(&layout, Constant::Int(key), RID::new(0, 0))
-                .unwrap();
-        }
-
-        // Exact match with 30 should return slot before it (slot 1 = 20)
+        // Test find_slot_before exact match (30 returns 20)
         let slot = page.find_slot_before(&layout, &Constant::Int(30));
         assert_eq!(slot, Some(1));
     }
-
-    // ========== Phase 1: Basic CRUD Tests ==========
 
     #[test]
     fn btree_leaf_insert_get_verify() {
@@ -4461,52 +4206,6 @@ mod btree_page_tests {
             .expect("get should succeed");
         assert_eq!(entry.key, Constant::Int(42));
         assert_eq!(entry.rid, rid);
-    }
-
-    #[test]
-    fn btree_leaf_insert_delete_verify() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        // Insert two entries - they will be sorted by key (10, 20)
-        page.insert_leaf_entry(&layout, Constant::Int(10), RID::new(1, 1))
-            .unwrap();
-        page.insert_leaf_entry(&layout, Constant::Int(20), RID::new(2, 2))
-            .unwrap();
-
-        // Verify both entries exist at expected positions
-        assert_eq!(page.slot_count(), 2);
-        let entry0 = page.get_leaf_entry(&layout, 0).unwrap();
-        assert_eq!(entry0.key, Constant::Int(10));
-        assert_eq!(entry0.rid, RID::new(1, 1));
-
-        let entry1 = page.get_leaf_entry(&layout, 1).unwrap();
-        assert_eq!(entry1.key, Constant::Int(20));
-        assert_eq!(entry1.rid, RID::new(2, 2));
-
-        // Delete first entry (slot 0, key=10)
-        page.delete_leaf_entry(0, &layout)
-            .expect("delete should succeed");
-
-        // After physical deletion, only one entry remains
-        assert_eq!(page.slot_count(), 1);
-
-        // The entry that was at slot 1 is now at slot 0 due to dense array maintenance
-        let remaining = page.get_leaf_entry(&layout, 0).unwrap();
-        assert_eq!(remaining.key, Constant::Int(20));
-        assert_eq!(remaining.rid, RID::new(2, 2));
-
-        // Verify slot 1 no longer exists (out of bounds)
-        assert!(page.get_leaf_entry(&layout, 1).is_err());
-    }
-
-    #[test]
-    fn btree_leaf_get_invalid_slot() {
-        let layout = btree_leaf_layout_int();
-        let page = LeafTestPage::new();
-
-        let result = page.get_leaf_entry(&layout, 999);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -4535,49 +4234,6 @@ mod btree_page_tests {
         assert_eq!(entry.child_block, 0);
         assert_eq!(page.rightmost_child().unwrap(), 123);
     }
-
-    #[test]
-    fn btree_internal_insert_delete_verify() {
-        let layout = btree_internal_layout_int();
-        let mut page = InternalTestPage::new(1);
-
-        // Insert two entries - they will be sorted by key (10, 20)
-        page.insert_internal_entry(&layout, Constant::Int(10), 100)
-            .unwrap();
-        page.insert_internal_entry(&layout, Constant::Int(20), 200)
-            .unwrap();
-
-        // Verify both entries exist at expected positions
-        assert_eq!(page.slot_count(), 2);
-        let entry0 = page.get_internal_entry(&layout, 0).unwrap();
-        assert_eq!(entry0.key, Constant::Int(10));
-        // entry0 child is left of 10 (initial C0 = 0)
-        assert_eq!(entry0.child_block, 0);
-
-        let entry1 = page.get_internal_entry(&layout, 1).unwrap();
-        assert_eq!(entry1.key, Constant::Int(20));
-        // entry1 child is left of 20 (which is previous right child)
-        assert_eq!(entry1.child_block, 100);
-        assert_eq!(page.rightmost_child().unwrap(), 200);
-
-        // Delete the first entry (slot 0, key=10)
-        page.delete_internal_entry(0, &layout)
-            .expect("delete should succeed");
-
-        // After physical deletion, only one entry remains
-        assert_eq!(page.slot_count(), 1);
-
-        // The entry that was at slot 1 is now at slot 0 due to dense array maintenance
-        let remaining = page.get_internal_entry(&layout, 0).unwrap();
-        assert_eq!(remaining.key, Constant::Int(20));
-        assert_eq!(remaining.child_block, 100);
-        assert_eq!(page.rightmost_child().unwrap(), 200);
-
-        // Verify slot 1 no longer exists (out of bounds)
-        assert!(page.get_internal_entry(&layout, 1).is_err());
-    }
-
-    // ========== Phase 2: Capacity Tests ==========
 
     #[test]
     fn btree_leaf_is_full_detection() {
@@ -4610,46 +4266,43 @@ mod btree_page_tests {
     }
 
     #[test]
-    fn btree_leaf_fill_to_capacity_then_fail() {
+    fn test_btree_delete_operations() {
+        use crate::{test_utils::generate_filename, SimpleDB};
+
+        // Test leaf insert and delete
         let layout = btree_leaf_layout_int();
         let mut page = LeafTestPage::new();
+        page.insert_leaf_entry(&layout, Constant::Int(10), RID::new(1, 1))
+            .unwrap();
+        page.insert_leaf_entry(&layout, Constant::Int(20), RID::new(2, 2))
+            .unwrap();
+        assert_eq!(page.slot_count(), 2);
+        page.delete_leaf_entry(0, &layout)
+            .expect("delete should succeed");
+        assert_eq!(page.slot_count(), 1);
+        let remaining = page.get_leaf_entry(&layout, 0).unwrap();
+        assert_eq!(remaining.key, Constant::Int(20));
 
-        // Fill page completely
-        let mut inserted = 0;
-        loop {
-            let result = page.insert_leaf_entry(
-                &layout,
-                Constant::Int(inserted),
-                RID::new(inserted as usize, inserted as usize),
-            );
-            if result.is_err() {
-                break;
-            }
-            inserted += 1;
-            if inserted > 1000 {
-                panic!("infinite loop - page never fills");
-            }
-        }
+        // Test internal insert and delete
+        let layout = btree_internal_layout_int();
+        let mut page = InternalTestPage::new(1);
+        page.insert_internal_entry(&layout, Constant::Int(10), 100)
+            .unwrap();
+        page.insert_internal_entry(&layout, Constant::Int(20), 200)
+            .unwrap();
+        assert_eq!(page.slot_count(), 2);
+        page.delete_internal_entry(0, &layout)
+            .expect("delete should succeed");
+        assert_eq!(page.slot_count(), 1);
 
-        // One more insert should fail
-        let result = page.insert_leaf_entry(&layout, Constant::Int(9999), RID::new(9999, 9999));
-        assert!(result.is_err(), "insert should fail on full page");
-
-        // Verify all previously inserted entries are still accessible and sorted
-        for slot in 0..inserted {
-            let entry = page
-                .get_leaf_entry(&layout, slot as usize)
-                .expect("entry should exist");
-            assert_eq!(entry.key, Constant::Int(slot));
-        }
-    }
-
-    #[test]
-    fn btree_leaf_delete_then_insert_more() {
+        // Test delete invalid slot
         let layout = btree_leaf_layout_int();
         let mut page = LeafTestPage::new();
+        let result = page.delete_leaf_entry(999, &layout);
+        assert!(result.is_err());
 
-        // Fill page
+        // Test delete then insert more
+        let mut page = LeafTestPage::new();
         let mut inserted = 0;
         loop {
             let result = page.insert_leaf_entry(
@@ -4665,26 +4318,64 @@ mod btree_page_tests {
                 panic!("infinite loop");
             }
         }
-
-        let _initial_count = inserted;
         assert!(page.is_full(&layout), "page should be full");
-
-        // Delete several entries
         for slot in 0..5 {
             page.delete_leaf_entry(slot, &layout)
                 .expect("delete should succeed");
         }
-
-        // Should no longer be marked as full (freed some space)
-        // Note: is_full checks if there's space for one more entry
         let was_full_after_delete = page.is_full(&layout);
-
-        // Try inserting again - should succeed now that we've freed space
         let result = page.insert_leaf_entry(&layout, Constant::Int(8888), RID::new(8888, 8888));
         assert!(
             result.is_ok() || was_full_after_delete,
             "either insert succeeds or page was still full after deletes"
         );
+
+        // Test view delete and reinsert
+        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
+        let txn = db.new_tx();
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        let layout = btree_leaf_layout_int();
+
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
+
+            view.insert_entry(Constant::Int(10), RID::new(1, 0))
+                .unwrap();
+            view.insert_entry(Constant::Int(20), RID::new(2, 0))
+                .unwrap();
+            view.insert_entry(Constant::Int(30), RID::new(3, 0))
+                .unwrap();
+            view.insert_entry(Constant::Int(40), RID::new(4, 0))
+                .unwrap();
+            view.insert_entry(Constant::Int(50), RID::new(5, 0))
+                .unwrap();
+
+            assert_eq!(view.slot_count(), 5);
+
+            view.delete_entry(3).expect("delete key 40 at slot 3");
+            view.delete_entry(1).expect("delete key 20 at slot 1");
+            assert_eq!(view.slot_count(), 3);
+
+            view.insert_entry(Constant::Int(15), RID::new(10, 0))
+                .unwrap();
+            view.insert_entry(Constant::Int(25), RID::new(11, 0))
+                .unwrap();
+
+            let collected: Vec<i32> = view
+                .iter()
+                .filter_map(|e| {
+                    if let Constant::Int(val) = e.key {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(collected, vec![10, 15, 25, 30, 50]);
+        }
     }
 
     #[test]
@@ -4708,108 +4399,6 @@ mod btree_page_tests {
         }
 
         assert!(page.is_full(&layout));
-    }
-
-    // ========== Phase 2: Empty/Single Entry Tests ==========
-
-    #[test]
-    fn btree_leaf_operations_on_empty_page() {
-        let layout = btree_leaf_layout_int();
-        let page = LeafTestPage::new();
-
-        // Empty page operations
-        assert_eq!(page.slot_count(), 0);
-        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(42)), 0);
-        assert_eq!(page.find_slot_before(&layout, &Constant::Int(42)), None);
-        assert!(page.get_leaf_entry(&layout, 0).is_err());
-    }
-
-    #[test]
-    fn btree_leaf_single_entry_operations() {
-        let layout = btree_leaf_layout_int();
-        let mut page = LeafTestPage::new();
-
-        // Insert single entry
-        let slot = page
-            .insert_leaf_entry(&layout, Constant::Int(50), RID::new(10, 5))
-            .expect("insert should succeed");
-        assert_eq!(slot, 0);
-        assert_eq!(page.slot_count(), 1);
-
-        // Search operations with single entry
-        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(40)), 0); // before
-        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(50)), 1); // exact (rightmost for duplicates)
-        assert_eq!(page.find_insertion_slot(&layout, &Constant::Int(60)), 1); // after
-
-        assert_eq!(page.find_slot_before(&layout, &Constant::Int(40)), None);
-        assert_eq!(page.find_slot_before(&layout, &Constant::Int(50)), None);
-        assert_eq!(page.find_slot_before(&layout, &Constant::Int(60)), Some(0));
-
-        // Delete the only entry - physical deletion removes it from the line_pointers array
-        page.delete_leaf_entry(0, &layout)
-            .expect("delete should succeed");
-
-        // After deletion, slot count should be 0 and accessing slot 0 should fail
-        assert_eq!(page.slot_count(), 0);
-        assert!(page.tuple_bytes(0).is_none());
-        assert!(page.get_leaf_entry(&layout, 0).is_err());
-    }
-
-    #[test]
-    fn btree_internal_single_entry_operations() {
-        let layout = btree_internal_layout_int();
-        let mut page = InternalTestPage::new(2);
-
-        let slot = page
-            .insert_internal_entry(&layout, Constant::Int(100), 500)
-            .expect("insert should succeed");
-        assert_eq!(slot, 0);
-
-        let entry = page
-            .get_internal_entry(&layout, slot)
-            .expect("get should succeed");
-        assert_eq!(entry.key, Constant::Int(100));
-        // Entry child is the left child; rightmost child holds the right side
-        assert_eq!(entry.child_block, 0);
-        assert_eq!(page.rightmost_child().unwrap(), 500);
-
-        page.delete_internal_entry(slot, &layout)
-            .expect("delete should succeed");
-    }
-
-    // ========== Phase 2: Metadata Persistence Tests ==========
-
-    #[test]
-    fn btree_leaf_overflow_block_roundtrip() {
-        let mut page = LeafTestPage::new();
-
-        // Initially None
-        assert_eq!(page.overflow_block(), None);
-
-        // Set to Some value
-        page.set_overflow_block(Some(42));
-        assert_eq!(page.overflow_block(), Some(42));
-
-        // Change value
-        page.set_overflow_block(Some(999));
-        assert_eq!(page.overflow_block(), Some(999));
-
-        // Clear back to None
-        page.set_overflow_block(None);
-        assert_eq!(page.overflow_block(), None);
-    }
-
-    #[test]
-    fn btree_internal_level_roundtrip() {
-        let mut page = InternalTestPage::new(0);
-
-        assert_eq!(page.btree_level(), 0);
-
-        page.set_btree_level(5);
-        assert_eq!(page.btree_level(), 5);
-
-        page.set_btree_level(255);
-        assert_eq!(page.btree_level(), 255);
     }
 
     #[test]
@@ -4894,8 +4483,6 @@ mod btree_page_tests {
         assert_eq!(restored.rightmost_child().unwrap(), 600);
     }
 
-    // ========== Phase 3: Iterator Tests ==========
-
     #[test]
     fn btree_leaf_iterator_yields_sorted_order() {
         let layout = btree_leaf_layout_int();
@@ -4961,21 +4548,6 @@ mod btree_page_tests {
     }
 
     #[test]
-    fn btree_leaf_iterator_empty_page() {
-        let layout = btree_leaf_layout_int();
-        let mut bytes = init_btree_leaf_bytes(0, None, None);
-        let page = leaf_view_mut_from_bytes(&mut bytes);
-
-        let mut iter = BTreeLeafIterator {
-            page: page.as_read().unwrap(),
-            layout: &layout,
-            current_slot: 0,
-        };
-
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
     fn btree_internal_iterator_yields_sorted_order() {
         let layout = btree_internal_layout_int();
         let mut bytes = init_btree_internal_bytes(1, None);
@@ -5003,213 +4575,22 @@ mod btree_page_tests {
         assert_eq!(collected, vec![10, 20, 50, 80, 90]);
     }
 
-    // ========== Phase 3: Mixed Operations via Views ==========
-
     #[test]
-    fn btree_leaf_view_delete_and_reinsert() {
+    fn test_btree_view_stress() {
         use crate::{test_utils::generate_filename, SimpleDB};
 
         let (db, _dir) = SimpleDB::new_for_test(2, 1000);
         let txn = db.new_tx();
+
+        // Test fill, delete, refill
         let filename = generate_filename();
         let block_id = txn.append(&filename);
         let layout = btree_leaf_layout_int();
-
         {
             let mut guard = txn.pin_write_guard(&block_id);
             guard.format_as_btree_leaf(None);
-
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
-            // Insert 5 entries - keys will be sorted: [10, 20, 30, 40, 50]
-            view.insert_entry(Constant::Int(10), RID::new(1, 0))
-                .unwrap();
-            view.insert_entry(Constant::Int(20), RID::new(2, 0))
-                .unwrap();
-            view.insert_entry(Constant::Int(30), RID::new(3, 0))
-                .unwrap();
-            view.insert_entry(Constant::Int(40), RID::new(4, 0))
-                .unwrap();
-            view.insert_entry(Constant::Int(50), RID::new(5, 0))
-                .unwrap();
-
-            assert_eq!(view.slot_count(), 5);
-
-            // Delete entries with keys 20 and 40
-            // Must delete in reverse order to avoid slot shifting issues
-            // After sorting: slot 0=10, 1=20, 2=30, 3=40, 4=50
-            view.delete_entry(3).expect("delete key 40 at slot 3");
-            view.delete_entry(1).expect("delete key 20 at slot 1");
-
-            // After deletions: [10, 30, 50] remain
-            assert_eq!(view.slot_count(), 3);
-            let live_count = view.iter().count();
-            assert_eq!(live_count, 3);
-
-            // Insert new entries - they will be inserted in sorted order
-            view.insert_entry(Constant::Int(15), RID::new(10, 0))
-                .unwrap();
-            view.insert_entry(Constant::Int(25), RID::new(11, 0))
-                .unwrap();
-
-            // Verify all live entries are in sorted order via iterator
-            let collected: Vec<i32> = view
-                .iter()
-                .filter_map(|e| {
-                    if let Constant::Int(k) = e.key {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            assert_eq!(collected, vec![10, 15, 25, 30, 50]);
-            assert_eq!(collected.len(), 5);
-        }
-    }
-
-    #[test]
-    fn btree_leaf_view_serialize_with_deletes() {
-        use crate::{test_utils::generate_filename, SimpleDB};
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-        let layout = btree_leaf_layout_int();
-
-        {
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
-
-            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
-
-            // Insert 10 entries with keys [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
-            for i in 0..10 {
-                view.insert_entry(Constant::Int(i * 10), RID::new(i as usize, 0))
-                    .unwrap();
-            }
-
-            // Delete entries with keys 0, 20, 40, 60, 80 (every other entry)
-            // Must delete in reverse order to avoid slot shifting issues
-            // Initial: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
-            // Slots:    0   1   2   3   4   5   6   7   8   9
-            view.delete_entry(8).expect("delete key 80 at slot 8");
-            view.delete_entry(6).expect("delete key 60 at slot 6");
-            view.delete_entry(4).expect("delete key 40 at slot 4");
-            view.delete_entry(2).expect("delete key 20 at slot 2");
-            view.delete_entry(0).expect("delete key 0 at slot 0");
-
-            // Verify 5 live entries remain via iterator
-            let count = view.iter().count();
-            assert_eq!(count, 5);
-        }
-
-        // Serialize happens automatically when guard is dropped
-        // Re-read the page
-        {
-            let view = txn
-                .pin_read_guard(&block_id)
-                .into_btree_leaf_page_view(&layout)
-                .expect("create read view");
-
-            // Verify 5 live entries still accessible: [10, 30, 50, 70, 90]
-            let collected: Vec<i32> = view
-                .iter()
-                .filter_map(|e| {
-                    if let Constant::Int(k) = e.key {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            assert_eq!(collected, vec![10, 30, 50, 70, 90]);
-        }
-    }
-
-    #[test]
-    fn btree_leaf_view_insert_delete_chaos() {
-        use crate::{test_utils::generate_filename, SimpleDB};
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-        let layout = btree_leaf_layout_int();
-
-        {
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
-
-            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
-
-            // Insert 20 entries with keys [0, 1, 2, ..., 19]
-            for i in 0..20 {
-                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
-                    .unwrap();
-            }
-
-            // Delete entries with odd keys: 1, 3, 5, 7, 9, 11, 13, 15, 17, 19
-            // Must delete in reverse order to avoid slot shifting issues
-            // After insertion, keys are at their corresponding slots
-            view.delete_entry(19).expect("delete key 19");
-            view.delete_entry(17).expect("delete key 17");
-            view.delete_entry(15).expect("delete key 15");
-            view.delete_entry(13).expect("delete key 13");
-            view.delete_entry(11).expect("delete key 11");
-            view.delete_entry(9).expect("delete key 9");
-            view.delete_entry(7).expect("delete key 7");
-            view.delete_entry(5).expect("delete key 5");
-            view.delete_entry(3).expect("delete key 3");
-            view.delete_entry(1).expect("delete key 1");
-
-            // After deletions, should have 10 entries with even keys: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
-            assert_eq!(view.slot_count(), 10);
-
-            // Insert 5 new entries with keys [100, 101, 102, 103, 104]
-            for i in 100..105 {
-                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
-                    .unwrap();
-            }
-
-            // Verify sorted order maintained
-            let collected: Vec<i32> = view
-                .iter()
-                .filter_map(|e| {
-                    if let Constant::Int(k) = e.key {
-                        Some(k)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Should be: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 100, 101, 102, 103, 104]
-            let mut expected = vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18];
-            expected.extend(100..105);
-            assert_eq!(collected, expected);
-            assert_eq!(collected.len(), 15);
-        }
-    }
-
-    #[test]
-    fn btree_leaf_view_fill_delete_refill() {
-        use crate::{test_utils::generate_filename, SimpleDB};
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-        let layout = btree_leaf_layout_int();
-
-        {
-            let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
-
-            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
-
-            // Fill page to capacity
             let mut inserted = 0;
             loop {
                 let result =
@@ -5224,18 +4605,11 @@ mod btree_page_tests {
             }
 
             assert!(view.is_full());
-            let _full_count = inserted;
-
-            // Delete 10 entries from the middle
-            let start_delete = (_full_count / 2 - 5) as usize;
+            let start_delete = (inserted / 2 - 5) as usize;
             for slot in start_delete..start_delete + 10 {
                 view.delete_entry(slot).expect("delete should succeed");
             }
-
-            // Should no longer be full
             let still_full = view.is_full();
-
-            // Try to insert more entries
             let mut new_inserted = 0;
             for i in 1000..1010 {
                 let result = view.insert_entry(Constant::Int(i), RID::new(i as usize, 0));
@@ -5245,11 +4619,40 @@ mod btree_page_tests {
                     break;
                 }
             }
-
-            // Should have inserted at least some entries (or page was still full)
             assert!(new_inserted > 0 || still_full);
+        }
 
-            // Verify sorted order maintained
+        // Test insert/delete chaos
+        let filename = generate_filename();
+        let block_id = txn.append(&filename);
+        {
+            let mut guard = txn.pin_write_guard(&block_id);
+            guard.format_as_btree_leaf(None);
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
+
+            for i in 0..20 {
+                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
+            view.delete_entry(19).expect("delete key 19");
+            view.delete_entry(17).expect("delete key 17");
+            view.delete_entry(15).expect("delete key 15");
+            view.delete_entry(13).expect("delete key 13");
+            view.delete_entry(11).expect("delete key 11");
+            view.delete_entry(9).expect("delete key 9");
+            view.delete_entry(7).expect("delete key 7");
+            view.delete_entry(5).expect("delete key 5");
+            view.delete_entry(3).expect("delete key 3");
+            view.delete_entry(1).expect("delete key 1");
+
+            assert_eq!(view.slot_count(), 10);
+
+            for i in 100..105 {
+                view.insert_entry(Constant::Int(i), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
             let collected: Vec<i32> = view
                 .iter()
                 .filter_map(|e| {
@@ -5260,63 +4663,66 @@ mod btree_page_tests {
                     }
                 })
                 .collect();
-
-            // Verify sorted
-            for window in collected.windows(2) {
-                assert!(
-                    window[0] < window[1],
-                    "not sorted: {} >= {}",
-                    window[0],
-                    window[1]
-                );
-            }
+            let mut expected = vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18];
+            expected.extend(100..105);
+            assert_eq!(collected, expected);
         }
-    }
 
-    #[test]
-    fn btree_leaf_view_wrong_page_type_error() {
-        use crate::{test_utils::generate_filename, SimpleDB};
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
+        // Test serialize with deletes
         let filename = generate_filename();
         let block_id = txn.append(&filename);
-        let layout = btree_leaf_layout_int();
-
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            // Format as Heap page, NOT BTree
-            guard.format_as_heap();
+            guard.format_as_btree_leaf(None);
+            let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
-            // Try to create BTree leaf view on heap page
-            let result = BTreeLeafPageViewMut::new(guard, &layout);
-            assert!(result.is_err());
+            for i in 0..10 {
+                view.insert_entry(Constant::Int(i * 10), RID::new(i as usize, 0))
+                    .unwrap();
+            }
+
+            view.delete_entry(8).expect("delete key 80 at slot 8");
+            view.delete_entry(6).expect("delete key 60 at slot 6");
+            view.delete_entry(4).expect("delete key 40 at slot 4");
+            view.delete_entry(2).expect("delete key 20 at slot 2");
+            view.delete_entry(0).expect("delete key 0 at slot 0");
+
+            let count = view.iter().count();
+            assert_eq!(count, 5);
         }
-    }
+        {
+            let view = txn
+                .pin_read_guard(&block_id)
+                .into_btree_leaf_page_view(&layout)
+                .expect("create read view");
 
-    #[test]
-    fn btree_internal_view_mixed_operations() {
-        use crate::{test_utils::generate_filename, SimpleDB};
+            let collected: Vec<i32> = view
+                .iter()
+                .filter_map(|e| {
+                    if let Constant::Int(k) = e.key {
+                        Some(k)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(collected, vec![10, 30, 50, 70, 90]);
+        }
 
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
+        // Test internal view mixed operations
         let filename = generate_filename();
         let block_id = txn.append(&filename);
         let layout = btree_internal_layout_int();
-
         {
             let mut guard = txn.pin_write_guard(&block_id);
             guard.format_as_btree_internal(2, Some(0));
-
             let mut view =
                 BTreeInternalPageViewMut::new(guard, &layout).expect("create internal view");
 
-            // Insert entries
             view.insert_entry(Constant::Int(50), 100).unwrap();
             view.insert_entry(Constant::Int(30), 200).unwrap();
             view.insert_entry(Constant::Int(70), 300).unwrap();
 
-            // Verify sorted
             let collected: Vec<i32> = view
                 .iter()
                 .filter_map(|e| {
@@ -5329,10 +4735,8 @@ mod btree_page_tests {
                 .collect();
             assert_eq!(collected, vec![30, 50, 70]);
 
-            // Delete middle entry
             view.delete_entry(1).expect("delete should succeed");
 
-            // Verify remaining sorted
             let collected: Vec<i32> = view
                 .iter()
                 .filter_map(|e| {
@@ -5344,8 +4748,6 @@ mod btree_page_tests {
                 })
                 .collect();
             assert_eq!(collected, vec![30, 70]);
-
-            // Verify level preserved
             assert_eq!(view.btree_level(), 2);
         }
     }
