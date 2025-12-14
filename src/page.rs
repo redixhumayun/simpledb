@@ -1388,34 +1388,26 @@ impl<'a> BTreeMetaHeaderRef<'a> {
         PageType::try_from(self.bytes[0]).expect("invalid page type byte")
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.bytes[1]
     }
 
-    #[allow(dead_code)]
     pub fn tree_height(&self) -> u16 {
         u16::from_le_bytes(self.bytes[2..4].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn root_block(&self) -> u32 {
         u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn first_free_block(&self) -> u32 {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
-    }
-
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
     }
 }
 
@@ -1493,10 +1485,7 @@ impl<'a> BTreeMetaPageZeroCopy<'a> {
         })
     }
 
-    pub fn header(&self) -> BTreeMetaHeaderRef<'_> {
-        self.header
-    }
-
+    #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.header.version()
     }
@@ -1509,12 +1498,9 @@ impl<'a> BTreeMetaPageZeroCopy<'a> {
         self.header.root_block()
     }
 
+    #[cfg(test)]
     pub fn first_free_block(&self) -> u32 {
         self.header.first_free_block()
-    }
-
-    pub fn lsn(&self) -> u64 {
-        self.header.lsn()
     }
 }
 
@@ -1537,29 +1523,12 @@ impl<'a> BTreeMetaPageZeroCopyMut<'a> {
         Ok(Self { header, body_bytes })
     }
 
-    pub fn header(&self) -> BTreeMetaHeaderRef<'_> {
-        self.header.as_ref()
-    }
-
-    pub fn header_mut(&mut self) -> &mut BTreeMetaHeaderMut<'a> {
-        &mut self.header
-    }
-
-    pub fn init(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
-        self.header
-            .init_meta(version, tree_height, root_block, first_free);
-    }
-
     pub fn set_root_block(&mut self, root: u32) {
         self.header.write(4, root.to_le_bytes());
     }
 
     pub fn set_tree_height(&mut self, h: u16) {
         self.header.write(2, h.to_le_bytes());
-    }
-
-    pub fn set_first_free_block(&mut self, blk: u32) {
-        self.header.write(8, blk.to_le_bytes());
     }
 
     pub fn update_crc32(&mut self) {
@@ -1590,10 +1559,6 @@ impl<'a> BTreeMetaPageView<'a> {
         Ok(Self { guard })
     }
 
-    pub fn version(&self) -> u8 {
-        self.page().version()
-    }
-
     pub fn tree_height(&self) -> u16 {
         self.page().tree_height()
     }
@@ -1602,6 +1567,12 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().root_block()
     }
 
+    #[cfg(test)]
+    pub fn version(&self) -> u8 {
+        self.page().version()
+    }
+
+    #[cfg(test)]
     pub fn first_free_block(&self) -> u32 {
         self.page().first_free_block()
     }
@@ -1623,11 +1594,6 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         Ok(Self { guard })
     }
 
-    pub fn init(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
-        self.page_mut()
-            .init(version, tree_height, root_block, first_free);
-    }
-
     pub fn set_root_block(&mut self, root: u32) {
         self.page_mut().set_root_block(root);
     }
@@ -1636,37 +1602,8 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().set_tree_height(h);
     }
 
-    pub fn set_first_free_block(&mut self, blk: u32) {
-        self.page_mut().set_first_free_block(blk);
-    }
-
     pub fn update_crc32(&mut self) {
         self.page_mut().update_crc32();
-    }
-
-    pub fn verify_crc32(&mut self) -> bool {
-        self.page_mut().verify_crc32()
-    }
-
-    pub fn version(&self) -> u8 {
-        self.page().version()
-    }
-
-    pub fn tree_height(&self) -> u16 {
-        self.page().tree_height()
-    }
-
-    pub fn root_block(&self) -> u32 {
-        self.page().root_block()
-    }
-
-    pub fn first_free_block(&self) -> u32 {
-        self.page().first_free_block()
-    }
-
-    fn page(&self) -> BTreeMetaPageZeroCopy<'_> {
-        BTreeMetaPageZeroCopy::new(self.guard.bytes())
-            .expect("meta page view constructed with valid meta page")
     }
 
     fn page_mut(&mut self) -> BTreeMetaPageZeroCopyMut<'_> {

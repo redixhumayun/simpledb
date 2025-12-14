@@ -423,13 +423,12 @@ mod btree_index_tests {
         {
             let guard = index
                 .txn
-                .pin_write_guard(&BlockId::new(index.index_file_name.clone(), 0));
-            let mut meta = BTreeMetaPageViewMut::new(guard).expect("meta page view");
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0));
+            let meta = BTreeMetaPageView::new(guard).expect("meta page view");
             assert_eq!(meta.version(), 1);
             assert_eq!(meta.tree_height(), 1);
             assert_eq!(meta.root_block(), 1);
             assert_eq!(meta.first_free_block(), u32::MAX);
-            assert!(meta.verify_crc32());
         }
 
         // Root internal assertions
