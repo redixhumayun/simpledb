@@ -84,11 +84,6 @@ compile_error!(
     "One of `page-4k`, `page-8k`, or `page-1m` features must be enabled to select a page size."
 );
 
-/// Fixed header size as per `docs/record_management.md`.
-pub const PAGE_HEADER_SIZE_BYTES: u16 = 32;
-/// Sentinel value indicating no free slots in the free list.
-pub const NO_FREE_SLOT: u16 = 0xFFFF;
-
 mod crc {
     pub fn crc32<I>(bytes: I) -> u32
     where
@@ -114,8 +109,10 @@ pub struct HeapHeaderRef<'a> {
 }
 
 impl<'a> HeapHeaderRef<'a> {
+    /// Sentinel value indicating no free slots in the free list.
+    pub const NO_FREE_SLOT: u16 = 0xFFFF;
     pub fn new(bytes: &'a [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), HeapPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -178,7 +175,7 @@ impl<'a> HeapHeaderRef<'a> {
     }
 
     pub fn has_free_slot(&self) -> bool {
-        self.free_head() != NO_FREE_SLOT
+        self.free_head() != Self::NO_FREE_SLOT
     }
 }
 
@@ -211,7 +208,7 @@ pub struct HeapHeaderMut<'a> {
 
 impl<'a> HeapHeaderMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        debug_assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        debug_assert_eq!(bytes.len(), HeapPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -219,12 +216,12 @@ impl<'a> HeapHeaderMut<'a> {
         self.set_page_type(PageType::Heap);
         self.set_reserved_flags(0);
         self.set_slot_count(0);
-        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_lower(HeapPage::HEADER_SIZE as u16);
         self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_free_ptr(PAGE_SIZE_BYTES as u32);
         self.set_crc32(0);
         self.set_latch_word(0);
-        self.set_free_head(NO_FREE_SLOT);
+        self.set_free_head(HeapHeaderRef::NO_FREE_SLOT);
         self.set_reserved_bytes([0; 6]);
     }
 
@@ -315,7 +312,7 @@ pub(crate) mod test_helpers {
     {
         let bytes = page.bytes_mut();
         bytes.fill(0);
-        let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (header_bytes, _) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
         let mut header = HeapHeaderMut::new(header_bytes);
         header.init_heap();
 
@@ -427,7 +424,7 @@ pub struct BTreeLeafHeaderRef<'a> {
 
 impl<'a> BTreeLeafHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeLeafPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -511,7 +508,7 @@ pub struct BTreeLeafHeaderMut<'a> {
 
 impl<'a> BTreeLeafHeaderMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeLeafPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -548,7 +545,7 @@ impl<'a> BTreeLeafHeaderMut<'a> {
     }
 
     pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
-        debug_assert!(lower >= PAGE_HEADER_SIZE_BYTES);
+        debug_assert!(lower as usize >= BTreeLeafPage::HEADER_SIZE);
         debug_assert!(upper <= PAGE_SIZE_BYTES);
         debug_assert!(lower <= upper);
         self.set_free_lower(lower);
@@ -593,7 +590,7 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.set_page_type();
         self.set_level(level);
         self.set_slot_count(0);
-        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_lower(BTreeLeafPage::HEADER_SIZE as u16);
         self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_high_key_len(0);
         self.set_high_key_off(0);
@@ -630,7 +627,7 @@ pub struct BTreeInternalHeaderRef<'a> {
 
 impl<'a> BTreeInternalHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeInternalPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -709,7 +706,7 @@ pub struct BTreeInternalHeaderMut<'a> {
 
 impl<'a> BTreeInternalHeaderMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeInternalPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -746,7 +743,7 @@ impl<'a> BTreeInternalHeaderMut<'a> {
     }
 
     pub fn set_free_bounds(&mut self, lower: u16, upper: u16) {
-        debug_assert!(lower >= PAGE_HEADER_SIZE_BYTES);
+        debug_assert!(lower as usize >= BTreeInternalPage::HEADER_SIZE);
         debug_assert!(upper <= PAGE_SIZE_BYTES);
         debug_assert!(lower <= upper);
         self.set_free_lower(lower);
@@ -782,7 +779,7 @@ impl<'a> BTreeInternalHeaderMut<'a> {
         self.set_page_type();
         self.set_level(level);
         self.set_slot_count(0);
-        self.set_free_lower(PAGE_HEADER_SIZE_BYTES);
+        self.set_free_lower(BTreeInternalPage::HEADER_SIZE as u16);
         self.set_free_upper(PAGE_SIZE_BYTES);
         self.set_rightmost_child_block(rightmost_child.unwrap_or(u32::MAX));
         self.set_high_key_len(0);
@@ -1380,7 +1377,7 @@ pub struct BTreeMetaHeaderRef<'a> {
 
 impl<'a> BTreeMetaHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeMetaPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -1418,7 +1415,7 @@ pub struct BTreeMetaHeaderMut<'a> {
 
 impl<'a> BTreeMetaHeaderMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        assert_eq!(bytes.len(), PAGE_HEADER_SIZE_BYTES as usize);
+        assert_eq!(bytes.len(), BTreeMetaPage::HEADER_SIZE);
         Self { bytes }
     }
 
@@ -1470,11 +1467,13 @@ pub struct BTreeMetaPage<'a> {
 }
 
 impl<'a> BTreeMetaPage<'a> {
+    pub const HEADER_SIZE: usize = 32;
+
     pub fn new(bytes: &'a [u8]) -> SimpleDBResult<Self> {
-        if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
+        if bytes.len() < Self::HEADER_SIZE {
             return Err("meta page too small".into());
         }
-        let (hdr_bytes, body_bytes) = bytes.split_at(PAGE_HEADER_SIZE_BYTES as usize);
+        let (hdr_bytes, body_bytes) = bytes.split_at(Self::HEADER_SIZE);
         let header = BTreeMetaHeaderRef::new(hdr_bytes);
         if header.page_type() != PageType::Meta {
             return Err("not a meta page".into());
@@ -1512,10 +1511,10 @@ pub struct BTreeMetaPageMut<'a> {
 
 impl<'a> BTreeMetaPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
-        if bytes.len() < PAGE_HEADER_SIZE_BYTES as usize {
+        if bytes.len() < BTreeMetaPage::HEADER_SIZE {
             return Err("meta page too small".into());
         }
-        let (hdr_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (hdr_bytes, body_bytes) = bytes.split_at_mut(BTreeMetaPage::HEADER_SIZE);
         let header = BTreeMetaHeaderMut::new(hdr_bytes);
         if header.as_ref().page_type() != PageType::Meta {
             return Err("not a meta page".into());
@@ -1550,7 +1549,7 @@ impl<'a> BTreeMetaPageView<'a> {
         let hdr = BTreeMetaHeaderRef::new(
             guard
                 .bytes()
-                .get(..PAGE_HEADER_SIZE_BYTES as usize)
+                .get(..BTreeMetaPage::HEADER_SIZE)
                 .ok_or("meta header slice")?,
         );
         if hdr.page_type() != PageType::Meta {
@@ -1859,7 +1858,7 @@ impl<'a> PageKind for HeapPageMut<'a> {
 
 impl<'a> HeapPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
-        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
         let header = HeapHeaderMut::new(header_bytes);
         if header.as_ref().page_type() != PageType::Heap {
             return Err("not a heap page".into());
@@ -2428,7 +2427,7 @@ impl<'a> PageWriteGuard<'a> {
     ) {
         let bytes = self.bytes_mut();
         bytes.fill(0);
-        let (hdr_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (hdr_bytes, body_bytes) = bytes.split_at_mut(BTreeMetaPage::HEADER_SIZE);
         let mut header = BTreeMetaHeaderMut::new(hdr_bytes);
         header.init_meta(version, tree_height, root_block, first_free_block);
         header.update_crc32(body_bytes);
@@ -2499,7 +2498,7 @@ mod page_tests {
     fn crc32_detects_corruption() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
-            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let (header_bytes, _) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
         let mut page = HeapPageMut::new(&mut bytes).unwrap();
@@ -2539,7 +2538,7 @@ mod page_tests {
     fn test_page_lifecycle() {
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
-            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let (header_bytes, _) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
         let payload = vec![1u8, 2, 3, 4];
@@ -2564,7 +2563,7 @@ mod page_tests {
         // Test delete and reuse (was delete_frees_slot_and_allocation_reuses_it)
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
-            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let (header_bytes, _) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
         let mut page = HeapPageMut::new(&mut bytes).unwrap();
@@ -2595,7 +2594,7 @@ mod page_tests {
 
         let mut bytes = [0u8; PAGE_SIZE_BYTES as usize];
         {
-            let (header_bytes, _) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+            let (header_bytes, _) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
             HeapHeaderMut::new(header_bytes).init_heap();
         }
         let mut page = HeapPageMut::new(&mut bytes).unwrap();
@@ -5166,7 +5165,7 @@ impl<'a> PageKind for BTreeLeafPageMut<'a> {
 
 impl<'a> BTreeLeafPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
-        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (header_bytes, body_bytes) = bytes.split_at_mut(BTreeLeafPage::HEADER_SIZE);
         let header = BTreeLeafHeaderMut::new(header_bytes);
         if header.as_ref().page_type() != PageType::IndexLeaf {
             return Err("not a B-tree leaf page".into());
@@ -5582,7 +5581,7 @@ impl<'a> PageKind for BTreeInternalPageMut<'a> {
 
 impl<'a> BTreeInternalPageMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> SimpleDBResult<Self> {
-        let (header_bytes, body_bytes) = bytes.split_at_mut(PAGE_HEADER_SIZE_BYTES as usize);
+        let (header_bytes, body_bytes) = bytes.split_at_mut(BTreeInternalPage::HEADER_SIZE);
         let header = BTreeInternalHeaderMut::new(header_bytes);
         if header.as_ref().page_type() != PageType::IndexInternal {
             return Err("not a B-tree internal page".into());
