@@ -5115,7 +5115,7 @@ impl<'a> BTreeLeafPageZeroCopyMut<'a> {
             return Err("insufficient space for high key".into());
         }
         let off = free_upper - len;
-        let base = BTreeLeafPageZeroCopy::HEADER_SIZE as usize;
+        let base = BTreeLeafPageZeroCopy::HEADER_SIZE;
         let start = off as usize - base;
         self.body_bytes
             .get_mut(start..start + bytes.len())

@@ -679,7 +679,7 @@ impl BTreeInternal {
         if let Some(&last_right) = right_children.last() {
             new_view.set_rightmost_child_block(last_right)?;
         }
-        for (_i, (k, right_child)) in moved.into_iter().enumerate() {
+        for (k, right_child) in moved.into_iter() {
             new_view.insert_entry(k, right_child)?;
         }
 
@@ -1053,7 +1053,10 @@ mod btree_internal_tests {
         let right_view = BTreeInternalPageView::new(right_guard, &internal.layout).unwrap();
 
         // Verify right page structure
-        assert!(right_view.slot_count() > 0, "right page should have entries");
+        assert!(
+            right_view.slot_count() > 0,
+            "right page should have entries"
+        );
         let right_count = right_view.slot_count();
 
         // Verify first key of right page equals separator
@@ -1080,7 +1083,10 @@ mod btree_internal_tests {
         );
 
         // Verify pages have reasonable distribution
-        assert!(left_count > 0 && right_count > 0, "both pages should have entries after split");
+        assert!(
+            left_count > 0 && right_count > 0,
+            "both pages should have entries after split"
+        );
 
         // Verify total entry count is preserved (all entries plus separator should equal original)
         // Note: The separator IS the first key of right page, not a separate entry
@@ -1162,7 +1168,7 @@ impl BTreeLeaf {
         // Left high key = separator, right link = new page (reuse existing guard)
         orig_view.set_high_key(&sep_bytes)?;
         orig_view.set_right_sibling_block(Some(new_block_id.block_num))?;
-        new_view.set_right_sibling_block(old_right.map(|b| b as usize))?;
+        new_view.set_right_sibling_block(old_right)?;
         new_view.clear_high_key()?;
 
         Ok(new_block_id)
