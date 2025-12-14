@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Run buffer_pool benchmarks for each replacement-policy variant.
 
 This helper wraps `cargo bench --bench buffer_pool` so that we can:

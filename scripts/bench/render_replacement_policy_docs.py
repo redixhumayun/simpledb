@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Render replacement-policy docs and summary tables from JSON artifacts.
 
 This script consumes the raw outputs captured by

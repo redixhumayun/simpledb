@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Generate scaling charts from benchmark JSON data.
 
 This script reads benchmark data for different replacement policies and
@@ -14,13 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
-    import numpy as np
-except ImportError:
-    print("Error: matplotlib is required. Install with: pip install matplotlib")
-    exit(1)
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
@@ -237,7 +233,7 @@ def extract_scaling_data(spec: ChartSpec, platform_data: Dict) -> Dict[str, List
     return scaling_data
 
 
-def create_scaling_chart(spec: ChartSpec, platform_data: Dict, output_path: Path):
+def create_scaling_chart(spec: ChartSpec, platform_data: Dict, output_path: Path, platform: str):
     """Create and save a scaling chart."""
     scaling_data = extract_scaling_data(spec, platform_data)
 
@@ -272,7 +268,11 @@ def create_scaling_chart(spec: ChartSpec, platform_data: Dict, output_path: Path
     ax.set_xscale('log', base=2)
     ax.set_xlabel('Thread Count', fontsize=14, fontweight='bold')
     ax.set_ylabel(spec.ylabel, fontsize=14, fontweight='bold')
-    ax.set_title(spec.title, fontsize=16, fontweight='bold', pad=20)
+
+    # Add platform to title
+    platform_display = platform.title() if platform != "macos" else "macOS"
+    title_with_platform = f"{spec.title} ({platform_display})"
+    ax.set_title(title_with_platform, fontsize=16, fontweight='bold', pad=20)
 
     # Set x-axis ticks to thread counts
     ax.set_xticks(THREAD_COUNTS)
@@ -284,6 +284,10 @@ def create_scaling_chart(spec: ChartSpec, platform_data: Dict, output_path: Path
 
     # Legend
     ax.legend(loc='best', fontsize=12, framealpha=0.9)
+
+    # Add data source footnote
+    data_source = f"Data: docs/benchmarks/replacement_policies/raw/{platform}/metadata.json"
+    fig.text(0.99, 0.01, data_source, ha='right', va='bottom', fontsize=8, style='italic', color='gray')
 
     # Tight layout
     plt.tight_layout()
@@ -321,11 +325,18 @@ def main():
 
     # Generate charts
     print(f"Generating scaling charts for {args.platform}...")
-    for spec in CHART_SPECS:
-        output_path = CHARTS_DIR / spec.filename
-        create_scaling_chart(spec, platform_data, output_path)
 
-    print(f"\nAll charts saved to: {CHARTS_DIR}")
+    # Create platform-specific directory
+    platform_charts_dir = CHARTS_DIR / args.platform
+    platform_charts_dir.mkdir(parents=True, exist_ok=True)
+
+    for spec in CHART_SPECS:
+        output_path = platform_charts_dir / spec.filename
+        create_scaling_chart(spec, platform_data, output_path, args.platform)
+
+    print(f"\nAll charts saved to: {platform_charts_dir}")
+    print(f"Platform: {args.platform}")
+    print(f"Data source: {RAW_ROOT / args.platform / 'metadata.json'}")
 
 
 if __name__ == "__main__":

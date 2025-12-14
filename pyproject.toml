@@ -1,0 +1,9 @@
+[project]
+name = "simpledb-bench"
+version = "0.1.0"
+description = "Benchmark visualization and analysis tools for SimpleDB"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.7.0",
+    "numpy>=1.24.0",
+]
