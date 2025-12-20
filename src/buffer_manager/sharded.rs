@@ -12,7 +12,10 @@
 use std::{
     collections::HashMap,
     error::Error,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+    },
     time::{Duration, Instant},
 };
 
@@ -66,7 +69,8 @@ pub struct BufferManager {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_pool: Vec<Arc<BufferFrame>>,
-    num_available: Mutex<usize>,
+    num_available: AtomicUsize,
+    wait_mutex: Mutex<()>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
     latch_shards: [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>; Self::SHARDS],
@@ -98,7 +102,8 @@ impl BufferManager {
             file_manager,
             log_manager,
             buffer_pool,
-            num_available: Mutex::new(num_buffers),
+            num_available: AtomicUsize::new(num_buffers),
+            wait_mutex: Mutex::new(()),
             cond: Condvar::new(),
             stats: OnceLock::new(),
             latch_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
@@ -138,7 +143,7 @@ impl BufferManager {
     }
 
     pub fn available(&self) -> usize {
-        *self.num_available.lock().unwrap()
+        self.num_available.load(Ordering::Acquire)
     }
 
     pub fn file_manager(&self) -> SharedFS {
@@ -165,20 +170,20 @@ impl BufferManager {
                 return Ok(buffer);
             }
 
-            let mut avail = self.num_available.lock().unwrap();
-            while *avail == 0 {
+            let mut guard = self.wait_mutex.lock().unwrap();
+            while self.num_available.load(Ordering::Acquire) == 0 {
                 let elapsed = start.elapsed();
                 if elapsed >= Duration::from_secs(Self::MAX_TIME) {
                     return Err("Timed out waiting for buffer".into());
                 }
                 let timeout = Duration::from_secs(Self::MAX_TIME) - elapsed;
-                let (guard, wait_res) = self.cond.wait_timeout(avail, timeout).unwrap();
-                avail = guard;
+                let (wait_guard, wait_res) = self.cond.wait_timeout(guard, timeout).unwrap();
+                guard = wait_guard;
                 if wait_res.timed_out() {
                     return Err("Timed out waiting for buffer".into());
                 }
             }
-            drop(avail);
+            drop(guard);
         }
     }
 
@@ -206,7 +211,7 @@ impl BufferManager {
                 let mut meta_guard = self.record_hit(&frame_ptr, block_id)?;
                 let was_unpinned = meta_guard.pin();
                 if was_unpinned {
-                    *self.num_available.lock().unwrap() -= 1;
+                    self.num_available.fetch_sub(1, Ordering::AcqRel);
                 }
                 if let Some(stats) = self.stats.get() {
                     stats
@@ -244,7 +249,7 @@ impl BufferManager {
             .lock()
             .unwrap()
             .insert(block_id.clone(), Arc::downgrade(&frame));
-        *self.num_available.lock().unwrap() -= 1;
+        self.num_available.fetch_sub(1, Ordering::AcqRel);
         Some(frame)
     }
 
@@ -252,7 +257,7 @@ impl BufferManager {
         let mut meta = frame.lock_meta();
         let became_unpinned = meta.unpin();
         if became_unpinned {
-            *self.num_available.lock().unwrap() += 1;
+            self.num_available.fetch_add(1, Ordering::AcqRel);
             self.cond.notify_all();
         }
     }
@@ -277,7 +282,7 @@ impl BufferManager {
 
     #[cfg(test)]
     pub fn assert_buffer_count_invariant(&self) {
-        let available = *self.num_available.lock().unwrap();
+        let available = self.num_available.load(Ordering::Acquire);
         let num_pinned_buffers: usize = self
             .buffer_pool
             .iter()
