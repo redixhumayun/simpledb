@@ -29,8 +29,9 @@ use std::{
 };
 
 use crate::{
+    buffer_manager::{BufferFrame, FrameMeta},
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId, BufferFrame, FrameMeta,
+    BlockId,
 };
 
 /// Internal state combining list structure and hand pointer.
