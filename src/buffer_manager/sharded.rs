@@ -3,6 +3,7 @@
 //!
 //! Optimized implementation with:
 //! - Sharded `latch_shards: [Mutex<HashMap<...>>; SHARDS]` (16 shards)
+//! - Sharded `resident_shards: [Mutex<HashMap<...>>; SHARDS]` (16 shards)
 //! - No Drop-based latch cleanup (latches persist for memory, but no lock contention)
 //!
 //! This variant reduces lock contention at high thread counts by distributing
@@ -69,7 +70,7 @@ pub struct BufferManager {
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
     latch_shards: [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>; Self::SHARDS],
-    resident_table: Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
+    resident_shards: [Mutex<HashMap<BlockId, Weak<BufferFrame>>>; Self::SHARDS],
     policy: PolicyState,
 }
 
@@ -101,7 +102,7 @@ impl BufferManager {
             cond: Condvar::new(),
             stats: OnceLock::new(),
             latch_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            resident_table: Mutex::new(HashMap::new()),
+            resident_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             policy,
         }
     }
@@ -187,7 +188,7 @@ impl BufferManager {
         let _block_latch = latch_table_guard.lock();
 
         let frame_ptr = {
-            let mut resident_guard = self.resident_table.lock().unwrap();
+            let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
             match resident_guard.get(block_id) {
                 Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
                     Some(frame_ptr) => Some(frame_ptr),
@@ -228,7 +229,8 @@ impl BufferManager {
         };
 
         if let Some(old) = meta_guard.block_id.clone() {
-            self.resident_table.lock().unwrap().remove(&old);
+            let old_shard = self.shard_index(&old);
+            self.resident_shards[old_shard].lock().unwrap().remove(&old);
         }
         let frame = Arc::clone(&self.buffer_pool[tail_idx]);
         frame.assign_to_block_locked(&mut meta_guard, block_id);
@@ -238,7 +240,7 @@ impl BufferManager {
 
         self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
 
-        self.resident_table
+        self.resident_shards[shard_index]
             .lock()
             .unwrap()
             .insert(block_id.clone(), Arc::downgrade(&frame));
@@ -264,8 +266,13 @@ impl BufferManager {
         frame_ptr: &'a Arc<BufferFrame>,
         block_id: &BlockId,
     ) -> Option<MutexGuard<'a, FrameMeta>> {
-        self.policy
-            .record_hit(&self.buffer_pool, frame_ptr, block_id, &self.resident_table)
+        let shard_index = self.shard_index(block_id);
+        self.policy.record_hit(
+            &self.buffer_pool,
+            frame_ptr,
+            block_id,
+            &self.resident_shards[shard_index],
+        )
     }
 
     #[cfg(test)]
