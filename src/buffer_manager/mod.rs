@@ -34,9 +34,9 @@ use crate::intrusive_dll::IntrusiveNode;
 // === SWITCH IMPLEMENTATION HERE ===
 // Uncomment ONE of the following lines:
 
-// pub use baseline::BufferManager;  // Global latch_table + Drop cleanup
-// pub use no_drop::BufferManager;   // Global latch_table + NO Drop cleanup
-pub use sharded::BufferManager;   // Sharded latch_table + NO Drop cleanup
+pub use baseline::BufferManager; // Global latch_table + Drop cleanup
+                                 // pub use no_drop::BufferManager;   // Global latch_table + NO Drop cleanup
+                                 // pub use sharded::BufferManager;   // Sharded latch_table + NO Drop cleanup
 
 // ============================================================================
 // FrameMeta
