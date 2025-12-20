@@ -1,2 +1,0 @@
-[profile.bench]
-rustflags = ["-C", "force-frame-pointers=yes"]
