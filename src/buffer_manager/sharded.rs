@@ -24,9 +24,7 @@ use super::{BufferFrame, BufferStats, FrameMeta};
 // ============================================================================
 
 struct LatchTableGuard<'a> {
-    #[allow(dead_code)]
     latch_shards: &'a [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>],
-    #[allow(dead_code)]
     block_id: BlockId,
     latch: Arc<Mutex<()>>,
 }
