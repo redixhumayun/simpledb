@@ -5,6 +5,8 @@
 node_modules
 perf.*
 *.txt
+*.svg
 .DS_Store
 /output
 docs/local.md
+docs/sharded/**/*
