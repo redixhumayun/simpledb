@@ -15,6 +15,7 @@
 //! - `sharded`: Optimized with 16-shard latch table and no Drop cleanup
 
 mod baseline;
+mod no_drop;
 mod sharded;
 
 use std::sync::{
@@ -33,8 +34,9 @@ use crate::intrusive_dll::IntrusiveNode;
 // === SWITCH IMPLEMENTATION HERE ===
 // Uncomment ONE of the following lines:
 
-pub use baseline::BufferManager;
-// pub use sharded::BufferManager;
+pub use baseline::BufferManager;  // Global latch_table + Drop cleanup
+// pub use no_drop::BufferManager;   // Global latch_table + NO Drop cleanup
+// pub use sharded::BufferManager;   // Sharded latch_table + NO Drop cleanup
 
 // ============================================================================
 // FrameMeta
