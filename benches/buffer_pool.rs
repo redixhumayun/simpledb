@@ -1,6 +1,9 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Barrier,
+};
 use std::thread;
 use std::time::Instant;
 
@@ -882,32 +885,51 @@ fn sequential_scan_multithreaded(
     );
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = ranges
+        .iter()
+        .map(|&(start, end)| {
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in start..end {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), i);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!("Seq Scan MT x{} ({} blocks)", num_threads, total_blocks),
         iterations,
         2,
         || {
-            let handles: Vec<_> = ranges
-                .iter()
-                .map(|&(start, end)| {
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in start..end {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), i);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn repeated_access_multithreaded(
@@ -926,7 +948,37 @@ fn repeated_access_multithreaded(
     let per_thread_ops = Arc::new(per_thread_ops);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = per_thread_ops
+        .iter()
+        .enumerate()
+        .map(|(thread_id, &ops)| {
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops {
+                    let block_idx = (i + thread_id) % working_set;
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Repeated Access MT x{} ({} ops)",
             num_threads, total_accesses
@@ -934,29 +986,18 @@ fn repeated_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = per_thread_ops
-                .iter()
-                .enumerate()
-                .map(|(thread_id, &ops)| {
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops {
-                            let block_idx = (i + thread_id) % working_set;
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn random_access_multithreaded(
@@ -984,7 +1025,35 @@ fn random_access_multithreaded(
     let sequences = Arc::new(sequences);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let sequences = Arc::clone(&sequences);
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for &block_idx in &sequences[thread_id] {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Random MT x{} (K={}, {} ops)",
             num_threads, working_set_size, total_accesses
@@ -992,27 +1061,18 @@ fn random_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let sequences = sequences.clone();
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for &block_idx in &sequences[thread_id] {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn zipfian_access_multithreaded(
@@ -1052,7 +1112,35 @@ fn zipfian_access_multithreaded(
     let sequences = Arc::new(sequences);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let sequences = Arc::clone(&sequences);
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for &block_idx in &sequences[thread_id] {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Zipfian MT x{} (80/20, {} ops)",
             num_threads, total_accesses
@@ -1060,27 +1148,18 @@ fn zipfian_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let sequences = sequences.clone();
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for &block_idx in &sequences[thread_id] {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 // Phase 3: Pool Size Sensitivity
@@ -1188,7 +1267,37 @@ fn multithreaded_pin(
     // Pre-create blocks (each thread gets its own range)
     precreate_blocks(db, &test_file, num_threads * 10);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let test_file = test_file.clone();
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops_per_thread {
+                    // Each thread accesses blocks in its own range to reduce contention
+                    let block_num = (thread_id * 10) + (i % 10);
+                    let block_id = BlockId::new(test_file.clone(), block_num);
+
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Concurrent ({} threads, {} ops)",
             num_threads, ops_per_thread
@@ -1196,31 +1305,18 @@ fn multithreaded_pin(
         iterations,
         2,
         || {
-            // Spawn threads
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let test_file = test_file.clone();
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops_per_thread {
-                            // Each thread accesses blocks in its own range to reduce contention
-                            let block_num = (thread_id * 10) + (i % 10);
-                            let block_id = BlockId::new(test_file.clone(), block_num);
-
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            // Wait for all threads
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn multithreaded_hotset_contention(
@@ -1237,7 +1333,37 @@ fn multithreaded_hotset_contention(
     // Pre-create a small hot set shared across all threads
     precreate_blocks(db, &test_file, hot_set_size);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let test_file = test_file.clone();
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops_per_thread {
+                    // All threads reuse the same hot set to maximize latch contention
+                    let block_num = i % hot_set_size;
+                    let block_id = BlockId::new(test_file.clone(), block_num);
+
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Concurrent Hotset ({} threads, K={}, {} ops)",
             num_threads, hot_set_size, ops_per_thread
@@ -1245,29 +1371,18 @@ fn multithreaded_hotset_contention(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|_| {
-                    let test_file = test_file.clone();
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops_per_thread {
-                            // All threads reuse the same hot set to maximize latch contention
-                            let block_num = i % hot_set_size;
-                            let block_id = BlockId::new(test_file.clone(), block_num);
-
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn buffer_starvation(db: &SimpleDB, num_buffers: usize) {
