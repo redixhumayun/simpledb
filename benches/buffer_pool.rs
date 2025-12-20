@@ -16,6 +16,8 @@ use simpledb::{
     BlockId, Lsn, Page, SimpleDB, TestDir,
 };
 
+const PIN_HOTSET_POOL_SIZE: usize = 4096;
+
 fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
     SimpleDB::new_for_test(num_buffers, 5000)
 }
@@ -1495,6 +1497,7 @@ fn main() {
     let (iterations, num_buffers, json_output, filter) = parse_bench_args();
     let filter_ref = filter.as_deref();
     let block_size = 4096;
+    let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
 
     if json_output {
         let mut results = Vec::new();
@@ -1518,12 +1521,12 @@ fn main() {
         }
 
         results.extend(PIN_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
             multithreaded_pin(&db, case.threads, case.ops_per_thread, iterations)
         }));
 
         results.extend(HOTSET_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
             multithreaded_hotset_contention(
                 &db,
                 case.threads,
@@ -1683,7 +1686,11 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        if pin_hotset_pool != num_buffers {
+            println!("Pin pool size override: {pin_hotset_pool} buffers");
+            println!();
+        }
+        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
         run_multithreaded_pin_benchmarks(&db, iterations, &pin_cases);
     }
 
@@ -1700,7 +1707,11 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        if pin_hotset_pool != num_buffers {
+            println!("Hotset pool size override: {pin_hotset_pool} buffers");
+            println!();
+        }
+        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
         run_hotset_contention_benchmarks(&db, iterations, &hotset_cases);
     }
 

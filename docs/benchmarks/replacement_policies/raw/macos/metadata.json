@@ -3,8 +3,8 @@
   "title": "macOS (M1 Pro, macOS Sequoia)",
   "environment": "macos (aarch64)",
   "iterations": 100,
-  "num_buffers": 4096,
-  "generated_at": "2025-12-20T16:50:41.868041+00:00",
+  "num_buffers": 12,
+  "generated_at": "2025-12-20T17:56:57.702322+00:00",
   "policies": {
     "replacement_lru": {
       "display": "Replacement LRU (4KB pages)",
@@ -14,7 +14,7 @@
         "Sequential Scan": {
           "hit_rate": 0.0,
           "hits": 0,
-          "misses": 4177920
+          "misses": 12240
         },
         "Repeated Access": {
           "hit_rate": 100.0,
@@ -22,9 +22,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 99.1,
-          "hits": 50519,
-          "misses": 481
+          "hit_rate": 81.4,
+          "hits": 41507,
+          "misses": 9493
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -32,14 +32,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 99.9,
-          "hits": 50950,
-          "misses": 50
+          "hit_rate": 27.8,
+          "hits": 14177,
+          "misses": 36823
         },
         "Random (K=100)": {
-          "hit_rate": 99.8,
-          "hits": 50900,
-          "misses": 100
+          "hit_rate": 11.6,
+          "hits": 5916,
+          "misses": 45084
         }
       }
     },
@@ -51,7 +51,7 @@
         "Sequential Scan": {
           "hit_rate": 0.0,
           "hits": 0,
-          "misses": 4178940
+          "misses": 13260
         },
         "Repeated Access": {
           "hit_rate": 100.0,
@@ -59,9 +59,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 99.1,
-          "hits": 50533,
-          "misses": 467
+          "hit_rate": 75.5,
+          "hits": 38497,
+          "misses": 12506
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -69,14 +69,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 99.9,
-          "hits": 50950,
-          "misses": 50
+          "hit_rate": 24.2,
+          "hits": 12342,
+          "misses": 38660
         },
         "Random (K=100)": {
-          "hit_rate": 99.8,
-          "hits": 50900,
-          "misses": 100
+          "hit_rate": 8.6,
+          "hits": 4387,
+          "misses": 46614
         }
       }
     },
@@ -88,7 +88,7 @@
         "Sequential Scan": {
           "hit_rate": 0.0,
           "hits": 0,
-          "misses": 4178940
+          "misses": 13260
         },
         "Repeated Access": {
           "hit_rate": 100.0,
@@ -96,9 +96,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 99.1,
-          "hits": 50529,
-          "misses": 471
+          "hit_rate": 75.3,
+          "hits": 39270,
+          "misses": 12853
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -106,17 +106,18 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 99.9,
-          "hits": 50950,
-          "misses": 50
+          "hit_rate": 25.0,
+          "hits": 13565,
+          "misses": 40698
         },
         "Random (K=100)": {
-          "hit_rate": 99.8,
-          "hits": 50901,
-          "misses": 99
+          "hit_rate": 8.9,
+          "hits": 4895,
+          "misses": 49980
         }
       }
     }
   },
-  "page_size": "page-4k"
+  "page_size": "page-4k",
+  "pin_hotset_pool_size": 4096
 }

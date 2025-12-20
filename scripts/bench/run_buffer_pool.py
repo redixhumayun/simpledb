@@ -46,6 +46,7 @@ from typing import Dict, List
 # Repository root (…/simpledb)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
+PIN_HOTSET_POOL_SIZE = 4096
 
 
 POLICIES = {
@@ -184,6 +185,7 @@ def main() -> None:
             "environment": args.environment,
             "iterations": args.iterations,
             "num_buffers": args.num_buffers,
+            "pin_hotset_pool_size": PIN_HOTSET_POOL_SIZE,
             "page_size": args.page_size,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
