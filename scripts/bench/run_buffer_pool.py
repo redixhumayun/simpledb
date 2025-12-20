@@ -43,23 +43,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-# Repository root (…/simpledb)
-REPO_ROOT = Path(__file__).resolve().parents[2]
-RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
-PIN_HOTSET_POOL_SIZE = 4096
-
-
-POLICIES = {
-    "replacement_lru": "Replacement LRU",
-    "replacement_clock": "Replacement Clock",
-    "replacement_sieve": "Replacement SIEVE",
-}
-
-PAGE_SIZES = {
-    "page-4k": "4KB pages",
-    "page-8k": "8KB pages",
-    "page-1m": "1MB pages",
-}
+from config import (
+    DEFAULT_ITERATIONS,
+    DEFAULT_NUM_BUFFERS,
+    PAGE_SIZES,
+    PIN_HOTSET_POOL_SIZE,
+    POLICIES,
+    RAW_ROOT,
+    REPO_ROOT,
+)
 
 HIT_RATE_RE = re.compile(
     r"^(?P<name>[^|]+?)\s*\|\s*Hit rate:\s*(?P<rate>[\d.]+)%\s*"
@@ -78,8 +70,8 @@ def parse_args() -> argparse.Namespace:
         "--environment",
         help="Short environment string (e.g., 'macos (aarch64)')",
     )
-    parser.add_argument("--iterations", type=int, default=100, help="Iterations per benchmark")
-    parser.add_argument("--num-buffers", type=int, default=12, help="Buffer pool size")
+    parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS, help="Iterations per benchmark")
+    parser.add_argument("--num-buffers", type=int, default=DEFAULT_NUM_BUFFERS, help="Buffer pool size")
     parser.add_argument(
         "--policies",
         nargs="*",

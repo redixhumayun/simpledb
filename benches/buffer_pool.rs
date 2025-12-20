@@ -16,6 +16,7 @@ use simpledb::{
     BlockId, Lsn, Page, SimpleDB, TestDir,
 };
 
+// Keep in sync with scripts/bench/config.py
 const PIN_HOTSET_POOL_SIZE: usize = 4096;
 
 fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
@@ -163,7 +164,6 @@ fn render_latency_section(title: &str, results: &[BenchResult]) {
 struct PinCase {
     filter_token: &'static str,
     threads: usize,
-    ops_per_thread: usize,
 }
 
 impl PinCase {
@@ -171,10 +171,15 @@ impl PinCase {
         PIN_TOTAL_OPS
     }
 
+    const fn ops_per_thread(&self) -> usize {
+        PIN_TOTAL_OPS / self.threads
+    }
+
     fn label(&self) -> String {
         format!(
             "{} threads, {} ops/thread",
-            self.threads, self.ops_per_thread
+            self.threads,
+            self.ops_per_thread()
         )
     }
 }
@@ -182,7 +187,6 @@ impl PinCase {
 struct HotsetCase {
     filter_token: &'static str,
     threads: usize,
-    ops_per_thread: usize,
     hot_set_size: usize,
 }
 
@@ -191,121 +195,49 @@ impl HotsetCase {
         HOTSET_TOTAL_OPS
     }
 
+    const fn ops_per_thread(&self) -> usize {
+        HOTSET_TOTAL_OPS / self.threads
+    }
+
     fn label(&self) -> String {
         format!(
             "{} threads, K={}, {} ops/thread",
-            self.threads, self.hot_set_size, self.ops_per_thread
+            self.threads,
+            self.hot_set_size,
+            self.ops_per_thread()
         )
     }
 }
 
+// IMPORTANT: Keep these constants in sync with scripts/bench/config.py
 const PIN_TOTAL_OPS: usize = 10_000;
 
 const PIN_CASES: &[PinCase] = &[
-    PinCase {
-        filter_token: "[pin:t1]",
-        threads: 1,
-        ops_per_thread: 10000,
-    },
-    PinCase {
-        filter_token: "[pin:t2]",
-        threads: 2,
-        ops_per_thread: 5000,
-    },
-    PinCase {
-        filter_token: "[pin:t4]",
-        threads: 4,
-        ops_per_thread: 2500,
-    },
-    PinCase {
-        filter_token: "[pin:t8]",
-        threads: 8,
-        ops_per_thread: 1250,
-    },
-    PinCase {
-        filter_token: "[pin:t16]",
-        threads: 16,
-        ops_per_thread: 625,
-    },
-    PinCase {
-        filter_token: "[pin:t32]",
-        threads: 32,
-        ops_per_thread: 312,
-    },
-    PinCase {
-        filter_token: "[pin:t64]",
-        threads: 64,
-        ops_per_thread: 156,
-    },
-    PinCase {
-        filter_token: "[pin:t128]",
-        threads: 128,
-        ops_per_thread: 78,
-    },
-    PinCase {
-        filter_token: "[pin:t256]",
-        threads: 256,
-        ops_per_thread: 39,
-    },
+    PinCase { filter_token: "[pin:t1]", threads: 1 },
+    PinCase { filter_token: "[pin:t2]", threads: 2 },
+    PinCase { filter_token: "[pin:t4]", threads: 4 },
+    PinCase { filter_token: "[pin:t8]", threads: 8 },
+    PinCase { filter_token: "[pin:t16]", threads: 16 },
+    PinCase { filter_token: "[pin:t32]", threads: 32 },
+    PinCase { filter_token: "[pin:t64]", threads: 64 },
+    PinCase { filter_token: "[pin:t128]", threads: 128 },
+    PinCase { filter_token: "[pin:t256]", threads: 256 },
 ];
 
+// Keep in sync with scripts/bench/config.py
 const HOTSET_TOTAL_OPS: usize = 10_000;
+const HOTSET_K: usize = 4;
 
 const HOTSET_CASES: &[HotsetCase] = &[
-    HotsetCase {
-        filter_token: "[hotset:t1_k4]",
-        threads: 1,
-        ops_per_thread: 10000,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t2_k4]",
-        threads: 2,
-        ops_per_thread: 5000,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t4_k4]",
-        threads: 4,
-        ops_per_thread: 2500,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t8_k4]",
-        threads: 8,
-        ops_per_thread: 1250,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t16_k4]",
-        threads: 16,
-        ops_per_thread: 625,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t32_k4]",
-        threads: 32,
-        ops_per_thread: 312,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t64_k4]",
-        threads: 64,
-        ops_per_thread: 156,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t128_k4]",
-        threads: 128,
-        ops_per_thread: 78,
-        hot_set_size: 4,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t256_k4]",
-        threads: 256,
-        ops_per_thread: 39,
-        hot_set_size: 4,
-    },
+    HotsetCase { filter_token: "[hotset:t1_k4]", threads: 1, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t2_k4]", threads: 2, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t4_k4]", threads: 4, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t8_k4]", threads: 8, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t16_k4]", threads: 16, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t32_k4]", threads: 32, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t64_k4]", threads: 64, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t128_k4]", threads: 128, hot_set_size: HOTSET_K },
+    HotsetCase { filter_token: "[hotset:t256_k4]", threads: 256, hot_set_size: HOTSET_K },
 ];
 
 const ACCESS_CASES: &[AccessCase] = &[
@@ -1454,7 +1386,7 @@ fn run_multithreaded_pin_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&
     }
 
     for case in cases {
-        let result = multithreaded_pin(db, case.threads, case.ops_per_thread, iterations);
+        let result = multithreaded_pin(db, case.threads, case.ops_per_thread(), iterations);
         let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
         row.label = case.label();
         rows.push(row);
@@ -1474,7 +1406,7 @@ fn run_hotset_contention_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&
         let result = multithreaded_hotset_contention(
             db,
             case.threads,
-            case.ops_per_thread,
+            case.ops_per_thread(),
             case.hot_set_size,
             iterations,
         );
@@ -1522,7 +1454,7 @@ fn main() {
 
         results.extend(PIN_CASES.iter().map(|case| {
             let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
-            multithreaded_pin(&db, case.threads, case.ops_per_thread, iterations)
+            multithreaded_pin(&db, case.threads, case.ops_per_thread(), iterations)
         }));
 
         results.extend(HOTSET_CASES.iter().map(|case| {
@@ -1530,7 +1462,7 @@ fn main() {
             multithreaded_hotset_contention(
                 &db,
                 case.threads,
-                case.ops_per_thread,
+                case.ops_per_thread(),
                 case.hot_set_size,
                 iterations,
             )

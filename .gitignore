@@ -3,6 +3,8 @@
 /bench-data
 /random
 node_modules
+__pycache__/
+*.pyc
 perf.*
 *.txt
 *.svg

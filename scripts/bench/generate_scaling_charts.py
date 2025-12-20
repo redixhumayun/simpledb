@@ -18,29 +18,17 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
-CHARTS_DIR = REPO_ROOT / "docs" / "benchmarks" / "charts"
-
-POLICY_ORDER = [
-    "replacement_lru",
-    "replacement_clock",
-    "replacement_sieve",
-]
-
-POLICY_DISPLAY = {
-    "replacement_lru": "LRU",
-    "replacement_clock": "Clock",
-    "replacement_sieve": "SIEVE",
-}
-
-POLICY_COLORS = {
-    "replacement_lru": "#2E86AB",      # Blue
-    "replacement_clock": "#A23B72",    # Purple
-    "replacement_sieve": "#F18F01",    # Orange
-}
-
-THREAD_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+from config import (
+    CHARTS_DIR,
+    POLICY_COLORS,
+    POLICY_DISPLAY,
+    POLICY_ORDER,
+    RAW_ROOT,
+    REPO_ROOT,
+    THREAD_COUNTS,
+    TOTAL_OPS,
+    compute_ops_per_thread,
+)
 
 
 @dataclass
@@ -59,7 +47,7 @@ CHART_SPECS = [
         filename="pin_scaling.png",
         title="PIN Concurrency Scaling",
         bench_patterns=["Concurrent ({} threads, {} ops)"],
-        total_ops=10_000,
+        total_ops=TOTAL_OPS["pin"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -67,7 +55,7 @@ CHART_SPECS = [
         filename="hotset_scaling.png",
         title="Hotset Contention Scaling (K=4)",
         bench_patterns=["Concurrent Hotset ({} threads, K=4, {} ops)"],
-        total_ops=10_000,
+        total_ops=TOTAL_OPS["hotset"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -89,7 +77,7 @@ CHART_SPECS = [
             "Repeated Access ({} ops)",
             "Repeated Access MT x{} ({} ops)",
         ],
-        total_ops=1000,
+        total_ops=TOTAL_OPS["repeated"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -100,7 +88,7 @@ CHART_SPECS = [
             "Random (K=10, {} ops)",
             "Random MT x{} (K=10, {} ops)",
         ],
-        total_ops=500,
+        total_ops=TOTAL_OPS["random"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -111,7 +99,7 @@ CHART_SPECS = [
             "Random (K=50, {} ops)",
             "Random MT x{} (K=50, {} ops)",
         ],
-        total_ops=500,
+        total_ops=TOTAL_OPS["random"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -122,7 +110,7 @@ CHART_SPECS = [
             "Random (K=100, {} ops)",
             "Random MT x{} (K=100, {} ops)",
         ],
-        total_ops=500,
+        total_ops=TOTAL_OPS["random"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -133,7 +121,7 @@ CHART_SPECS = [
             "Zipfian (80/20, {} ops)",
             "Zipfian MT x{} (80/20, {} ops)",
         ],
-        total_ops=500,
+        total_ops=TOTAL_OPS["zipfian"],
         unit="ops",
         ylabel="Throughput (M ops/s)",
     ),
@@ -177,7 +165,7 @@ def get_bench_name(spec: ChartSpec, thread_count: int) -> Optional[str]:
         pattern = spec.bench_patterns[0]
         # Handle different patterns for single-threaded
         if "Concurrent" in pattern:
-            ops_per_thread = spec.total_ops // thread_count
+            ops_per_thread = compute_ops_per_thread(spec.total_ops, thread_count)
             return pattern.format(thread_count, ops_per_thread)
         elif "Seq Scan MT" in pattern or "Repeated Access MT" in pattern or "Random MT" in pattern or "Zipfian MT" in pattern:
             # For access patterns, use the ST version from first pattern
@@ -193,7 +181,7 @@ def get_bench_name(spec: ChartSpec, thread_count: int) -> Optional[str]:
 
         # Format the pattern based on what placeholders it expects
         if "Concurrent Hotset" in pattern or "Concurrent" in pattern:
-            ops_per_thread = spec.total_ops // thread_count
+            ops_per_thread = compute_ops_per_thread(spec.total_ops, thread_count)
             return pattern.format(thread_count, ops_per_thread)
         elif "{} blocks)" in pattern:
             return pattern.format(thread_count, spec.total_ops)
