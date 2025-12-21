@@ -22,7 +22,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
-use crate::{buffer_manager::{BufferFrame, FrameMeta}, BlockId};
+use crate::{
+    buffer_manager::{BufferFrame, FrameMeta},
+    BlockId,
+};
 
 /// Clock policy state with circular hand pointer.
 #[derive(Debug)]
