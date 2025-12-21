@@ -332,20 +332,14 @@ impl BufferStats {
 // LatchTableGuard (NO Drop - latches persist)
 // ============================================================================
 
-struct LatchTableGuard<'a> {
-    #[allow(dead_code)]
-    latch_shards: &'a [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>],
-    #[allow(dead_code)]
-    block_id: BlockId,
+type LatchShards = [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>];
+
+struct LatchTableGuard {
     latch: Arc<Mutex<()>>,
 }
 
-impl<'a> LatchTableGuard<'a> {
-    pub fn new(
-        latch_shards: &'a [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>],
-        block_id: &BlockId,
-        shard_index: usize,
-    ) -> Self {
+impl LatchTableGuard {
+    pub fn new(latch_shards: &LatchShards, block_id: &BlockId, shard_index: usize) -> Self {
         let latch = {
             let mut guard = latch_shards[shard_index].lock().unwrap();
             let block_latch_ptr = guard
@@ -353,14 +347,10 @@ impl<'a> LatchTableGuard<'a> {
                 .or_insert_with(|| Arc::new(Mutex::new(())));
             Arc::clone(block_latch_ptr)
         };
-        Self {
-            latch_shards,
-            block_id: block_id.clone(),
-            latch,
-        }
+        Self { latch }
     }
 
-    fn lock(&'a self) -> MutexGuard<'a, ()> {
+    fn lock<'a>(&'a self) -> MutexGuard<'a, ()> {
         self.latch.lock().unwrap()
     }
 }
