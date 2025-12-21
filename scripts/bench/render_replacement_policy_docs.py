@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Render replacement-policy docs and summary tables from JSON artifacts.
 
 This script consumes the raw outputs captured by
@@ -20,14 +20,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-RAW_ROOT = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / "raw"
-
-POLICY_ORDER = [
-    "replacement_lru",
-    "replacement_clock",
-    "replacement_sieve",
-]
+from config import (
+    DEFAULT_NUM_BUFFERS,
+    HOTSET_K,
+    POLICY_ORDER,
+    RAW_ROOT,
+    README_HOTSET_THREAD_COUNTS,
+    README_MT_THREAD_COUNTS,
+    README_PIN_THREAD_COUNTS,
+    REPO_ROOT,
+    TOTAL_OPS,
+    hotset_benchmark_name,
+    pin_benchmark_name,
+    random_benchmark_name,
+    repeated_benchmark_name,
+    sequential_benchmark_name,
+    zipfian_benchmark_name,
+)
 
 
 @dataclass
@@ -41,177 +50,106 @@ class RowSpec:
     precision: int = 3
 
 
-README_ROWS: List[RowSpec] = [
-    RowSpec("Pin/Unpin hit", "Pin/Unpin (hit)", "latency", ""),
-    RowSpec("Cold pin", "Cold Pin (miss)", "latency", ""),
-    RowSpec(
+def seq_total_blocks(num_buffers: int) -> int:
+    return num_buffers * 10
+
+
+def build_readme_rows() -> List[RowSpec]:
+    """Build README_ROWS dynamically using config helper functions."""
+    rows: List[RowSpec] = [
+        RowSpec("Pin/Unpin hit", "Pin/Unpin (hit)", "latency", ""),
+        RowSpec("Cold pin", "Cold Pin (miss)", "latency", ""),
+    ]
+
+    # Sequential scan rows (use num_buffers * 10 for total blocks)
+    # The actual num_buffers comes from metadata, default is 12 -> 120 blocks
+    seq_total = DEFAULT_NUM_BUFFERS * 10
+    rows.append(RowSpec(
         "Sequential Scan",
-        "Sequential Scan (120 blocks)",
-        "throughput",
-        "blocks",
-        lambda num_buffers: num_buffers * 10,
+        sequential_benchmark_name(1, seq_total),
+        "throughput", "blocks",
+        seq_total_blocks,
         "Sequential Scan",
-    ),
-    RowSpec(
-        "Seq Scan MT x4",
-        "Seq Scan MT x4 (120 blocks)",
-        "throughput",
-        "blocks",
-        lambda num_buffers: num_buffers * 10,
-    ),
-    RowSpec(
-        "Seq Scan MT x16",
-        "Seq Scan MT x16 (120 blocks)",
-        "throughput",
-        "blocks",
-        lambda num_buffers: num_buffers * 10,
-    ),
-    RowSpec(
+    ))
+    for threads in README_MT_THREAD_COUNTS:
+        rows.append(RowSpec(
+            f"Seq Scan MT x{threads}",
+            sequential_benchmark_name(threads, seq_total),
+            "throughput", "blocks",
+            seq_total_blocks,
+        ))
+
+    # Repeated access rows
+    rows.append(RowSpec(
         "Repeated Access",
-        "Repeated Access (1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 1000,
+        repeated_benchmark_name(1),
+        "throughput", "ops",
+        lambda _: TOTAL_OPS["repeated"],
         "Repeated Access",
-    ),
-    RowSpec(
-        "Repeated Access MT x4",
-        "Repeated Access MT x4 (1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 1000,
-    ),
-    RowSpec(
-        "Repeated Access MT x16",
-        "Repeated Access MT x16 (1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 1000,
-    ),
-    RowSpec(
-        "Random K=10",
-        "Random (K=10, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-        "Random (K=10)",
-    ),
-    RowSpec(
-        "Random MT x4 K=10",
-        "Random MT x4 (K=10, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Random MT x16 K=10",
-        "Random MT x16 (K=10, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Random K=50",
-        "Random (K=50, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-        "Random (K=50)",
-    ),
-    RowSpec(
-        "Random MT x4 K=50",
-        "Random MT x4 (K=50, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Random MT x16 K=50",
-        "Random MT x16 (K=50, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Random K=100",
-        "Random (K=100, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-        "Random (K=100)",
-    ),
-    RowSpec(
-        "Random MT x4 K=100",
-        "Random MT x4 (K=100, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Random MT x16 K=100",
-        "Random MT x16 (K=100, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
+    ))
+    for threads in README_MT_THREAD_COUNTS:
+        rows.append(RowSpec(
+            f"Repeated Access MT x{threads}",
+            repeated_benchmark_name(threads),
+            "throughput", "ops",
+            lambda _: TOTAL_OPS["repeated"],
+        ))
+
+    # Random access rows for K=10, 50, 100
+    for k in [10, 50, 100]:
+        rows.append(RowSpec(
+            f"Random K={k}",
+            random_benchmark_name(1, k),
+            "throughput", "ops",
+            lambda _: TOTAL_OPS["random"],
+            f"Random (K={k})",
+        ))
+        for threads in README_MT_THREAD_COUNTS:
+            rows.append(RowSpec(
+                f"Random MT x{threads} K={k}",
+                random_benchmark_name(threads, k),
+                "throughput", "ops",
+                lambda _: TOTAL_OPS["random"],
+            ))
+
+    # Zipfian rows
+    rows.append(RowSpec(
         "Zipfian",
-        "Zipfian (80/20, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
+        zipfian_benchmark_name(1),
+        "throughput", "ops",
+        lambda _: TOTAL_OPS["zipfian"],
         "Zipfian (80/20)",
-    ),
-    RowSpec(
-        "Zipfian MT x4",
-        "Zipfian MT x4 (80/20, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "Zipfian MT x16",
-        "Zipfian MT x16 (80/20, 500 ops)",
-        "throughput",
-        "ops",
-        lambda _: 500,
-    ),
-    RowSpec(
-        "pin:t2",
-        "Concurrent (2 threads, 1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 2000,
-    ),
-    RowSpec(
-        "pin:t8",
-        "Concurrent (8 threads, 1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 8000,
-    ),
-    RowSpec(
-        "pin:t16",
-        "Concurrent (16 threads, 1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 16000,
-    ),
-    RowSpec(
-        "hotset:t8_k4",
-        "Concurrent Hotset (8 threads, K=4, 1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 8000,
-    ),
-    RowSpec(
-        "hotset:t16_k4",
-        "Concurrent Hotset (16 threads, K=4, 1000 ops)",
-        "throughput",
-        "ops",
-        lambda _: 16000,
-    ),
-]
+    ))
+    for threads in README_MT_THREAD_COUNTS:
+        rows.append(RowSpec(
+            f"Zipfian MT x{threads}",
+            zipfian_benchmark_name(threads),
+            "throughput", "ops",
+            lambda _: TOTAL_OPS["zipfian"],
+        ))
+
+    # Pin benchmark rows
+    for threads in README_PIN_THREAD_COUNTS:
+        rows.append(RowSpec(
+            f"pin:t{threads}",
+            pin_benchmark_name(threads),
+            "throughput", "ops",
+            lambda _: TOTAL_OPS["pin"],
+        ))
+
+    # Hotset benchmark rows
+    for threads in README_HOTSET_THREAD_COUNTS:
+        rows.append(RowSpec(
+            f"hotset:t{threads}_k{HOTSET_K}",
+            hotset_benchmark_name(threads, HOTSET_K),
+            "throughput", "ops",
+            lambda _: TOTAL_OPS["hotset"],
+        ))
+
+    return rows
+
+
+README_ROWS: List[RowSpec] = build_readme_rows()
 
 
 
@@ -344,7 +282,13 @@ def make_table_markdown(rows: List[RowSpec], platform_data: Dict[str, Dict[str, 
 def render_platform_doc(platform: str, metadata: Dict[str, object], platform_data: Dict[str, Dict[str, object]]):
     output_path = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / f"{platform}_buffer_pool.md"
     lines = [f"# {metadata.get('title', platform.title())}", ""]
+    num_buffers = metadata.get("num_buffers", 12)
     lines.append("Command template: `cargo bench --bench buffer_pool -- <iterations> <num_buffers>`")
+    pin_hotset_pool = metadata.get("pin_hotset_pool_size")
+    if pin_hotset_pool and pin_hotset_pool != num_buffers:
+        lines.append(
+            f"Note: Pin/Hotset benchmarks use {pin_hotset_pool} buffers regardless of `num_buffers`."
+        )
     lines.append("")
 
     for policy in POLICY_ORDER:
