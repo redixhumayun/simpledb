@@ -330,6 +330,9 @@ impl BufferStats {
 
 // ============================================================================
 // LatchTableGuard (NO Drop - latches persist)
+// Latch cleanup is intentionally avoided on the pin path to reduce contention.
+// If latch growth becomes an issue, prefer periodic/thresholded cleanup off
+// the hot path.
 // ============================================================================
 
 type LatchShards = [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>];
@@ -372,6 +375,7 @@ pub struct BufferManager {
 impl BufferManager {
     const MAX_TIME: u64 = 10;
     const SHARDS: usize = 16;
+    const _: () = assert!(Self::SHARDS.is_power_of_two());
 
     pub fn new(
         file_manager: SharedFS,
@@ -461,6 +465,8 @@ impl BufferManager {
                 return Ok(buffer);
             }
 
+            // Slow path: only use wait_mutex when pool is empty. num_available is
+            // atomic, so wakeups can be spurious (TOCTOU), but pin() retries.
             let mut guard = self.wait_mutex.lock().unwrap();
             while self.num_available.load(Ordering::Acquire) == 0 {
                 let elapsed = start.elapsed();
