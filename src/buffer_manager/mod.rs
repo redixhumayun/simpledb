@@ -375,7 +375,7 @@ pub struct BufferManager {
 impl BufferManager {
     const MAX_TIME: u64 = 10;
     const SHARDS: usize = 16;
-    const SHARDS_POWER_OF_TWO: () = assert!(Self::SHARDS.is_power_of_two());
+    const _SHARDS_POWER_OF_TWO: () = assert!(Self::SHARDS.is_power_of_two());
 
     pub fn new(
         file_manager: SharedFS,
