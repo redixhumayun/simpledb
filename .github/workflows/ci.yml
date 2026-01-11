@@ -65,6 +65,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Setup PATH
+      run: echo "$HOME/.cargo/bin:$PATH" >> $GITHUB_PATH
+
     - name: Cache cargo registry
       uses: actions/cache@v3
       with:
