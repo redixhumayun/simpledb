@@ -1,6 +1,9 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Barrier,
+};
 use std::thread;
 use std::time::Instant;
 
@@ -12,6 +15,9 @@ use simpledb::{
     test_utils::generate_random_number,
     BlockId, Lsn, Page, SimpleDB, TestDir,
 };
+
+// Keep in sync with scripts/bench/config.py
+const PIN_HOTSET_POOL_SIZE: usize = 4096;
 
 fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
     SimpleDB::new_for_test(num_buffers, 5000)
@@ -158,18 +164,22 @@ fn render_latency_section(title: &str, results: &[BenchResult]) {
 struct PinCase {
     filter_token: &'static str,
     threads: usize,
-    ops_per_thread: usize,
 }
 
 impl PinCase {
     const fn total_ops(&self) -> usize {
-        self.threads * self.ops_per_thread
+        PIN_TOTAL_OPS
+    }
+
+    const fn ops_per_thread(&self) -> usize {
+        PIN_TOTAL_OPS / self.threads
     }
 
     fn label(&self) -> String {
         format!(
             "{} threads, {} ops/thread",
-            self.threads, self.ops_per_thread
+            self.threads,
+            self.ops_per_thread()
         )
     }
 }
@@ -177,64 +187,119 @@ impl PinCase {
 struct HotsetCase {
     filter_token: &'static str,
     threads: usize,
-    ops_per_thread: usize,
     hot_set_size: usize,
 }
 
 impl HotsetCase {
     const fn total_ops(&self) -> usize {
-        self.threads * self.ops_per_thread
+        HOTSET_TOTAL_OPS
+    }
+
+    const fn ops_per_thread(&self) -> usize {
+        HOTSET_TOTAL_OPS / self.threads
     }
 
     fn label(&self) -> String {
         format!(
             "{} threads, K={}, {} ops/thread",
-            self.threads, self.hot_set_size, self.ops_per_thread
+            self.threads,
+            self.hot_set_size,
+            self.ops_per_thread()
         )
     }
 }
 
+// IMPORTANT: Keep these constants in sync with scripts/bench/config.py
+const PIN_TOTAL_OPS: usize = 10_000;
+
 const PIN_CASES: &[PinCase] = &[
+    PinCase {
+        filter_token: "[pin:t1]",
+        threads: 1,
+    },
     PinCase {
         filter_token: "[pin:t2]",
         threads: 2,
-        ops_per_thread: 1000,
     },
     PinCase {
         filter_token: "[pin:t4]",
         threads: 4,
-        ops_per_thread: 1000,
     },
     PinCase {
         filter_token: "[pin:t8]",
         threads: 8,
-        ops_per_thread: 1000,
     },
     PinCase {
         filter_token: "[pin:t16]",
         threads: 16,
-        ops_per_thread: 1000,
+    },
+    PinCase {
+        filter_token: "[pin:t32]",
+        threads: 32,
+    },
+    PinCase {
+        filter_token: "[pin:t64]",
+        threads: 64,
+    },
+    PinCase {
+        filter_token: "[pin:t128]",
+        threads: 128,
+    },
+    PinCase {
+        filter_token: "[pin:t256]",
+        threads: 256,
     },
 ];
 
+// Keep in sync with scripts/bench/config.py
+const HOTSET_TOTAL_OPS: usize = 10_000;
+const HOTSET_K: usize = 4;
+
 const HOTSET_CASES: &[HotsetCase] = &[
+    HotsetCase {
+        filter_token: "[hotset:t1_k4]",
+        threads: 1,
+        hot_set_size: HOTSET_K,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t2_k4]",
+        threads: 2,
+        hot_set_size: HOTSET_K,
+    },
     HotsetCase {
         filter_token: "[hotset:t4_k4]",
         threads: 4,
-        ops_per_thread: 1000,
-        hot_set_size: 4,
+        hot_set_size: HOTSET_K,
     },
     HotsetCase {
         filter_token: "[hotset:t8_k4]",
         threads: 8,
-        ops_per_thread: 1000,
-        hot_set_size: 4,
+        hot_set_size: HOTSET_K,
     },
     HotsetCase {
         filter_token: "[hotset:t16_k4]",
         threads: 16,
-        ops_per_thread: 1000,
-        hot_set_size: 4,
+        hot_set_size: HOTSET_K,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t32_k4]",
+        threads: 32,
+        hot_set_size: HOTSET_K,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t64_k4]",
+        threads: 64,
+        hot_set_size: HOTSET_K,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t128_k4]",
+        threads: 128,
+        hot_set_size: HOTSET_K,
+    },
+    HotsetCase {
+        filter_token: "[hotset:t256_k4]",
+        threads: 256,
+        hot_set_size: HOTSET_K,
     },
 ];
 
@@ -244,21 +309,59 @@ const ACCESS_CASES: &[AccessCase] = &[
         pattern: AccessPattern::Sequential,
     },
     AccessCase {
-        filter_token: "Seq Scan MT",
+        filter_token: "Seq Scan MT x2",
+        pattern: AccessPattern::SequentialMt { threads: 2 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x4",
         pattern: AccessPattern::SequentialMt { threads: 4 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x8",
+        pattern: AccessPattern::SequentialMt { threads: 8 },
     },
     AccessCase {
         filter_token: "Seq Scan MT x16",
         pattern: AccessPattern::SequentialMt { threads: 16 },
     },
     AccessCase {
+        filter_token: "Seq Scan MT x32",
+        pattern: AccessPattern::SequentialMt { threads: 32 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x64",
+        pattern: AccessPattern::SequentialMt { threads: 64 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x128",
+        pattern: AccessPattern::SequentialMt { threads: 128 },
+    },
+    AccessCase {
+        filter_token: "Seq Scan MT x256",
+        pattern: AccessPattern::SequentialMt { threads: 256 },
+    },
+    AccessCase {
         filter_token: "Repeated Access (1000 ops)",
         pattern: AccessPattern::Repeated { total_ops: 1000 },
     },
     AccessCase {
-        filter_token: "Repeated Access MT",
+        filter_token: "Repeated Access MT x2",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 2,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x4",
         pattern: AccessPattern::RepeatedMt {
             threads: 4,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x8",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 8,
             total_ops: 1000,
         },
     },
@@ -266,6 +369,34 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Repeated Access MT x16",
         pattern: AccessPattern::RepeatedMt {
             threads: 16,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x32",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 32,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x64",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 64,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x128",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 128,
+            total_ops: 1000,
+        },
+    },
+    AccessCase {
+        filter_token: "Repeated Access MT x256",
+        pattern: AccessPattern::RepeatedMt {
+            threads: 256,
             total_ops: 1000,
         },
     },
@@ -291,9 +422,25 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x2 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=10,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 10,
             total_ops: 500,
         },
@@ -307,9 +454,57 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=10,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 10,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x2 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=50,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 50,
             total_ops: 500,
         },
@@ -323,9 +518,57 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=50,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 50,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x2 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 2,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Random MT x4 (K=100,",
         pattern: AccessPattern::RandomMt {
             threads: 4,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x8 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 8,
             working_set: 100,
             total_ops: 500,
         },
@@ -339,13 +582,59 @@ const ACCESS_CASES: &[AccessCase] = &[
         },
     },
     AccessCase {
+        filter_token: "Random MT x32 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 32,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x64 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 64,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x128 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 128,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Random MT x256 (K=100,",
+        pattern: AccessPattern::RandomMt {
+            threads: 256,
+            working_set: 100,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
         filter_token: "Zipfian (80/20,",
         pattern: AccessPattern::Zipfian { total_ops: 500 },
     },
     AccessCase {
-        filter_token: "Zipfian MT",
+        filter_token: "Zipfian MT x2",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 2,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x4",
         pattern: AccessPattern::ZipfianMt {
             threads: 4,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x8",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 8,
             total_ops: 500,
         },
     },
@@ -353,6 +642,34 @@ const ACCESS_CASES: &[AccessCase] = &[
         filter_token: "Zipfian MT x16",
         pattern: AccessPattern::ZipfianMt {
             threads: 16,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x32",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 32,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x64",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 64,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x128",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 128,
+            total_ops: 500,
+        },
+    },
+    AccessCase {
+        filter_token: "Zipfian MT x256",
+        pattern: AccessPattern::ZipfianMt {
+            threads: 256,
             total_ops: 500,
         },
     },
@@ -565,32 +882,51 @@ fn sequential_scan_multithreaded(
     );
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = ranges
+        .iter()
+        .map(|&(start, end)| {
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in start..end {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), i);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!("Seq Scan MT x{} ({} blocks)", num_threads, total_blocks),
         iterations,
         2,
         || {
-            let handles: Vec<_> = ranges
-                .iter()
-                .map(|&(start, end)| {
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in start..end {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), i);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn repeated_access_multithreaded(
@@ -609,7 +945,37 @@ fn repeated_access_multithreaded(
     let per_thread_ops = Arc::new(per_thread_ops);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = per_thread_ops
+        .iter()
+        .enumerate()
+        .map(|(thread_id, &ops)| {
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops {
+                    let block_idx = (i + thread_id) % working_set;
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Repeated Access MT x{} ({} ops)",
             num_threads, total_accesses
@@ -617,29 +983,18 @@ fn repeated_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = per_thread_ops
-                .iter()
-                .enumerate()
-                .map(|(thread_id, &ops)| {
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops {
-                            let block_idx = (i + thread_id) % working_set;
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn random_access_multithreaded(
@@ -667,7 +1022,35 @@ fn random_access_multithreaded(
     let sequences = Arc::new(sequences);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let sequences = Arc::clone(&sequences);
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for &block_idx in &sequences[thread_id] {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Random MT x{} (K={}, {} ops)",
             num_threads, working_set_size, total_accesses
@@ -675,27 +1058,18 @@ fn random_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let sequences = sequences.clone();
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for &block_idx in &sequences[thread_id] {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn zipfian_access_multithreaded(
@@ -735,7 +1109,35 @@ fn zipfian_access_multithreaded(
     let sequences = Arc::new(sequences);
     let test_file = Arc::new(test_file);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let sequences = Arc::clone(&sequences);
+            let test_file = Arc::clone(&test_file);
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for &block_idx in &sequences[thread_id] {
+                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Zipfian MT x{} (80/20, {} ops)",
             num_threads, total_accesses
@@ -743,27 +1145,18 @@ fn zipfian_access_multithreaded(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let sequences = sequences.clone();
-                    let test_file = Arc::clone(&test_file);
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for &block_idx in &sequences[thread_id] {
-                            let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 // Phase 3: Pool Size Sensitivity
@@ -871,7 +1264,37 @@ fn multithreaded_pin(
     // Pre-create blocks (each thread gets its own range)
     precreate_blocks(db, &test_file, num_threads * 10);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let test_file = test_file.clone();
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops_per_thread {
+                    // Each thread accesses blocks in its own range to reduce contention
+                    let block_num = (thread_id * 10) + (i % 10);
+                    let block_id = BlockId::new(test_file.clone(), block_num);
+
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Concurrent ({} threads, {} ops)",
             num_threads, ops_per_thread
@@ -879,31 +1302,18 @@ fn multithreaded_pin(
         iterations,
         2,
         || {
-            // Spawn threads
-            let handles: Vec<_> = (0..num_threads)
-                .map(|thread_id| {
-                    let test_file = test_file.clone();
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops_per_thread {
-                            // Each thread accesses blocks in its own range to reduce contention
-                            let block_num = (thread_id * 10) + (i % 10);
-                            let block_id = BlockId::new(test_file.clone(), block_num);
-
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            // Wait for all threads
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn multithreaded_hotset_contention(
@@ -920,7 +1330,37 @@ fn multithreaded_hotset_contention(
     // Pre-create a small hot set shared across all threads
     precreate_blocks(db, &test_file, hot_set_size);
 
-    benchmark(
+    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let test_file = test_file.clone();
+            let buffer_manager = db.buffer_manager();
+            let start_barrier = Arc::clone(&start_barrier);
+            let end_barrier = Arc::clone(&end_barrier);
+            let stop = Arc::clone(&stop);
+
+            thread::spawn(move || loop {
+                start_barrier.wait();
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                for i in 0..ops_per_thread {
+                    // All threads reuse the same hot set to maximize latch contention
+                    let block_num = i % hot_set_size;
+                    let block_id = BlockId::new(test_file.clone(), block_num);
+
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+                end_barrier.wait();
+            })
+        })
+        .collect();
+
+    let result = benchmark(
         &format!(
             "Concurrent Hotset ({} threads, K={}, {} ops)",
             num_threads, hot_set_size, ops_per_thread
@@ -928,29 +1368,18 @@ fn multithreaded_hotset_contention(
         iterations,
         2,
         || {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|_| {
-                    let test_file = test_file.clone();
-                    let buffer_manager = db.buffer_manager();
-
-                    thread::spawn(move || {
-                        for i in 0..ops_per_thread {
-                            // All threads reuse the same hot set to maximize latch contention
-                            let block_num = i % hot_set_size;
-                            let block_id = BlockId::new(test_file.clone(), block_num);
-
-                            let buffer = buffer_manager.pin(&block_id).unwrap();
-                            buffer_manager.unpin(buffer);
-                        }
-                    })
-                })
-                .collect();
-
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            start_barrier.wait();
+            end_barrier.wait();
         },
-    )
+    );
+
+    stop.store(true, Ordering::Release);
+    start_barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    result
 }
 
 fn buffer_starvation(db: &SimpleDB, num_buffers: usize) {
@@ -1020,7 +1449,7 @@ fn run_multithreaded_pin_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&
     }
 
     for case in cases {
-        let result = multithreaded_pin(db, case.threads, case.ops_per_thread, iterations);
+        let result = multithreaded_pin(db, case.threads, case.ops_per_thread(), iterations);
         let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
         row.label = case.label();
         rows.push(row);
@@ -1040,7 +1469,7 @@ fn run_hotset_contention_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&
         let result = multithreaded_hotset_contention(
             db,
             case.threads,
-            case.ops_per_thread,
+            case.ops_per_thread(),
             case.hot_set_size,
             iterations,
         );
@@ -1063,6 +1492,7 @@ fn main() {
     let (iterations, num_buffers, json_output, filter) = parse_bench_args();
     let filter_ref = filter.as_deref();
     let block_size = 4096;
+    let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
 
     if json_output {
         let mut results = Vec::new();
@@ -1086,16 +1516,16 @@ fn main() {
         }
 
         results.extend(PIN_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
-            multithreaded_pin(&db, case.threads, case.ops_per_thread, iterations)
+            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
+            multithreaded_pin(&db, case.threads, case.ops_per_thread(), iterations)
         }));
 
         results.extend(HOTSET_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
+            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
             multithreaded_hotset_contention(
                 &db,
                 case.threads,
-                case.ops_per_thread,
+                case.ops_per_thread(),
                 case.hot_set_size,
                 iterations,
             )
@@ -1251,7 +1681,11 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        if pin_hotset_pool != num_buffers {
+            println!("Pin pool size override: {pin_hotset_pool} buffers");
+            println!();
+        }
+        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
         run_multithreaded_pin_benchmarks(&db, iterations, &pin_cases);
     }
 
@@ -1268,7 +1702,11 @@ fn main() {
             println!();
             phase5_has_output = true;
         }
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
+        if pin_hotset_pool != num_buffers {
+            println!("Hotset pool size override: {pin_hotset_pool} buffers");
+            println!();
+        }
+        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
         run_hotset_contention_benchmarks(&db, iterations, &hotset_cases);
     }
 

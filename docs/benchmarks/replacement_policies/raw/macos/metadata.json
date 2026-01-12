@@ -4,7 +4,7 @@
   "environment": "macos (aarch64)",
   "iterations": 100,
   "num_buffers": 12,
-  "generated_at": "2025-12-05T18:43:28.465085+00:00",
+  "generated_at": "2026-01-12T02:56:30.251889+00:00",
   "policies": {
     "replacement_lru": {
       "display": "Replacement LRU (4KB pages)",
@@ -22,9 +22,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 79.6,
-          "hits": 40589,
-          "misses": 10411
+          "hit_rate": 78.2,
+          "hits": 39873,
+          "misses": 11127
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -32,14 +32,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 20.2,
-          "hits": 10301,
-          "misses": 40699
+          "hit_rate": 24.6,
+          "hits": 12544,
+          "misses": 38456
         },
         "Random (K=100)": {
-          "hit_rate": 12.0,
-          "hits": 6118,
-          "misses": 44882
+          "hit_rate": 11.4,
+          "hits": 5813,
+          "misses": 45187
         }
       }
     },
@@ -59,9 +59,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 70.1,
-          "hits": 35795,
-          "misses": 15257
+          "hit_rate": 75.8,
+          "hits": 38725,
+          "misses": 12374
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -69,14 +69,14 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 25.8,
-          "hits": 13153,
-          "misses": 37848
+          "hit_rate": 27.0,
+          "hits": 13767,
+          "misses": 37234
         },
         "Random (K=100)": {
-          "hit_rate": 11.4,
-          "hits": 5814,
-          "misses": 45188
+          "hit_rate": 12.8,
+          "hits": 6525,
+          "misses": 44476
         }
       }
     },
@@ -96,9 +96,9 @@
           "misses": 10
         },
         "Zipfian (80/20)": {
-          "hit_rate": 73.2,
-          "hits": 38252,
-          "misses": 13970
+          "hit_rate": 66.8,
+          "hits": 35085,
+          "misses": 17444
         },
         "Random (K=10)": {
           "hit_rate": 100.0,
@@ -106,17 +106,18 @@
           "misses": 10
         },
         "Random (K=50)": {
-          "hit_rate": 20.6,
-          "hits": 11218,
-          "misses": 43148
+          "hit_rate": 23.1,
+          "hits": 12546,
+          "misses": 41768
         },
         "Random (K=100)": {
-          "hit_rate": 11.0,
-          "hits": 6016,
-          "misses": 48758
+          "hit_rate": 11.4,
+          "hits": 6221,
+          "misses": 48553
         }
       }
     }
   },
-  "page_size": "page-4k"
+  "page_size": "page-4k",
+  "pin_hotset_pool_size": 4096
 }

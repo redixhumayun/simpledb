@@ -3,8 +3,12 @@
 /bench-data
 /random
 node_modules
+__pycache__/
+*.pyc
 perf.*
 *.txt
+*.svg
 .DS_Store
 /output
 docs/local.md
+docs/sharded/**/*
