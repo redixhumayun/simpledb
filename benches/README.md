@@ -6,16 +6,16 @@ Stdlib-only benchmarking framework with CLI filtering support.
 
 All benchmarks reference the following machines.
 
-### Linux runner (Dell XPS 13‑9370, Netac NVMe, Ubuntu 6.8.0‑86)
+### Linux runner (Intel Xeon E3‑1275 v5, Samsung NVMe RAID1, Ubuntu 6.8.0‑90)
 
-- **CPU / Memory**: Intel i7‑8650U (4C/8T), 16 GB DDR4‑2133
-- **Storage**: Netac 512 GB NVMe (PCIe)
-- **fio (direct I/O)**  
-  - Sequential write, 1 MiB: **1.27 GiB/s · 1.27 k IOPS**  
-  - Sequential read, 1 MiB: **2.97 GiB/s · 2.97 k IOPS**  
-  - Random write, 4 KiB: **326 MiB/s · 83.5 k IOPS**  
-  - Random read, 4 KiB: **426 MiB/s · 109 k IOPS** 
-  - Random write, 4 KiB + per-op `fdatasync`: **≈0.80 MiB/s · ≈200 IOPS**
+- **CPU / Memory**: Intel Xeon E3‑1275 v5 @ 3.60GHz (4C/8T), 62 GB
+- **Storage**: 2× Samsung NVMe 512 GB (RAID1, md2)
+- **fio (direct I/O)**
+  - Sequential write, 1 MiB: **1.17 GiB/s · 1.20 k IOPS**
+  - Sequential read, 1 MiB: **2.70 GiB/s · 2.76 k IOPS**
+  - Random write, 4 KiB: **247 MiB/s · 63.3 k IOPS**
+  - Random read, 4 KiB: **478 MiB/s · 122 k IOPS**
+  - Random write, 4 KiB + per-op `fdatasync`: **≈0.47 MiB/s · ≈121 IOPS**
 
   ```bash
   fio --name=seqwrite --filename=fiotest.bin --size=4G --bs=1M --rw=write --direct=1 --ioengine=libaio --numjobs=1 --iodepth=16
