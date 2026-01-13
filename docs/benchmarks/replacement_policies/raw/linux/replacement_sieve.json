@@ -2,141 +2,376 @@
   {
     "name": "Pin/Unpin (hit)",
     "unit": "ns",
-    "value": 801
+    "value": 1133
   },
   {
     "name": "Cold Pin (miss)",
     "unit": "ns",
-    "value": 4259
+    "value": 6260
   },
   {
     "name": "Dirty Eviction",
     "unit": "ns",
-    "value": 451678
+    "value": 833828
   },
   {
     "name": "Sequential Scan (120 blocks)",
     "unit": "ns",
-    "value": 466790
+    "value": 702633
+  },
+  {
+    "name": "Seq Scan MT x2 (120 blocks)",
+    "unit": "ns",
+    "value": 757744
   },
   {
     "name": "Seq Scan MT x4 (120 blocks)",
     "unit": "ns",
-    "value": 652497
+    "value": 835171
+  },
+  {
+    "name": "Seq Scan MT x8 (120 blocks)",
+    "unit": "ns",
+    "value": 996376
   },
   {
     "name": "Seq Scan MT x16 (120 blocks)",
     "unit": "ns",
-    "value": 981834
+    "value": 1222450
+  },
+  {
+    "name": "Seq Scan MT x32 (120 blocks)",
+    "unit": "ns",
+    "value": 1948567
+  },
+  {
+    "name": "Seq Scan MT x64 (120 blocks)",
+    "unit": "ns",
+    "value": 2307783
+  },
+  {
+    "name": "Seq Scan MT x128 (120 blocks)",
+    "unit": "ns",
+    "value": 2192785
+  },
+  {
+    "name": "Seq Scan MT x256 (120 blocks)",
+    "unit": "ns",
+    "value": 2721470
   },
   {
     "name": "Repeated Access (1000 ops)",
     "unit": "ns",
-    "value": 978299
+    "value": 1125980
+  },
+  {
+    "name": "Repeated Access MT x2 (1000 ops)",
+    "unit": "ns",
+    "value": 693319
   },
   {
     "name": "Repeated Access MT x4 (1000 ops)",
     "unit": "ns",
-    "value": 790636
+    "value": 364084
+  },
+  {
+    "name": "Repeated Access MT x8 (1000 ops)",
+    "unit": "ns",
+    "value": 434449
   },
   {
     "name": "Repeated Access MT x16 (1000 ops)",
     "unit": "ns",
-    "value": 1214184
+    "value": 449036
+  },
+  {
+    "name": "Repeated Access MT x32 (1000 ops)",
+    "unit": "ns",
+    "value": 543734
+  },
+  {
+    "name": "Repeated Access MT x64 (1000 ops)",
+    "unit": "ns",
+    "value": 769489
+  },
+  {
+    "name": "Repeated Access MT x128 (1000 ops)",
+    "unit": "ns",
+    "value": 1261168
+  },
+  {
+    "name": "Repeated Access MT x256 (1000 ops)",
+    "unit": "ns",
+    "value": 2400461
   },
   {
     "name": "Random (K=10, 500 ops)",
     "unit": "ns",
-    "value": 405880
+    "value": 561452
   },
   {
     "name": "Random (K=50, 500 ops)",
     "unit": "ns",
-    "value": 1727705
+    "value": 2423284
   },
   {
     "name": "Random (K=100, 500 ops)",
     "unit": "ns",
-    "value": 1907203
+    "value": 2725124
+  },
+  {
+    "name": "Random MT x2 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 365980
   },
   {
     "name": "Random MT x4 (K=10, 500 ops)",
     "unit": "ns",
-    "value": 445867
+    "value": 211183
+  },
+  {
+    "name": "Random MT x8 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 219369
   },
   {
     "name": "Random MT x16 (K=10, 500 ops)",
     "unit": "ns",
-    "value": 574815
+    "value": 290231
+  },
+  {
+    "name": "Random MT x32 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 392812
+  },
+  {
+    "name": "Random MT x64 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 633514
+  },
+  {
+    "name": "Random MT x128 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 1167793
+  },
+  {
+    "name": "Random MT x256 (K=10, 500 ops)",
+    "unit": "ns",
+    "value": 2269593
+  },
+  {
+    "name": "Random MT x2 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 2025661
   },
   {
     "name": "Random MT x4 (K=50, 500 ops)",
     "unit": "ns",
-    "value": 2144865
+    "value": 2864950
+  },
+  {
+    "name": "Random MT x8 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 3321925
   },
   {
     "name": "Random MT x16 (K=50, 500 ops)",
     "unit": "ns",
-    "value": 3194415
+    "value": 3800814
+  },
+  {
+    "name": "Random MT x32 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 5420784
+  },
+  {
+    "name": "Random MT x64 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 7310557
+  },
+  {
+    "name": "Random MT x128 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 7903700
+  },
+  {
+    "name": "Random MT x256 (K=50, 500 ops)",
+    "unit": "ns",
+    "value": 8195346
+  },
+  {
+    "name": "Random MT x2 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 2293174
   },
   {
     "name": "Random MT x4 (K=100, 500 ops)",
     "unit": "ns",
-    "value": 2349941
+    "value": 3403918
+  },
+  {
+    "name": "Random MT x8 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 3668159
   },
   {
     "name": "Random MT x16 (K=100, 500 ops)",
     "unit": "ns",
-    "value": 3850173
+    "value": 4343121
+  },
+  {
+    "name": "Random MT x32 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 7220805
+  },
+  {
+    "name": "Random MT x64 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 9640386
+  },
+  {
+    "name": "Random MT x128 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 9705035
+  },
+  {
+    "name": "Random MT x256 (K=100, 500 ops)",
+    "unit": "ns",
+    "value": 9706948
   },
   {
     "name": "Zipfian (80/20, 500 ops)",
     "unit": "ns",
-    "value": 1017637
+    "value": 1253719
+  },
+  {
+    "name": "Zipfian MT x2 (80/20, 500 ops)",
+    "unit": "ns",
+    "value": 1038469
   },
   {
     "name": "Zipfian MT x4 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 904153
+    "value": 1056076
+  },
+  {
+    "name": "Zipfian MT x8 (80/20, 500 ops)",
+    "unit": "ns",
+    "value": 1313647
   },
   {
     "name": "Zipfian MT x16 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 1436842
+    "value": 1483888
   },
   {
-    "name": "Concurrent (2 threads, 1000 ops)",
+    "name": "Zipfian MT x32 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 8302325
+    "value": 1796580
   },
   {
-    "name": "Concurrent (4 threads, 1000 ops)",
+    "name": "Zipfian MT x64 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 19703887
+    "value": 2233188
   },
   {
-    "name": "Concurrent (8 threads, 1000 ops)",
+    "name": "Zipfian MT x128 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 47193694
+    "value": 2280912
   },
   {
-    "name": "Concurrent (16 threads, 1000 ops)",
+    "name": "Zipfian MT x256 (80/20, 500 ops)",
     "unit": "ns",
-    "value": 170114642
+    "value": 2828173
   },
   {
-    "name": "Concurrent Hotset (4 threads, K=4, 1000 ops)",
+    "name": "Concurrent (1 threads, 10000 ops)",
     "unit": "ns",
-    "value": 3444519
+    "value": 11209304
   },
   {
-    "name": "Concurrent Hotset (8 threads, K=4, 1000 ops)",
+    "name": "Concurrent (2 threads, 5000 ops)",
     "unit": "ns",
-    "value": 9095589
+    "value": 6082367
   },
   {
-    "name": "Concurrent Hotset (16 threads, K=4, 1000 ops)",
+    "name": "Concurrent (4 threads, 2500 ops)",
     "unit": "ns",
-    "value": 17835175
+    "value": 3246792
+  },
+  {
+    "name": "Concurrent (8 threads, 1250 ops)",
+    "unit": "ns",
+    "value": 3186070
+  },
+  {
+    "name": "Concurrent (16 threads, 625 ops)",
+    "unit": "ns",
+    "value": 3086969
+  },
+  {
+    "name": "Concurrent (32 threads, 312 ops)",
+    "unit": "ns",
+    "value": 3292127
+  },
+  {
+    "name": "Concurrent (64 threads, 156 ops)",
+    "unit": "ns",
+    "value": 3408181
+  },
+  {
+    "name": "Concurrent (128 threads, 78 ops)",
+    "unit": "ns",
+    "value": 3861870
+  },
+  {
+    "name": "Concurrent (256 threads, 39 ops)",
+    "unit": "ns",
+    "value": 4702365
+  },
+  {
+    "name": "Concurrent Hotset (1 threads, K=4, 10000 ops)",
+    "unit": "ns",
+    "value": 11205455
+  },
+  {
+    "name": "Concurrent Hotset (2 threads, K=4, 5000 ops)",
+    "unit": "ns",
+    "value": 6657867
+  },
+  {
+    "name": "Concurrent Hotset (4 threads, K=4, 2500 ops)",
+    "unit": "ns",
+    "value": 3642516
+  },
+  {
+    "name": "Concurrent Hotset (8 threads, K=4, 1250 ops)",
+    "unit": "ns",
+    "value": 3466587
+  },
+  {
+    "name": "Concurrent Hotset (16 threads, K=4, 625 ops)",
+    "unit": "ns",
+    "value": 3930157
+  },
+  {
+    "name": "Concurrent Hotset (32 threads, K=4, 312 ops)",
+    "unit": "ns",
+    "value": 4021278
+  },
+  {
+    "name": "Concurrent Hotset (64 threads, K=4, 156 ops)",
+    "unit": "ns",
+    "value": 4245504
+  },
+  {
+    "name": "Concurrent Hotset (128 threads, K=4, 78 ops)",
+    "unit": "ns",
+    "value": 4606808
+  },
+  {
+    "name": "Concurrent Hotset (256 threads, K=4, 39 ops)",
+    "unit": "ns",
+    "value": 5446894
   }
 ]

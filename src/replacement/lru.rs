@@ -20,8 +20,9 @@ use std::{
 };
 
 use crate::{
+    buffer_manager::{BufferFrame, FrameMeta},
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId, BufferFrame, FrameMeta,
+    BlockId,
 };
 
 /// LRU policy state maintaining an intrusive doubly-linked list.
