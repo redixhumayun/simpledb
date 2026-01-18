@@ -103,6 +103,18 @@ mod crc {
 }
 
 /// Read-only view over a heap header stored inline in `PageBytes`.
+///
+/// Heap header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: reserved_flags (u8)
+/// - 2..4: slot_count (u16)
+/// - 4..6: free_lower (u16)
+/// - 6..8: free_upper (u16)
+/// - 8..12: free_ptr (u32)
+/// - 12..16: crc32 (u32)
+/// - 16..24: latch_word (u64)
+/// - 24..26: free_head (u16)
+/// - 26..32: reserved_bytes (6 bytes)
 #[derive(Clone, Copy)]
 pub struct HeapHeaderRef<'a> {
     bytes: &'a [u8],
@@ -202,6 +214,18 @@ impl<'a> HeaderReader<'a> for HeapHeaderRef<'a> {
 }
 
 /// Mutable view over a heap header stored inline in `PageBytes`.
+///
+/// Heap header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: reserved_flags (u8)
+/// - 2..4: slot_count (u16)
+/// - 4..6: free_lower (u16)
+/// - 6..8: free_upper (u16)
+/// - 8..12: free_ptr (u32)
+/// - 12..16: crc32 (u32)
+/// - 16..24: latch_word (u64)
+/// - 24..26: free_head (u16)
+/// - 26..32: reserved_bytes (6 bytes)
 pub struct HeapHeaderMut<'a> {
     bytes: &'a mut [u8],
 }
@@ -418,6 +442,19 @@ pub(crate) mod test_helpers {
 }
 
 /// Read-only view over a B-tree leaf header.
+///
+/// B-tree leaf header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: level (u8)
+/// - 2..4: slot_count (u16)
+/// - 4..6: free_lower (u16)
+/// - 6..8: free_upper (u16)
+/// - 8..10: high_key_len (u16)
+/// - 10..12: high_key_off (u16)
+/// - 12..16: right_sibling (u32)
+/// - 16..20: overflow_block (u32)
+/// - 20..24: crc32 (u32)
+/// - 24..32: lsn (u64)
 #[derive(Clone, Copy)]
 pub struct BTreeLeafHeaderRef<'a> {
     bytes: &'a [u8],
@@ -508,6 +545,18 @@ pub struct BTreeLeafHeaderMut<'a> {
 }
 
 impl<'a> BTreeLeafHeaderMut<'a> {
+    /// B-tree leaf header layout (bytes):
+    /// - 0: page_type (u8)
+    /// - 1: level (u8)
+    /// - 2..4: slot_count (u16)
+    /// - 4..6: free_lower (u16)
+    /// - 6..8: free_upper (u16)
+    /// - 8..10: high_key_len (u16)
+    /// - 10..12: high_key_off (u16)
+    /// - 12..16: right_sibling (u32)
+    /// - 16..20: overflow_block (u32)
+    /// - 20..24: crc32 (u32)
+    /// - 24..32: lsn (u64)
     pub fn new(bytes: &'a mut [u8]) -> Self {
         assert_eq!(bytes.len(), BTreeLeafPage::HEADER_SIZE);
         Self { bytes }
@@ -577,10 +626,6 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.write(24, lsn.to_le_bytes());
     }
 
-    pub fn set_reserved_bytes(&mut self, reserved: [u8; 2]) {
-        self.write(30, reserved);
-    }
-
     pub fn init_leaf(
         &mut self,
         level: u8,
@@ -599,7 +644,6 @@ impl<'a> BTreeLeafHeaderMut<'a> {
         self.set_overflow_block(overflow_block.unwrap_or(u32::MAX));
         self.set_crc32(0);
         self.set_lsn(0);
-        self.set_reserved_bytes([0; 2]);
     }
 
     pub fn update_crc32(&mut self, body_bytes: &[u8]) {
@@ -621,6 +665,19 @@ impl<'a> BTreeLeafHeaderMut<'a> {
 }
 
 /// Read-only view over a B-tree internal header.
+///
+/// B-tree internal header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: level (u8)
+/// - 2..4: slot_count (u16)
+/// - 4..6: free_lower (u16)
+/// - 6..8: free_upper (u16)
+/// - 8..12: rightmost_child (u32)
+/// - 12..14: high_key_len (u16)
+/// - 14..16: high_key_off (u16)
+/// - 16..20: crc32 (u32)
+/// - 20..28: lsn (u64)
+/// - 28..32: reserved_bytes (u32)
 #[derive(Clone, Copy)]
 pub struct BTreeInternalHeaderRef<'a> {
     bytes: &'a [u8],
@@ -706,6 +763,18 @@ pub struct BTreeInternalHeaderMut<'a> {
 }
 
 impl<'a> BTreeInternalHeaderMut<'a> {
+    /// B-tree internal header layout (bytes):
+    /// - 0: page_type (u8)
+    /// - 1: level (u8)
+    /// - 2..4: slot_count (u16)
+    /// - 4..6: free_lower (u16)
+    /// - 6..8: free_upper (u16)
+    /// - 8..12: rightmost_child (u32)
+    /// - 12..14: high_key_len (u16)
+    /// - 14..16: high_key_off (u16)
+    /// - 16..20: crc32 (u32)
+    /// - 20..28: lsn (u64)
+    /// - 28..32: reserved_bytes (u32)
     pub fn new(bytes: &'a mut [u8]) -> Self {
         assert_eq!(bytes.len(), BTreeInternalPage::HEADER_SIZE);
         Self { bytes }
@@ -1371,6 +1440,16 @@ pub struct PageBytes {
 }
 
 /// Read-only view over a B-tree meta header.
+///
+/// B-tree meta header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: version (u8)
+/// - 2..4: tree_height (u16)
+/// - 4..8: root_block (u32)
+/// - 8..12: first_free_block (u32)
+/// - 12..20: reserved (8 bytes)
+/// - 20..24: crc32 (u32)
+/// - 24..32: reserved (u64)
 #[derive(Clone, Copy)]
 pub struct BTreeMetaHeaderRef<'a> {
     bytes: &'a [u8],
@@ -1410,6 +1489,16 @@ impl<'a> BTreeMetaHeaderRef<'a> {
 }
 
 /// Mutable view over a B-tree meta header.
+///
+/// B-tree meta header layout (bytes):
+/// - 0: page_type (u8)
+/// - 1: version (u8)
+/// - 2..4: tree_height (u16)
+/// - 4..8: root_block (u32)
+/// - 8..12: first_free_block (u32)
+/// - 12..20: reserved (8 bytes)
+/// - 20..24: crc32 (u32)
+/// - 24..32: reserved (u64)
 pub struct BTreeMetaHeaderMut<'a> {
     bytes: &'a mut [u8],
 }
@@ -1941,6 +2030,89 @@ impl<'a> HeapPageMut<'a> {
         );
         Ok(parts)
     }
+
+    pub fn undo_insert(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        if slot >= parts.line_ptrs().len() {
+            return Err(format!("slot {slot} out of bounds").into());
+        }
+        parts.delete_slot(slot)?;
+        parts.rebuild_free_list();
+        Ok(())
+    }
+
+    pub fn undo_update(
+        &mut self,
+        slot: SlotId,
+        old_offset: usize,
+        old_tuple: &[u8],
+        new_offset: usize,
+        new_len: usize,
+    ) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        if slot >= parts.line_ptrs().len() {
+            return Err(format!("slot {slot} out of bounds").into());
+        }
+        let old_len: u16 = old_tuple
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
+        let old_offset: u16 = old_offset
+            .try_into()
+            .map_err(|_| "tuple offset larger than max offset")?;
+        parts.record_space().write_tuple(old_offset as usize, old_tuple);
+        parts
+            .line_ptrs()
+            .set(slot, LinePtr::new(old_offset, old_len, LineState::Live));
+
+        if old_offset as usize != new_offset {
+            let new_offset: u16 = new_offset
+                .try_into()
+                .map_err(|_| "tuple offset larger than max offset")?;
+            let new_len: u16 = new_len
+                .try_into()
+                .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
+            for idx in 0..parts.line_ptrs().len() {
+                if idx == slot {
+                    continue;
+                }
+                let lp = parts.line_ptrs().as_ref().get(idx);
+                if lp.is_live() && lp.offset() == new_offset && lp.length() == new_len {
+                    let mut lp = lp;
+                    lp.mark_free();
+                    parts.line_ptrs().set(idx, lp);
+                }
+            }
+        }
+
+        parts.rebuild_free_list();
+        Ok(())
+    }
+
+    pub fn undo_delete(
+        &mut self,
+        slot: SlotId,
+        offset: usize,
+        old_tuple: &[u8],
+    ) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        if slot >= parts.line_ptrs().len() {
+            return Err(format!("slot {slot} out of bounds").into());
+        }
+        let old_len: u16 = old_tuple
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
+        let offset: u16 = offset
+            .try_into()
+            .map_err(|_| "tuple offset larger than max offset")?;
+        parts.record_space().write_tuple(offset as usize, old_tuple);
+        parts
+            .line_ptrs()
+            .set(slot, LinePtr::new(offset, old_len, LineState::Live));
+        parts.rebuild_free_list();
+        Ok(())
+    }
 }
 
 struct ReservedSlot {
@@ -2092,6 +2264,25 @@ impl<'a> HeapPageParts<'a> {
         line_pointer.mark_redirect(target.try_into().expect("slot id does not in u16"));
         self.line_ptrs.set(slot, line_pointer);
         Ok(())
+    }
+
+    fn rebuild_free_list(&mut self) {
+        self.header.set_free_head(HeapHeaderRef::NO_FREE_SLOT);
+        let len = self.line_ptrs.len();
+        for slot in (0..len).rev() {
+            let lp = self.line_ptrs.as_ref().get(slot);
+            if !lp.is_free() {
+                continue;
+            }
+            let next = self.header.as_ref().free_head();
+            let mut lp = lp;
+            lp.set_offset(next);
+            lp.set_length(0);
+            lp.set_state(LineState::Free);
+            self.line_ptrs.set(slot, lp);
+            self.header
+                .set_free_head(slot.try_into().expect("slot id fits in u16"));
+        }
     }
 }
 
