@@ -9980,6 +9980,32 @@ enum LogRecord {
         offset: usize,
         old_val: String,
     },
+    /// Physical tuple-level insert: logs full tuple bytes for undo
+    HeapTupleInsert {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        tuple: Vec<u8>,
+    },
+    /// Physical tuple-level update: logs before/after tuple bytes
+    HeapTupleUpdate {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        old_offset: usize,
+        old_tuple: Vec<u8>,
+        new_offset: usize,
+        new_tuple: Vec<u8>,
+    },
+    /// Physical tuple-level delete: logs old tuple bytes for undo
+    HeapTupleDelete {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        old_tuple: Vec<u8>,
+    },
 }
 
 impl Display for LogRecord {
@@ -10007,6 +10033,42 @@ impl Display for LogRecord {
                 f,
                 "SetString(txnum: {txnum}, block_id: {block_id:?}, offset: {offset}, old_val: {old_val})"
             ),
+            LogRecord::HeapTupleInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                tuple,
+            } => write!(
+                f,
+                "HeapTupleInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, tuple_len: {})",
+                tuple.len()
+            ),
+            LogRecord::HeapTupleUpdate {
+                txnum,
+                block_id,
+                slot,
+                old_offset,
+                old_tuple,
+                new_offset,
+                new_tuple,
+            } => write!(
+                f,
+                "HeapTupleUpdate(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, old_offset: {old_offset}, old_len: {}, new_offset: {new_offset}, new_len: {})",
+                old_tuple.len(),
+                new_tuple.len()
+            ),
+            LogRecord::HeapTupleDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                old_tuple,
+            } => write!(
+                f,
+                "HeapTupleDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, tuple_len: {})",
+                old_tuple.len()
+            ),
         }
     }
 }
@@ -10022,6 +10084,11 @@ impl TryInto<Vec<u8>> for &LogRecord {
         fn push_string(buf: &mut Vec<u8>, value: &str) {
             push_i32(buf, value.len() as i32);
             buf.extend_from_slice(value.as_bytes());
+        }
+
+        fn push_bytes(buf: &mut Vec<u8>, value: &[u8]) {
+            push_i32(buf, value.len() as i32);
+            buf.extend_from_slice(value);
         }
 
         let mut buf = Vec::with_capacity(self.calculate_size());
@@ -10054,6 +10121,52 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_i32(&mut buf, block_id.block_num as i32);
                 push_i32(&mut buf, *offset as i32);
                 push_string(&mut buf, old_val);
+            }
+            LogRecord::HeapTupleInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                tuple,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_bytes(&mut buf, tuple);
+            }
+            LogRecord::HeapTupleUpdate {
+                txnum,
+                block_id,
+                slot,
+                old_offset,
+                old_tuple,
+                new_offset,
+                new_tuple,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *old_offset as i32);
+                push_bytes(&mut buf, old_tuple);
+                push_i32(&mut buf, *new_offset as i32);
+                push_bytes(&mut buf, new_tuple);
+            }
+            LogRecord::HeapTupleDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                old_tuple,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_bytes(&mut buf, old_tuple);
             }
         }
         Ok(buf)
@@ -10092,6 +10205,16 @@ impl TryFrom<Vec<u8>> for LogRecord {
             Ok(std::str::from_utf8(slice)?.to_string())
         }
 
+        fn read_bytes(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, Box<dyn Error>> {
+            let len = read_usize(bytes, pos)?;
+            if *pos + len > bytes.len() {
+                return Err("truncated bytes in log record".into());
+            }
+            let slice = bytes[*pos..*pos + len].to_vec();
+            *pos += len;
+            Ok(slice)
+        }
+
         let mut pos = 0;
         let discriminant = read_i32(&value, &mut pos)?;
 
@@ -10118,6 +10241,38 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 offset: read_usize(&value, &mut pos)?,
                 old_val: read_string(&value, &mut pos)?,
             }),
+            6 => Ok(LogRecord::HeapTupleInsert {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                slot: read_usize(&value, &mut pos)?,
+                offset: read_usize(&value, &mut pos)?,
+                tuple: read_bytes(&value, &mut pos)?,
+            }),
+            7 => Ok(LogRecord::HeapTupleUpdate {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                slot: read_usize(&value, &mut pos)?,
+                old_offset: read_usize(&value, &mut pos)?,
+                old_tuple: read_bytes(&value, &mut pos)?,
+                new_offset: read_usize(&value, &mut pos)?,
+                new_tuple: read_bytes(&value, &mut pos)?,
+            }),
+            8 => Ok(LogRecord::HeapTupleDelete {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                slot: read_usize(&value, &mut pos)?,
+                offset: read_usize(&value, &mut pos)?,
+                old_tuple: read_bytes(&value, &mut pos)?,
+            }),
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -10131,6 +10286,8 @@ impl LogRecord {
     const OFFSET_SIZE: usize = Self::INT_BYTES;
     const BLOCK_NUM_SIZE: usize = Self::INT_BYTES;
     const STR_LEN_SIZE: usize = Self::INT_BYTES;
+    const SLOT_SIZE: usize = Self::INT_BYTES;
+    const BYTES_LEN_SIZE: usize = Self::INT_BYTES;
 
     fn calculate_size(&self) -> usize {
         let base_size = Self::DISCRIMINANT_SIZE; // Every record has a discriminant
@@ -10160,6 +10317,51 @@ impl LogRecord {
                     + Self::STR_LEN_SIZE
                     + old_val.len()
             }
+            LogRecord::HeapTupleInsert {
+                block_id, tuple, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + tuple.len()
+            }
+            LogRecord::HeapTupleUpdate {
+                block_id,
+                old_tuple,
+                new_tuple,
+                ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + old_tuple.len()
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + new_tuple.len()
+            }
+            LogRecord::HeapTupleDelete {
+                block_id, old_tuple, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + old_tuple.len()
+            }
         }
     }
 
@@ -10172,6 +10374,9 @@ impl LogRecord {
             LogRecord::Checkpoint => 3,
             LogRecord::SetInt { .. } => 4,
             LogRecord::SetString { .. } => 5,
+            LogRecord::HeapTupleInsert { .. } => 6,
+            LogRecord::HeapTupleUpdate { .. } => 7,
+            LogRecord::HeapTupleDelete { .. } => 8,
         }
     }
 
@@ -10185,6 +10390,9 @@ impl LogRecord {
             LogRecord::Rollback(txnum) => *txnum,
             LogRecord::SetInt { txnum, .. } => *txnum,
             LogRecord::SetString { txnum, .. } => *txnum,
+            LogRecord::HeapTupleInsert { txnum, .. } => *txnum,
+            LogRecord::HeapTupleUpdate { txnum, .. } => *txnum,
+            LogRecord::HeapTupleDelete { txnum, .. } => *txnum,
         }
     }
 
@@ -10215,6 +10423,18 @@ impl LogRecord {
                 let mut guard = txn.pin_write_guard(block_id);
                 Self::write_legacy_string(&mut guard, *offset, old_val);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::HeapTupleInsert { .. } => {
+                // TODO: Undo insert = mark slot as free
+                unimplemented!("HeapTupleInsert undo not yet implemented")
+            }
+            LogRecord::HeapTupleUpdate { .. } => {
+                // TODO: Undo update = restore old tuple bytes at old_offset
+                unimplemented!("HeapTupleUpdate undo not yet implemented")
+            }
+            LogRecord::HeapTupleDelete { .. } => {
+                // TODO: Undo delete = restore old tuple and mark slot as live
+                unimplemented!("HeapTupleDelete undo not yet implemented")
             }
         }
     }
