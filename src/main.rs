@@ -8280,6 +8280,7 @@ impl RecordPage {
         let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
         view.row_mut(slot)
             .unwrap()
+            .unwrap()
             .set_column(field_name, &Constant::Int(value));
     }
 
@@ -8289,6 +8290,7 @@ impl RecordPage {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
         view.row_mut(slot)
+            .unwrap()
             .unwrap()
             .set_column(field_name, &Constant::String(value.to_string()));
     }
@@ -8778,7 +8780,8 @@ impl Transaction {
         let raw = Arc::into_raw(frame_clone);
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        PageWriteGuard::new(handle, frame_for_guard, page)
+        let log_ctx = LogContext::new(Arc::clone(&self.log_manager), block_id, self.tx_id);
+        PageWriteGuard::new(handle, frame_for_guard, page, log_ctx)
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -9942,6 +9945,22 @@ impl RecoveryManager {
     }
 }
 
+pub struct LogContext {
+    log_manager: Arc<Mutex<LogManager>>,
+    block_id: BlockId,
+    txn_id: TransactionID,
+}
+
+impl LogContext {
+    fn new(log_manager: Arc<Mutex<LogManager>>, block_id: &BlockId, txn_id: TransactionID) -> Self {
+        Self {
+            log_manager,
+            block_id: block_id.clone(),
+            txn_id,
+        }
+    }
+}
+
 /// The container for all the different types of log records that are written to the WAL
 #[derive(Clone)]
 enum LogRecord {
@@ -10218,7 +10237,7 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> Result<Lsn, Box<dyn Error>> {
+    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
         let bytes: Vec<u8> = self.try_into()?;
         Ok(log_manager.lock().unwrap().append(bytes))
     }
@@ -10285,7 +10304,7 @@ mod recovery_manager_tests {
     fn write_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists").unwrap();
         row_mut
             .set_column(INT_FIELD, &Constant::Int(value))
             .expect("write int field");
@@ -10294,7 +10313,7 @@ mod recovery_manager_tests {
     fn write_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(0).expect("row 0 exists");
+        let mut row_mut = view.row_mut(0).expect("row 0 exists").unwrap();
         row_mut
             .set_column(STR_FIELD, &Constant::String(value.to_string()))
             .expect("write string field");

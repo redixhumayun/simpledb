@@ -28,12 +28,12 @@ use std::{
     error::Error,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, Mutex, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crate::{
-    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, Lsn,
-    SimpleDBResult, RID,
+    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, LogContext, Lsn,
+    SimpleDBResult, TransactionID, RID,
 };
 
 /// Discriminator for the type of data stored in a page.
@@ -379,8 +379,9 @@ pub(crate) mod test_helpers {
         {
             let tuple_mut = HeapTupleMut::from_bytes(buf.as_mut_slice());
             let layout_clone = layout.clone();
+            let page_lsn = Rc::new(Cell::new(None));
             let dirty = Rc::new(Cell::new(false));
-            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, dirty);
+            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, None, page_lsn, dirty);
             builder(&mut row_mut);
         }
         Ok(buf)
@@ -1866,7 +1867,6 @@ impl<'a> HeapPageMut<'a> {
         Ok(Self { header, body_bytes })
     }
 
-    #[cfg(test)]
     fn as_read(&self) -> SimpleDBResult<HeapPage<'_>> {
         let slot_len = self.header.as_ref().slot_count() as usize * LinePtrBytes::LINE_PTR_BYTES;
         if slot_len > self.body_bytes.len() {
@@ -2344,6 +2344,7 @@ pub struct PageWriteGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
     page: RwLockWriteGuard<'a, PageBytes>,
+    log_ctx: LogContext,
 }
 
 impl<'a> PageWriteGuard<'a> {
@@ -2352,11 +2353,13 @@ impl<'a> PageWriteGuard<'a> {
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
         page: RwLockWriteGuard<'a, PageBytes>,
+        log_ctx: LogContext,
     ) -> Self {
         Self {
             handle,
             frame,
             page,
+            log_ctx,
         }
     }
 
@@ -2830,8 +2833,13 @@ mod logical_row_tests {
 
         {
             let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-            let mut row_mut =
-                LogicalRowMut::new(tuple_mut, layout.clone(), Rc::new(Cell::new(false)));
+            let mut row_mut = LogicalRowMut::new(
+                tuple_mut,
+                layout.clone(),
+                None,
+                Rc::new(Cell::new(None)),
+                Rc::new(Cell::new(false)),
+            );
             row_mut
                 .set_column("a", &Constant::Int(99))
                 .expect("set int");
@@ -2871,8 +2879,13 @@ mod logical_row_tests {
 
             {
                 let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-                let mut row_mut =
-                    LogicalRowMut::new(tuple_mut, layout.clone(), Rc::new(Cell::new(false)));
+                let mut row_mut = LogicalRowMut::new(
+                    tuple_mut,
+                    layout.clone(),
+                    None,
+                    Rc::new(Cell::new(None)),
+                    Rc::new(Cell::new(false)),
+                );
                 row_mut
                     .set_column("num", &Constant::Int(int_val))
                     .expect("set int column");
@@ -3084,20 +3097,87 @@ impl<'a> LogicalRow<'a> {
     }
 }
 
+struct TupleSnapshot {
+    slot_id: SlotId,
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+impl TupleSnapshot {
+    fn capture_heap_image(page: &HeapPageMut, slot_id: SlotId) -> SimpleDBResult<Self> {
+        let line_ptr = page
+            .as_read()?
+            .line_ptr(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                "cannot find the slot while constructing tuple snapshot".into()
+            })?;
+        let offset = line_ptr.offset();
+        let bytes = page
+            .as_read()?
+            .tuple_bytes(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                "cannot get tuple bytes for the relevant slot".into()
+            })?
+            .to_vec();
+        Ok(TupleSnapshot {
+            slot_id,
+            offset: offset.into(),
+            bytes,
+        })
+    }
+}
+
+use crate::LogManager;
+struct RowLogContext {
+    log_manager: Arc<Mutex<LogManager>>,
+    block_id: BlockId,
+    txn_id: TransactionID,
+    slot_id: SlotId,
+    before_image: TupleSnapshot,
+}
+
+impl RowLogContext {
+    fn new(
+        log_manager: Arc<Mutex<LogManager>>,
+        block_id: BlockId,
+        txn_id: TransactionID,
+        slot_id: SlotId,
+        before_image: TupleSnapshot,
+    ) -> Self {
+        Self {
+            log_manager,
+            block_id,
+            txn_id,
+            slot_id,
+            before_image,
+        }
+    }
+}
+
 /// Mutable type-safe view of a heap tuple with schema-aware column access.
 ///
 /// Tracks modifications via a shared dirty flag.
 pub struct LogicalRowMut<'a> {
     tuple: HeapTupleMut<'a>,
     layout: Layout,
+    row_log_context: Option<RowLogContext>,
+    page_lsn: Rc<Cell<Option<Lsn>>>,
     dirty: Rc<Cell<bool>>,
 }
 
 impl<'a> LogicalRowMut<'a> {
-    fn new(tuple: HeapTupleMut<'a>, layout: Layout, dirty: Rc<Cell<bool>>) -> Self {
+    fn new(
+        tuple: HeapTupleMut<'a>,
+        layout: Layout,
+        row_log_context: Option<RowLogContext>,
+        page_lsn: Rc<Cell<Option<Lsn>>>,
+        dirty: Rc<Cell<bool>>,
+    ) -> Self {
         Self {
             tuple,
             layout,
+            row_log_context,
+            page_lsn,
             dirty,
         }
     }
@@ -3136,6 +3216,16 @@ impl<'a> LogicalRowMut<'a> {
                 let len = value.len() as u32;
                 bytes[..4].copy_from_slice(&len.to_le_bytes());
                 bytes[4..4 + len as usize].copy_from_slice(value.as_bytes());
+            }
+        }
+    }
+}
+
+impl Drop for LogicalRowMut<'_> {
+    fn drop(&mut self) {
+        if self.dirty.get() {
+            if let Some(_ctx) = &self.row_log_context {
+                //  TODO: write the changes into the WAL and then update the page LSN
             }
         }
     }
@@ -3202,6 +3292,7 @@ impl<'a> HeapPageView<'a> {
 pub struct HeapPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     layout: &'a Layout,
+    page_lsn: Rc<Cell<Option<Lsn>>>,
     dirty: Rc<Cell<bool>>,
 }
 
@@ -3211,6 +3302,7 @@ impl<'a> HeapPageViewMut<'a> {
         Ok(Self {
             guard,
             layout,
+            page_lsn: Rc::new(Cell::new(None)),
             dirty: Rc::new(Cell::new(false)),
         })
     }
@@ -3239,6 +3331,32 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
+    /// Returns a mutable logical row for a live slot, following redirect chains.
+    pub fn row_mut(&mut self, slot: SlotId) -> SimpleDBResult<Option<LogicalRowMut<'_>>> {
+        //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
+        let layout_clone = self.layout.clone();
+        let page_lsn = Rc::clone(&self.page_lsn);
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let row_log_context = RowLogContext::new(
+            Arc::clone(&self.guard.log_ctx.log_manager),
+            self.guard.block_id().clone(),
+            self.guard.txn_id() as TransactionID,
+            slot,
+            before_image,
+        );
+        let dirty = Rc::clone(&self.dirty);
+        let heap_tuple_mut = self
+            .resolve_live_tuple_mut(slot)
+            .ok_or_else(|| -> Box<dyn Error> { "could not resolve the live tuple".into() })?;
+        Ok(Some(LogicalRowMut::new(
+            heap_tuple_mut,
+            layout_clone,
+            Some(row_log_context),
+            page_lsn,
+            dirty,
+        )))
+    }
+
     /// Returns the absolute page offset for the given column within `slot`.
     pub fn column_page_offset(&self, slot: SlotId, column_name: &str) -> Option<usize> {
         let payload_offset = self.layout.offset(column_name)?;
@@ -3249,15 +3367,6 @@ impl<'a> HeapPageViewMut<'a> {
         }
         let tuple_start = line_ptr.offset() as usize;
         Some(tuple_start + HEAP_TUPLE_HEADER_BYTES + payload_offset)
-    }
-
-    /// Returns a mutable logical row for a live slot, following redirect chains.
-    pub fn row_mut(&mut self, slot: SlotId) -> Option<LogicalRowMut<'_>> {
-        //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
-        let layout_clone = self.layout.clone();
-        let dirty = self.dirty.clone();
-        let heap_tuple_mut = self.resolve_live_tuple_mut(slot)?;
-        Some(LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty))
     }
 
     /// Inserts a raw tuple payload into the page and returns the allocated slot.
@@ -3349,15 +3458,30 @@ impl<'a> HeapPageViewMut<'a> {
         header.set_nullmap_ptr(0);
         buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
         let slot = self.insert_tuple(&buf)?;
+        let page_lsn = Rc::clone(&self.page_lsn);
         self.dirty.set(true);
-        let dirty = self.dirty.clone();
+        let dirty = Rc::clone(&self.dirty);
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let row_log_context = RowLogContext::new(
+            Arc::clone(&self.guard.log_ctx.log_manager),
+            self.guard.block_id().clone(),
+            self.guard.txn_id() as TransactionID,
+            slot,
+            before_image,
+        );
         let layout_clone = self.layout.clone();
         let heap_tuple_mut = self
             .resolve_live_tuple_mut(slot)
             .expect("tuple must exist after allocation");
         Ok((
             slot,
-            LogicalRowMut::new(heap_tuple_mut, layout_clone, dirty),
+            LogicalRowMut::new(
+                heap_tuple_mut,
+                layout_clone,
+                Some(row_log_context),
+                page_lsn,
+                dirty,
+            ),
         ))
     }
 
@@ -3424,7 +3548,8 @@ impl<'a> HeapPageViewMut<'a> {
 impl Drop for HeapPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
-            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+            let lsn = self.page_lsn.take().unwrap_or(Lsn::MAX);
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }
@@ -3992,12 +4117,14 @@ mod heap_page_view_tests {
             format_heap_page(&mut guard);
             let mut view_mut = HeapPageViewMut::new(guard, &layout)
                 .expect("heap page mutable view initialization");
-            let (slot0, mut row0) = view_mut.insert_row_mut().expect("insert row 0");
-            assert_eq!(slot0, 0);
-            row0.set_column("id", &Constant::Int(42)).unwrap();
-            row0.set_column("name", &Constant::String("alpha".into()))
-                .unwrap();
-            row0.set_column("score", &Constant::Int(9)).unwrap();
+            {
+                let (slot0, mut row0) = view_mut.insert_row_mut().expect("insert row 0");
+                assert_eq!(slot0, 0);
+                row0.set_column("id", &Constant::Int(42)).unwrap();
+                row0.set_column("name", &Constant::String("alpha".into()))
+                    .unwrap();
+                row0.set_column("score", &Constant::Int(9)).unwrap();
+            }
 
             let (slot1, mut row1) = view_mut.insert_row_mut().expect("insert row 1");
             assert_eq!(slot1, 1);
@@ -4039,15 +4166,21 @@ mod heap_page_view_tests {
         format_heap_page(&mut guard);
         let mut view =
             HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
-        let (slot, mut row_initial) = view.insert_row_mut().expect("insert new row");
-        assert_eq!(slot, 0);
-        row_initial.set_column("id", &Constant::Int(5)).unwrap();
-        row_initial
-            .set_column("name", &Constant::String("seed".into()))
-            .unwrap();
-        row_initial.set_column("score", &Constant::Int(10)).unwrap();
+        let slot = {
+            let (slot, mut row_initial) = view.insert_row_mut().expect("insert new row");
+            assert_eq!(slot, 0);
+            row_initial.set_column("id", &Constant::Int(5)).unwrap();
+            row_initial
+                .set_column("name", &Constant::String("seed".into()))
+                .unwrap();
+            row_initial.set_column("score", &Constant::Int(10)).unwrap();
+            slot
+        };
         {
-            let mut row_mut = view.row_mut(slot).expect("mutable access to slot 0");
+            let mut row_mut = view
+                .row_mut(slot)
+                .expect("mutable access to slot 0")
+                .expect("row exists");
             row_mut
                 .set_column("id", &Constant::Int(777))
                 .expect("update int column");
