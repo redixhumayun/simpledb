@@ -8190,6 +8190,17 @@ impl Constant {
             _ => panic!("Expected a string constant"),
         }
     }
+
+    fn serialized_size(&self) -> usize {
+        const TYPE_TAG_SIZE: usize = 4; // i32 for type tag
+        const INT_SIZE: usize = 4; // i32 for integer value
+        const STR_LEN_SIZE: usize = 4; // i32 for string length
+
+        TYPE_TAG_SIZE + match self {
+            Constant::Int(_) => INT_SIZE,
+            Constant::String(s) => STR_LEN_SIZE + s.len(),
+        }
+    }
 }
 
 impl TryInto<Vec<u8>> for Constant {
@@ -9946,6 +9957,42 @@ enum LogRecord {
         offset: usize,
         old_tuple: Vec<u8>,
     },
+    /// Physical entry-level B-tree leaf insert: logs entry bytes for undo
+    BTreeLeafInsert {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        entry: Vec<u8>,
+    },
+    /// Physical B-tree leaf delete: logs slot, offset, and entry bytes for inverse compaction
+    BTreeLeafDelete {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        key: Constant,   // for display/debugging
+        rid: RID,        // for display/debugging
+        entry_bytes: Vec<u8>, // full entry bytes for physical undo
+    },
+    /// Physical entry-level B-tree internal insert: logs entry bytes for undo
+    BTreeInternalInsert {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        entry: Vec<u8>,
+    },
+    /// Physical B-tree internal delete: logs slot, offset, and entry bytes for inverse compaction
+    BTreeInternalDelete {
+        txnum: usize,
+        block_id: BlockId,
+        slot: usize,
+        offset: usize,
+        key: Constant,       // for display/debugging
+        child_block: usize,  // for display/debugging
+        entry_bytes: Vec<u8>, // full entry bytes for physical undo
+    },
 }
 
 impl Display for LogRecord {
@@ -9990,6 +10037,52 @@ impl Display for LogRecord {
                 f,
                 "HeapTupleDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, tuple_len: {})",
                 old_tuple.len()
+            ),
+            LogRecord::BTreeLeafInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                entry,
+            } => write!(
+                f,
+                "BTreeLeafInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {})",
+                entry.len()
+            ),
+            LogRecord::BTreeLeafDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                key,
+                rid,
+                ..
+            } => write!(
+                f,
+                "BTreeLeafDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, rid: {rid:?})"
+            ),
+            LogRecord::BTreeInternalInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                entry,
+            } => write!(
+                f,
+                "BTreeInternalInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {})",
+                entry.len()
+            ),
+            LogRecord::BTreeInternalDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                key,
+                child_block,
+                ..
+            } => write!(
+                f,
+                "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block})"
             ),
         }
     }
@@ -10065,6 +10158,91 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_i32(&mut buf, *slot as i32);
                 push_i32(&mut buf, *offset as i32);
                 push_bytes(&mut buf, old_tuple);
+            }
+            LogRecord::BTreeLeafInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                entry,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_bytes(&mut buf, entry);
+            }
+            LogRecord::BTreeLeafDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                key,
+                rid,
+                entry_bytes,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                // Serialize key (Constant)
+                match key {
+                    Constant::Int(v) => {
+                        push_i32(&mut buf, 0); // type tag for Int
+                        push_i32(&mut buf, *v);
+                    }
+                    Constant::String(s) => {
+                        push_i32(&mut buf, 1); // type tag for String
+                        push_string(&mut buf, s);
+                    }
+                }
+                push_i32(&mut buf, rid.block_num as i32);
+                push_i32(&mut buf, rid.slot as i32);
+                push_bytes(&mut buf, entry_bytes);
+            }
+            LogRecord::BTreeInternalInsert {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                entry,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                push_bytes(&mut buf, entry);
+            }
+            LogRecord::BTreeInternalDelete {
+                txnum,
+                block_id,
+                slot,
+                offset,
+                key,
+                child_block,
+                entry_bytes,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *slot as i32);
+                push_i32(&mut buf, *offset as i32);
+                // Serialize key (Constant)
+                match key {
+                    Constant::Int(v) => {
+                        push_i32(&mut buf, 0); // type tag for Int
+                        push_i32(&mut buf, *v);
+                    }
+                    Constant::String(s) => {
+                        push_i32(&mut buf, 1); // type tag for String
+                        push_string(&mut buf, s);
+                    }
+                }
+                push_i32(&mut buf, *child_block as i32);
+                push_bytes(&mut buf, entry_bytes);
             }
         }
         Ok(buf)
@@ -10153,6 +10331,80 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 offset: read_usize(&value, &mut pos)?,
                 old_tuple: read_bytes(&value, &mut pos)?,
             }),
+            7 => Ok(LogRecord::BTreeLeafInsert {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                slot: read_usize(&value, &mut pos)?,
+                offset: read_usize(&value, &mut pos)?,
+                entry: read_bytes(&value, &mut pos)?,
+            }),
+            8 => {
+                let txnum = read_usize(&value, &mut pos)?;
+                let block_id = BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                );
+                let slot = read_usize(&value, &mut pos)?;
+                let offset = read_usize(&value, &mut pos)?;
+                // Deserialize key (Constant)
+                let key_type = read_i32(&value, &mut pos)?;
+                let key = match key_type {
+                    0 => Constant::Int(read_i32(&value, &mut pos)?),
+                    1 => Constant::String(read_string(&value, &mut pos)?),
+                    _ => return Err("invalid constant type tag".into()),
+                };
+                let rid = RID::new(read_usize(&value, &mut pos)?, read_usize(&value, &mut pos)?);
+                let entry_bytes = read_bytes(&value, &mut pos)?;
+                Ok(LogRecord::BTreeLeafDelete {
+                    txnum,
+                    block_id,
+                    slot,
+                    offset,
+                    key,
+                    rid,
+                    entry_bytes,
+                })
+            }
+            9 => Ok(LogRecord::BTreeInternalInsert {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                slot: read_usize(&value, &mut pos)?,
+                offset: read_usize(&value, &mut pos)?,
+                entry: read_bytes(&value, &mut pos)?,
+            }),
+            10 => {
+                let txnum = read_usize(&value, &mut pos)?;
+                let block_id = BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                );
+                let slot = read_usize(&value, &mut pos)?;
+                let offset = read_usize(&value, &mut pos)?;
+                // Deserialize key (Constant)
+                let key_type = read_i32(&value, &mut pos)?;
+                let key = match key_type {
+                    0 => Constant::Int(read_i32(&value, &mut pos)?),
+                    1 => Constant::String(read_string(&value, &mut pos)?),
+                    _ => return Err("invalid constant type tag".into()),
+                };
+                let child_block = read_usize(&value, &mut pos)?;
+                let entry_bytes = read_bytes(&value, &mut pos)?;
+                Ok(LogRecord::BTreeInternalDelete {
+                    txnum,
+                    block_id,
+                    slot,
+                    offset,
+                    key,
+                    child_block,
+                    entry_bytes,
+                })
+            }
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -10223,6 +10475,63 @@ impl LogRecord {
                     + Self::BYTES_LEN_SIZE
                     + old_tuple.len()
             }
+            LogRecord::BTreeLeafInsert {
+                block_id, entry, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + entry.len()
+            }
+            LogRecord::BTreeLeafDelete {
+                block_id, key, entry_bytes, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + key.serialized_size()
+                    + Self::INT_BYTES // rid block_num
+                    + Self::INT_BYTES // rid slot
+                    + Self::BYTES_LEN_SIZE
+                    + entry_bytes.len()
+            }
+            LogRecord::BTreeInternalInsert {
+                block_id, entry, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + Self::BYTES_LEN_SIZE
+                    + entry.len()
+            }
+            LogRecord::BTreeInternalDelete {
+                block_id, key, entry_bytes, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::SLOT_SIZE
+                    + Self::OFFSET_SIZE
+                    + key.serialized_size()
+                    + Self::INT_BYTES // child_block
+                    + Self::BYTES_LEN_SIZE
+                    + entry_bytes.len()
+            }
         }
     }
 
@@ -10236,6 +10545,10 @@ impl LogRecord {
             LogRecord::HeapTupleInsert { .. } => 4,
             LogRecord::HeapTupleUpdate { .. } => 5,
             LogRecord::HeapTupleDelete { .. } => 6,
+            LogRecord::BTreeLeafInsert { .. } => 7,
+            LogRecord::BTreeLeafDelete { .. } => 8,
+            LogRecord::BTreeInternalInsert { .. } => 9,
+            LogRecord::BTreeInternalDelete { .. } => 10,
         }
     }
 
@@ -10250,6 +10563,10 @@ impl LogRecord {
             LogRecord::HeapTupleInsert { txnum, .. } => *txnum,
             LogRecord::HeapTupleUpdate { txnum, .. } => *txnum,
             LogRecord::HeapTupleDelete { txnum, .. } => *txnum,
+            LogRecord::BTreeLeafInsert { txnum, .. } => *txnum,
+            LogRecord::BTreeLeafDelete { txnum, .. } => *txnum,
+            LogRecord::BTreeInternalInsert { txnum, .. } => *txnum,
+            LogRecord::BTreeInternalDelete { txnum, .. } => *txnum,
         }
     }
 
@@ -10307,6 +10624,63 @@ impl LogRecord {
                     .expect("heap page required for undo");
                 page.undo_delete(*slot, *offset, old_tuple)
                     .expect("undo heap tuple delete");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeLeafInsert { .. } => {
+                let LogRecord::BTreeLeafInsert { block_id, slot, .. } = self else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::BTreeLeafPageMut::new(guard.bytes_mut())
+                    .expect("btree leaf page required for undo");
+                page.undo_insert(*slot).expect("undo btree leaf insert");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeLeafDelete { .. } => {
+                let LogRecord::BTreeLeafDelete {
+                    block_id,
+                    slot,
+                    offset,
+                    entry_bytes,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::BTreeLeafPageMut::new(guard.bytes_mut())
+                    .expect("btree leaf page required for undo");
+                page.undo_delete(*slot, *offset, entry_bytes)
+                    .expect("undo btree leaf delete");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeInternalInsert { .. } => {
+                let LogRecord::BTreeInternalInsert { block_id, slot, .. } = self else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
+                    .expect("btree internal page required for undo");
+                page.undo_insert(*slot)
+                    .expect("undo btree internal insert");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeInternalDelete { .. } => {
+                let LogRecord::BTreeInternalDelete {
+                    block_id,
+                    slot,
+                    offset,
+                    entry_bytes,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
+                    .expect("btree internal page required for undo");
+                page.undo_delete(*slot, *offset, entry_bytes)
+                    .expect("undo btree internal delete");
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
         }

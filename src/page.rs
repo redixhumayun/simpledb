@@ -3381,6 +3381,54 @@ impl RowLogContext {
     }
 }
 
+/// Snapshot of a B-tree entry for before-image capture.
+struct EntrySnapshot {
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+impl EntrySnapshot {
+    /// Capture B-tree entry bytes at the given slot.
+    fn capture_leaf_entry(page: &BTreeLeafPageMut, slot_id: SlotId) -> SimpleDBResult<Self> {
+        let line_ptr = page
+            .as_read()?
+            .line_ptr(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("slot {slot_id} not found for entry snapshot").into()
+            })?;
+        let offset = line_ptr.offset() as usize;
+        let bytes = page
+            .as_read()?
+            .entry_bytes(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("entry bytes not found for slot {slot_id}").into()
+            })?
+            .to_vec();
+        Ok(Self { offset, bytes })
+    }
+
+    fn capture_internal_entry(
+        page: &BTreeInternalPageMut,
+        slot_id: SlotId,
+    ) -> SimpleDBResult<Self> {
+        let line_ptr = page
+            .as_read()?
+            .line_ptr(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("slot {slot_id} not found for entry snapshot").into()
+            })?;
+        let offset = line_ptr.offset() as usize;
+        let bytes = page
+            .as_read()?
+            .entry_bytes(slot_id)
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("entry bytes not found for slot {slot_id}").into()
+            })?
+            .to_vec();
+        Ok(Self { offset, bytes })
+    }
+}
+
 /// Mutable type-safe view of a heap tuple with schema-aware column access.
 ///
 /// Tracks modifications via a shared dirty flag.
@@ -4073,7 +4121,8 @@ impl<'a> BTreeLeafPageView<'a> {
 pub struct BTreeLeafPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     layout: &'a Layout,
-    dirty: bool,
+    page_lsn: Rc<Cell<Option<Lsn>>>,
+    dirty: Rc<Cell<bool>>,
 }
 
 impl<'a> BTreeLeafPageViewMut<'a> {
@@ -4082,7 +4131,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         Ok(Self {
             guard,
             layout,
-            dirty: false,
+            page_lsn: Rc::new(Cell::new(None)),
+            dirty: Rc::new(Cell::new(false)),
         })
     }
 
@@ -4144,30 +4194,81 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, rid: RID) -> SimpleDBResult<SlotId> {
         let layout = self.layout;
-        let mut page = self.build_mut_page()?;
-        let slot = page.insert_entry(layout, key, rid)?;
-        self.dirty = true;
+
+        // Build page once, insert and capture snapshot
+        let (slot, entry_snapshot) = {
+            let mut page = self.build_mut_page()?;
+            let slot = page.insert_entry(layout, key, rid)?;
+            let entry_snapshot = EntrySnapshot::capture_leaf_entry(&page, slot)?;
+            (slot, entry_snapshot)
+        };
+
+        self.dirty.set(true);
+
+        // Log the insert with entry bytes captured after insertion
+        let record = LogRecord::BTreeLeafInsert {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot,
+            offset: entry_snapshot.offset,
+            entry: entry_snapshot.bytes,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
+
         Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
-        let mut page = self.build_mut_page()?;
-        page.delete_entry(slot)?;
-        self.dirty = true;
+        let layout = self.layout;
+
+        // Build page once, capture before-image and delete
+        let (offset, entry_bytes, decoded_entry) = {
+            let mut page = self.build_mut_page()?;
+            let entry_snapshot = EntrySnapshot::capture_leaf_entry(&page, slot)?;
+            let decoded = BTreeLeafEntry::decode(layout, &entry_snapshot.bytes)?;
+            let offset = entry_snapshot.offset;
+            page.delete_entry(slot)?;
+            (offset, entry_snapshot.bytes, decoded)
+        };
+
+        self.dirty.set(true);
+
+        // Log the delete with slot, offset, decoded key/rid, and entry bytes for physical undo
+        let record = LogRecord::BTreeLeafDelete {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot,
+            offset,
+            key: decoded_entry.key,
+            rid: decoded_entry.rid,
+            entry_bytes,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
+
         Ok(())
     }
 
     pub fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_overflow_block(block)?;
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
     pub fn set_right_sibling_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_right_sibling_block(block.map(|b| b as u32).unwrap_or(u32::MAX));
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4175,7 +4276,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.write_high_key(key_bytes)?;
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4183,7 +4284,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.clear_high_key();
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4194,8 +4295,9 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
 impl Drop for BTreeLeafPageViewMut<'_> {
     fn drop(&mut self) {
-        if self.dirty {
-            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+        if self.dirty.get() {
+            let lsn = self.page_lsn.get().unwrap_or(Lsn::MAX);
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }
@@ -4259,7 +4361,8 @@ impl<'a> BTreeInternalPageView<'a> {
 pub struct BTreeInternalPageViewMut<'a> {
     guard: PageWriteGuard<'a>,
     layout: &'a Layout,
-    dirty: bool,
+    page_lsn: Rc<Cell<Option<Lsn>>>,
+    dirty: Rc<Cell<bool>>,
 }
 
 impl<'a> BTreeInternalPageViewMut<'a> {
@@ -4268,7 +4371,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         Ok(Self {
             guard,
             layout,
-            dirty: false,
+            page_lsn: Rc::new(Cell::new(None)),
+            dirty: Rc::new(Cell::new(false)),
         })
     }
 
@@ -4319,31 +4423,81 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, child_block: usize) -> SimpleDBResult<SlotId> {
         let layout = self.layout;
-        let mut page = self.build_mut_page()?;
-        let slot = page.insert_entry(layout, key, child_block)?;
-        self.dirty = true;
+
+        // Build page once, insert and capture snapshot
+        let (slot, entry_snapshot) = {
+            let mut page = self.build_mut_page()?;
+            let slot = page.insert_entry(layout, key, child_block)?;
+            let entry_snapshot = EntrySnapshot::capture_internal_entry(&page, slot)?;
+            (slot, entry_snapshot)
+        };
+
+        self.dirty.set(true);
+
+        // Log the insert with entry bytes captured after insertion
+        let record = LogRecord::BTreeInternalInsert {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot,
+            offset: entry_snapshot.offset,
+            entry: entry_snapshot.bytes,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
+
         Ok(slot)
     }
 
     pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
         let layout = self.layout;
-        let mut page = self.build_mut_page()?;
-        page.delete_entry(slot, layout)?;
-        self.dirty = true;
+
+        // Build page once, capture before-image and delete
+        let (offset, entry_bytes, decoded_entry) = {
+            let mut page = self.build_mut_page()?;
+            let entry_snapshot = EntrySnapshot::capture_internal_entry(&page, slot)?;
+            let decoded = BTreeInternalEntry::decode(layout, &entry_snapshot.bytes)?;
+            let offset = entry_snapshot.offset;
+            page.delete_entry(slot, layout)?;
+            (offset, entry_snapshot.bytes, decoded)
+        };
+
+        self.dirty.set(true);
+
+        // Log the delete with slot, offset, decoded key/child_block, and entry bytes for physical undo
+        let record = LogRecord::BTreeInternalDelete {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot,
+            offset,
+            key: decoded_entry.key,
+            child_block: decoded_entry.child_block,
+            entry_bytes,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
+
         Ok(())
     }
 
     pub fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_btree_level(level)?;
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
     pub fn set_rightmost_child_block(&mut self, block: usize) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.set_rightmost_child_block(block);
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4351,7 +4505,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.write_high_key(key_bytes)?;
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4359,7 +4513,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page()?;
         page.clear_high_key();
-        self.dirty = true;
+        self.dirty.set(true);
         Ok(())
     }
 
@@ -4370,8 +4524,9 @@ impl<'a> BTreeInternalPageViewMut<'a> {
 
 impl Drop for BTreeInternalPageViewMut<'_> {
     fn drop(&mut self) {
-        if self.dirty {
-            self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+        if self.dirty.get() {
+            let lsn = self.page_lsn.get().unwrap_or(Lsn::MAX);
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }
@@ -5812,6 +5967,152 @@ impl<'a> BTreeLeafPageMut<'a> {
     pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(self.body_bytes)
     }
+
+    /// Undo a B-tree leaf insert by marking the slot as free
+    pub fn undo_insert(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        let free_upper = {
+            let header = parts.header();
+            header.as_ref().free_upper() as usize
+        };
+        let (deleted_offset, deleted_len) = {
+            let line_ptrs = parts.line_ptrs();
+            if slot >= line_ptrs.len() {
+                return Err("invalid slot for undo insert".into());
+            }
+            let lp = line_ptrs.as_ref().get(slot);
+            if !lp.is_live() {
+                return Err("slot not live for undo insert".into());
+            }
+            let offset = lp.offset() as usize;
+            let len = lp.length() as usize;
+            line_ptrs.delete(slot);
+            (offset, len)
+        };
+        let deleted_len_u16 = deleted_len
+            .try_into()
+            .map_err(|_| "entry length exceeds header capacity".to_string())?;
+
+        if deleted_offset > free_upper {
+            let shift_len = deleted_offset - free_upper;
+            parts
+                .record_space()
+                .copy_within(free_upper, free_upper + deleted_len, shift_len);
+        }
+
+        {
+            let line_ptrs = parts.line_ptrs();
+            let len = line_ptrs.len();
+            for idx in 0..len {
+                let mut lp = {
+                    let view = line_ptrs.as_ref();
+                    view.get(idx)
+                };
+                if (lp.offset() as usize) < deleted_offset {
+                    let new_offset = lp.offset() as usize + deleted_len;
+                    lp.set_offset(new_offset as u16);
+                    line_ptrs.set(idx, lp);
+                }
+            }
+        }
+
+        {
+            let header = parts.header();
+            let current_lower = header.as_ref().free_lower();
+            let current_upper = header.as_ref().free_upper();
+            let new_lower = current_lower
+                .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower underflow during undo insert");
+            let new_upper = current_upper
+                .checked_add(deleted_len_u16)
+                .expect("free_upper overflow during undo insert");
+            header.set_free_bounds(new_lower, new_upper);
+            let slot_count = header.as_ref().slot_count();
+            header.set_slot_count(
+                slot_count
+                    .checked_sub(1)
+                    .expect("slot_count underflow during undo insert"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Undo a B-tree leaf delete by re-inserting using normal insert logic
+    /// Undo a delete operation using inverse compaction.
+    /// Reverses the physical changes made by delete_entry.
+    pub fn undo_delete(
+        &mut self,
+        slot: SlotId,
+        offset: usize,
+        entry_bytes: &[u8],
+    ) -> SimpleDBResult<()> {
+        let deleted_len = entry_bytes.len();
+
+        // CRITICAL: Restore free_lower FIRST, before calling split()
+        // split() calculates lp_capacity from free_lower, so we need to increase it first
+        // to ensure the line pointer array has enough capacity for the insert
+        {
+            let current_lower = self.header.as_ref().free_lower();
+            let new_lower = current_lower
+                .checked_add(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower overflow during undo");
+            self.header.set_free_lower(new_lower);
+        }
+
+        // Now split with the restored free_lower
+        let mut parts = self.split()?;
+
+        // Calculate old and new free_upper
+        let new_free_upper = parts.header().as_ref().free_upper() as usize;
+        let old_free_upper = new_free_upper
+            .checked_sub(deleted_len)
+            .ok_or("free_upper underflow during undo")?;
+
+        // 1. Shift record space back down to re-create the hole
+        if offset > old_free_upper {
+            let shift_len = offset - old_free_upper;
+            parts
+                .record_space()
+                .copy_within(new_free_upper, old_free_upper, shift_len);
+        }
+
+        // 2. Write deleted entry bytes back at original offset
+        parts.record_space().write_entry(offset, entry_bytes);
+
+        // 3. Adjust line pointers that were shifted during delete
+        let deleted_offset = offset;
+        let len = parts.line_ptrs().len();
+        for idx in 0..len {
+            let mut lp = parts.line_ptrs().as_ref().get(idx);
+            let lp_offset = lp.offset() as usize;
+            if lp_offset >= new_free_upper && lp_offset < deleted_offset + deleted_len {
+                let new_offset = lp_offset - deleted_len;
+                lp.set_offset(new_offset as u16);
+                parts.line_ptrs().set(idx, lp);
+            }
+        }
+
+        // 4. Insert line pointer at original slot
+        let deleted_len_u16: u16 = deleted_len
+            .try_into()
+            .map_err(|_| "entry length exceeds u16::MAX")?;
+        let offset_u16: u16 = offset.try_into().map_err(|_| "offset exceeds u16::MAX")?;
+        parts.line_ptrs().insert(
+            slot,
+            LinePtr::new(offset_u16, deleted_len_u16, LineState::Live),
+        );
+
+        // 5. Update header: free_upper and slot_count (free_lower already updated)
+        let old_free_upper_u16: u16 = old_free_upper
+            .try_into()
+            .map_err(|_| "free_upper exceeds u16::MAX")?;
+        parts.header().set_free_upper(old_free_upper_u16);
+
+        let slot_count = parts.header().as_ref().slot_count();
+        parts.header().set_slot_count(slot_count + 1);
+
+        Ok(())
+    }
 }
 
 pub struct BTreeLeafPageParts<'a> {
@@ -6298,6 +6599,152 @@ impl<'a> BTreeInternalPageMut<'a> {
 
     pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(self.body_bytes)
+    }
+
+    /// Undo a B-tree internal insert by marking the slot as free
+    pub fn undo_insert(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let mut parts = self.split()?;
+        let free_upper = {
+            let header = parts.header();
+            header.as_ref().free_upper() as usize
+        };
+        let (deleted_offset, deleted_len) = {
+            let line_ptrs = parts.line_ptrs();
+            if slot >= line_ptrs.len() {
+                return Err("invalid slot for undo insert".into());
+            }
+            let lp = line_ptrs.as_ref().get(slot);
+            if !lp.is_live() {
+                return Err("slot not live for undo insert".into());
+            }
+            let offset = lp.offset() as usize;
+            let len = lp.length() as usize;
+            line_ptrs.delete(slot);
+            (offset, len)
+        };
+        let deleted_len_u16: u16 = deleted_len
+            .try_into()
+            .map_err(|_| "entry length exceeds header capacity".to_string())?;
+
+        if deleted_offset > free_upper {
+            let shift_len = deleted_offset - free_upper;
+            parts
+                .record_space()
+                .copy_within(free_upper, free_upper + deleted_len, shift_len);
+        }
+
+        {
+            let line_ptrs = parts.line_ptrs();
+            let len = line_ptrs.len();
+            for idx in 0..len {
+                let mut lp = {
+                    let view = line_ptrs.as_ref();
+                    view.get(idx)
+                };
+                if (lp.offset() as usize) < deleted_offset {
+                    let new_offset = lp.offset() as usize + deleted_len;
+                    lp.set_offset(new_offset as u16);
+                    line_ptrs.set(idx, lp);
+                }
+            }
+        }
+
+        {
+            let header = parts.header();
+            let current_lower = header.as_ref().free_lower();
+            let current_upper = header.as_ref().free_upper();
+            let new_lower = current_lower
+                .checked_sub(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower underflow during undo insert");
+            let new_upper = current_upper
+                .checked_add(deleted_len_u16)
+                .expect("free_upper overflow during undo insert");
+            header.set_free_bounds(new_lower, new_upper);
+            let slot_count = header.as_ref().slot_count();
+            header.set_slot_count(
+                slot_count
+                    .checked_sub(1)
+                    .expect("slot_count underflow during undo insert"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Undo a B-tree internal delete by re-inserting using normal insert logic
+    /// Undo a delete operation using inverse compaction.
+    /// Reverses the physical changes made by delete_entry.
+    pub fn undo_delete(
+        &mut self,
+        slot: SlotId,
+        offset: usize,
+        entry_bytes: &[u8],
+    ) -> SimpleDBResult<()> {
+        let deleted_len = entry_bytes.len();
+
+        // CRITICAL: Restore free_lower FIRST, before calling split()
+        // split() calculates lp_capacity from free_lower, so we need to increase it first
+        // to ensure the line pointer array has enough capacity for the insert
+        {
+            let current_lower = self.header.as_ref().free_lower();
+            let new_lower = current_lower
+                .checked_add(LinePtrBytes::LINE_PTR_BYTES as u16)
+                .expect("free_lower overflow during undo");
+            self.header.set_free_lower(new_lower);
+        }
+
+        // Now split with the restored free_lower
+        let mut parts = self.split()?;
+
+        // Calculate old and new free_upper
+        let new_free_upper = parts.header().as_ref().free_upper() as usize;
+        let old_free_upper = new_free_upper
+            .checked_sub(deleted_len)
+            .ok_or("free_upper underflow during undo")?;
+
+        // 1. Shift record space back down to re-create the hole
+        if offset > old_free_upper {
+            let shift_len = offset - old_free_upper;
+            parts
+                .record_space()
+                .copy_within(new_free_upper, old_free_upper, shift_len);
+        }
+
+        // 2. Write deleted entry bytes back at original offset
+        parts.record_space().write_entry(offset, entry_bytes);
+
+        // 3. Adjust line pointers that were shifted during delete
+        let deleted_offset = offset;
+        let len = parts.line_ptrs().len();
+        for idx in 0..len {
+            let mut lp = parts.line_ptrs().as_ref().get(idx);
+            let lp_offset = lp.offset() as usize;
+            if lp_offset >= new_free_upper && lp_offset < deleted_offset + deleted_len {
+                let new_offset = lp_offset - deleted_len;
+                lp.set_offset(new_offset as u16);
+                parts.line_ptrs().set(idx, lp);
+            }
+        }
+
+        // 4. Insert line pointer at original slot
+        let deleted_len_u16: u16 = deleted_len
+            .try_into()
+            .map_err(|_| "entry length exceeds u16::MAX")?;
+        let offset_u16: u16 = offset.try_into().map_err(|_| "offset exceeds u16::MAX")?;
+        parts.line_ptrs().insert(
+            slot,
+            LinePtr::new(offset_u16, deleted_len_u16, LineState::Live),
+        );
+
+        // 5. Update header: free_upper and slot_count (free_lower already updated)
+        let old_free_upper_u16: u16 = old_free_upper
+            .try_into()
+            .map_err(|_| "free_upper exceeds u16::MAX")?;
+        parts.header().set_free_upper(old_free_upper_u16);
+
+        let slot_count = parts.header().as_ref().slot_count();
+        parts.header().set_slot_count(slot_count + 1);
+
+        Ok(())
     }
 }
 

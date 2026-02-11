@@ -1562,7 +1562,10 @@ impl BTreeLeaf {
 #[cfg(test)]
 mod btree_leaf_tests {
     use super::*;
-    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+    use crate::{
+        test_utils::{generate_filename, generate_random_number},
+        Schema, SimpleDB, TestDir,
+    };
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
@@ -1682,5 +1685,294 @@ mod btree_leaf_tests {
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
         assert_eq!(entry.sep_key, Constant::Int(20));
+    }
+
+    #[test]
+    fn test_btree_leaf_rollback_mixed_operations() {
+        // Test rollback of B-tree leaf insert operations
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let layout = create_test_layout();
+        let filename = generate_filename();
+
+        // Transaction 1: Insert initial entries and commit
+        let t1 = db.new_tx();
+        let block = t1.append(&filename);
+        {
+            let mut guard = t1.pin_write_guard(&block);
+            guard.format_as_btree_leaf(None);
+            guard.mark_modified(t1.id(), crate::Lsn::MAX);
+        }
+        {
+            let guard = t1.pin_write_guard(&block);
+            let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+            view.insert_entry(Constant::Int(10), RID::new(1, 1))
+                .unwrap();
+            view.insert_entry(Constant::Int(20), RID::new(1, 2))
+                .unwrap();
+        }
+        t1.commit().unwrap();
+
+        // Transaction 2: Mixed insert/delete operations that will be rolled back
+        let t2 = db.new_tx();
+        let slot_to_delete = {
+            let guard = t2.pin_read_guard(&block);
+            let view = guard.into_btree_leaf_page_view(&layout).unwrap();
+            // Find slot for key=20
+            (0..view.slot_count())
+                .find(|&slot| {
+                    view.is_slot_live(slot)
+                        && view
+                            .get_entry(slot)
+                            .ok()
+                            .map(|e| e.key == Constant::Int(20))
+                            .unwrap_or(false)
+                })
+                .unwrap()
+        };
+        {
+            let guard = t2.pin_write_guard(&block);
+            let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+            // Delete existing entry (should be undone)
+            view.delete_entry(slot_to_delete).unwrap();
+            // Insert new entries (should be undone)
+            view.insert_entry(Constant::Int(15), RID::new(1, 3))
+                .unwrap();
+            view.insert_entry(Constant::Int(25), RID::new(1, 4))
+                .unwrap();
+        }
+        // Rollback - t2 operations should be undone
+        t2.rollback().unwrap();
+
+        // Transaction 3: Verify committed entries remain, rolled-back entries are gone
+        let t3 = db.new_tx();
+        let guard = t3.pin_read_guard(&block);
+        let view = guard.into_btree_leaf_page_view(&layout).unwrap();
+
+        // Collect live entries sorted by key
+        let mut live_keys: Vec<_> = (0..view.slot_count())
+            .filter(|&slot| view.is_slot_live(slot))
+            .filter_map(|slot| view.get_entry(slot).ok())
+            .map(|e| e.key)
+            .collect();
+        live_keys.sort();
+
+        // Should only have original committed entries
+        assert_eq!(live_keys, vec![Constant::Int(10), Constant::Int(20)]);
+    }
+
+    #[test]
+    fn test_btree_leaf_recovery_mixed_operations() {
+        // Test recovery undoes uncommitted B-tree operations after crash
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = create_test_layout();
+        let filename = generate_filename();
+
+        // Simulate crash by ending process scope without commit/rollback, then reopening DB.
+        let block = {
+            let db = SimpleDB::new(&dir, 8, true, 5000);
+
+            // Transaction 1: Insert initial entries and commit
+            let t1 = db.new_tx();
+            let block = t1.append(&filename);
+            {
+                let mut guard = t1.pin_write_guard(&block);
+                guard.format_as_btree_leaf(None);
+                guard.mark_modified(t1.id(), crate::Lsn::MAX);
+            }
+            {
+                let guard = t1.pin_write_guard(&block);
+                let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+                view.insert_entry(Constant::Int(100), RID::new(1, 1))
+                    .unwrap();
+                view.insert_entry(Constant::Int(200), RID::new(1, 2))
+                    .unwrap();
+            }
+            t1.commit().unwrap();
+
+            // Transaction 2: Committed operation
+            let t2 = db.new_tx();
+            {
+                let guard = t2.pin_write_guard(&block);
+                let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+                view.insert_entry(Constant::Int(150), RID::new(1, 3))
+                    .unwrap();
+            }
+            t2.commit().unwrap();
+
+            // Transaction 3: Uncommitted operations (simulates crash)
+            let t3 = db.new_tx();
+            {
+                let guard = t3.pin_write_guard(&block);
+                let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+                // Insert new entries without committing
+                view.insert_entry(Constant::Int(175), RID::new(1, 4))
+                    .unwrap();
+                view.insert_entry(Constant::Int(250), RID::new(1, 5))
+                    .unwrap();
+            }
+            block
+        };
+
+        // Recover in a fresh DB instance (new lock table)
+        let db = SimpleDB::new(&dir, 8, false, 5000);
+        let recovery_tx = db.new_tx();
+        recovery_tx.recover().unwrap();
+
+        // Transaction 4: Verify only committed state remains
+        let t4 = db.new_tx();
+        let guard = t4.pin_read_guard(&block);
+        let view = guard.into_btree_leaf_page_view(&layout).unwrap();
+
+        // Collect live entries sorted by key
+        let mut live_keys: Vec<_> = (0..view.slot_count())
+            .filter(|&slot| view.is_slot_live(slot))
+            .filter_map(|slot| view.get_entry(slot).ok())
+            .map(|e| e.key)
+            .collect();
+        live_keys.sort();
+
+        // Should have only committed entries: t1's 2 + t2's 1 (t3's undone)
+        assert_eq!(
+            live_keys,
+            vec![Constant::Int(100), Constant::Int(150), Constant::Int(200)]
+        );
+    }
+
+    #[test]
+    fn test_btree_leaf_rollback_delete() {
+        // Test rollback of a single delete operation
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let layout = create_test_layout();
+        let filename = generate_filename();
+
+        // Transaction 1: Insert entries and commit
+        let t1 = db.new_tx();
+        let block = t1.append(&filename);
+        {
+            let mut guard = t1.pin_write_guard(&block);
+            guard.format_as_btree_leaf(None);
+            guard.mark_modified(t1.id(), crate::Lsn::MAX);
+        }
+        let slot_to_delete;
+        {
+            let guard = t1.pin_write_guard(&block);
+            let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+            view.insert_entry(Constant::Int(10), RID::new(1, 1))
+                .unwrap();
+            slot_to_delete = view
+                .insert_entry(Constant::Int(20), RID::new(1, 2))
+                .unwrap();
+            view.insert_entry(Constant::Int(30), RID::new(1, 3))
+                .unwrap();
+        }
+        t1.commit().unwrap();
+
+        // Transaction 2: Delete middle entry and rollback
+        let t2 = db.new_tx();
+        println!("Deleting slot {}", slot_to_delete);
+        {
+            let guard = t2.pin_write_guard(&block);
+            let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+            view.delete_entry(slot_to_delete).unwrap();
+        }
+
+        println!("Rolling back transaction");
+        t2.rollback().unwrap();
+
+        // Transaction 3: Verify all entries still present
+        let t3 = db.new_tx();
+        let guard = t3.pin_read_guard(&block);
+        let view = guard.into_btree_leaf_page_view(&layout).unwrap();
+
+        println!("\nAfter rollback:");
+        println!("  Slot count: {}", view.slot_count());
+        let mut live_keys: Vec<_> = (0..view.slot_count())
+            .filter(|&slot| {
+                let is_live = view.is_slot_live(slot);
+                println!("    Slot {} live: {}", slot, is_live);
+                is_live
+            })
+            .filter_map(|slot| {
+                let entry = view.get_entry(slot).ok();
+                if let Some(ref e) = entry {
+                    println!("      key={:?}", e.key);
+                }
+                entry
+            })
+            .map(|e| e.key)
+            .collect();
+        live_keys.sort();
+
+        println!("\nLive keys: {:?}", live_keys);
+
+        // All three entries should still be live after rollback
+        assert_eq!(
+            live_keys,
+            vec![Constant::Int(10), Constant::Int(20), Constant::Int(30)]
+        );
+    }
+
+    #[test]
+    fn test_btree_leaf_recovery_delete() {
+        // Test recovery undoes uncommitted delete operation
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = create_test_layout();
+        let filename = generate_filename();
+
+        // Transaction 1: Insert entries and commit
+        let block = {
+            let db = SimpleDB::new(&dir, 8, true, 5000);
+            let t1 = db.new_tx();
+            let block = t1.append(&filename);
+            {
+                let mut guard = t1.pin_write_guard(&block);
+                guard.format_as_btree_leaf(None);
+            }
+            let slot_to_delete = {
+                let guard = t1.pin_write_guard(&block);
+                let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+                view.insert_entry(Constant::Int(100), RID::new(1, 1))
+                    .unwrap();
+                let slot_to_delete = view
+                    .insert_entry(Constant::Int(200), RID::new(1, 2))
+                    .unwrap();
+                view.insert_entry(Constant::Int(300), RID::new(1, 3))
+                    .unwrap();
+                slot_to_delete
+            };
+            t1.commit().unwrap();
+
+            let t2 = db.new_tx();
+            {
+                let guard = t2.pin_write_guard(&block);
+                let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
+                view.delete_entry(slot_to_delete).unwrap();
+            }
+            // No commit - simulate crash
+            block
+        };
+
+        // Recover - should undo the delete (new DB instance resets lock table)
+        let db = SimpleDB::new(&dir, 8, false, 5000);
+        let recovery_tx = db.new_tx();
+        recovery_tx.recover().unwrap();
+
+        // Transaction 3: Verify all entries still present
+        let t3 = db.new_tx();
+        let guard = t3.pin_read_guard(&block);
+        let view = guard.into_btree_leaf_page_view(&layout).unwrap();
+
+        let mut live_keys: Vec<_> = (0..view.slot_count())
+            .filter(|&slot| view.is_slot_live(slot))
+            .filter_map(|slot| view.get_entry(slot).ok())
+            .map(|e| e.key)
+            .collect();
+        live_keys.sort();
+
+        // All three entries should be restored after recovery
+        assert_eq!(
+            live_keys,
+            vec![Constant::Int(100), Constant::Int(200), Constant::Int(300)]
+        );
     }
 }

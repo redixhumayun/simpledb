@@ -446,9 +446,58 @@ pub enum LogRecord {
     },
 
     // Future: B-tree physical operations (Phase 3)
-    // BTreeEntryInsert { ... }
-    // BTreeEntryDelete { ... }
-    // BTreePageSplit { ... }
+    //
+    // Physical entry-level records for leaf/internal pages.
+    // `entry` stores the encoded entry bytes; undo replays the bytes into the slot/offset.
+    BTreeLeafInsert {
+        txnum: usize,
+        block_id: BlockId,
+        slot: SlotId,
+        offset: u16,
+        entry: Vec<u8>,
+    },
+    BTreeLeafDelete {
+        txnum: usize,
+        block_id: BlockId,
+        slot: SlotId,
+        offset: u16,
+        entry: Vec<u8>,
+    },
+    BTreeInternalInsert {
+        txnum: usize,
+        block_id: BlockId,
+        slot: SlotId,
+        offset: u16,
+        entry: Vec<u8>,
+    },
+    BTreeInternalDelete {
+        txnum: usize,
+        block_id: BlockId,
+        slot: SlotId,
+        offset: u16,
+        entry: Vec<u8>,
+    },
+    //
+    // Page split uses full page images (Option A) to keep undo/redo simple.
+    // Store both before/after images so undo/redo are symmetric.
+    // Larger but deterministic and avoids complex split reconstruction logic.
+    BTreePageSplit {
+        txnum: usize,
+        left_block_id: BlockId,
+        right_block_id: BlockId,
+        left_before: Vec<u8>,
+        right_before: Vec<u8>,
+        left_after: Vec<u8>,
+        right_after: Vec<u8>,
+    },
+    // Root pointer update (metadata/catalog).
+    // When root splits, a new root page is allocated and the root pointer changes.
+    BTreeRootUpdate {
+        txnum: usize,
+        old_root: BlockId,
+        new_root: BlockId,
+        new_root_image: Vec<u8>,
+    },
 }
 ```
 
@@ -483,6 +532,29 @@ pub enum LogRecord {
 2. Add logging to `BTreeInternalPageViewMut::insert_entry` / `delete_entry`
 3. Handle split operations (multiple log records in one operation)
 4. Test B-tree crash recovery
+
+### Cascading Splits (Clarification)
+
+When a split propagates upward, we emit **one `BTreePageSplit` per split** and **one
+`BTreeInternalInsert` per parent insert**. So a k-level cascade yields 2k records
+in the steady case (split + parent insert at each level).
+
+**Undo order:** process WAL backwards; each record undoes independently.
+
+**Root split:** special handling is required because the root pointer changes and a
+new root page is allocated (in addition to the new right child).
+Two options:
+1. **Dedicated root record**:
+   `BTreeRootUpdate { old_root, new_root, new_root_image }`
+   - Root pointer lives in index catalog metadata (not page headers).
+   - Undo: update catalog to `old_root`, free `new_root`.
+   - Redo: update catalog to `new_root`, restore `new_root_image`.
+2. **Root as normal split + root update**:
+   - Use `BTreePageSplit` to capture old root + new right page.
+   - Emit `BTreeRootUpdate` to create the new root page and update the root pointer (metadata).
+
+We recommend option (2): keep `BTreePageSplit` uniform and log root pointer changes
+separately via `BTreeRootUpdate`.
 
 ### Phase 4: Remove Legacy Logging Paths
 1. Deprecate `Transaction::set_int` / `set_string` (raw offset-based logging)
