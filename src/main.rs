@@ -10330,7 +10330,7 @@ mod recovery_manager_tests {
     use std::sync::Arc;
 
     use crate::{
-        page::SlotId,
+        page::{test_helpers, SlotId},
         test_utils::{generate_filename, generate_random_number},
         BlockId, Constant, Layout, Schema, SimpleDB, TestDir, Transaction,
     };
@@ -10678,6 +10678,43 @@ mod recovery_manager_tests {
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 5);
+    }
+
+    #[test]
+    fn rollback_restores_relocated_tuple() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, 1, "a");
+        txn1.commit().unwrap();
+
+        let txn2 = db.new_tx();
+        {
+            let guard = txn2.pin_write_guard(&block);
+            let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
+            let new_bytes = test_helpers::build_tuple_bytes_with_payload_len(
+                &layout,
+                layout.slot_size + 32,
+                |row| {
+                    row.set_column(INT_FIELD, &Constant::Int(99))
+                        .expect("set int");
+                    row.set_column(STR_FIELD, &Constant::String("relocated".to_string()))
+                        .expect("set string");
+                },
+            )
+            .expect("build tuple bytes");
+            view.update_tuple(slot, &new_bytes)
+                .expect("update tuple with relocation");
+        }
+        txn2.rollback().unwrap();
+
+        let txn3 = db.new_tx();
+        assert_eq!(read_int_at(&txn3, &block, &layout, slot), 1);
+        assert_eq!(read_string_at(&txn3, &block, &layout, slot), "a");
     }
 }
 

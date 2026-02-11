@@ -388,14 +388,29 @@ pub(crate) mod test_helpers {
     where
         F: FnOnce(&mut LogicalRowMut<'_>),
     {
-        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + layout.slot_size];
+        build_tuple_bytes_with_payload_len(layout, layout.slot_size, builder)
+    }
+
+    pub fn build_tuple_bytes_with_payload_len<F>(
+        layout: &Layout,
+        payload_len: usize,
+        builder: F,
+    ) -> SimpleDBResult<Vec<u8>>
+    where
+        F: FnOnce(&mut LogicalRowMut<'_>),
+    {
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
         {
             let (header_bytes, payload_bytes) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
             let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
             let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
             header.set_xmin(0);
             header.set_xmax(0);
-            header.set_payload_len(layout.slot_size as u32);
+            header.set_payload_len(
+                payload_len
+                    .try_into()
+                    .map_err(|_| "payload length too large for tuple header".to_string())?,
+            );
             header.set_flags(0);
             header.set_nullmap_ptr(0);
             payload_bytes.fill(0);
