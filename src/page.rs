@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! Pages use a slotted layout with three regions:
-//! - Fixed 32-byte header containing metadata and free space pointers
+//! - Fixed-size header containing metadata and free space pointers
 //! - Line pointer array growing downward (4 bytes per slot)
 //! - Tuple heap growing upward from the end
 //!
@@ -32,8 +32,8 @@ use std::{
 };
 
 use crate::{
-    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, LogContext, Lsn,
-    SimpleDBResult, TransactionID, RID,
+    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, LogContext,
+    LogRecord, Lsn, SimpleDBResult, TransactionID, RID,
 };
 
 /// Discriminator for the type of data stored in a page.
@@ -114,7 +114,7 @@ mod crc {
 /// - 12..16: crc32 (u32)
 /// - 16..24: latch_word (u64)
 /// - 24..26: free_head (u16)
-/// - 26..32: reserved_bytes (6 bytes)
+/// - 26..34: lsn (u64)
 #[derive(Clone, Copy)]
 pub struct HeapHeaderRef<'a> {
     bytes: &'a [u8],
@@ -181,9 +181,8 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(24))
     }
 
-    #[allow(dead_code)]
-    pub fn reserved_bytes(&self) -> [u8; 6] {
-        self.range::<6>(26)
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.range::<8>(26))
     }
 
     pub fn has_free_slot(&self) -> bool {
@@ -225,7 +224,7 @@ impl<'a> HeaderReader<'a> for HeapHeaderRef<'a> {
 /// - 12..16: crc32 (u32)
 /// - 16..24: latch_word (u64)
 /// - 24..26: free_head (u16)
-/// - 26..32: reserved_bytes (6 bytes)
+/// - 26..34: lsn (u64)
 pub struct HeapHeaderMut<'a> {
     bytes: &'a mut [u8],
 }
@@ -246,7 +245,7 @@ impl<'a> HeapHeaderMut<'a> {
         self.set_crc32(0);
         self.set_latch_word(0);
         self.set_free_head(HeapHeaderRef::NO_FREE_SLOT);
-        self.set_reserved_bytes([0; 6]);
+        self.set_lsn(0);
     }
 
     pub fn as_ref(&self) -> HeapHeaderRef<'_> {
@@ -295,8 +294,8 @@ impl<'a> HeapHeaderMut<'a> {
         self.write(24, free_head.to_le_bytes());
     }
 
-    pub fn set_reserved_bytes(&mut self, reserved: [u8; 6]) {
-        self.write(26, reserved);
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.write(26, lsn.to_le_bytes());
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
@@ -403,9 +402,8 @@ pub(crate) mod test_helpers {
         {
             let tuple_mut = HeapTupleMut::from_bytes(buf.as_mut_slice());
             let layout_clone = layout.clone();
-            let page_lsn = Rc::new(Cell::new(None));
             let dirty = Rc::new(Cell::new(false));
-            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, None, page_lsn, dirty);
+            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, None, dirty);
             builder(&mut row_mut);
         }
         Ok(buf)
@@ -1863,7 +1861,7 @@ struct HeapPage<'a> {
 
 impl<'a> PageKind for HeapPage<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
-    const HEADER_SIZE: usize = 32;
+    const HEADER_SIZE: usize = 34;
     type Header = HeapHeaderRef<'a>;
     type HeaderRef<'b> = HeapHeaderRef<'b>;
 }
@@ -1941,7 +1939,7 @@ pub struct HeapPageMut<'a> {
 
 impl<'a> PageKind for HeapPageMut<'a> {
     const PAGE_TYPE: PageType = PageType::Heap;
-    const HEADER_SIZE: usize = 32;
+    const HEADER_SIZE: usize = 34;
     type Header = HeapHeaderMut<'a>;
     type HeaderRef<'b> = HeapHeaderRef<'b>;
 }
@@ -2060,7 +2058,9 @@ impl<'a> HeapPageMut<'a> {
         let old_offset: u16 = old_offset
             .try_into()
             .map_err(|_| "tuple offset larger than max offset")?;
-        parts.record_space().write_tuple(old_offset as usize, old_tuple);
+        parts
+            .record_space()
+            .write_tuple(old_offset as usize, old_tuple);
         parts
             .line_ptrs()
             .set(slot, LinePtr::new(old_offset, old_len, LineState::Live));
@@ -3024,13 +3024,8 @@ mod logical_row_tests {
 
         {
             let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-            let mut row_mut = LogicalRowMut::new(
-                tuple_mut,
-                layout.clone(),
-                None,
-                Rc::new(Cell::new(None)),
-                Rc::new(Cell::new(false)),
-            );
+            let mut row_mut =
+                LogicalRowMut::new(tuple_mut, layout.clone(), None, Rc::new(Cell::new(false)));
             row_mut
                 .set_column("a", &Constant::Int(99))
                 .expect("set int");
@@ -3070,13 +3065,8 @@ mod logical_row_tests {
 
             {
                 let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-                let mut row_mut = LogicalRowMut::new(
-                    tuple_mut,
-                    layout.clone(),
-                    None,
-                    Rc::new(Cell::new(None)),
-                    Rc::new(Cell::new(false)),
-                );
+                let mut row_mut =
+                    LogicalRowMut::new(tuple_mut, layout.clone(), None, Rc::new(Cell::new(false)));
                 row_mut
                     .set_column("num", &Constant::Int(int_val))
                     .expect("set int column");
@@ -3121,6 +3111,10 @@ struct HeapTupleHeaderBytes<'a> {
 impl<'a> HeapTupleHeaderBytes<'a> {
     fn from_bytes(bytes: &'a [u8; HEAP_TUPLE_HEADER_BYTES]) -> Self {
         Self { bytes }
+    }
+
+    fn bytes(&self) -> &[u8; HEAP_TUPLE_HEADER_BYTES] {
+        self.bytes
     }
 
     #[allow(dead_code)]
@@ -3250,6 +3244,13 @@ impl<'a> HeapTupleMut<'a> {
         let bytes = &mut self.payload[offset..offset + bytes_needed];
         NullBitmapMut::new(bytes)
     }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEAP_TUPLE_HEADER_BYTES + self.payload.len());
+        buf.extend_from_slice(self.header.as_ref().bytes());
+        buf.extend_from_slice(self.payload);
+        buf
+    }
 }
 
 /// Type-safe view of a heap tuple with schema-aware column access.
@@ -3319,12 +3320,15 @@ impl TupleSnapshot {
 }
 
 use crate::LogManager;
+
 struct RowLogContext {
     log_manager: Arc<Mutex<LogManager>>,
     block_id: BlockId,
     txn_id: TransactionID,
     slot_id: SlotId,
-    before_image: TupleSnapshot,
+    tuple_offset: usize,
+    before_image: Option<TupleSnapshot>,
+    page_lsn: Rc<Cell<Option<Lsn>>>,
 }
 
 impl RowLogContext {
@@ -3333,14 +3337,25 @@ impl RowLogContext {
         block_id: BlockId,
         txn_id: TransactionID,
         slot_id: SlotId,
-        before_image: TupleSnapshot,
+        tuple_offset: usize,
+        before_image: Option<TupleSnapshot>,
+        page_lsn: Rc<Cell<Option<Lsn>>>,
     ) -> Self {
         Self {
             log_manager,
             block_id,
             txn_id,
             slot_id,
+            tuple_offset,
             before_image,
+            page_lsn,
+        }
+    }
+
+    fn update_page_lsn(&self, lsn: Lsn) {
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
     }
 }
@@ -3352,7 +3367,6 @@ pub struct LogicalRowMut<'a> {
     tuple: HeapTupleMut<'a>,
     layout: Layout,
     row_log_context: Option<RowLogContext>,
-    page_lsn: Rc<Cell<Option<Lsn>>>,
     dirty: Rc<Cell<bool>>,
 }
 
@@ -3361,14 +3375,12 @@ impl<'a> LogicalRowMut<'a> {
         tuple: HeapTupleMut<'a>,
         layout: Layout,
         row_log_context: Option<RowLogContext>,
-        page_lsn: Rc<Cell<Option<Lsn>>>,
         dirty: Rc<Cell<bool>>,
     ) -> Self {
         Self {
             tuple,
             layout,
             row_log_context,
-            page_lsn,
             dirty,
         }
     }
@@ -3414,10 +3426,36 @@ impl<'a> LogicalRowMut<'a> {
 
 impl Drop for LogicalRowMut<'_> {
     fn drop(&mut self) {
-        if self.dirty.get() {
-            if let Some(_ctx) = &self.row_log_context {
-                //  TODO: write the changes into the WAL and then update the page LSN
-            }
+        let Some(mut ctx) = self.row_log_context.take() else {
+            return;
+        };
+        if !self.dirty.get() {
+            return;
+        }
+
+        let after_bytes = self.tuple.as_bytes();
+        let block_id = ctx.block_id.clone();
+        let record = match ctx.before_image.take() {
+            None => LogRecord::HeapTupleInsert {
+                txnum: ctx.txn_id as usize,
+                block_id,
+                slot: ctx.slot_id,
+                offset: ctx.tuple_offset,
+                tuple: after_bytes,
+            },
+            Some(before) => LogRecord::HeapTupleUpdate {
+                txnum: ctx.txn_id as usize,
+                block_id,
+                slot: ctx.slot_id,
+                old_offset: before.offset,
+                old_tuple: before.bytes,
+                new_offset: ctx.tuple_offset,
+                new_tuple: after_bytes,
+            },
+        };
+
+        if let Ok(lsn) = record.write_log_record(&ctx.log_manager) {
+            ctx.update_page_lsn(lsn);
         }
     }
 }
@@ -3507,7 +3545,7 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Returns the current [`TupleRef`] at `slot`, including redirect/dead markers.
-    pub fn tuple_ref(&self, slot: SlotId) -> Option<TupleRef<'_>> {
+    fn tuple_ref(&self, slot: SlotId) -> Option<TupleRef<'_>> {
         let view = self.build_page();
         view.tuple_ref(slot)
     }
@@ -3526,14 +3564,15 @@ impl<'a> HeapPageViewMut<'a> {
     pub fn row_mut(&mut self, slot: SlotId) -> SimpleDBResult<Option<LogicalRowMut<'_>>> {
         //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
         let layout_clone = self.layout.clone();
-        let page_lsn = Rc::clone(&self.page_lsn);
         let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
         let row_log_context = RowLogContext::new(
             Arc::clone(&self.guard.log_ctx.log_manager),
             self.guard.block_id().clone(),
             self.guard.txn_id() as TransactionID,
             slot,
-            before_image,
+            before_image.offset,
+            Some(before_image),
+            Rc::clone(&self.page_lsn),
         );
         let dirty = Rc::clone(&self.dirty);
         let heap_tuple_mut = self
@@ -3543,7 +3582,6 @@ impl<'a> HeapPageViewMut<'a> {
             heap_tuple_mut,
             layout_clone,
             Some(row_log_context),
-            page_lsn,
             dirty,
         )))
     }
@@ -3561,7 +3599,7 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Inserts a raw tuple payload into the page and returns the allocated slot.
-    pub fn insert_tuple(&mut self, bytes: &[u8]) -> SimpleDBResult<SlotId> {
+    fn insert_tuple(&mut self, bytes: &[u8]) -> SimpleDBResult<SlotId> {
         let mut page = self.build_mut_page();
         let mut split_guard = page.split()?;
         match split_guard.insert_tuple_fast(bytes)? {
@@ -3580,6 +3618,20 @@ impl<'a> HeapPageViewMut<'a> {
 
     /// Deletes the tuple at `slot`, marking it free for reuse.
     pub fn delete_slot(&mut self, slot: SlotId) -> SimpleDBResult<()> {
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let record = LogRecord::HeapTupleDelete {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot,
+            offset: before_image.offset,
+            old_tuple: before_image.bytes,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
         let mut page = self.build_mut_page();
         let mut split_guard = page.split()?;
         split_guard.delete_slot(slot)?;
@@ -3597,6 +3649,8 @@ impl<'a> HeapPageViewMut<'a> {
             .try_into()
             .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
 
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), target_slot)?;
+
         {
             let mut page = self.build_mut_page();
             let mut split_guard = page.split()?;
@@ -3612,17 +3666,51 @@ impl<'a> HeapPageViewMut<'a> {
                 lp.set_length(new_len);
                 split_guard.line_ptrs().set(target_slot, lp);
                 self.dirty.set(true);
+
+                let record = LogRecord::HeapTupleUpdate {
+                    txnum: self.guard.txn_id(),
+                    block_id: self.guard.block_id().clone(),
+                    slot: target_slot,
+                    old_offset: before_image.offset,
+                    old_tuple: before_image.bytes,
+                    new_offset: lp.offset() as usize,
+                    new_tuple: bytes.to_vec(),
+                };
+                if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+                    let current = self.page_lsn.get().unwrap_or(0);
+                    if lsn > current {
+                        self.page_lsn.set(Some(lsn));
+                    }
+                }
                 return Ok(());
             }
         }
 
+        // Tuple grew — need to relocate. Capture the new offset after insertion.
         let new_slot = self.insert_tuple(bytes)?;
+        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), new_slot)?;
         self.redirect_slot(target_slot, new_slot)?;
+
+        let record = LogRecord::HeapTupleUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            slot: target_slot,
+            old_offset: before_image.offset,
+            old_tuple: before_image.bytes,
+            new_offset: after_image.offset,
+            new_tuple: bytes.to_vec(),
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+            let current = self.page_lsn.get().unwrap_or(0);
+            if lsn > current {
+                self.page_lsn.set(Some(lsn));
+            }
+        }
         Ok(())
     }
 
     /// Marks `slot` as a redirect to `target`, used for tuple forwarding.
-    pub fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> SimpleDBResult<()> {
+    fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> SimpleDBResult<()> {
         let mut page = self.build_mut_page();
         let mut split_guard = page.split()?;
         split_guard.redirect_slot(slot, target)?;
@@ -3631,7 +3719,7 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Serializes the page into the provided buffer.
-    pub fn write_bytes(&self, out: &mut [u8]) -> SimpleDBResult<()> {
+    fn write_bytes(&self, out: &mut [u8]) -> SimpleDBResult<()> {
         out.copy_from_slice(self.guard.bytes());
         Ok(())
     }
@@ -3649,16 +3737,17 @@ impl<'a> HeapPageViewMut<'a> {
         header.set_nullmap_ptr(0);
         buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
         let slot = self.insert_tuple(&buf)?;
-        let page_lsn = Rc::clone(&self.page_lsn);
         self.dirty.set(true);
         let dirty = Rc::clone(&self.dirty);
-        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
         let row_log_context = RowLogContext::new(
             Arc::clone(&self.guard.log_ctx.log_manager),
             self.guard.block_id().clone(),
             self.guard.txn_id() as TransactionID,
             slot,
-            before_image,
+            after_image.offset,
+            None,
+            Rc::clone(&self.page_lsn),
         );
         let layout_clone = self.layout.clone();
         let heap_tuple_mut = self
@@ -3666,13 +3755,7 @@ impl<'a> HeapPageViewMut<'a> {
             .expect("tuple must exist after allocation");
         Ok((
             slot,
-            LogicalRowMut::new(
-                heap_tuple_mut,
-                layout_clone,
-                Some(row_log_context),
-                page_lsn,
-                dirty,
-            ),
+            LogicalRowMut::new(heap_tuple_mut, layout_clone, Some(row_log_context), dirty),
         ))
     }
 
@@ -3739,8 +3822,14 @@ impl<'a> HeapPageViewMut<'a> {
 impl Drop for HeapPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
-            let lsn = self.page_lsn.take().unwrap_or(Lsn::MAX);
-            self.guard.mark_modified(self.guard.txn_id(), lsn);
+            let lsn = self.page_lsn.get();
+            if let Some(lsn) = lsn {
+                let mut page = self.build_mut_page();
+                page.header.set_lsn(lsn as u64);
+                self.guard.mark_modified(self.guard.txn_id(), lsn);
+            } else {
+                self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+            }
         }
     }
 }

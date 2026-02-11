@@ -8949,7 +8949,7 @@ mod transaction_tests {
             offset: snapshot.int_offset,
             old_val: snapshot.int_val,
         }
-        .write_log_record(Arc::clone(&test_db.log_manager))
+        .write_log_record(&test_db.log_manager)
         .unwrap();
         LogRecord::SetString {
             txnum: t3.id(),
@@ -8957,7 +8957,7 @@ mod transaction_tests {
             offset: snapshot.str_offset,
             old_val: snapshot.str_val.clone(),
         }
-        .write_log_record(Arc::clone(&test_db.log_manager))
+        .write_log_record(&test_db.log_manager)
         .unwrap();
         {
             let guard = t3.pin_write_guard(&block_id);
@@ -9162,7 +9162,7 @@ mod transaction_tests {
             offset: snapshot.int_offset,
             old_val: snapshot.int_val,
         }
-        .write_log_record(Arc::clone(&test_db.log_manager))
+        .write_log_record(&test_db.log_manager)
         .unwrap();
         LogRecord::SetString {
             txnum: t2.id(),
@@ -9170,7 +9170,7 @@ mod transaction_tests {
             offset: snapshot.str_offset,
             old_val: snapshot.str_val.clone(),
         }
-        .write_log_record(Arc::clone(&test_db.log_manager))
+        .write_log_record(&test_db.log_manager)
         .unwrap();
         {
             let guard = t2.pin_write_guard(&block_id);
@@ -9882,9 +9882,7 @@ impl RecoveryManager {
     fn commit(&self) {
         self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
-        let lsn = record
-            .write_log_record(Arc::clone(&self.log_manager))
-            .unwrap();
+        let lsn = record.write_log_record(&self.log_manager).unwrap();
         self.log_manager.lock().unwrap().flush_lsn(lsn);
     }
 
@@ -9909,7 +9907,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
+        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -9939,7 +9937,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(Arc::clone(&self.log_manager))?;
+        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -10350,7 +10348,9 @@ impl LogRecord {
                     + new_tuple.len()
             }
             LogRecord::HeapTupleDelete {
-                block_id, old_tuple, ..
+                block_id,
+                old_tuple,
+                ..
             } => {
                 base_size
                     + Self::TXNUM_SIZE
@@ -10425,16 +10425,52 @@ impl LogRecord {
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::HeapTupleInsert { .. } => {
-                // TODO: Undo insert = mark slot as free
-                unimplemented!("HeapTupleInsert undo not yet implemented")
+                let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
+                    .expect("heap page required for undo");
+                page.undo_insert(*slot).expect("undo heap tuple insert");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::HeapTupleUpdate { .. } => {
-                // TODO: Undo update = restore old tuple bytes at old_offset
-                unimplemented!("HeapTupleUpdate undo not yet implemented")
+                let LogRecord::HeapTupleUpdate {
+                    block_id,
+                    slot,
+                    old_offset,
+                    old_tuple,
+                    new_offset,
+                    new_tuple,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
+                    .expect("heap page required for undo");
+                page.undo_update(*slot, *old_offset, old_tuple, *new_offset, new_tuple.len())
+                    .expect("undo heap tuple update");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
             LogRecord::HeapTupleDelete { .. } => {
-                // TODO: Undo delete = restore old tuple and mark slot as live
-                unimplemented!("HeapTupleDelete undo not yet implemented")
+                let LogRecord::HeapTupleDelete {
+                    block_id,
+                    slot,
+                    offset,
+                    old_tuple,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+                let mut guard = txn.pin_write_guard(block_id);
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
+                    .expect("heap page required for undo");
+                page.undo_delete(*slot, *offset, old_tuple)
+                    .expect("undo heap tuple delete");
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
         }
     }
@@ -10457,7 +10493,7 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
+    fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
         let bytes: Vec<u8> = self.try_into()?;
         Ok(log_manager.lock().unwrap().append(bytes))
     }
@@ -10583,7 +10619,7 @@ mod recovery_manager_tests {
             offset,
             old_val: original,
         }
-        .write_log_record(Arc::clone(&db.log_manager))
+        .write_log_record(&db.log_manager)
         .unwrap();
 
         write_int_field(&txn, &block, &layout, 9999);
@@ -10617,7 +10653,7 @@ mod recovery_manager_tests {
             offset,
             old_val: original.clone(),
         }
-        .write_log_record(Arc::clone(&db.log_manager))
+        .write_log_record(&db.log_manager)
         .unwrap();
 
         write_string_field(&txn, &block, &layout, "corrupted value");

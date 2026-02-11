@@ -616,72 +616,105 @@ Note: The `HeapTupleUpdate` record stores both offsets, allowing undo to restore
 
 ## Testing Strategy
 
-### Unit Tests
+### Recovery Model
 
-```rust
-#[test]
-fn test_logged_column_update_redo() {
-    let (db, _dir) = SimpleDB::new_for_test(8, 5000);
-    let txn = db.new_tx();
+The current system uses **undo-only recovery** with a **force** buffer policy (all dirty pages
+flushed on commit). This means:
+- Committed data is always durable on disk — no redo pass needed.
+- Recovery only undoes incomplete transactions.
+- The new `HeapTupleUpdate` records store both old and new tuple bytes, which is sufficient
+  for redo if we ever move to a no-force policy, but redo is not implemented or needed today.
 
-    // Insert row
-    let block_id = txn.append("test_file");
-    let mut guard = txn.pin_write_guard(&block_id);
-    guard.format_as_heap();
-    let mut view = guard.into_heap_view_mut(&layout).unwrap();
-    let (slot, mut row) = view.insert_row_mut().unwrap();
-    row.set_column("id", &Constant::Int(42));
-    drop(view);
-    drop(guard);
+### Rollback Tests (Undo)
 
-    // Force log to disk
-    txn.commit().unwrap();
+These verify that `RecoveryManager::rollback()` correctly undoes heap operations for the
+current transaction.
 
-    // Simulate crash and recovery
-    drop(txn);
-    drop(db);
+#### 1. Rollback insert — slot is freed
 
-    // Reopen and verify
-    let db2 = SimpleDB::new(/* same path */, 8, false, 5000);
-    let txn2 = db2.new_tx();
-    txn2.recover().unwrap();
+Insert a row via `insert_row_mut`, then rollback. Verify the slot is no longer live
+(the page should have no live tuples).
 
-    // Read value back
-    let guard = txn2.pin_read_guard(&block_id);
-    let view = guard.into_heap_view(&layout).unwrap();
-    let row = view.row(slot).unwrap();
-    assert_eq!(row.get_column("id").unwrap(), Constant::Int(42));
-}
+#### 2. Rollback update — old value restored
 
-#[test]
-fn test_logged_column_update_undo() {
-    let (db, _dir) = SimpleDB::new_for_test(8, 5000);
-    let txn = db.new_tx();
+Insert a row with value A, commit. In a new transaction, update to value B via `row_mut`,
+then rollback. Read back and verify value is A.
 
-    // Insert and update
-    // ... (setup)
-    let mut row = view.row_mut(slot).unwrap();
-    row.set_column("id", &Constant::Int(100));
-    drop(view);
+#### 3. Rollback delete — tuple restored
 
-    // Rollback
-    txn.rollback().unwrap();
+Insert a row, commit. In a new transaction, delete via `delete_slot`, then rollback.
+Read back and verify the row is live with original values.
 
-    // Verify old value restored
-    let guard = txn.pin_read_guard(&block_id);
-    let view = guard.into_heap_view(&layout).unwrap();
-    let row = view.row(slot).unwrap();
-    assert_eq!(row.get_column("id").unwrap(), Constant::Int(42));
-}
-```
+#### 4. Rollback multiple operations in one transaction
 
-### Integration Tests
+In a single transaction: insert row 1, insert row 2, update row 1, delete row 2.
+Rollback. Verify: row 1 is gone (insert undone), row 2 is gone (insert undone).
+Operations undo in reverse log order.
 
-1. **Crash during transaction**: Insert rows, crash before commit, verify rollback
-2. **Crash during checkpoint**: Dirty pages flushing, verify recovery completes correctly
-3. **Mixed operations**: Insert, update, delete in single transaction, crash, verify correct final state
-4. **B-tree recovery**: Insert keys causing splits, crash, verify tree structure intact
-5. **Concurrent transactions**: Multiple transactions, one crashes, others unaffected
+#### 5. Rollback update with string field
+
+Same as test 2 but with a varchar column. Ensures variable-length tuple bytes are
+correctly captured and restored by `TupleSnapshot`.
+
+### Recovery Tests (Crash Undo)
+
+These verify that `RecoveryManager::recover()` undoes incomplete transactions found in
+the WAL after a simulated crash.
+
+#### 6. Recovery undoes uncommitted insert
+
+Insert a row but don't commit. Call `recover()`. Verify the slot is freed — the insert
+is rolled back because the transaction never committed.
+
+#### 7. Recovery leaves committed data intact
+
+Transaction A inserts a row and commits. Transaction B inserts a row but doesn't commit.
+Call `recover()`. Verify A's row is still live, B's row is freed.
+
+#### 8. Recovery undoes uncommitted update
+
+Insert and commit a row with value A. In a new transaction, update to value B but don't
+commit. Call `recover()`. Verify value is A.
+
+#### 9. Recovery undoes uncommitted delete
+
+Insert and commit a row. In a new transaction, delete the row but don't commit.
+Call `recover()`. Verify the row is restored.
+
+### Log Record Serialization Tests
+
+#### 10. Round-trip serialization for HeapTupleInsert
+
+Create a `HeapTupleInsert` record, serialize to bytes, deserialize back. Verify all
+fields match (txnum, block_id, slot, offset, tuple bytes).
+
+#### 11. Round-trip serialization for HeapTupleUpdate
+
+Same for `HeapTupleUpdate` — verify old_offset, old_tuple, new_offset, new_tuple all
+survive the round-trip.
+
+#### 12. Round-trip serialization for HeapTupleDelete
+
+Same for `HeapTupleDelete`.
+
+### Edge Case Tests
+
+#### 13. Multiple row updates in one page view
+
+Get `row_mut` for slot 0, modify, drop. Get `row_mut` for slot 1, modify, drop.
+Drop the view. Verify both updates are logged as separate `HeapTupleUpdate` records
+and the page LSN reflects the max of both.
+
+#### 14. Insert then immediate update in same transaction
+
+`insert_row_mut`, set column to A, drop row. `row_mut` on same slot, set column to B,
+drop row. Verify two log records: one `HeapTupleInsert` and one `HeapTupleUpdate`.
+Rollback should undo both, leaving the slot free.
+
+#### 15. No-op row_mut (no columns changed)
+
+Get `row_mut` but don't call `set_column`. Drop. Verify no `HeapTupleUpdate` log record
+is written (the dirty flag should be false).
 
 ## Performance Considerations
 
@@ -733,12 +766,87 @@ fn test_logged_column_update_undo() {
 - **docs/record_management.md**: Current page layout and view architecture
 - **Issue #59**: Transaction lock integration (related concurrency work)
 
+## WAL Rule Enforcement
+
+### The Problem
+
+The WAL protocol requires: **a log record must reach stable storage before the dirty page
+it describes can be written to disk.** This ensures that on crash, we can always undo
+changes by replaying the log.
+
+Currently, `BufferFrame::flush_to_disk` flushes the log up to the frame's LSN before
+writing the page:
+
+```rust
+fn flush_to_disk(&self, ...) {
+    if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
+        self.log_manager.lock().unwrap().flush_lsn(lsn);
+        // ... write page to disk
+    }
+}
+```
+
+This is correct **if** the LSN on the frame always reflects the latest log record for that
+page. With the new view-based logging, the LSN flows as:
+
+1. `LogicalRowMut::drop()` writes log record → gets LSN → updates shared `page_lsn` Rc
+2. `HeapPageViewMut::drop()` reads `page_lsn` → writes to page header → calls
+   `mark_modified(txn_id, lsn)` which sets the frame's LSN
+
+The risk: if `mark_modified` is called with `Lsn::MAX` (the fallback when no log context
+exists), the buffer manager will try to flush LSN `MAX`, which is meaningless. This
+currently happens when `dirty` is true but `page_lsn` is `None` — for example, if a
+mutation occurs without logging (a bug, now that all public mutating methods log).
+
+### What To Verify
+
+1. Every path that sets `dirty = true` on `HeapPageViewMut` also produces a log record
+   with a real LSN. The `Lsn::MAX` fallback in `HeapPageViewMut::drop` should be
+   unreachable in normal operation.
+2. `BufferFrame::flush_to_disk` should assert or warn if it sees `Lsn::MAX`, since that
+   indicates a page was dirtied without logging.
+3. The `format_as_heap` / `format_as_btree_*` methods on `PageWriteGuard` call
+   `mark_modified` with `Lsn::MAX` — these are page initialization paths that don't go
+   through views. These are safe because formatting an empty page doesn't need undo, but
+   they should be audited if we ever add redo.
+
+### Future: No-Force Policy
+
+If we move to a no-force buffer policy (don't flush all dirty pages on commit), then:
+- Committed pages may not be on disk after commit returns.
+- Recovery would need a **redo pass** to replay committed changes.
+- The existing log records already store enough data for redo (`HeapTupleInsert` has
+  tuple bytes, `HeapTupleUpdate` has `new_tuple`).
+- Recovery would need to compare page LSN vs log record LSN to decide whether to redo.
+- This is not needed today since we use force (flush-on-commit).
+
 ## Status
 
-**Current**: Design complete for heap operations
-**Next steps**: Implement Phase 1 (logging infrastructure)
+**Current**: Phase 2 substantially complete for heap operations.
+
+### What's Done
+- `LogContext` carries `log_manager`, `block_id`, `txn_id` from Transaction → PageWriteGuard
+- `HeapPageViewMut` creates its own `page_lsn` tracker
+- `RowLogContext` + `TupleSnapshot` capture before/after images per row operation
+- All public mutating methods on `HeapPageViewMut` log:
+  - `insert_row_mut()` → `HeapTupleInsert` (via `LogicalRowMut::drop`)
+  - `row_mut()` → `HeapTupleUpdate` (via `LogicalRowMut::drop`)
+  - `delete_slot()` → `HeapTupleDelete` (via `RowLogContext::write_delete_log`)
+  - `update_tuple()` → `HeapTupleUpdate` (logged directly)
+- `HeapPageViewMut::drop()` writes LSN to page header and marks frame modified
+- Undo implemented for all three record types via `HeapPageMut::undo_insert/update/delete`
+- Serialization/deserialization for all new log record variants
+- Non-public helpers (`insert_tuple`, `redirect_slot`, `write_bytes`, `tuple_ref`) are private
 
 ### Decisions Made
 - Physical tuple-level logging (not logical)
 - LSN in page header (not per-tuple)
+- Undo-only recovery (no redo) — sufficient with force buffer policy
+- `LogContext` carries only infrastructure (no LSN); `page_lsn` owned by view
 - Start with heap operations only; B-tree deferred to Phase 3
+
+### Next Steps
+- Write recovery tests (see Testing Strategy above)
+- B-tree logging (Phase 3)
+- Audit `Lsn::MAX` usage to ensure WAL rule is not violated
+- Remove legacy `SetInt`/`SetString` logging paths (Phase 4)
