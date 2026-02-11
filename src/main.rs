@@ -9993,6 +9993,17 @@ enum LogRecord {
         child_block: usize,  // for display/debugging
         entry_bytes: Vec<u8>, // full entry bytes for physical undo
     },
+    /// Structural split record for undoing split metadata and deallocating right page
+    BTreePageSplit {
+        txnum: usize,
+        left_block_id: BlockId,
+        right_block_id: BlockId,
+        is_leaf: bool,
+        old_left_high_key: Option<Vec<u8>>,
+        old_left_right_sibling: Option<usize>,   // leaf-only
+        old_left_overflow: Option<usize>,        // leaf-only
+        old_left_rightmost_child: Option<usize>, // internal-only
+    },
 }
 
 impl Display for LogRecord {
@@ -10083,6 +10094,16 @@ impl Display for LogRecord {
             } => write!(
                 f,
                 "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block})"
+            ),
+            LogRecord::BTreePageSplit {
+                txnum,
+                left_block_id,
+                right_block_id,
+                is_leaf,
+                ..
+            } => write!(
+                f,
+                "BTreePageSplit(txnum: {txnum}, left: {left_block_id:?}, right: {right_block_id:?}, is_leaf: {is_leaf})"
             ),
         }
     }
@@ -10243,6 +10264,51 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 }
                 push_i32(&mut buf, *child_block as i32);
                 push_bytes(&mut buf, entry_bytes);
+            }
+            LogRecord::BTreePageSplit {
+                txnum,
+                left_block_id,
+                right_block_id,
+                is_leaf,
+                old_left_high_key,
+                old_left_right_sibling,
+                old_left_overflow,
+                old_left_rightmost_child,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &left_block_id.filename);
+                push_i32(&mut buf, left_block_id.block_num as i32);
+                push_string(&mut buf, &right_block_id.filename);
+                push_i32(&mut buf, right_block_id.block_num as i32);
+                push_i32(&mut buf, if *is_leaf { 1 } else { 0 });
+                match old_left_high_key {
+                    Some(bytes) => {
+                        push_i32(&mut buf, 1);
+                        push_bytes(&mut buf, bytes);
+                    }
+                    None => push_i32(&mut buf, 0),
+                }
+                match old_left_right_sibling {
+                    Some(v) => {
+                        push_i32(&mut buf, 1);
+                        push_i32(&mut buf, *v as i32);
+                    }
+                    None => push_i32(&mut buf, 0),
+                }
+                match old_left_overflow {
+                    Some(v) => {
+                        push_i32(&mut buf, 1);
+                        push_i32(&mut buf, *v as i32);
+                    }
+                    None => push_i32(&mut buf, 0),
+                }
+                match old_left_rightmost_child {
+                    Some(v) => {
+                        push_i32(&mut buf, 1);
+                        push_i32(&mut buf, *v as i32);
+                    }
+                    None => push_i32(&mut buf, 0),
+                }
             }
         }
         Ok(buf)
@@ -10405,6 +10471,49 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     entry_bytes,
                 })
             }
+            11 => {
+                let txnum = read_usize(&value, &mut pos)?;
+                let left_block_id = BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                );
+                let right_block_id = BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                );
+                let is_leaf = read_i32(&value, &mut pos)? != 0;
+                let has_hk = read_i32(&value, &mut pos)? != 0;
+                let old_left_high_key = if has_hk {
+                    Some(read_bytes(&value, &mut pos)?)
+                } else {
+                    None
+                };
+                let old_left_right_sibling = if read_i32(&value, &mut pos)? != 0 {
+                    Some(read_usize(&value, &mut pos)?)
+                } else {
+                    None
+                };
+                let old_left_overflow = if read_i32(&value, &mut pos)? != 0 {
+                    Some(read_usize(&value, &mut pos)?)
+                } else {
+                    None
+                };
+                let old_left_rightmost_child = if read_i32(&value, &mut pos)? != 0 {
+                    Some(read_usize(&value, &mut pos)?)
+                } else {
+                    None
+                };
+                Ok(LogRecord::BTreePageSplit {
+                    txnum,
+                    left_block_id,
+                    right_block_id,
+                    is_leaf,
+                    old_left_high_key,
+                    old_left_right_sibling,
+                    old_left_overflow,
+                    old_left_rightmost_child,
+                })
+            }
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -10532,6 +10641,48 @@ impl LogRecord {
                     + Self::BYTES_LEN_SIZE
                     + entry_bytes.len()
             }
+            LogRecord::BTreePageSplit {
+                left_block_id,
+                right_block_id,
+                old_left_high_key,
+                old_left_right_sibling,
+                old_left_overflow,
+                old_left_rightmost_child,
+                ..
+            } => {
+                let hk_size = match old_left_high_key {
+                    Some(bytes) => Self::INT_BYTES + Self::BYTES_LEN_SIZE + bytes.len(),
+                    None => Self::INT_BYTES,
+                };
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + left_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + right_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // is_leaf
+                    + hk_size
+                    + Self::INT_BYTES
+                    + if old_left_right_sibling.is_some() {
+                        Self::INT_BYTES
+                    } else {
+                        0
+                    }
+                    + Self::INT_BYTES
+                    + if old_left_overflow.is_some() {
+                        Self::INT_BYTES
+                    } else {
+                        0
+                    }
+                    + Self::INT_BYTES
+                    + if old_left_rightmost_child.is_some() {
+                        Self::INT_BYTES
+                    } else {
+                        0
+                    }
+            }
         }
     }
 
@@ -10549,6 +10700,7 @@ impl LogRecord {
             LogRecord::BTreeLeafDelete { .. } => 8,
             LogRecord::BTreeInternalInsert { .. } => 9,
             LogRecord::BTreeInternalDelete { .. } => 10,
+            LogRecord::BTreePageSplit { .. } => 11,
         }
     }
 
@@ -10567,6 +10719,7 @@ impl LogRecord {
             LogRecord::BTreeLeafDelete { txnum, .. } => *txnum,
             LogRecord::BTreeInternalInsert { txnum, .. } => *txnum,
             LogRecord::BTreeInternalDelete { txnum, .. } => *txnum,
+            LogRecord::BTreePageSplit { txnum, .. } => *txnum,
         }
     }
 
@@ -10682,6 +10835,72 @@ impl LogRecord {
                 page.undo_delete(*slot, *offset, entry_bytes)
                     .expect("undo btree internal delete");
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreePageSplit { .. } => {
+                let LogRecord::BTreePageSplit {
+                    left_block_id,
+                    right_block_id,
+                    is_leaf,
+                    old_left_high_key,
+                    old_left_right_sibling,
+                    old_left_overflow,
+                    old_left_rightmost_child,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                // Restore left-page structural metadata.
+                if *is_leaf {
+                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut page = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
+                        .expect("btree leaf page required for split undo");
+                    match old_left_high_key {
+                        Some(bytes) => page
+                            .write_high_key(bytes)
+                            .expect("restore btree leaf high key during split undo"),
+                        None => page.clear_high_key(),
+                    }
+                    let rsib = old_left_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX);
+                    page.set_right_sibling_block(rsib);
+                    let overflow = *old_left_overflow;
+                    page.set_overflow_block(overflow)
+                        .expect("restore btree leaf overflow during split undo");
+                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                } else {
+                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut page = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
+                        .expect("btree internal page required for split undo");
+                    match old_left_high_key {
+                        Some(bytes) => page
+                            .write_high_key(bytes)
+                            .expect("restore btree internal high key during split undo"),
+                        None => page.clear_high_key(),
+                    }
+                    if let Some(rightmost) = old_left_rightmost_child {
+                        page.set_rightmost_child_block(*rightmost);
+                    }
+                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                }
+
+                // Deallocate right split page by pushing it onto the index free-list.
+                let meta_block = BlockId::new(left_block_id.filename.clone(), 0);
+                let meta_guard = txn.pin_write_guard(&meta_block);
+                meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
+                    .expect("meta page required for split undo");
+                let old_head = meta_view.first_free_block();
+
+                let mut right_guard = txn.pin_write_guard(right_block_id);
+                let bytes = right_guard.bytes_mut();
+                bytes.fill(0);
+                bytes[0] = crate::page::PageType::Free as u8;
+                bytes[4..8].copy_from_slice(&old_head.to_le_bytes());
+                right_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+
+                meta_view.set_first_free_block(right_block_id.block_num as u32);
+                meta_view.update_crc32();
             }
         }
     }

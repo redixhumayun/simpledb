@@ -5,10 +5,11 @@ use crate::page::BTreeLeafEntry;
 use crate::{
     debug,
     page::{
-        BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeMetaPageView,
-        BTreeMetaPageViewMut, PageType,
+        BTreeInternalEntry, BTreeInternalHeaderRef, BTreeInternalPageView, BTreeInternalPageViewMut,
+        BTreeLeafHeaderRef, BTreeMetaPageView, BTreeMetaPageViewMut, PageType,
     },
-    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, SimpleDBResult, Transaction, RID,
+    BlockId, Constant, Index, IndexInfo, Layout, LogRecord, Lsn, Schema, SimpleDBResult,
+    Transaction, RID,
 };
 
 /// Separator promoted from a child split.
@@ -115,6 +116,70 @@ mod free_list {
 }
 
 use free_list::IndexFreeList;
+
+const BTREE_HEADER_BYTES: usize = 32;
+
+mod split_wal {
+    use super::{BTreeInternalHeaderRef, BTreeLeafHeaderRef, SimpleDBResult, BTREE_HEADER_BYTES};
+
+    fn decode_optional_block(raw: u32) -> Option<usize> {
+        if raw == u32::MAX {
+            None
+        } else {
+            Some(raw as usize)
+        }
+    }
+
+    pub(crate) fn read_leaf_split_state(
+        page_bytes: &[u8],
+    ) -> SimpleDBResult<(Option<Vec<u8>>, Option<usize>, Option<usize>)> {
+        let header = BTreeLeafHeaderRef::new(
+            page_bytes
+                .get(..BTREE_HEADER_BYTES)
+                .ok_or("leaf page header too small")?,
+        );
+        let hk = if header.high_key_len() == 0 {
+            None
+        } else {
+            let len = header.high_key_len() as usize;
+            let off = header.high_key_off() as usize;
+            Some(
+                page_bytes
+                    .get(off..off + len)
+                    .ok_or("leaf high key out of bounds")?
+                    .to_vec(),
+            )
+        };
+        Ok((
+            hk,
+            decode_optional_block(header.right_sibling()),
+            decode_optional_block(header.overflow_block()),
+        ))
+    }
+
+    pub(crate) fn read_internal_split_state(
+        page_bytes: &[u8],
+    ) -> SimpleDBResult<(Option<Vec<u8>>, Option<usize>)> {
+        let header = BTreeInternalHeaderRef::new(
+            page_bytes
+                .get(..BTREE_HEADER_BYTES)
+                .ok_or("internal page header too small")?,
+        );
+        let hk = if header.high_key_len() == 0 {
+            None
+        } else {
+            let len = header.high_key_len() as usize;
+            let off = header.high_key_off() as usize;
+            Some(
+                page_bytes
+                    .get(off..off + len)
+                    .ok_or("internal high key out of bounds")?
+                    .to_vec(),
+            )
+        };
+        Ok((hk, decode_optional_block(header.rightmost_child_block())))
+    }
+}
 
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
@@ -855,6 +920,8 @@ impl BTreeInternal {
     fn split_page(&self, split_slot: usize) -> Result<BlockId, Box<dyn Error>> {
         let txn_id = self.txn.id();
         let orig_guard = self.txn.pin_write_guard(&self.block_id);
+        let (old_left_high_key, old_left_rightmost_child) =
+            split_wal::read_internal_split_state(orig_guard.bytes())?;
         let mut orig_view = BTreeInternalPageViewMut::new(orig_guard, &self.layout)?;
 
         let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
@@ -863,6 +930,18 @@ impl BTreeInternal {
         new_guard.format_as_btree_internal(orig_view.btree_level(), None);
         new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
+
+        let split_record = LogRecord::BTreePageSplit {
+            txnum: txn_id,
+            left_block_id: self.block_id.clone(),
+            right_block_id: new_block_id.clone(),
+            is_leaf: false,
+            old_left_high_key,
+            old_left_right_sibling: None,
+            old_left_overflow: None,
+            old_left_rightmost_child,
+        };
+        let _ = split_record.write_log_record(&self.txn.log_manager());
 
         // Snapshot children array C0..Ck
         let orig_slot_count = orig_view.slot_count();
@@ -1061,9 +1140,19 @@ mod btree_internal_tests {
     fn setup_internal_node(db: &SimpleDB) -> (Arc<Transaction>, BTreeInternal) {
         let tx = db.new_tx();
         let filename = generate_filename();
+        let layout = create_test_layout();
+
+        // Reserve block 0 as meta to match production index layout assumptions.
+        let meta = tx.append(&filename);
+        assert_eq!(meta.block_num, 0);
+        {
+            let mut guard = tx.pin_write_guard(&meta);
+            guard.format_as_btree_meta(1, 1, 1, u32::MAX);
+            guard.mark_modified(tx.id(), Lsn::MAX);
+        }
+
         let block = tx.append(&filename);
         let dummy_child = tx.append(&filename);
-        let layout = create_test_layout();
 
         // Format the page as internal node
         let mut guard = tx.pin_write_guard(&block);
@@ -1208,9 +1297,11 @@ mod btree_internal_tests {
         let result = internal.find_child_block(&Constant::Int(10)).unwrap();
         assert_eq!(result.block_num, 2);
 
-        // Test searching for key less than all entries
+        // Test searching for key less than all entries.
+        // With separator semantics this returns C0, which is the initial
+        // rightmost child seeded during setup (block 2 in this fixture).
         let result = internal.find_child_block(&Constant::Int(5)).unwrap();
-        assert_eq!(result.block_num, 1); // First entry
+        assert_eq!(result.block_num, 2);
 
         // Test searching for key greater than all entries
         let result = internal.find_child_block(&Constant::Int(15)).unwrap();
@@ -1369,6 +1460,8 @@ impl BTreeLeaf {
     ) -> Result<BlockId, Box<dyn Error>> {
         let txn_id = self.txn.id();
         let orig_guard = self.txn.pin_write_guard(&self.current_block_id);
+        let (old_left_high_key, old_left_right_sibling, old_left_overflow) =
+            split_wal::read_leaf_split_state(orig_guard.bytes())?;
         let mut orig_view = orig_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
@@ -1376,6 +1469,18 @@ impl BTreeLeaf {
         new_guard.format_as_btree_leaf(overflow_block);
         new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
+
+        let split_record = LogRecord::BTreePageSplit {
+            txnum: txn_id,
+            left_block_id: self.current_block_id.clone(),
+            right_block_id: new_block_id.clone(),
+            is_leaf: true,
+            old_left_high_key,
+            old_left_right_sibling,
+            old_left_overflow,
+            old_left_rightmost_child: None,
+        };
+        let _ = split_record.write_log_record(&self.txn.log_manager());
 
         // Preserve old right sibling so we can re-chain after the split.
         let old_right = orig_view.right_sibling_block();
@@ -1701,8 +1806,17 @@ mod btree_leaf_tests {
     fn setup_leaf(db: &SimpleDB, search_key: Constant) -> (Arc<Transaction>, BTreeLeaf) {
         let txn = db.new_tx();
         let filename = generate_filename();
+        let meta = txn.append(&filename);
+        assert_eq!(meta.block_num, 0);
         let block = txn.append(&filename);
         let layout = create_test_layout();
+
+        // Keep block 0 as meta so split allocation can safely consult free-list metadata.
+        {
+            let mut guard = txn.pin_write_guard(&meta);
+            guard.format_as_btree_meta(1, 1, block.block_num as u32, u32::MAX);
+            guard.mark_modified(txn.id(), Lsn::MAX);
+        }
 
         // Format the page as a leaf using new page format
         {
@@ -1751,7 +1865,7 @@ mod btree_leaf_tests {
         // Verify split occurred
         assert!(split_result.is_some());
         let entry = split_result.unwrap();
-        assert_eq!(entry.right_block, 1); // new sibling block id
+        assert_eq!(entry.right_block, 2); // block 0 is meta, leaf starts at block 1
         assert_eq!(entry.sep_key, Constant::Int(counter / 2)); // Middle key
     }
 

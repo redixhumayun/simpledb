@@ -5929,19 +5929,19 @@ impl<'a> BTreeLeafPageMut<'a> {
         Ok(())
     }
 
-    fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
+    pub(crate) fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
         let mut parts = self.split()?;
         let value = block.map(|b| b as u32).unwrap_or(u32::MAX);
         parts.header().set_overflow_block(value);
         Ok(())
     }
 
-    fn set_right_sibling_block(&mut self, block: u32) {
+    pub(crate) fn set_right_sibling_block(&mut self, block: u32) {
         self.header.set_right_sibling_block(block);
     }
 
     /// Writes a new high key payload; compacts first.
-    fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
+    pub(crate) fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
         let len: u16 = bytes
             .len()
             .try_into()
@@ -5965,7 +5965,7 @@ impl<'a> BTreeLeafPageMut<'a> {
         Ok(())
     }
 
-    fn clear_high_key(&mut self) {
+    pub(crate) fn clear_high_key(&mut self) {
         let mut hdr = BTreeLeafHeaderMut::new(self.header.bytes_mut());
         hdr.set_high_key_len(0);
         hdr.set_high_key_off(0);
@@ -6545,7 +6545,7 @@ impl<'a> BTreeInternalPageMut<'a> {
     }
 
     /// Writes a new high key payload; compacts first.
-    fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
+    pub(crate) fn write_high_key(&mut self, bytes: &[u8]) -> SimpleDBResult<()> {
         let len: u16 = bytes
             .len()
             .try_into()
@@ -6571,13 +6571,13 @@ impl<'a> BTreeInternalPageMut<'a> {
         Ok(())
     }
 
-    fn clear_high_key(&mut self) {
+    pub(crate) fn clear_high_key(&mut self) {
         let mut hdr = BTreeInternalHeaderMut::new(self.header.bytes_mut());
         hdr.set_high_key_len(0);
         hdr.set_high_key_off(0);
     }
 
-    fn set_rightmost_child_block(&mut self, block: usize) {
+    pub(crate) fn set_rightmost_child_block(&mut self, block: usize) {
         self.header.set_rightmost_child_block(block as u32);
     }
 
