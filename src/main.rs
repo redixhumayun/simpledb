@@ -10716,6 +10716,43 @@ mod recovery_manager_tests {
         assert_eq!(read_int_at(&txn3, &block, &layout, slot), 1);
         assert_eq!(read_string_at(&txn3, &block, &layout, slot), "a");
     }
+
+    #[test]
+    fn recovery_undoes_mixed_uncommitted_ops() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, slot0, slot1, slot2) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let slot0 = insert_row(&txn1, &block, &layout, 1, "one");
+            let slot1 = insert_row(&txn1, &block, &layout, 2, "two");
+            txn1.commit().unwrap();
+
+            let txn2 = db.new_tx();
+            let slot2 = insert_row(&txn2, &block, &layout, 3, "three");
+            update_int_at(&txn2, &block, &layout, slot0, 10);
+            delete_slot(&txn2, &block, &layout, slot1);
+            (block, slot0, slot1, slot2)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        txn.recover().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot0), 1);
+        assert_eq!(read_string_at(&check_txn, &block_id, &layout, slot0), "one");
+        assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot1), 2);
+        assert_eq!(read_string_at(&check_txn, &block_id, &layout, slot1), "two");
+
+        let guard = check_txn.pin_read_guard(&block_id);
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert!(view.row(slot2).is_none());
+        assert_eq!(view.live_slot_iter().count(), 2);
+    }
 }
 
 /// Wrapper for the value contained in the hash map of the [`BufferList`]
