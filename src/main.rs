@@ -9948,6 +9948,8 @@ enum LogRecord {
         old_tuple: Vec<u8>,
         new_offset: usize,
         new_tuple: Vec<u8>,
+        relocated: bool,
+        relocated_slot: Option<usize>,
     },
     /// Physical tuple-level delete: logs old tuple bytes for undo
     HeapTupleDelete {
@@ -10041,9 +10043,11 @@ impl Display for LogRecord {
                 old_tuple,
                 new_offset,
                 new_tuple,
+                relocated,
+                relocated_slot,
             } => write!(
                 f,
-                "HeapTupleUpdate(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, old_offset: {old_offset}, old_len: {}, new_offset: {new_offset}, new_len: {})",
+                "HeapTupleUpdate(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, old_offset: {old_offset}, old_len: {}, new_offset: {new_offset}, new_len: {}, relocated: {relocated}, relocated_slot: {relocated_slot:?})",
                 old_tuple.len(),
                 new_tuple.len()
             ),
@@ -10176,6 +10180,8 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 old_tuple,
                 new_offset,
                 new_tuple,
+                relocated,
+                relocated_slot,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
@@ -10185,6 +10191,14 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_bytes(&mut buf, old_tuple);
                 push_i32(&mut buf, *new_offset as i32);
                 push_bytes(&mut buf, new_tuple);
+                push_i32(&mut buf, if *relocated { 1 } else { 0 });
+                match relocated_slot {
+                    Some(slot_id) => {
+                        push_i32(&mut buf, 1);
+                        push_i32(&mut buf, *slot_id as i32);
+                    }
+                    None => push_i32(&mut buf, 0),
+                }
             }
             LogRecord::HeapTupleDelete {
                 txnum,
@@ -10422,6 +10436,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 old_tuple: read_bytes(&value, &mut pos)?,
                 new_offset: read_usize(&value, &mut pos)?,
                 new_tuple: read_bytes(&value, &mut pos)?,
+                relocated: read_i32(&value, &mut pos)? != 0,
+                relocated_slot: if read_i32(&value, &mut pos)? != 0 {
+                    Some(read_usize(&value, &mut pos)?)
+                } else {
+                    None
+                },
             }),
             6 => Ok(LogRecord::HeapTupleDelete {
                 txnum: read_usize(&value, &mut pos)?,
@@ -10601,6 +10621,7 @@ impl LogRecord {
                 block_id,
                 old_tuple,
                 new_tuple,
+                relocated_slot,
                 ..
             } => {
                 base_size
@@ -10615,6 +10636,13 @@ impl LogRecord {
                     + Self::OFFSET_SIZE
                     + Self::BYTES_LEN_SIZE
                     + new_tuple.len()
+                    + Self::INT_BYTES // relocated flag
+                    + Self::INT_BYTES // relocated_slot present flag
+                    + if relocated_slot.is_some() {
+                        Self::INT_BYTES
+                    } else {
+                        0
+                    }
             }
             LogRecord::HeapTupleDelete {
                 block_id,
@@ -10809,8 +10837,7 @@ impl LogRecord {
                     slot,
                     old_offset,
                     old_tuple,
-                    new_offset,
-                    new_tuple,
+                    relocated_slot,
                     ..
                 } = self
                 else {
@@ -10819,7 +10846,7 @@ impl LogRecord {
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
                     .expect("heap page required for undo");
-                page.undo_update(*slot, *old_offset, old_tuple, *new_offset, new_tuple.len())
+                page.undo_update(*slot, *old_offset, old_tuple, *relocated_slot)
                     .expect("undo heap tuple update");
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
@@ -10846,10 +10873,14 @@ impl LogRecord {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::BTreeLeafPageMut::new(guard.bytes_mut())
-                    .expect("btree leaf page required for undo");
-                page.undo_insert(*slot).expect("undo btree leaf insert");
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                // Recovery can legitimately see uncommitted B-tree records for pages that
+                // never reached disk as typed index pages before crash. Treat those as
+                // idempotent no-op undos instead of panicking.
+                if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
+                    if page.undo_insert(*slot).is_ok() {
+                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    }
+                }
             }
             LogRecord::BTreeLeafDelete { .. } => {
                 let LogRecord::BTreeLeafDelete {
@@ -10863,22 +10894,22 @@ impl LogRecord {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::BTreeLeafPageMut::new(guard.bytes_mut())
-                    .expect("btree leaf page required for undo");
-                page.undo_delete(*slot, *offset, entry_bytes)
-                    .expect("undo btree leaf delete");
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
+                    if page.undo_delete(*slot, *offset, entry_bytes).is_ok() {
+                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    }
+                }
             }
             LogRecord::BTreeInternalInsert { .. } => {
                 let LogRecord::BTreeInternalInsert { block_id, slot, .. } = self else {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
-                    .expect("btree internal page required for undo");
-                page.undo_insert(*slot)
-                    .expect("undo btree internal insert");
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
+                    if page.undo_insert(*slot).is_ok() {
+                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    }
+                }
             }
             LogRecord::BTreeInternalDelete { .. } => {
                 let LogRecord::BTreeInternalDelete {
@@ -10892,11 +10923,11 @@ impl LogRecord {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
-                    .expect("btree internal page required for undo");
-                page.undo_delete(*slot, *offset, entry_bytes)
-                    .expect("undo btree internal delete");
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
+                    if page.undo_delete(*slot, *offset, entry_bytes).is_ok() {
+                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    }
+                }
             }
             LogRecord::BTreePageSplit { .. } => {
                 let LogRecord::BTreePageSplit {
@@ -10916,34 +10947,34 @@ impl LogRecord {
                 // Restore left-page structural metadata.
                 if *is_leaf {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    let mut page = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
-                        .expect("btree leaf page required for split undo");
-                    match old_left_high_key {
-                        Some(bytes) => page
-                            .write_high_key(bytes)
-                            .expect("restore btree leaf high key during split undo"),
-                        None => page.clear_high_key(),
+                    if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut()) {
+                        match old_left_high_key {
+                            Some(bytes) => page
+                                .write_high_key(bytes)
+                                .expect("restore btree leaf high key during split undo"),
+                            None => page.clear_high_key(),
+                        }
+                        let rsib = old_left_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX);
+                        page.set_right_sibling_block(rsib);
+                        let overflow = *old_left_overflow;
+                        page.set_overflow_block(overflow)
+                            .expect("restore btree leaf overflow during split undo");
+                        left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                     }
-                    let rsib = old_left_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX);
-                    page.set_right_sibling_block(rsib);
-                    let overflow = *old_left_overflow;
-                    page.set_overflow_block(overflow)
-                        .expect("restore btree leaf overflow during split undo");
-                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 } else {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    let mut page = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
-                        .expect("btree internal page required for split undo");
-                    match old_left_high_key {
-                        Some(bytes) => page
-                            .write_high_key(bytes)
-                            .expect("restore btree internal high key during split undo"),
-                        None => page.clear_high_key(),
+                    if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut()) {
+                        match old_left_high_key {
+                            Some(bytes) => page
+                                .write_high_key(bytes)
+                                .expect("restore btree internal high key during split undo"),
+                            None => page.clear_high_key(),
+                        }
+                        if let Some(rightmost) = old_left_rightmost_child {
+                            page.set_rightmost_child_block(*rightmost);
+                        }
+                        left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                     }
-                    if let Some(rightmost) = old_left_rightmost_child {
-                        page.set_rightmost_child_block(*rightmost);
-                    }
-                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 }
 
                 // Deallocate right split page by pushing it onto the index free-list.

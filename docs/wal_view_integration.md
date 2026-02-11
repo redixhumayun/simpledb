@@ -553,6 +553,11 @@ parent-insert records at each level.
 - `BTreePageSplit` undoes last for that level (restore left-page structural fields and
   logically free/deallocate the right page).
 
+**Crash-window idempotence note:** recovery may observe uncommitted B-tree entry records
+targeting pages that were allocated/mutated in memory but never reached disk as typed
+`IndexLeaf`/`IndexInternal` pages before crash. Undo for entry-level records should treat
+this as a no-op (already effectively undone on disk), not a hard error.
+
 **Root split:** special handling is required because root metadata changes
 (whether root is rewritten in-place or a new root page is allocated).
 Two options:

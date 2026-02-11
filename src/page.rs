@@ -2071,8 +2071,7 @@ impl<'a> HeapPageMut<'a> {
         slot: SlotId,
         old_offset: usize,
         old_tuple: &[u8],
-        new_offset: usize,
-        new_len: usize,
+        relocated_slot: Option<SlotId>,
     ) -> SimpleDBResult<()> {
         let mut parts = self.split()?;
         if slot >= parts.line_ptrs().len() {
@@ -2092,23 +2091,14 @@ impl<'a> HeapPageMut<'a> {
             .line_ptrs()
             .set(slot, LinePtr::new(old_offset, old_len, LineState::Live));
 
-        if old_offset as usize != new_offset {
-            let new_offset: u16 = new_offset
-                .try_into()
-                .map_err(|_| "tuple offset larger than max offset")?;
-            let new_len: u16 = new_len
-                .try_into()
-                .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
-            for idx in 0..parts.line_ptrs().len() {
-                if idx == slot {
-                    continue;
-                }
-                let lp = parts.line_ptrs().as_ref().get(idx);
-                if lp.is_live() && lp.offset() == new_offset && lp.length() == new_len {
-                    let mut lp = lp;
-                    lp.mark_free();
-                    parts.line_ptrs().set(idx, lp);
-                }
+        if let Some(relocated_slot) = relocated_slot {
+            if relocated_slot >= parts.line_ptrs().len() {
+                return Err(format!("relocated slot {relocated_slot} out of bounds").into());
+            }
+            if relocated_slot != slot {
+                let mut relocated_lp = parts.line_ptrs().as_ref().get(relocated_slot);
+                relocated_lp.mark_free();
+                parts.line_ptrs().set(relocated_slot, relocated_lp);
             }
         }
 
@@ -3531,6 +3521,8 @@ impl Drop for LogicalRowMut<'_> {
                 old_tuple: before.bytes,
                 new_offset: ctx.tuple_offset,
                 new_tuple: after_bytes,
+                relocated: false,
+                relocated_slot: None,
             },
         };
 
@@ -3749,6 +3741,8 @@ impl<'a> HeapPageViewMut<'a> {
                     old_tuple: before_image.bytes,
                     new_offset: lp.offset() as usize,
                     new_tuple: bytes.to_vec(),
+                    relocated: false,
+                    relocated_slot: None,
                 };
                 if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
                     let current = self.page_lsn.get().unwrap_or(0);
@@ -3773,6 +3767,8 @@ impl<'a> HeapPageViewMut<'a> {
             old_tuple: before_image.bytes,
             new_offset: after_image.offset,
             new_tuple: bytes.to_vec(),
+            relocated: true,
+            relocated_slot: Some(new_slot),
         };
         if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             let current = self.page_lsn.get().unwrap_or(0);

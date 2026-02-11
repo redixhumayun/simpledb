@@ -487,7 +487,10 @@ impl Index for BTreeIndex {
 #[cfg(test)]
 mod btree_index_tests {
     use super::*;
-    use crate::{test_utils::generate_filename, Schema, SimpleDB};
+    use crate::{
+        test_utils::{generate_filename, generate_random_number},
+        Schema, SimpleDB, TestDir,
+    };
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
@@ -907,6 +910,77 @@ mod btree_index_tests {
             let meta = BTreeMetaPageView::new(guard).unwrap();
             assert_eq!(meta.first_free_block(), IndexFreeList::no_free_block());
         }
+    }
+
+    #[test]
+    fn recovery_undoes_uncommitted_btree_split_cascade() {
+        let dir = TestDir::new(format!(
+            "/tmp/recovery_test/split_cascade_{}",
+            generate_random_number()
+        ));
+        let layout = create_test_layout();
+        let index_name = generate_filename();
+
+        let (committed_root_block, committed_tree_height, index_file_name) = {
+            let db = SimpleDB::new(&dir, 8, true, 5000);
+
+            // Transaction 1: establish committed baseline.
+            let t1 = db.new_tx();
+            let mut idx = BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
+            for key in 0..120 {
+                idx.insert(&Constant::Int(key), &RID::new(1, key as usize));
+            }
+            let committed_root_block = idx.root_block.block_num as u32;
+            let committed_tree_height = idx.tree_height;
+            let index_file_name = idx.index_file_name.clone();
+            t1.commit().unwrap();
+
+            // Transaction 2: force many uncommitted splits/cascades.
+            let t2 = db.new_tx();
+            let mut idx2 = BTreeIndex::new(Arc::clone(&t2), &index_name, layout.clone()).unwrap();
+            let blocks_before = idx2.txn.size(&idx2.index_file_name);
+            for key in 1000..1600 {
+                idx2.insert(&Constant::Int(key), &RID::new(2, key as usize));
+            }
+            let blocks_after = idx2.txn.size(&idx2.index_file_name);
+            assert!(
+                blocks_after > blocks_before,
+                "expected uncommitted inserts to trigger split allocations"
+            );
+            // No commit: simulate crash.
+            (committed_root_block, committed_tree_height, index_file_name)
+        };
+
+        // Recover in fresh DB process view.
+        let db = SimpleDB::new(&dir, 8, false, 5000);
+        let recovery_tx = db.new_tx();
+        recovery_tx.recover().unwrap();
+
+        let verify_tx = db.new_tx();
+        let mut verify_index =
+            BTreeIndex::new(Arc::clone(&verify_tx), &index_name, layout.clone()).unwrap();
+
+        // Baseline committed keys must remain queryable.
+        for key in 0..120 {
+            verify_index.before_first(&Constant::Int(key));
+            assert!(verify_index.next(), "committed key {key} should remain");
+            assert_eq!(verify_index.get_data_rid(), RID::new(1, key as usize));
+        }
+
+        // Uncommitted keys must be absent after recovery undo.
+        for key in 1000..1600 {
+            verify_index.before_first(&Constant::Int(key));
+            assert!(
+                !verify_index.next(),
+                "uncommitted key {key} should be undone by recovery"
+            );
+        }
+
+        // Meta state should match committed baseline.
+        let guard = verify_tx.pin_read_guard(&BlockId::new(index_file_name, 0));
+        let meta = BTreeMetaPageView::new(guard).unwrap();
+        assert_eq!(meta.root_block(), committed_root_block);
+        assert_eq!(meta.tree_height(), committed_tree_height);
     }
 }
 
