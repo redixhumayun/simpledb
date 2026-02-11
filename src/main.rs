@@ -10330,8 +10330,9 @@ mod recovery_manager_tests {
     use std::sync::Arc;
 
     use crate::{
-        page::SlotId, test_utils::generate_filename, BlockId, Constant, Layout, Schema, SimpleDB,
-        Transaction,
+        page::SlotId,
+        test_utils::{generate_filename, generate_random_number},
+        BlockId, Constant, Layout, Schema, SimpleDB, TestDir, Transaction,
     };
 
     const INT_FIELD: &str = "int_val";
@@ -10570,6 +10571,113 @@ mod recovery_manager_tests {
 
         let check_txn = db.new_tx();
         assert_eq!(read_string_at(&check_txn, &block, &layout, slot), "delta");
+    }
+
+    #[test]
+    fn recovery_undoes_uncommitted_insert() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let block_id = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let init_txn = db.new_tx();
+            let block = init_txn.append(&filename);
+            format_heap(&init_txn, &block);
+            insert_row(&init_txn, &block, &layout, 0, "seed");
+            init_txn.commit().unwrap();
+
+            let txn = db.new_tx();
+            insert_row(&txn, &block, &layout, 10, "alpha");
+            block
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        txn.recover().unwrap();
+
+        let guard = txn.pin_read_guard(&block_id);
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert_eq!(view.live_slot_iter().count(), 1);
+    }
+
+    #[test]
+    fn recovery_keeps_committed_and_removes_uncommitted() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, committed_slot, uncommitted_slot) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let slot_a = insert_row(&txn1, &block, &layout, 1, "a");
+            txn1.commit().unwrap();
+
+            let txn2 = db.new_tx();
+            let slot_b = insert_row(&txn2, &block, &layout, 2, "b");
+            (block, slot_a, slot_b)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        txn.recover().unwrap();
+
+        let guard = txn.pin_read_guard(&block_id);
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert!(view.row(committed_slot).is_some());
+        assert!(view.row(uncommitted_slot).is_none());
+    }
+
+    #[test]
+    fn recovery_undoes_uncommitted_update() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, slot) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let slot = insert_row(&txn1, &block, &layout, 7, "orig");
+            txn1.commit().unwrap();
+
+            let txn2 = db.new_tx();
+            update_int_at(&txn2, &block, &layout, slot, 99);
+            (block, slot)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        txn.recover().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 7);
+    }
+
+    #[test]
+    fn recovery_undoes_uncommitted_delete() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, slot) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let slot = insert_row(&txn1, &block, &layout, 5, "keep");
+            txn1.commit().unwrap();
+
+            let txn2 = db.new_tx();
+            delete_slot(&txn2, &block, &layout, slot);
+            (block, slot)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        txn.recover().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 5);
     }
 }
 

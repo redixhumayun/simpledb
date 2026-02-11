@@ -2594,6 +2594,7 @@ impl<'a> PageWriteGuard<'a> {
 
         let mut header = HeapHeaderMut::new(&mut bytes[0..HeapPageMut::HEADER_SIZE]);
         header.init_heap();
+        self.mark_modified(self.txn_id(), Lsn::MAX);
     }
 
     /// Formats the page as an empty B-tree leaf page.
@@ -2603,6 +2604,7 @@ impl<'a> PageWriteGuard<'a> {
 
         let mut header = BTreeLeafHeaderMut::new(&mut bytes[0..BTreeLeafPageMut::HEADER_SIZE]);
         header.init_leaf(0, None, overflow_block.map(|b| b as u32));
+        self.mark_modified(self.txn_id(), Lsn::MAX);
     }
 
     /// Formats the page as an empty B-tree internal page.
@@ -2614,6 +2616,7 @@ impl<'a> PageWriteGuard<'a> {
         let mut header =
             BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageMut::HEADER_SIZE]);
         header.init_internal(level, rightmost_child.map(|c| c as u32));
+        self.mark_modified(self.txn_id(), Lsn::MAX);
     }
 
     /// Formats the page as a B-tree meta page (block 0 in single-file layout).
