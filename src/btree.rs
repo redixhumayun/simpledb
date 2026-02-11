@@ -285,6 +285,28 @@ impl BTreeIndex {
         view.update_crc32();
         Ok(())
     }
+
+    fn apply_root_update(
+        &mut self,
+        old_root_block: usize,
+        new_root_block: usize,
+        old_tree_height: u16,
+        new_tree_height: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        let record = LogRecord::BTreeRootUpdate {
+            txnum: self.txn.id(),
+            meta_block_id: self.meta_block.clone(),
+            old_root_block: old_root_block as u32,
+            new_root_block: new_root_block as u32,
+            old_tree_height,
+            new_tree_height,
+        };
+        let _ = record.write_log_record(&self.txn.log_manager());
+
+        self.root_block = BlockId::new(self.index_file_name.clone(), new_root_block);
+        self.tree_height = new_tree_height;
+        self.update_meta()
+    }
 }
 
 /// Range iterator that walks leaf pages via right-sibling links.
@@ -440,9 +462,18 @@ impl Index for BTreeIndex {
         }
         debug!("Insert in index caused a root split");
         let root_split = root_split.unwrap();
+        let old_root_block = self.root_block.block_num;
+        let old_tree_height = self.tree_height;
         root.make_new_root(root_split).unwrap();
-        self.tree_height = self.tree_height.saturating_add(1);
-        self.update_meta().unwrap();
+        let new_root_block = self.root_block.block_num;
+        let new_tree_height = old_tree_height.saturating_add(1);
+        self.apply_root_update(
+            old_root_block,
+            new_root_block,
+            old_tree_height,
+            new_tree_height,
+        )
+        .unwrap();
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {

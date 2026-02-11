@@ -10004,6 +10004,15 @@ enum LogRecord {
         old_left_overflow: Option<usize>,        // leaf-only
         old_left_rightmost_child: Option<usize>, // internal-only
     },
+    /// Root metadata transition emitted for root split/rewrite.
+    BTreeRootUpdate {
+        txnum: usize,
+        meta_block_id: BlockId,
+        old_root_block: u32,
+        new_root_block: u32,
+        old_tree_height: u16,
+        new_tree_height: u16,
+    },
 }
 
 impl Display for LogRecord {
@@ -10104,6 +10113,17 @@ impl Display for LogRecord {
             } => write!(
                 f,
                 "BTreePageSplit(txnum: {txnum}, left: {left_block_id:?}, right: {right_block_id:?}, is_leaf: {is_leaf})"
+            ),
+            LogRecord::BTreeRootUpdate {
+                txnum,
+                meta_block_id,
+                old_root_block,
+                new_root_block,
+                old_tree_height,
+                new_tree_height,
+            } => write!(
+                f,
+                "BTreeRootUpdate(txnum: {txnum}, meta: {meta_block_id:?}, old_root: {old_root_block}, new_root: {new_root_block}, old_height: {old_tree_height}, new_height: {new_tree_height})"
             ),
         }
     }
@@ -10310,6 +10330,22 @@ impl TryInto<Vec<u8>> for &LogRecord {
                     None => push_i32(&mut buf, 0),
                 }
             }
+            LogRecord::BTreeRootUpdate {
+                txnum,
+                meta_block_id,
+                old_root_block,
+                new_root_block,
+                old_tree_height,
+                new_tree_height,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &meta_block_id.filename);
+                push_i32(&mut buf, meta_block_id.block_num as i32);
+                push_i32(&mut buf, *old_root_block as i32);
+                push_i32(&mut buf, *new_root_block as i32);
+                push_i32(&mut buf, *old_tree_height as i32);
+                push_i32(&mut buf, *new_tree_height as i32);
+            }
         }
         Ok(buf)
     }
@@ -10514,6 +10550,17 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     old_left_rightmost_child,
                 })
             }
+            12 => Ok(LogRecord::BTreeRootUpdate {
+                txnum: read_usize(&value, &mut pos)?,
+                meta_block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                old_root_block: read_usize(&value, &mut pos)? as u32,
+                new_root_block: read_usize(&value, &mut pos)? as u32,
+                old_tree_height: read_usize(&value, &mut pos)? as u16,
+                new_tree_height: read_usize(&value, &mut pos)? as u16,
+            }),
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -10683,6 +10730,19 @@ impl LogRecord {
                         0
                     }
             }
+            LogRecord::BTreeRootUpdate {
+                meta_block_id, ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + meta_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // old_root_block
+                    + Self::INT_BYTES // new_root_block
+                    + Self::INT_BYTES // old_tree_height
+                    + Self::INT_BYTES // new_tree_height
+            }
         }
     }
 
@@ -10701,6 +10761,7 @@ impl LogRecord {
             LogRecord::BTreeInternalInsert { .. } => 9,
             LogRecord::BTreeInternalDelete { .. } => 10,
             LogRecord::BTreePageSplit { .. } => 11,
+            LogRecord::BTreeRootUpdate { .. } => 12,
         }
     }
 
@@ -10720,6 +10781,7 @@ impl LogRecord {
             LogRecord::BTreeInternalInsert { txnum, .. } => *txnum,
             LogRecord::BTreeInternalDelete { txnum, .. } => *txnum,
             LogRecord::BTreePageSplit { txnum, .. } => *txnum,
+            LogRecord::BTreeRootUpdate { txnum, .. } => *txnum,
         }
     }
 
@@ -10900,6 +10962,40 @@ impl LogRecord {
                 right_guard.mark_modified(txn.txn_id(), Lsn::MAX);
 
                 meta_view.set_first_free_block(right_block_id.block_num as u32);
+                meta_view.update_crc32();
+            }
+            LogRecord::BTreeRootUpdate { .. } => {
+                let LogRecord::BTreeRootUpdate {
+                    meta_block_id,
+                    old_root_block,
+                    new_root_block,
+                    old_tree_height,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                let meta_guard = txn.pin_write_guard(meta_block_id);
+                meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
+                    .expect("meta page required for root-update undo");
+                let old_free_head = meta_view.first_free_block();
+                meta_view.set_root_block(*old_root_block);
+                meta_view.set_tree_height(*old_tree_height);
+
+                // If root moved to a newly allocated page, deallocate it by pushing to free-list.
+                if old_root_block != new_root_block {
+                    let new_root = BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
+                    let mut new_root_guard = txn.pin_write_guard(&new_root);
+                    let bytes = new_root_guard.bytes_mut();
+                    bytes.fill(0);
+                    bytes[0] = crate::page::PageType::Free as u8;
+                    bytes[4..8].copy_from_slice(&old_free_head.to_le_bytes());
+                    new_root_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    meta_view.set_first_free_block(*new_root_block);
+                }
+
                 meta_view.update_crc32();
             }
         }
