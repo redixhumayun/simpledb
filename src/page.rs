@@ -32,8 +32,8 @@ use std::{
 };
 
 use crate::{
-    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, LogContext,
-    LogRecord, Lsn, SimpleDBResult, TransactionID, RID,
+    BlockId, BufferFrame, BufferHandle, Constant, FieldInfo, FieldType, Layout, LogRecord, Lsn,
+    SimpleDBResult, TransactionID, RID,
 };
 
 /// Discriminator for the type of data stored in a page.
@@ -181,6 +181,7 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(24))
     }
 
+    #[allow(dead_code)]
     pub fn lsn(&self) -> u64 {
         u64::from_le_bytes(self.range::<8>(26))
     }
@@ -1430,7 +1431,7 @@ pub trait PageKind: Sized {
 }
 
 /// Slot identifier within a page.
-type SlotId = usize;
+pub type SlotId = usize;
 
 #[derive(Debug)]
 pub struct PageBytes {
@@ -2535,7 +2536,7 @@ pub struct PageWriteGuard<'a> {
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
     page: RwLockWriteGuard<'a, PageBytes>,
-    log_ctx: LogContext,
+    log_manager: Arc<Mutex<LogManager>>,
 }
 
 impl<'a> PageWriteGuard<'a> {
@@ -2544,13 +2545,13 @@ impl<'a> PageWriteGuard<'a> {
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
         page: RwLockWriteGuard<'a, PageBytes>,
-        log_ctx: LogContext,
+        log_manager: Arc<Mutex<LogManager>>,
     ) -> Self {
         Self {
             handle,
             frame,
             page,
-            log_ctx,
+            log_manager,
         }
     }
 
@@ -2570,6 +2571,10 @@ impl<'a> PageWriteGuard<'a> {
     /// Returns the transaction ID.
     pub fn txn_id(&self) -> usize {
         self.handle.txn_id()
+    }
+
+    pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        Arc::clone(&self.log_manager)
     }
 
     /// Returns the buffer frame.
@@ -3290,7 +3295,6 @@ impl<'a> LogicalRow<'a> {
 }
 
 struct TupleSnapshot {
-    slot_id: SlotId,
     offset: usize,
     bytes: Vec<u8>,
 }
@@ -3312,7 +3316,6 @@ impl TupleSnapshot {
             })?
             .to_vec();
         Ok(TupleSnapshot {
-            slot_id,
             offset: offset.into(),
             bytes,
         })
@@ -3544,12 +3547,6 @@ impl<'a> HeapPageViewMut<'a> {
         HeapPageMut::new(self.guard.bytes_mut()).unwrap()
     }
 
-    /// Returns the current [`TupleRef`] at `slot`, including redirect/dead markers.
-    fn tuple_ref(&self, slot: SlotId) -> Option<TupleRef<'_>> {
-        let view = self.build_page();
-        view.tuple_ref(slot)
-    }
-
     /// Returns a logical row for the slot if it is live; otherwise `None`.
     pub fn row(&self, slot: SlotId) -> Option<LogicalRow<'_>> {
         let view = self.build_page();
@@ -3566,7 +3563,7 @@ impl<'a> HeapPageViewMut<'a> {
         let layout_clone = self.layout.clone();
         let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
         let row_log_context = RowLogContext::new(
-            Arc::clone(&self.guard.log_ctx.log_manager),
+            Arc::clone(&self.guard.log_manager),
             self.guard.block_id().clone(),
             self.guard.txn_id() as TransactionID,
             slot,
@@ -3626,7 +3623,7 @@ impl<'a> HeapPageViewMut<'a> {
             offset: before_image.offset,
             old_tuple: before_image.bytes,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             let current = self.page_lsn.get().unwrap_or(0);
             if lsn > current {
                 self.page_lsn.set(Some(lsn));
@@ -3676,7 +3673,7 @@ impl<'a> HeapPageViewMut<'a> {
                     new_offset: lp.offset() as usize,
                     new_tuple: bytes.to_vec(),
                 };
-                if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+                if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
                     let current = self.page_lsn.get().unwrap_or(0);
                     if lsn > current {
                         self.page_lsn.set(Some(lsn));
@@ -3700,7 +3697,7 @@ impl<'a> HeapPageViewMut<'a> {
             new_offset: after_image.offset,
             new_tuple: bytes.to_vec(),
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_ctx.log_manager) {
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             let current = self.page_lsn.get().unwrap_or(0);
             if lsn > current {
                 self.page_lsn.set(Some(lsn));
@@ -3715,12 +3712,6 @@ impl<'a> HeapPageViewMut<'a> {
         let mut split_guard = page.split()?;
         split_guard.redirect_slot(slot, target)?;
         self.dirty.set(true);
-        Ok(())
-    }
-
-    /// Serializes the page into the provided buffer.
-    fn write_bytes(&self, out: &mut [u8]) -> SimpleDBResult<()> {
-        out.copy_from_slice(self.guard.bytes());
         Ok(())
     }
 
@@ -3741,7 +3732,7 @@ impl<'a> HeapPageViewMut<'a> {
         let dirty = Rc::clone(&self.dirty);
         let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
         let row_log_context = RowLogContext::new(
-            Arc::clone(&self.guard.log_ctx.log_manager),
+            Arc::clone(&self.guard.log_manager),
             self.guard.block_id().clone(),
             self.guard.txn_id() as TransactionID,
             slot,

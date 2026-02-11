@@ -8780,8 +8780,8 @@ impl Transaction {
         let raw = Arc::into_raw(frame_clone);
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        let log_ctx = LogContext::new(Arc::clone(&self.log_manager), block_id, self.tx_id);
-        PageWriteGuard::new(handle, frame_for_guard, page, log_ctx)
+        let log_manager = Arc::clone(&self.log_manager);
+        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -8840,7 +8840,7 @@ mod transaction_tests {
     use crate::{
         page::{PageReadGuard, PageWriteGuard},
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, BufferHandle, Constant, Layout, LogRecord, Schema, SimpleDB, Transaction,
+        BlockId, BufferHandle, Constant, Layout, Schema, SimpleDB, Transaction,
     };
 
     const TXN_INT_FIELD: &str = "txn_int";
@@ -8858,22 +8858,28 @@ mod transaction_tests {
     struct TxnRowSnapshot {
         int_val: i32,
         str_val: String,
-        int_offset: usize,
-        str_offset: usize,
     }
 
-    fn overwrite_txn_row(
-        mut guard: PageWriteGuard<'_>,
-        layout: &Layout,
-        int_val: i32,
-        str_val: &str,
-    ) {
+    fn init_txn_row(mut guard: PageWriteGuard<'_>, layout: &Layout, int_val: i32, str_val: &str) {
         guard.format_as_heap();
         let mut view = guard
             .into_heap_view_mut(layout)
             .expect("heap page view mut");
         let (slot, mut row_mut) = view.insert_row_mut().expect("allocate txn row");
         assert_eq!(slot, TXN_SLOT);
+        row_mut
+            .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
+            .expect("set txn int");
+        row_mut
+            .set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
+            .expect("set txn string");
+    }
+
+    fn update_txn_row(guard: PageWriteGuard<'_>, layout: &Layout, int_val: i32, str_val: &str) {
+        let mut view = guard
+            .into_heap_view_mut(layout)
+            .expect("heap page view mut");
+        let mut row_mut = view.row_mut(TXN_SLOT).expect("txn row exists").unwrap();
         row_mut
             .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
             .expect("set txn int");
@@ -8893,13 +8899,9 @@ mod transaction_tests {
             Constant::String(s) => s,
             _ => return None,
         };
-        let int_offset = view.column_page_offset(TXN_SLOT, TXN_INT_FIELD)?;
-        let str_offset = view.column_page_offset(TXN_SLOT, TXN_STR_FIELD)?;
         Some(TxnRowSnapshot {
             int_val,
             str_val,
-            int_offset,
-            str_offset,
         })
     }
 
@@ -8919,7 +8921,7 @@ mod transaction_tests {
         let block_id = t1.append(&file);
         {
             let guard = t1.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, &layout, 1, "one");
+            init_txn_row(guard, &layout, 1, "one");
         }
         t1.commit().unwrap();
 
@@ -8933,7 +8935,7 @@ mod transaction_tests {
         }
         {
             let guard = t2.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, &layout, 2, "two");
+            update_txn_row(guard, &layout, 2, "two");
         }
         t2.commit().unwrap();
 
@@ -8943,25 +8945,9 @@ mod transaction_tests {
         let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
         assert_eq!(snapshot.int_val, 2);
         assert_eq!(snapshot.str_val, "two");
-        LogRecord::SetInt {
-            txnum: t3.id(),
-            block_id: block_id.clone(),
-            offset: snapshot.int_offset,
-            old_val: snapshot.int_val,
-        }
-        .write_log_record(&test_db.log_manager)
-        .unwrap();
-        LogRecord::SetString {
-            txnum: t3.id(),
-            block_id: block_id.clone(),
-            offset: snapshot.str_offset,
-            old_val: snapshot.str_val.clone(),
-        }
-        .write_log_record(&test_db.log_manager)
-        .unwrap();
         {
             let guard = t3.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, &layout, 3, "three");
+            update_txn_row(guard, &layout, 3, "three");
         }
         t3.rollback().unwrap();
 
@@ -8991,7 +8977,7 @@ mod transaction_tests {
         {
             let init_txn = test_db.new_tx();
             let guard = init_txn.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, layout.as_ref(), 0, "");
+            init_txn_row(guard, layout.as_ref(), 0, "");
             init_txn.commit().unwrap();
         }
 
@@ -9021,7 +9007,7 @@ mod transaction_tests {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
                 let guard = txn.pin_write_guard(&bid2);
-                overwrite_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
+                update_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
             //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
             //  The related GitHub issue is https://github.com/redixhumayun/simpledb/issues/63
@@ -9062,7 +9048,7 @@ mod transaction_tests {
         ));
         {
             let guard = init_txn.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, layout.as_ref(), 0, "initial");
+            init_txn_row(guard, layout.as_ref(), 0, "initial");
         }
         init_txn.commit().unwrap();
 
@@ -9102,7 +9088,7 @@ mod transaction_tests {
         ));
         {
             let guard = txn.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, layout.as_ref(), 42, "final");
+            update_txn_row(guard, layout.as_ref(), 42, "final");
         }
         txn.commit().unwrap();
 
@@ -9144,7 +9130,7 @@ mod transaction_tests {
         ));
         {
             let guard = t1.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, &layout, 100, "initial");
+            init_txn_row(guard, &layout, 100, "initial");
         }
         t1.commit().unwrap();
 
@@ -9155,26 +9141,9 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
-        LogRecord::SetInt {
-            txnum: t2.id(),
-            block_id: block_id.clone(),
-            offset: snapshot.int_offset,
-            old_val: snapshot.int_val,
-        }
-        .write_log_record(&test_db.log_manager)
-        .unwrap();
-        LogRecord::SetString {
-            txnum: t2.id(),
-            block_id: block_id.clone(),
-            offset: snapshot.str_offset,
-            old_val: snapshot.str_val.clone(),
-        }
-        .write_log_record(&test_db.log_manager)
-        .unwrap();
         {
             let guard = t2.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, &layout, 200, "modified");
+            update_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
         t2.rollback().unwrap();
@@ -9224,7 +9193,7 @@ mod transaction_tests {
         ));
         {
             let guard = t1.pin_write_guard(&block_id);
-            overwrite_txn_row(guard, layout.as_ref(), 0, "");
+            init_txn_row(guard, layout.as_ref(), 0, "");
         }
         t1.commit().unwrap();
 
@@ -9265,7 +9234,7 @@ mod transaction_tests {
 
                         {
                             let guard = txn.pin_write_guard(&bid);
-                            overwrite_txn_row(guard, layout_clone.as_ref(), val + 1, "");
+                            update_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
                         txn.commit()?;
                         tx.send(format!(
@@ -9359,7 +9328,7 @@ mod transaction_tests {
             let block_id = t1.append(&file);
             {
                 let guard = t1.pin_write_guard(&block_id);
-                overwrite_txn_row(guard, &layout, 100, "");
+                init_txn_row(guard, &layout, 100, "");
             }
             t1.commit().unwrap();
             block_id
@@ -9943,21 +9912,6 @@ impl RecoveryManager {
     }
 }
 
-pub struct LogContext {
-    log_manager: Arc<Mutex<LogManager>>,
-    block_id: BlockId,
-    txn_id: TransactionID,
-}
-
-impl LogContext {
-    fn new(log_manager: Arc<Mutex<LogManager>>, block_id: &BlockId, txn_id: TransactionID) -> Self {
-        Self {
-            log_manager,
-            block_id: block_id.clone(),
-            txn_id,
-        }
-    }
-}
 
 /// The container for all the different types of log records that are written to the WAL
 #[derive(Clone)]
@@ -9966,18 +9920,6 @@ enum LogRecord {
     Commit(usize),
     Rollback(usize),
     Checkpoint,
-    SetInt {
-        txnum: usize,
-        block_id: BlockId,
-        offset: usize,
-        old_val: i32,
-    },
-    SetString {
-        txnum: usize,
-        block_id: BlockId,
-        offset: usize,
-        old_val: String,
-    },
     /// Physical tuple-level insert: logs full tuple bytes for undo
     HeapTupleInsert {
         txnum: usize,
@@ -10013,24 +9955,6 @@ impl Display for LogRecord {
             LogRecord::Commit(txnum) => write!(f, "Commit({txnum})"),
             LogRecord::Rollback(txnum) => write!(f, "Rollback({txnum})"),
             LogRecord::Checkpoint => write!(f, "Checkpoint"),
-            LogRecord::SetInt {
-                txnum,
-                block_id,
-                offset,
-                old_val,
-            } => write!(
-                f,
-                "SetInt(txnum: {txnum}, block_id: {block_id:?}, offset: {offset}, old_val: {old_val})"
-            ),
-            LogRecord::SetString {
-                txnum,
-                block_id,
-                offset,
-                old_val,
-            } => write!(
-                f,
-                "SetString(txnum: {txnum}, block_id: {block_id:?}, offset: {offset}, old_val: {old_val})"
-            ),
             LogRecord::HeapTupleInsert {
                 txnum,
                 block_id,
@@ -10096,30 +10020,6 @@ impl TryInto<Vec<u8>> for &LogRecord {
             LogRecord::Commit(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Rollback(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Checkpoint => {}
-            LogRecord::SetInt {
-                txnum,
-                block_id,
-                offset,
-                old_val,
-            } => {
-                push_i32(&mut buf, *txnum as i32);
-                push_string(&mut buf, &block_id.filename);
-                push_i32(&mut buf, block_id.block_num as i32);
-                push_i32(&mut buf, *offset as i32);
-                push_i32(&mut buf, *old_val);
-            }
-            LogRecord::SetString {
-                txnum,
-                block_id,
-                offset,
-                old_val,
-            } => {
-                push_i32(&mut buf, *txnum as i32);
-                push_string(&mut buf, &block_id.filename);
-                push_i32(&mut buf, block_id.block_num as i32);
-                push_i32(&mut buf, *offset as i32);
-                push_string(&mut buf, old_val);
-            }
             LogRecord::HeapTupleInsert {
                 txnum,
                 block_id,
@@ -10221,25 +10121,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
             1 => Ok(LogRecord::Commit(read_usize(&value, &mut pos)?)),
             2 => Ok(LogRecord::Rollback(read_usize(&value, &mut pos)?)),
             3 => Ok(LogRecord::Checkpoint),
-            4 => Ok(LogRecord::SetInt {
-                txnum: read_usize(&value, &mut pos)?,
-                block_id: BlockId::new(
-                    read_string(&value, &mut pos)?,
-                    read_usize(&value, &mut pos)?,
-                ),
-                offset: read_usize(&value, &mut pos)?,
-                old_val: read_i32(&value, &mut pos)?,
-            }),
-            5 => Ok(LogRecord::SetString {
-                txnum: read_usize(&value, &mut pos)?,
-                block_id: BlockId::new(
-                    read_string(&value, &mut pos)?,
-                    read_usize(&value, &mut pos)?,
-                ),
-                offset: read_usize(&value, &mut pos)?,
-                old_val: read_string(&value, &mut pos)?,
-            }),
-            6 => Ok(LogRecord::HeapTupleInsert {
+            4 => Ok(LogRecord::HeapTupleInsert {
                 txnum: read_usize(&value, &mut pos)?,
                 block_id: BlockId::new(
                     read_string(&value, &mut pos)?,
@@ -10249,7 +10131,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 offset: read_usize(&value, &mut pos)?,
                 tuple: read_bytes(&value, &mut pos)?,
             }),
-            7 => Ok(LogRecord::HeapTupleUpdate {
+            5 => Ok(LogRecord::HeapTupleUpdate {
                 txnum: read_usize(&value, &mut pos)?,
                 block_id: BlockId::new(
                     read_string(&value, &mut pos)?,
@@ -10261,7 +10143,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 new_offset: read_usize(&value, &mut pos)?,
                 new_tuple: read_bytes(&value, &mut pos)?,
             }),
-            8 => Ok(LogRecord::HeapTupleDelete {
+            6 => Ok(LogRecord::HeapTupleDelete {
                 txnum: read_usize(&value, &mut pos)?,
                 block_id: BlockId::new(
                     read_string(&value, &mut pos)?,
@@ -10294,27 +10176,6 @@ impl LogRecord {
                 base_size + Self::TXNUM_SIZE
             }
             LogRecord::Checkpoint => base_size,
-            LogRecord::SetInt { block_id, .. } => {
-                base_size
-                    + Self::TXNUM_SIZE
-                    + Self::STR_LEN_SIZE
-                    + block_id.filename.len()
-                    + Self::BLOCK_NUM_SIZE
-                    + Self::OFFSET_SIZE
-                    + Self::TXNUM_SIZE // NOTE: old_val size (be careful of this changing)
-            }
-            LogRecord::SetString {
-                block_id, old_val, ..
-            } => {
-                base_size
-                    + Self::TXNUM_SIZE
-                    + Self::STR_LEN_SIZE
-                    + block_id.filename.len()
-                    + Self::BLOCK_NUM_SIZE
-                    + Self::OFFSET_SIZE
-                    + Self::STR_LEN_SIZE
-                    + old_val.len()
-            }
             LogRecord::HeapTupleInsert {
                 block_id, tuple, ..
             } => {
@@ -10372,11 +10233,9 @@ impl LogRecord {
             LogRecord::Commit(_) => 1,
             LogRecord::Rollback(_) => 2,
             LogRecord::Checkpoint => 3,
-            LogRecord::SetInt { .. } => 4,
-            LogRecord::SetString { .. } => 5,
-            LogRecord::HeapTupleInsert { .. } => 6,
-            LogRecord::HeapTupleUpdate { .. } => 7,
-            LogRecord::HeapTupleDelete { .. } => 8,
+            LogRecord::HeapTupleInsert { .. } => 4,
+            LogRecord::HeapTupleUpdate { .. } => 5,
+            LogRecord::HeapTupleDelete { .. } => 6,
         }
     }
 
@@ -10388,8 +10247,6 @@ impl LogRecord {
             LogRecord::Commit(txnum) => *txnum,
             LogRecord::Checkpoint => usize::MAX, //  dummy value
             LogRecord::Rollback(txnum) => *txnum,
-            LogRecord::SetInt { txnum, .. } => *txnum,
-            LogRecord::SetString { txnum, .. } => *txnum,
             LogRecord::HeapTupleInsert { txnum, .. } => *txnum,
             LogRecord::HeapTupleUpdate { txnum, .. } => *txnum,
             LogRecord::HeapTupleDelete { txnum, .. } => *txnum,
@@ -10404,26 +10261,6 @@ impl LogRecord {
             LogRecord::Commit(_) => (),   //  no-op
             LogRecord::Rollback(_) => (), //  no-op
             LogRecord::Checkpoint => (),  //  no-op
-            LogRecord::SetInt {
-                block_id,
-                offset,
-                old_val,
-                ..
-            } => {
-                let mut guard = txn.pin_write_guard(block_id);
-                Self::write_legacy_int(&mut guard, *offset, *old_val);
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
-            }
-            LogRecord::SetString {
-                block_id,
-                offset,
-                old_val,
-                ..
-            } => {
-                let mut guard = txn.pin_write_guard(block_id);
-                Self::write_legacy_string(&mut guard, *offset, old_val);
-                guard.mark_modified(txn.txn_id(), Lsn::MAX);
-            }
             LogRecord::HeapTupleInsert { .. } => {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
                     return;
@@ -10475,23 +10312,6 @@ impl LogRecord {
         }
     }
 
-    fn write_legacy_int(guard: &mut PageWriteGuard<'_>, offset: usize, value: i32) {
-        let bytes = guard.bytes_mut();
-        let end = offset + Self::INT_BYTES;
-        bytes[offset..end].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn write_legacy_string(guard: &mut PageWriteGuard<'_>, offset: usize, value: &str) {
-        let bytes = guard.bytes_mut();
-        let len = value.len() as u32;
-        let len_bytes = len.to_le_bytes();
-        let len_end = offset + Self::INT_BYTES;
-        bytes[offset..len_end].copy_from_slice(&len_bytes);
-        let start = len_end;
-        let end = start + value.len();
-        bytes[start..end].copy_from_slice(value.as_bytes());
-    }
-
     /// Serialize the log record to bytes and write it to the log file
     fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
         let bytes: Vec<u8> = self.try_into()?;
@@ -10510,7 +10330,8 @@ mod recovery_manager_tests {
     use std::sync::Arc;
 
     use crate::{
-        BlockId, Constant, Layout, LogRecord, RecoveryManager, Schema, SimpleDB, Transaction,
+        page::SlotId, test_utils::generate_filename, BlockId, Constant, Layout, Schema, SimpleDB,
+        Transaction,
     };
 
     const INT_FIELD: &str = "int_val";
@@ -10523,72 +10344,85 @@ mod recovery_manager_tests {
         Layout::new(schema)
     }
 
-    fn init_row_with_int(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+    fn format_heap(txn: &Arc<Transaction>, block: &BlockId) {
         let mut guard = txn.pin_write_guard(block);
         guard.format_as_heap();
-        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
-        assert_eq!(slot, 0);
-        row_mut
-            .set_column(INT_FIELD, &Constant::Int(value))
-            .expect("set int value");
     }
 
-    fn init_row_with_string(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
-        let mut guard = txn.pin_write_guard(block);
-        guard.format_as_heap();
-        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
-        assert_eq!(slot, 0);
-        row_mut
-            .set_column(STR_FIELD, &Constant::String(value.to_string()))
-            .expect("set string value");
-    }
-
-    fn column_offset(
+    fn insert_row(
         txn: &Arc<Transaction>,
         block: &BlockId,
         layout: &Layout,
-        field: &str,
-    ) -> usize {
-        let guard = txn.pin_read_guard(block);
-        let view = guard.into_heap_view(layout).expect("heap view");
-        view.column_page_offset(0, field)
-            .expect("column offset available")
-    }
-
-    fn write_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: i32) {
+        int_value: i32,
+        text_value: &str,
+    ) -> SlotId {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(0).expect("row 0 exists").unwrap();
+        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
+        row_mut
+            .set_column(INT_FIELD, &Constant::Int(int_value))
+            .expect("set int value");
+        row_mut
+            .set_column(STR_FIELD, &Constant::String(text_value.to_string()))
+            .expect("set string value");
+        slot
+    }
+
+    fn update_int_at(
+        txn: &Arc<Transaction>,
+        block: &BlockId,
+        layout: &Layout,
+        slot: SlotId,
+        value: i32,
+    ) {
+        let guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        let mut row_mut = view.row_mut(slot).expect("row exists").unwrap();
         row_mut
             .set_column(INT_FIELD, &Constant::Int(value))
-            .expect("write int field");
+            .expect("update int value");
     }
 
-    fn write_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, value: &str) {
+    fn update_string_at(
+        txn: &Arc<Transaction>,
+        block: &BlockId,
+        layout: &Layout,
+        slot: SlotId,
+        value: &str,
+    ) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(0).expect("row 0 exists").unwrap();
+        let mut row_mut = view.row_mut(slot).expect("row exists").unwrap();
         row_mut
             .set_column(STR_FIELD, &Constant::String(value.to_string()))
-            .expect("write string field");
+            .expect("update string value");
     }
 
-    fn read_int_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> i32 {
+    fn delete_slot(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) {
+        let guard = txn.pin_write_guard(block);
+        let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
+        view.delete_slot(slot).expect("delete slot");
+    }
+
+    fn read_int_at(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) -> i32 {
         let guard = txn.pin_read_guard(block);
         let view = guard.into_heap_view(layout).expect("heap view");
-        let row = view.row(0).expect("row 0 exists");
+        let row = view.row(slot).expect("row exists");
         match row.get_column(INT_FIELD) {
             Some(Constant::Int(value)) => value,
             other => panic!("expected int value, got {other:?}"),
         }
     }
 
-    fn read_string_field(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout) -> String {
+    fn read_string_at(
+        txn: &Arc<Transaction>,
+        block: &BlockId,
+        layout: &Layout,
+        slot: SlotId,
+    ) -> String {
         let guard = txn.pin_read_guard(block);
         let view = guard.into_heap_view(layout).expect("heap view");
-        let row = view.row(0).expect("row 0 exists");
+        let row = view.row(slot).expect("row exists");
         match row.get_column(STR_FIELD) {
             Some(Constant::String(value)) => value,
             other => panic!("expected string value, got {other:?}"),
@@ -10598,69 +10432,144 @@ mod recovery_manager_tests {
     #[test]
     fn rollback_restores_int_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
-        let txn = db.new_tx();
         let layout = recovery_layout();
 
-        let filename = "recovery_int_test".to_string();
-        let block = txn.append(&filename);
+        let filename = generate_filename();
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
         let original = 1234;
-        init_row_with_int(&txn, &block, &layout, original);
-        let offset = column_offset(&txn, &block, &layout, INT_FIELD);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, original, "orig");
+        txn1.commit().unwrap();
 
-        let recovery_manager = RecoveryManager::new(
-            txn.id(),
-            Arc::clone(&db.log_manager),
-            Arc::clone(&db.buffer_manager),
-        );
+        let txn2 = db.new_tx();
+        update_int_at(&txn2, &block, &layout, slot, 9999);
+        txn2.rollback().unwrap();
 
-        LogRecord::SetInt {
-            txnum: txn.id(),
-            block_id: block.clone(),
-            offset,
-            old_val: original,
-        }
-        .write_log_record(&db.log_manager)
-        .unwrap();
-
-        write_int_field(&txn, &block, &layout, 9999);
-
-        recovery_manager.rollback(&txn).unwrap();
-
-        assert_eq!(read_int_field(&txn, &block, &layout), original);
+        let txn3 = db.new_tx();
+        assert_eq!(read_int_at(&txn3, &block, &layout, slot), original);
     }
 
     #[test]
     fn rollback_restores_string_value() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
-        let txn = db.new_tx();
         let layout = recovery_layout();
 
-        let filename = "recovery_string_test".to_string();
-        let block = txn.append(&filename);
+        let filename = generate_filename();
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
         let original = "hello recovery".to_string();
-        init_row_with_string(&txn, &block, &layout, &original);
-        let offset = column_offset(&txn, &block, &layout, STR_FIELD);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, 42, &original);
+        txn1.commit().unwrap();
 
-        let recovery_manager = RecoveryManager::new(
-            txn.id(),
-            Arc::clone(&db.log_manager),
-            Arc::clone(&db.buffer_manager),
-        );
+        let txn2 = db.new_tx();
+        update_string_at(&txn2, &block, &layout, slot, "corrupted value");
+        txn2.rollback().unwrap();
 
-        LogRecord::SetString {
-            txnum: txn.id(),
-            block_id: block.clone(),
-            offset,
-            old_val: original.clone(),
-        }
-        .write_log_record(&db.log_manager)
-        .unwrap();
+        let txn3 = db.new_tx();
+        assert_eq!(read_string_at(&txn3, &block, &layout, slot), original);
+    }
 
-        write_string_field(&txn, &block, &layout, "corrupted value");
+    #[test]
+    fn rollback_insert_frees_slot() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let txn = db.new_tx();
+        let block = txn.append(&filename);
+        format_heap(&txn, &block);
 
-        recovery_manager.rollback(&txn).unwrap();
+        insert_row(&txn, &block, &layout, 10, "alpha");
 
-        assert_eq!(read_string_field(&txn, &block, &layout), original);
+        txn.rollback().unwrap();
+
+        let check_txn = db.new_tx();
+        let guard = check_txn.pin_read_guard(&block);
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert!(view.row(0).is_none(), "slot 0 should not be live");
+        assert_eq!(view.live_slot_iter().count(), 0);
+    }
+
+    #[test]
+    fn rollback_update_restores_value() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, 11, "beta");
+        txn1.commit().unwrap();
+
+        let txn2 = db.new_tx();
+        update_int_at(&txn2, &block, &layout, slot, 99);
+        txn2.rollback().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_int_at(&check_txn, &block, &layout, slot), 11);
+    }
+
+    #[test]
+    fn rollback_delete_restores_tuple() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, 22, "gamma");
+        txn1.commit().unwrap();
+
+        let txn2 = db.new_tx();
+        delete_slot(&txn2, &block, &layout, slot);
+        txn2.rollback().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_int_at(&check_txn, &block, &layout, slot), 22);
+    }
+
+    #[test]
+    fn rollback_multiple_operations_in_one_transaction() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let txn = db.new_tx();
+        let block = txn.append(&filename);
+        format_heap(&txn, &block);
+        let slot1 = insert_row(&txn, &block, &layout, 1, "one");
+        let slot2 = insert_row(&txn, &block, &layout, 2, "two");
+        update_int_at(&txn, &block, &layout, slot1, 10);
+        delete_slot(&txn, &block, &layout, slot2);
+        txn.rollback().unwrap();
+
+        let check_txn = db.new_tx();
+        let guard = check_txn.pin_read_guard(&block);
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert_eq!(view.live_slot_iter().count(), 0);
+    }
+
+    #[test]
+    fn rollback_update_with_string_field() {
+        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let txn1 = db.new_tx();
+        let block = txn1.append(&filename);
+        format_heap(&txn1, &block);
+        let slot = insert_row(&txn1, &block, &layout, 33, "delta");
+        txn1.commit().unwrap();
+
+        let txn2 = db.new_tx();
+        update_string_at(&txn2, &block, &layout, slot, "epsilon");
+        txn2.rollback().unwrap();
+
+        let check_txn = db.new_tx();
+        assert_eq!(read_string_at(&check_txn, &block, &layout, slot), "delta");
     }
 }
 
@@ -11030,7 +10939,6 @@ impl LogManager {
             last_saved_lsn: 0,
         }
     }
-
     /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
     pub fn flush_lsn(&mut self, lsn: Lsn) {
         if self.last_saved_lsn >= lsn {
