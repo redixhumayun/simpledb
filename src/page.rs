@@ -1492,7 +1492,6 @@ impl<'a> BTreeMetaHeaderRef<'a> {
         u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
     }
 
-    #[cfg(test)]
     pub fn first_free_block(&self) -> u32 {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
@@ -1634,6 +1633,10 @@ impl<'a> BTreeMetaPageMut<'a> {
         self.header.write(2, h.to_le_bytes());
     }
 
+    pub fn set_first_free_block(&mut self, first_free: u32) {
+        self.header.write(8, first_free.to_le_bytes());
+    }
+
     pub fn update_crc32(&mut self) {
         self.header.update_crc32(self.body_bytes);
     }
@@ -1703,6 +1706,14 @@ impl<'a> BTreeMetaPageViewMut<'a> {
 
     pub fn set_tree_height(&mut self, h: u16) {
         self.page_mut().set_tree_height(h);
+    }
+
+    pub fn first_free_block(&mut self) -> u32 {
+        self.page_mut().header.as_ref().first_free_block()
+    }
+
+    pub fn set_first_free_block(&mut self, first_free: u32) {
+        self.page_mut().set_first_free_block(first_free);
     }
 
     pub fn update_crc32(&mut self) {

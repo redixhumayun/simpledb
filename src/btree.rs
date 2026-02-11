@@ -6,9 +6,9 @@ use crate::{
     debug,
     page::{
         BTreeInternalEntry, BTreeInternalPageView, BTreeInternalPageViewMut, BTreeMetaPageView,
-        BTreeMetaPageViewMut,
+        BTreeMetaPageViewMut, PageType,
     },
-    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, Transaction, RID,
+    BlockId, Constant, Index, IndexInfo, Layout, Lsn, Schema, SimpleDBResult, Transaction, RID,
 };
 
 /// Separator promoted from a child split.
@@ -18,6 +18,103 @@ struct SplitResult {
     left_block: usize,
     right_block: usize,
 }
+
+mod free_list {
+    use super::*;
+
+    pub(crate) struct IndexFreeList;
+
+    impl IndexFreeList {
+        const NO_FREE_BLOCK: u32 = u32::MAX;
+        const FREE_NEXT_OFFSET: usize = 4;
+
+        #[cfg(test)]
+        pub(crate) fn no_free_block() -> u32 {
+            Self::NO_FREE_BLOCK
+        }
+
+        fn meta_block_id(file_name: &str) -> BlockId {
+            BlockId::new(file_name.to_string(), 0)
+        }
+
+        fn read_next_free_block(bytes: &[u8]) -> SimpleDBResult<u32> {
+            if bytes.len() < Self::FREE_NEXT_OFFSET + 4 {
+                return Err("page too small for free-list header".into());
+            }
+            if PageType::try_from(bytes[0])? != PageType::Free {
+                return Err("expected free page while popping free list".into());
+            }
+            Ok(u32::from_le_bytes(
+                bytes[Self::FREE_NEXT_OFFSET..Self::FREE_NEXT_OFFSET + 4]
+                    .try_into()
+                    .expect("free next pointer slice is exactly 4 bytes"),
+            ))
+        }
+
+        #[cfg(test)]
+        fn mark_page_free(guard: &mut crate::page::PageWriteGuard<'_>, next_free: u32) {
+            let bytes = guard.bytes_mut();
+            bytes.fill(0);
+            bytes[0] = PageType::Free as u8;
+            bytes[Self::FREE_NEXT_OFFSET..Self::FREE_NEXT_OFFSET + 4]
+                .copy_from_slice(&next_free.to_le_bytes());
+            guard.mark_modified(guard.txn_id(), Lsn::MAX);
+        }
+
+        pub(crate) fn allocate(txn: &Arc<Transaction>, file_name: &str) -> SimpleDBResult<BlockId> {
+            let meta_block = Self::meta_block_id(file_name);
+            let tx_id = txn.id();
+
+            let meta_guard = txn.pin_write_guard(&meta_block);
+            meta_guard.mark_modified(tx_id, Lsn::MAX);
+            let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
+            let free_head = meta_view.first_free_block();
+            if free_head == Self::NO_FREE_BLOCK {
+                meta_view.update_crc32();
+                drop(meta_view);
+                return Ok(txn.append(file_name));
+            }
+
+            let free_block = BlockId::new(file_name.to_string(), free_head as usize);
+            let next_free = {
+                let free_guard = txn.pin_write_guard(&free_block);
+                Self::read_next_free_block(free_guard.bytes())?
+            };
+            meta_view.set_first_free_block(next_free);
+            meta_view.update_crc32();
+            Ok(free_block)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn deallocate(
+            txn: &Arc<Transaction>,
+            file_name: &str,
+            block_num: usize,
+        ) -> SimpleDBResult<()> {
+            if block_num == 0 {
+                return Err("cannot deallocate meta block".into());
+            }
+
+            let meta_block = Self::meta_block_id(file_name);
+            let tx_id = txn.id();
+
+            let meta_guard = txn.pin_write_guard(&meta_block);
+            meta_guard.mark_modified(tx_id, Lsn::MAX);
+            let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
+            let old_head = meta_view.first_free_block();
+
+            let target_block = BlockId::new(file_name.to_string(), block_num);
+            let mut target_guard = txn.pin_write_guard(&target_block);
+            Self::mark_page_free(&mut target_guard, old_head);
+
+            meta_view.set_first_free_block(block_num as u32);
+            meta_view.update_crc32();
+            Ok(())
+        }
+    }
+}
+
+use free_list::IndexFreeList;
 
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
@@ -689,6 +786,32 @@ mod btree_index_tests {
             assert!(l2.slot_count() > 0);
         }
     }
+
+    #[test]
+    fn test_free_list_push_pop_behavior() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let index = setup_index(&db);
+
+        // Append a spare block, then push it onto the free list.
+        let spare = index.txn.append(&index.index_file_name);
+        IndexFreeList::deallocate(&index.txn, &index.index_file_name, spare.block_num).unwrap();
+
+        {
+            let guard = index.txn.pin_read_guard(&index.meta_block);
+            let meta = BTreeMetaPageView::new(guard).unwrap();
+            assert_eq!(meta.first_free_block(), spare.block_num as u32);
+        }
+
+        // Pop from free list; allocator should return the same block.
+        let reused = IndexFreeList::allocate(&index.txn, &index.index_file_name).unwrap();
+        assert_eq!(reused.block_num, spare.block_num);
+
+        {
+            let guard = index.txn.pin_read_guard(&index.meta_block);
+            let meta = BTreeMetaPageView::new(guard).unwrap();
+            assert_eq!(meta.first_free_block(), IndexFreeList::no_free_block());
+        }
+    }
 }
 
 /// The general format of the BTreePage
@@ -734,7 +857,7 @@ impl BTreeInternal {
         let orig_guard = self.txn.pin_write_guard(&self.block_id);
         let mut orig_view = BTreeInternalPageViewMut::new(orig_guard, &self.layout)?;
 
-        let new_block_id = self.txn.append(&self.file_name);
+        let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         // rightmost will be set after we compute child partitions
         new_guard.format_as_btree_internal(orig_view.btree_level(), None);
@@ -1248,7 +1371,7 @@ impl BTreeLeaf {
         let orig_guard = self.txn.pin_write_guard(&self.current_block_id);
         let mut orig_view = orig_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
-        let new_block_id = self.txn.append(&self.file_name);
+        let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         new_guard.format_as_btree_leaf(overflow_block);
         new_guard.mark_modified(txn_id, Lsn::MAX);

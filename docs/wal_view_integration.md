@@ -478,25 +478,30 @@ pub enum LogRecord {
         entry: Vec<u8>,
     },
     //
-    // Page split uses full page images (Option A) to keep undo/redo simple.
-    // Store both before/after images so undo/redo are symmetric.
-    // Larger but deterministic and avoids complex split reconstruction logic.
+    // Split record is DELTA-BASED (no full page images).
+    // Entry movement during split is still logged via BTree*Insert/Delete records.
+    // This record captures only structural metadata needed to undo allocation/link rewrites.
     BTreePageSplit {
         txnum: usize,
+        page_kind: PageType,          // IndexLeaf or IndexInternal
         left_block_id: BlockId,
         right_block_id: BlockId,
-        left_before: Vec<u8>,
-        right_before: Vec<u8>,
-        left_after: Vec<u8>,
-        right_after: Vec<u8>,
+        old_left_high_key: Option<Vec<u8>>,
+        old_left_right_sibling: Option<u32>,     // leaf-only
+        old_left_overflow: Option<u32>,          // leaf-only
+        old_left_rightmost_child: Option<u32>,   // internal-only
+        old_meta_first_free: Option<u32>,        // if free-list is maintained
     },
     // Root pointer update (metadata/catalog).
-    // When root splits, a new root page is allocated and the root pointer changes.
+    // Encodes metadata/root-state transition caused by root split.
+    // If root is rewritten in-place, old_root_block == new_root_block.
     BTreeRootUpdate {
         txnum: usize,
-        old_root: BlockId,
-        new_root: BlockId,
-        new_root_image: Vec<u8>,
+        meta_block_id: BlockId,
+        old_root_block: u32,
+        new_root_block: u32,
+        old_tree_height: u16,
+        new_tree_height: u16,
     },
 }
 ```
@@ -535,26 +540,62 @@ pub enum LogRecord {
 
 ### Cascading Splits (Clarification)
 
-When a split propagates upward, we emit **one `BTreePageSplit` per split** and **one
-`BTreeInternalInsert` per parent insert**. So a k-level cascade yields 2k records
-in the steady case (split + parent insert at each level).
+When a split propagates upward, we emit:
+- **one `BTreePageSplit` per split** (allocation + structural delta)
+- **`BTreeLeaf/InternalInsert` + `BTreeLeaf/InternalDelete`** for moved entries
+- **one `BTreeInternalInsert`** for parent separator insertion
+
+So a k-level cascade yields one structural split record per level plus entry-move and
+parent-insert records at each level.
 
 **Undo order:** process WAL backwards; each record undoes independently.
+- Entry-move records undo first (restoring tuple distribution).
+- `BTreePageSplit` undoes last for that level (restore left-page structural fields and
+  logically free/deallocate the right page).
 
-**Root split:** special handling is required because the root pointer changes and a
-new root page is allocated (in addition to the new right child).
+**Root split:** special handling is required because root metadata changes
+(whether root is rewritten in-place or a new root page is allocated).
 Two options:
 1. **Dedicated root record**:
-   `BTreeRootUpdate { old_root, new_root, new_root_image }`
+   `BTreeRootUpdate { meta_block_id, old_root_block, new_root_block, old_tree_height, new_tree_height }`
    - Root pointer lives in index catalog metadata (not page headers).
-   - Undo: update catalog to `old_root`, free `new_root`.
-   - Redo: update catalog to `new_root`, restore `new_root_image`.
+   - Undo: restore metadata fields to old values.
+   - Redo: apply new metadata fields.
 2. **Root as normal split + root update**:
-   - Use `BTreePageSplit` to capture old root + new right page.
-   - Emit `BTreeRootUpdate` to create the new root page and update the root pointer (metadata).
+   - Use `BTreePageSplit` for structural split delta.
+   - Emit `BTreeRootUpdate` for metadata/root-pointer transition.
 
 We recommend option (2): keep `BTreePageSplit` uniform and log root pointer changes
 separately via `BTreeRootUpdate`.
+
+### Free-List Plumbing Required for Undo Deallocation
+
+Undoing a split or root update may need to deallocate a page that was newly allocated
+during the forward operation. Deallocation should be **logical** (reusable page), not
+file truncation.
+
+Current code already has metadata support:
+- `BTreeMetaPage.first_free_block` exists in the meta header.
+- `PageType::Free` exists as a valid page discriminator.
+
+Missing pieces to implement:
+1. Meta setters/getters for free-list head mutation in mutable meta views
+   (`set_first_free_block`).
+2. A free-page header field for `next_free` pointer (singly linked list of free blocks).
+3. Allocation path that first pops from `first_free_block` before appending.
+4. Deallocation helper to mark a page `Free` and push it onto free list.
+
+Undo behavior once plumbing exists:
+1. **Undo split (`BTreePageSplit`)**
+   - Undo entry movement via `BTree*Insert/Delete` records (reverse WAL order).
+   - Restore left-page structural fields from `BTreePageSplit`.
+   - Deallocate `right_block_id`: mark page `Free`, set its `next_free` to prior
+     meta head, update `meta.first_free_block` to `right_block_id`.
+2. **Undo root update (`BTreeRootUpdate`)**
+   - Restore `meta.root_block` and `meta.tree_height` to old values.
+   - If `old_root_block != new_root_block`, deallocate `new_root_block` using the
+     same free-list push operation.
+   - If equal (in-place root rewrite), no page deallocation is required.
 
 ### Phase 4: Remove Legacy Logging Paths
 1. Deprecate `Transaction::set_int` / `set_string` (raw offset-based logging)
