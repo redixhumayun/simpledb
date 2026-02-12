@@ -11004,9 +11004,6 @@ impl LogRecord {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                // Recovery can legitimately see uncommitted B-tree records for pages that
-                // never reached disk as typed index pages before crash. Treat those as
-                // idempotent no-op undos instead of panicking.
                 if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
                     if page.undo_insert(*slot).is_ok() {
                         guard.mark_modified(txn.txn_id(), Lsn::MAX);
