@@ -982,6 +982,75 @@ mod btree_index_tests {
         assert_eq!(meta.root_block(), committed_root_block);
         assert_eq!(meta.tree_height(), committed_tree_height);
     }
+
+    #[test]
+    fn rollback_btree_split_cascade_restores_tree_and_reuses_freelist() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let layout = create_test_layout();
+        let index_name = generate_filename();
+
+        // Transaction 1: committed baseline with enough keys to form a non-trivial tree.
+        let t1 = db.new_tx();
+        let mut baseline_idx = BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
+        for key in 0..120 {
+            baseline_idx.insert(&Constant::Int(key), &RID::new(1, key as usize));
+        }
+        let baseline_root_block = baseline_idx.root_block.block_num as u32;
+        let baseline_tree_height = baseline_idx.tree_height;
+        let index_file_name = baseline_idx.index_file_name.clone();
+        t1.commit().unwrap();
+
+        // Transaction 2: uncommitted heavy insert workload causing split cascades.
+        let t2 = db.new_tx();
+        let mut idx2 = BTreeIndex::new(Arc::clone(&t2), &index_name, layout.clone()).unwrap();
+        let blocks_before = idx2.txn.size(&idx2.index_file_name);
+        for key in 1000..1600 {
+            idx2.insert(&Constant::Int(key), &RID::new(2, key as usize));
+        }
+        let blocks_after = idx2.txn.size(&idx2.index_file_name);
+        assert!(
+            blocks_after > blocks_before,
+            "expected uncommitted inserts to allocate split pages"
+        );
+        t2.rollback().unwrap();
+
+        // Transaction 3: verify logical state restored to baseline.
+        let t3 = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(Arc::clone(&t3), &index_name, layout.clone()).unwrap();
+        for key in 0..120 {
+            verify_idx.before_first(&Constant::Int(key));
+            assert!(verify_idx.next(), "committed key {key} should remain after rollback");
+            assert_eq!(verify_idx.get_data_rid(), RID::new(1, key as usize));
+        }
+        for key in 1000..1600 {
+            verify_idx.before_first(&Constant::Int(key));
+            assert!(
+                !verify_idx.next(),
+                "rolled-back key {key} should be absent after rollback"
+            );
+        }
+
+        // Meta should match committed baseline.
+        let meta_guard = t3.pin_read_guard(&BlockId::new(index_file_name.clone(), 0));
+        let meta = BTreeMetaPageView::new(meta_guard).unwrap();
+        assert_eq!(meta.root_block(), baseline_root_block);
+        assert_eq!(meta.tree_height(), baseline_tree_height);
+        let free_head = meta.first_free_block();
+        assert_ne!(
+            free_head,
+            IndexFreeList::no_free_block(),
+            "rollback should reclaim split-allocated pages into free list"
+        );
+        drop(meta);
+
+        // Free-list pop should reuse reclaimed page (head).
+        let reused = IndexFreeList::allocate(&t3, &index_file_name).unwrap();
+        assert_eq!(reused.block_num, free_head as usize);
+        assert!(
+            reused.block_num >= blocks_before && reused.block_num < blocks_after,
+            "reused block should come from rollback-reclaimed split allocation range"
+        );
+    }
 }
 
 /// The general format of the BTreePage
