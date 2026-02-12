@@ -9873,7 +9873,7 @@ impl RecoveryManager {
     fn rollback(&self, tx: &dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
         //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
-        for log in log_iter {
+        for (_, log) in log_iter {
             let record = LogRecord::from_bytes(log)?;
             if record.get_tx_num() != self.tx_num {
                 continue;
@@ -9899,7 +9899,7 @@ impl RecoveryManager {
         //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
         let log_iter = self.log_manager.lock().unwrap().iterator();
         let mut finished_txns: Vec<usize> = Vec::new();
-        for log in log_iter {
+        for (record_lsn, log) in log_iter {
             let record = LogRecord::from_bytes(log)?;
             match record {
                 LogRecord::Checkpoint => return Ok(()),
@@ -9908,7 +9908,9 @@ impl RecoveryManager {
                 }
                 _ => {
                     if !finished_txns.contains(&record.get_tx_num()) {
-                        record.undo(tx);
+                        if record.should_undo_during_recovery(tx, record_lsn) {
+                            record.undo(tx);
+                        }
                     }
                 }
             }
@@ -11032,6 +11034,39 @@ impl LogRecord {
         }
     }
 
+    /// Returns true if this record should be undone during crash recovery.
+    /// Rollback path intentionally does not use this check.
+    fn should_undo_during_recovery(
+        &self,
+        txn: &dyn TransactionOperations,
+        record_lsn: Lsn,
+    ) -> bool {
+        let Some(block_id) = self.undo_block_id() else {
+            return true;
+        };
+        let guard = txn.pin_write_guard(block_id);
+        let page_lsn = crate::page::page_lsn_from_bytes(guard.bytes());
+        page_lsn >= record_lsn
+    }
+
+    fn undo_block_id(&self) -> Option<&BlockId> {
+        match self {
+            LogRecord::Start(_)
+            | LogRecord::Commit(_)
+            | LogRecord::Rollback(_)
+            | LogRecord::Checkpoint => None,
+            LogRecord::HeapTupleInsert { block_id, .. }
+            | LogRecord::HeapTupleUpdate { block_id, .. }
+            | LogRecord::HeapTupleDelete { block_id, .. }
+            | LogRecord::BTreeLeafInsert { block_id, .. }
+            | LogRecord::BTreeLeafDelete { block_id, .. }
+            | LogRecord::BTreeInternalInsert { block_id, .. }
+            | LogRecord::BTreeInternalDelete { block_id, .. } => Some(block_id),
+            LogRecord::BTreePageSplit { left_block_id, .. } => Some(left_block_id),
+            LogRecord::BTreeRootUpdate { .. } => None,
+        }
+    }
+
     /// Serialize the log record to bytes and write it to the log file
     fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
         let bytes: Vec<u8> = self.try_into()?;
@@ -11914,6 +11949,7 @@ impl LogManager {
         LogIterator::new(
             Arc::clone(&self.file_manager),
             BlockId::new(self.log_file.clone(), self.current_block.block_num),
+            self.latest_lsn,
         )
     }
 }
@@ -11924,10 +11960,11 @@ pub struct LogIterator {
     page: WalPage,
     current_pos: usize,
     boundary: usize,
+    current_lsn: Lsn,
 }
 
 impl LogIterator {
-    pub fn new(file_manager: SharedFS, current_block: BlockId) -> Self {
+    pub fn new(file_manager: SharedFS, current_block: BlockId, latest_lsn: Lsn) -> Self {
         let mut page = WalPage::new();
         file_manager
             .lock()
@@ -11941,6 +11978,7 @@ impl LogIterator {
             page,
             current_pos: boundary,
             boundary,
+            current_lsn: latest_lsn.saturating_add(1),
         }
     }
 
@@ -11955,7 +11993,7 @@ impl LogIterator {
 }
 
 impl Iterator for LogIterator {
-    type Item = Vec<u8>;
+    type Item = (Lsn, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -11972,13 +12010,14 @@ impl Iterator for LogIterator {
             }
             let (record, next_pos) = self.page.read_record(self.current_pos);
             self.current_pos = next_pos;
-            return Some(record);
+            self.current_lsn = self.current_lsn.saturating_sub(1);
+            return Some((self.current_lsn, record));
         }
     }
 }
 
 impl IntoIterator for LogManager {
-    type Item = Vec<u8>;
+    type Item = (Lsn, Vec<u8>);
     type IntoIter = LogIterator;
 
     fn into_iter(mut self) -> Self::IntoIter {
@@ -12027,7 +12066,7 @@ mod log_manager_tests {
         let iter = log_manager.lock().unwrap().iterator();
         let mut counter = 0;
 
-        for record in iter {
+        for (_, record) in iter {
             let length = i32::from_be_bytes(record[..4].try_into().unwrap());
             let string = String::from_utf8(record[4..4 + length as usize].to_vec()).unwrap();
             let n = usize::from_be_bytes(record[4 + length as usize..].try_into().unwrap());

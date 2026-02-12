@@ -102,6 +102,112 @@ mod crc {
     }
 }
 
+/// Lightweight header view for free pages.
+#[allow(dead_code)]
+pub struct FreePageHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+#[allow(dead_code)]
+impl<'a> FreePageHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn next_free_block(&self) -> u32 {
+        u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
+    }
+
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
+    }
+}
+
+/// Lightweight mutable header view for free pages.
+#[allow(dead_code)]
+pub struct FreePageHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+#[allow(dead_code)]
+impl<'a> FreePageHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn set_next_free_block(&mut self, block: u32) {
+        self.bytes[4..8].copy_from_slice(&block.to_le_bytes());
+    }
+
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.bytes[24..32].copy_from_slice(&lsn.to_le_bytes());
+    }
+}
+
+/// Lightweight header view for overflow pages.
+#[allow(dead_code)]
+pub struct OverflowPageHeaderRef<'a> {
+    bytes: &'a [u8],
+}
+
+#[allow(dead_code)]
+impl<'a> OverflowPageHeaderRef<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
+    }
+}
+
+/// Lightweight mutable header view for overflow pages.
+#[allow(dead_code)]
+pub struct OverflowPageHeaderMut<'a> {
+    bytes: &'a mut [u8],
+}
+
+#[allow(dead_code)]
+impl<'a> OverflowPageHeaderMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.bytes[24..32].copy_from_slice(&lsn.to_le_bytes());
+    }
+}
+
+/// Extract page LSN from raw page bytes.
+pub(crate) fn page_lsn_from_bytes(bytes: &[u8]) -> Lsn {
+    let Some(first) = bytes.first() else {
+        return 0;
+    };
+    let Ok(page_type) = PageType::try_from(*first) else {
+        return 0;
+    };
+    match page_type {
+        PageType::Heap => bytes
+            .get(..HeapPage::HEADER_SIZE)
+            .map(|b| HeapHeaderRef::new(b).lsn() as Lsn)
+            .unwrap_or(0),
+        PageType::IndexLeaf => bytes
+            .get(..BTreeLeafPage::HEADER_SIZE)
+            .map(|b| BTreeLeafHeaderRef::new(b).lsn() as Lsn)
+            .unwrap_or(0),
+        PageType::IndexInternal => bytes
+            .get(..BTreeInternalPage::HEADER_SIZE)
+            .map(|b| BTreeInternalHeaderRef::new(b).lsn() as Lsn)
+            .unwrap_or(0),
+        PageType::Meta => bytes
+            .get(..BTreeMetaPage::HEADER_SIZE)
+            .map(|b| BTreeMetaHeaderRef::new(b).lsn() as Lsn)
+            .unwrap_or(0),
+        PageType::Free => FreePageHeaderRef::new(bytes).lsn() as Lsn,
+        PageType::Overflow => OverflowPageHeaderRef::new(bytes).lsn() as Lsn,
+    }
+}
+
 /// Read-only view over a heap header stored inline in `PageBytes`.
 ///
 /// Heap header layout (bytes):
@@ -530,6 +636,10 @@ impl<'a> BTreeLeafHeaderRef<'a> {
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
     }
+
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
+    }
 }
 
 impl<'a> HeaderReader<'a> for BTreeLeafHeaderRef<'a> {
@@ -747,6 +857,10 @@ impl<'a> BTreeInternalHeaderRef<'a> {
 
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[16..20].try_into().unwrap())
+    }
+
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[20..28].try_into().unwrap())
     }
 }
 
@@ -1463,7 +1577,7 @@ pub struct PageBytes {
 /// - 8..12: first_free_block (u32)
 /// - 12..20: reserved (8 bytes)
 /// - 20..24: crc32 (u32)
-/// - 24..32: reserved (u64)
+/// - 24..32: lsn (u64)
 #[derive(Clone, Copy)]
 pub struct BTreeMetaHeaderRef<'a> {
     bytes: &'a [u8],
@@ -1499,6 +1613,10 @@ impl<'a> BTreeMetaHeaderRef<'a> {
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
     }
+
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[24..32].try_into().unwrap())
+    }
 }
 
 /// Mutable view over a B-tree meta header.
@@ -1511,7 +1629,7 @@ impl<'a> BTreeMetaHeaderRef<'a> {
 /// - 8..12: first_free_block (u32)
 /// - 12..20: reserved (8 bytes)
 /// - 20..24: crc32 (u32)
-/// - 24..32: reserved (u64)
+/// - 24..32: lsn (u64)
 pub struct BTreeMetaHeaderMut<'a> {
     bytes: &'a mut [u8],
 }
@@ -1538,11 +1656,15 @@ impl<'a> BTreeMetaHeaderMut<'a> {
         self.write(4, root_block.to_le_bytes());
         self.write(8, first_free.to_le_bytes());
         self.write(20, 0u32.to_le_bytes());
-        self.write(24, 0u64.to_le_bytes());
+        self.set_lsn(0);
     }
 
     pub fn set_crc32(&mut self, crc32: u32) {
         self.write(20, crc32.to_le_bytes());
+    }
+
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.write(24, lsn.to_le_bytes());
     }
 
     pub fn update_crc32(&mut self, body_bytes: &[u8]) {
@@ -1604,6 +1726,11 @@ impl<'a> BTreeMetaPage<'a> {
     pub fn first_free_block(&self) -> u32 {
         self.header.first_free_block()
     }
+
+    #[allow(dead_code)]
+    pub fn lsn(&self) -> u64 {
+        self.header.lsn()
+    }
 }
 
 /// Mutable zero-copy view over an entire B-tree meta page.
@@ -1637,12 +1764,22 @@ impl<'a> BTreeMetaPageMut<'a> {
         self.header.write(8, first_free.to_le_bytes());
     }
 
+    #[allow(dead_code)]
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.header.set_lsn(lsn);
+    }
+
     pub fn update_crc32(&mut self) {
         self.header.update_crc32(self.body_bytes);
     }
 
     pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(self.body_bytes)
+    }
+
+    #[allow(dead_code)]
+    pub fn lsn(&self) -> u64 {
+        self.header.as_ref().lsn()
     }
 }
 
@@ -1683,6 +1820,11 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().first_free_block()
     }
 
+    #[allow(dead_code)]
+    pub fn lsn(&self) -> u64 {
+        self.page().lsn()
+    }
+
     fn page(&self) -> BTreeMetaPage<'_> {
         BTreeMetaPage::new(self.guard.bytes())
             .expect("meta page view constructed with valid meta page")
@@ -1714,6 +1856,16 @@ impl<'a> BTreeMetaPageViewMut<'a> {
 
     pub fn set_first_free_block(&mut self, first_free: u32) {
         self.page_mut().set_first_free_block(first_free);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.page_mut().set_lsn(lsn);
+    }
+
+    #[allow(dead_code)]
+    pub fn lsn(&mut self) -> u64 {
+        self.page_mut().lsn()
     }
 
     pub fn update_crc32(&mut self) {
