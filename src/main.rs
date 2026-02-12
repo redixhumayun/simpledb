@@ -10001,23 +10001,15 @@ enum LogRecord {
     BTreeLeafHeaderUpdate {
         txnum: usize,
         block_id: BlockId,
-        old_high_key: Option<Vec<u8>>,
-        old_right_sibling: Option<usize>,
-        old_overflow: Option<usize>,
-        new_high_key: Option<Vec<u8>>,
-        new_right_sibling: Option<usize>,
-        new_overflow: Option<usize>,
+        old_header: Vec<u8>,
+        new_header: Vec<u8>,
     },
     /// Internal header structural update (high key / rightmost child / level)
     BTreeInternalHeaderUpdate {
         txnum: usize,
         block_id: BlockId,
-        old_high_key: Option<Vec<u8>>,
-        old_rightmost_child: Option<usize>,
-        old_level: u8,
-        new_high_key: Option<Vec<u8>>,
-        new_rightmost_child: Option<usize>,
-        new_level: u8,
+        old_header: Vec<u8>,
+        new_header: Vec<u8>,
     },
     /// Structural split record for undoing split metadata and deallocating right page
     BTreePageSplit {
@@ -10135,26 +10127,26 @@ impl Display for LogRecord {
             LogRecord::BTreeLeafHeaderUpdate {
                 txnum,
                 block_id,
-                old_right_sibling,
-                old_overflow,
-                new_right_sibling,
-                new_overflow,
+                old_header,
+                new_header,
                 ..
             } => write!(
                 f,
-                "BTreeLeafHeaderUpdate(txnum: {txnum}, block_id: {block_id:?}, old_rsib: {old_right_sibling:?}, old_overflow: {old_overflow:?}, new_rsib: {new_right_sibling:?}, new_overflow: {new_overflow:?})"
+                "BTreeLeafHeaderUpdate(txnum: {txnum}, block_id: {block_id:?}, old_header_len: {}, new_header_len: {})",
+                old_header.len(),
+                new_header.len()
             ),
             LogRecord::BTreeInternalHeaderUpdate {
                 txnum,
                 block_id,
-                old_rightmost_child,
-                old_level,
-                new_rightmost_child,
-                new_level,
+                old_header,
+                new_header,
                 ..
             } => write!(
                 f,
-                "BTreeInternalHeaderUpdate(txnum: {txnum}, block_id: {block_id:?}, old_rightmost: {old_rightmost_child:?}, old_level: {old_level}, new_rightmost: {new_rightmost_child:?}, new_level: {new_level})"
+                "BTreeInternalHeaderUpdate(txnum: {txnum}, block_id: {block_id:?}, old_header_len: {}, new_header_len: {})",
+                old_header.len(),
+                new_header.len()
             ),
             LogRecord::BTreePageSplit {
                 txnum,
@@ -10350,102 +10342,26 @@ impl TryInto<Vec<u8>> for &LogRecord {
             LogRecord::BTreeLeafHeaderUpdate {
                 txnum,
                 block_id,
-                old_high_key,
-                old_right_sibling,
-                old_overflow,
-                new_high_key,
-                new_right_sibling,
-                new_overflow,
+                old_header,
+                new_header,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
                 push_i32(&mut buf, block_id.block_num as i32);
-                match old_high_key {
-                    Some(bytes) => {
-                        push_i32(&mut buf, 1);
-                        push_bytes(&mut buf, bytes);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match old_right_sibling {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match old_overflow {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match new_high_key {
-                    Some(bytes) => {
-                        push_i32(&mut buf, 1);
-                        push_bytes(&mut buf, bytes);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match new_right_sibling {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match new_overflow {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
+                push_bytes(&mut buf, old_header);
+                push_bytes(&mut buf, new_header);
             }
             LogRecord::BTreeInternalHeaderUpdate {
                 txnum,
                 block_id,
-                old_high_key,
-                old_rightmost_child,
-                old_level,
-                new_high_key,
-                new_rightmost_child,
-                new_level,
+                old_header,
+                new_header,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
                 push_i32(&mut buf, block_id.block_num as i32);
-                match old_high_key {
-                    Some(bytes) => {
-                        push_i32(&mut buf, 1);
-                        push_bytes(&mut buf, bytes);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match old_rightmost_child {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                push_i32(&mut buf, *old_level as i32);
-                match new_high_key {
-                    Some(bytes) => {
-                        push_i32(&mut buf, 1);
-                        push_bytes(&mut buf, bytes);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                match new_rightmost_child {
-                    Some(v) => {
-                        push_i32(&mut buf, 1);
-                        push_i32(&mut buf, *v as i32);
-                    }
-                    None => push_i32(&mut buf, 0),
-                }
-                push_i32(&mut buf, *new_level as i32);
+                push_bytes(&mut buf, old_header);
+                push_bytes(&mut buf, new_header);
             }
             LogRecord::BTreePageSplit {
                 txnum,
@@ -10681,45 +10597,13 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 );
-                let old_high_key = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_bytes(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let old_right_sibling = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let old_overflow = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let new_high_key = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_bytes(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let new_right_sibling = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let new_overflow = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
+                let old_header = read_bytes(&value, &mut pos)?;
+                let new_header = read_bytes(&value, &mut pos)?;
                 Ok(LogRecord::BTreeLeafHeaderUpdate {
                     txnum,
                     block_id,
-                    old_high_key,
-                    old_right_sibling,
-                    old_overflow,
-                    new_high_key,
-                    new_right_sibling,
-                    new_overflow,
+                    old_header,
+                    new_header,
                 })
             }
             12 => {
@@ -10728,37 +10612,13 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 );
-                let old_high_key = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_bytes(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let old_rightmost_child = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let old_level = read_usize(&value, &mut pos)? as u8;
-                let new_high_key = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_bytes(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let new_rightmost_child = if read_i32(&value, &mut pos)? != 0 {
-                    Some(read_usize(&value, &mut pos)?)
-                } else {
-                    None
-                };
-                let new_level = read_usize(&value, &mut pos)? as u8;
+                let old_header = read_bytes(&value, &mut pos)?;
+                let new_header = read_bytes(&value, &mut pos)?;
                 Ok(LogRecord::BTreeInternalHeaderUpdate {
                     txnum,
                     block_id,
-                    old_high_key,
-                    old_rightmost_child,
-                    old_level,
-                    new_high_key,
-                    new_rightmost_child,
-                    new_level,
+                    old_header,
+                    new_header,
                 })
             }
             13 => {
@@ -10952,91 +10812,35 @@ impl LogRecord {
             }
             LogRecord::BTreeLeafHeaderUpdate {
                 block_id,
-                old_high_key,
-                old_right_sibling,
-                old_overflow,
-                new_high_key,
-                new_right_sibling,
-                new_overflow,
+                old_header,
+                new_header,
                 ..
             } => {
-                let old_hk_size = match old_high_key {
-                    Some(bytes) => Self::INT_BYTES + Self::BYTES_LEN_SIZE + bytes.len(),
-                    None => Self::INT_BYTES,
-                };
-                let new_hk_size = match new_high_key {
-                    Some(bytes) => Self::INT_BYTES + Self::BYTES_LEN_SIZE + bytes.len(),
-                    None => Self::INT_BYTES,
-                };
                 base_size
                     + Self::TXNUM_SIZE
                     + Self::STR_LEN_SIZE
                     + block_id.filename.len()
                     + Self::BLOCK_NUM_SIZE
-                    + old_hk_size
-                    + Self::INT_BYTES
-                    + if old_right_sibling.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
-                    + Self::INT_BYTES
-                    + if old_overflow.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
-                    + new_hk_size
-                    + Self::INT_BYTES
-                    + if new_right_sibling.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
-                    + Self::INT_BYTES
-                    + if new_overflow.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
+                    + Self::BYTES_LEN_SIZE
+                    + old_header.len()
+                    + Self::BYTES_LEN_SIZE
+                    + new_header.len()
             }
             LogRecord::BTreeInternalHeaderUpdate {
                 block_id,
-                old_high_key,
-                old_rightmost_child,
-                new_high_key,
-                new_rightmost_child,
+                old_header,
+                new_header,
                 ..
             } => {
-                let old_hk_size = match old_high_key {
-                    Some(bytes) => Self::INT_BYTES + Self::BYTES_LEN_SIZE + bytes.len(),
-                    None => Self::INT_BYTES,
-                };
-                let new_hk_size = match new_high_key {
-                    Some(bytes) => Self::INT_BYTES + Self::BYTES_LEN_SIZE + bytes.len(),
-                    None => Self::INT_BYTES,
-                };
                 base_size
                     + Self::TXNUM_SIZE
                     + Self::STR_LEN_SIZE
                     + block_id.filename.len()
                     + Self::BLOCK_NUM_SIZE
-                    + old_hk_size
-                    + Self::INT_BYTES
-                    + if old_rightmost_child.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
-                    + Self::INT_BYTES // old_level
-                    + new_hk_size
-                    + Self::INT_BYTES
-                    + if new_rightmost_child.is_some() {
-                        Self::INT_BYTES
-                    } else {
-                        0
-                    }
-                    + Self::INT_BYTES // new_level
+                    + Self::BYTES_LEN_SIZE
+                    + old_header.len()
+                    + Self::BYTES_LEN_SIZE
+                    + new_header.len()
             }
             LogRecord::BTreePageSplit {
                 left_block_id,
@@ -11258,48 +11062,30 @@ impl LogRecord {
             LogRecord::BTreeLeafHeaderUpdate { .. } => {
                 let LogRecord::BTreeLeafHeaderUpdate {
                     block_id,
-                    old_high_key,
-                    old_right_sibling,
-                    old_overflow,
+                    old_header,
                     ..
                 } = self
                 else {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
-                    match old_high_key {
-                        Some(bytes) => {
-                            let _ = page.write_high_key(bytes);
-                        }
-                        None => page.clear_high_key(),
-                    }
-                    page.set_right_sibling_block(old_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX));
-                    let _ = page.set_overflow_block(*old_overflow);
+                if let Some(header) = guard.bytes_mut().get_mut(..old_header.len()) {
+                    header.copy_from_slice(old_header);
                     guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 }
             }
             LogRecord::BTreeInternalHeaderUpdate { .. } => {
                 let LogRecord::BTreeInternalHeaderUpdate {
                     block_id,
-                    old_high_key,
-                    old_rightmost_child,
-                    old_level,
+                    old_header,
                     ..
                 } = self
                 else {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
-                    match old_high_key {
-                        Some(bytes) => {
-                            let _ = page.write_high_key(bytes);
-                        }
-                        None => page.clear_high_key(),
-                    }
-                    page.set_rightmost_child_block(old_rightmost_child.unwrap_or(u32::MAX as usize));
-                    let _ = page.set_btree_level(*old_level);
+                if let Some(header) = guard.bytes_mut().get_mut(..old_header.len()) {
+                    header.copy_from_slice(old_header);
                     guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 }
             }

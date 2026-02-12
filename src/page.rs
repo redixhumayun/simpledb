@@ -3582,18 +3582,6 @@ impl EntrySnapshot {
     }
 }
 
-struct BTreeLeafHeaderState {
-    high_key: Option<Vec<u8>>,
-    right_sibling: Option<usize>,
-    overflow: Option<usize>,
-}
-
-struct BTreeInternalHeaderState {
-    high_key: Option<Vec<u8>>,
-    rightmost_child: Option<usize>,
-    level: u8,
-}
-
 /// Mutable type-safe view of a heap tuple with schema-aware column access.
 ///
 /// Tracks modifications via a shared dirty flag.
@@ -4320,13 +4308,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             .expect("BTreeLeafPageViewMut constructed with valid leaf page")
     }
 
-    fn header_state(&self) -> SimpleDBResult<BTreeLeafHeaderState> {
-        let page = self.build_page()?;
-        Ok(BTreeLeafHeaderState {
-            high_key: page.high_key_bytes().map(|b| b.to_vec()),
-            right_sibling: page.right_sibling(),
-            overflow: page.overflow_block(),
-        })
+    fn header_snapshot(&self) -> Vec<u8> {
+        self.guard.bytes()[..BTreeLeafPage::HEADER_SIZE].to_vec()
     }
 
     fn update_page_lsn(&self, lsn: Lsn) {
@@ -4446,92 +4429,80 @@ impl<'a> BTreeLeafPageViewMut<'a> {
     }
 
     pub fn set_overflow_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeLeafHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key.clone(),
-            old_right_sibling: old_state.right_sibling,
-            old_overflow: old_state.overflow,
-            new_high_key: old_state.high_key,
-            new_right_sibling: old_state.right_sibling,
-            new_overflow: block,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.set_overflow_block(block)?;
         self.dirty.set(true);
-        Ok(())
-    }
-
-    pub fn set_right_sibling_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
+        let new_header = self.header_snapshot();
         let record = LogRecord::BTreeLeafHeaderUpdate {
             txnum: self.guard.txn_id(),
             block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key.clone(),
-            old_right_sibling: old_state.right_sibling,
-            old_overflow: old_state.overflow,
-            new_high_key: old_state.high_key,
-            new_right_sibling: block,
-            new_overflow: old_state.overflow,
+            old_header,
+            new_header,
         };
         if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             self.update_page_lsn(lsn);
         }
+        Ok(())
+    }
+
+    pub fn set_right_sibling_block(&mut self, block: Option<usize>) -> SimpleDBResult<()> {
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.set_right_sibling_block(block.map(|b| b as u32).unwrap_or(u32::MAX));
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeLeafHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
     /// Writes a high key payload (exclusive upper bound). Caller supplies encoded key bytes.
     pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeLeafHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key,
-            old_right_sibling: old_state.right_sibling,
-            old_overflow: old_state.overflow,
-            new_high_key: Some(key_bytes.to_vec()),
-            new_right_sibling: old_state.right_sibling,
-            new_overflow: old_state.overflow,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.write_high_key(key_bytes)?;
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeLeafHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
     /// Clears the high key (sets +∞ sentinel).
     pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeLeafHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key,
-            old_right_sibling: old_state.right_sibling,
-            old_overflow: old_state.overflow,
-            new_high_key: None,
-            new_right_sibling: old_state.right_sibling,
-            new_overflow: old_state.overflow,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.clear_high_key();
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeLeafHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
@@ -4638,13 +4609,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             .expect("BTreeInternalPageViewMut constructed with valid internal page")
     }
 
-    fn header_state(&self) -> SimpleDBResult<BTreeInternalHeaderState> {
-        let page = self.build_view()?;
-        Ok(BTreeInternalHeaderState {
-            high_key: page.high_key_bytes().map(|b| b.to_vec()),
-            rightmost_child: page.rightmost_child_block(),
-            level: page.btree_level(),
-        })
+    fn header_snapshot(&self) -> Vec<u8> {
+        self.guard.bytes()[..BTreeInternalPage::HEADER_SIZE].to_vec()
     }
 
     fn update_page_lsn(&self, lsn: Lsn) {
@@ -4757,92 +4723,80 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     }
 
     pub fn set_btree_level(&mut self, level: u8) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeInternalHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key.clone(),
-            old_rightmost_child: old_state.rightmost_child,
-            old_level: old_state.level,
-            new_high_key: old_state.high_key,
-            new_rightmost_child: old_state.rightmost_child,
-            new_level: level,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.set_btree_level(level)?;
         self.dirty.set(true);
-        Ok(())
-    }
-
-    pub fn set_rightmost_child_block(&mut self, block: usize) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
+        let new_header = self.header_snapshot();
         let record = LogRecord::BTreeInternalHeaderUpdate {
             txnum: self.guard.txn_id(),
             block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key.clone(),
-            old_rightmost_child: old_state.rightmost_child,
-            old_level: old_state.level,
-            new_high_key: old_state.high_key,
-            new_rightmost_child: Some(block),
-            new_level: old_state.level,
+            old_header,
+            new_header,
         };
         if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             self.update_page_lsn(lsn);
         }
+        Ok(())
+    }
+
+    pub fn set_rightmost_child_block(&mut self, block: usize) -> SimpleDBResult<()> {
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.set_rightmost_child_block(block);
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeInternalHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
     /// Writes a high key payload (exclusive upper bound). Compacts first.
     pub fn set_high_key(&mut self, key_bytes: &[u8]) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeInternalHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key,
-            old_rightmost_child: old_state.rightmost_child,
-            old_level: old_state.level,
-            new_high_key: Some(key_bytes.to_vec()),
-            new_rightmost_child: old_state.rightmost_child,
-            new_level: old_state.level,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.write_high_key(key_bytes)?;
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeInternalHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
     /// Clears the high key (sets +∞ sentinel).
     pub fn clear_high_key(&mut self) -> SimpleDBResult<()> {
-        let old_state = self.header_state()?;
-        let record = LogRecord::BTreeInternalHeaderUpdate {
-            txnum: self.guard.txn_id(),
-            block_id: self.guard.block_id().clone(),
-            old_high_key: old_state.high_key,
-            old_rightmost_child: old_state.rightmost_child,
-            old_level: old_state.level,
-            new_high_key: None,
-            new_rightmost_child: old_state.rightmost_child,
-            new_level: old_state.level,
-        };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let old_header = self.header_snapshot();
 
         let mut page = self.build_mut_page()?;
         page.clear_high_key();
         self.dirty.set(true);
+        let new_header = self.header_snapshot();
+        let record = LogRecord::BTreeInternalHeaderUpdate {
+            txnum: self.guard.txn_id(),
+            block_id: self.guard.block_id().clone(),
+            old_header,
+            new_header,
+        };
+        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
+            self.update_page_lsn(lsn);
+        }
         Ok(())
     }
 
