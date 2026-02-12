@@ -6459,6 +6459,7 @@ impl<'a> BTreeInternalPage<'a> {
         Ok(page)
     }
 
+    #[cfg(test)]
     fn high_key_bytes(&self) -> Option<&[u8]> {
         let len = self.header.high_key_len() as usize;
         if len == 0 {

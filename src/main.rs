@@ -8196,10 +8196,11 @@ impl Constant {
         const INT_SIZE: usize = 4; // i32 for integer value
         const STR_LEN_SIZE: usize = 4; // i32 for string length
 
-        TYPE_TAG_SIZE + match self {
-            Constant::Int(_) => INT_SIZE,
-            Constant::String(s) => STR_LEN_SIZE + s.len(),
-        }
+        TYPE_TAG_SIZE
+            + match self {
+                Constant::Int(_) => INT_SIZE,
+                Constant::String(s) => STR_LEN_SIZE + s.len(),
+            }
     }
 }
 
@@ -8910,10 +8911,7 @@ mod transaction_tests {
             Constant::String(s) => s,
             _ => return None,
         };
-        Some(TxnRowSnapshot {
-            int_val,
-            str_val,
-        })
+        Some(TxnRowSnapshot { int_val, str_val })
     }
 
     fn snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> TxnRowSnapshot {
@@ -9925,7 +9923,6 @@ impl RecoveryManager {
     }
 }
 
-
 /// The container for all the different types of log records that are written to the WAL
 #[derive(Clone)]
 enum LogRecord {
@@ -9975,8 +9972,8 @@ enum LogRecord {
         block_id: BlockId,
         slot: usize,
         offset: usize,
-        key: Constant,   // for display/debugging
-        rid: RID,        // for display/debugging
+        key: Constant,        // for display/debugging
+        rid: RID,             // for display/debugging
         entry_bytes: Vec<u8>, // full entry bytes for physical undo
     },
     /// Physical entry-level B-tree internal insert: logs entry bytes for undo
@@ -9993,8 +9990,8 @@ enum LogRecord {
         block_id: BlockId,
         slot: usize,
         offset: usize,
-        key: Constant,       // for display/debugging
-        child_block: usize,  // for display/debugging
+        key: Constant,        // for display/debugging
+        child_block: usize,   // for display/debugging
         entry_bytes: Vec<u8>, // full entry bytes for physical undo
     },
     /// Leaf header structural update (high key / sibling / overflow)
@@ -10767,7 +10764,10 @@ impl LogRecord {
                     + entry.len()
             }
             LogRecord::BTreeLeafDelete {
-                block_id, key, entry_bytes, ..
+                block_id,
+                key,
+                entry_bytes,
+                ..
             } => {
                 base_size
                     + Self::TXNUM_SIZE
@@ -10796,7 +10796,10 @@ impl LogRecord {
                     + entry.len()
             }
             LogRecord::BTreeInternalDelete {
-                block_id, key, entry_bytes, ..
+                block_id,
+                key,
+                entry_bytes,
+                ..
             } => {
                 base_size
                     + Self::TXNUM_SIZE
@@ -10884,9 +10887,7 @@ impl LogRecord {
                         0
                     }
             }
-            LogRecord::BTreeRootUpdate {
-                meta_block_id, ..
-            } => {
+            LogRecord::BTreeRootUpdate { meta_block_id, .. } => {
                 base_size
                     + Self::TXNUM_SIZE
                     + Self::STR_LEN_SIZE
@@ -11107,7 +11108,8 @@ impl LogRecord {
                 // Restore left-page structural metadata.
                 if *is_leaf {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut()) {
+                    if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
+                    {
                         match old_left_high_key {
                             Some(bytes) => page
                                 .write_high_key(bytes)
@@ -11123,7 +11125,9 @@ impl LogRecord {
                     }
                 } else {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut()) {
+                    if let Ok(mut page) =
+                        crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
+                    {
                         match old_left_high_key {
                             Some(bytes) => page
                                 .write_high_key(bytes)
@@ -11177,7 +11181,8 @@ impl LogRecord {
 
                 // If root moved to a newly allocated page, deallocate it by pushing to free-list.
                 if old_root_block != new_root_block {
-                    let new_root = BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
+                    let new_root =
+                        BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
                     let mut new_root_guard = txn.pin_write_guard(&new_root);
                     let bytes = new_root_guard.bytes_mut();
                     bytes.fill(0);
