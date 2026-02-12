@@ -573,6 +573,14 @@ Two options:
 We recommend option (2): keep `BTreePageSplit` uniform and log root pointer changes
 separately via `BTreeRootUpdate`.
 
+**Important correctness note (current gap):** if root split handling rewrites the root
+page in place (e.g. page reformat) without a dedicated WAL record for that structural
+rewrite, undo can observe slot/layout mismatches even with reverse WAL order. To keep
+undo deterministic, either:
+- WAL-log the in-place root structural rewrite explicitly, or
+- switch to allocating a new root page (old root becomes left child) and represent the
+  metadata transition via `BTreeRootUpdate`.
+
 ### Free-List Plumbing Required for Undo Deallocation
 
 Undoing a split or root update may need to deallocate a page that was newly allocated
