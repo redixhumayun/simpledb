@@ -5,8 +5,9 @@ use crate::page::BTreeLeafEntry;
 use crate::{
     debug,
     page::{
-        BTreeInternalEntry, BTreeInternalHeaderRef, BTreeInternalPageView, BTreeInternalPageViewMut,
-        BTreeLeafHeaderRef, BTreeMetaPageView, BTreeMetaPageViewMut, PageType,
+        BTreeInternalEntry, BTreeInternalHeaderRef, BTreeInternalPageView,
+        BTreeInternalPageViewMut, BTreeLeafHeaderRef, BTreeMetaPageView, BTreeMetaPageViewMut,
+        PageType,
     },
     BlockId, Constant, Index, IndexInfo, Layout, LogRecord, Lsn, Schema, SimpleDBResult,
     Transaction, RID,
@@ -464,8 +465,7 @@ impl Index for BTreeIndex {
         let root_split = root_split.unwrap();
         let old_root_block = self.root_block.block_num;
         let old_tree_height = self.tree_height;
-        root.make_new_root(root_split).unwrap();
-        let new_root_block = self.root_block.block_num;
+        let new_root_block = root.make_new_root(root_split).unwrap().block_num;
         let new_tree_height = old_tree_height.saturating_add(1);
         self.apply_root_update(
             old_root_block,
@@ -991,7 +991,8 @@ mod btree_index_tests {
 
         // Transaction 1: committed baseline with enough keys to form a non-trivial tree.
         let t1 = db.new_tx();
-        let mut baseline_idx = BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
+        let mut baseline_idx =
+            BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
         for key in 0..120 {
             baseline_idx.insert(&Constant::Int(key), &RID::new(1, key as usize));
         }
@@ -1019,7 +1020,10 @@ mod btree_index_tests {
         let mut verify_idx = BTreeIndex::new(Arc::clone(&t3), &index_name, layout.clone()).unwrap();
         for key in 0..120 {
             verify_idx.before_first(&Constant::Int(key));
-            assert!(verify_idx.next(), "committed key {key} should remain after rollback");
+            assert!(
+                verify_idx.next(),
+                "committed key {key} should remain after rollback"
+            );
             assert_eq!(verify_idx.get_data_rid(), RID::new(1, key as usize));
         }
         for key in 1000..1600 {
@@ -1186,7 +1190,7 @@ impl BTreeInternal {
     }
 
     /// Create a new root above current root after a split.
-    fn make_new_root(&self, split: SplitResult) -> Result<(), Box<dyn Error>> {
+    fn make_new_root(&self, split: SplitResult) -> Result<BlockId, Box<dyn Error>> {
         // read current level
         let level = {
             let guard = self.txn.pin_read_guard(&self.block_id);
@@ -1194,15 +1198,17 @@ impl BTreeInternal {
             view.btree_level()
         };
 
-        // Reformat current page as empty internal at level+1, pointing rightmost to LEFT child for upcoming insert.
-        let mut guard = self.txn.pin_write_guard(&self.block_id);
+        // Allocate a fresh root page and point its rightmost child at the left split child.
+        let new_root_block = IndexFreeList::allocate(&self.txn, &self.file_name)?;
+        let mut guard = self.txn.pin_write_guard(&new_root_block);
+        //  passing in split.left_block in the function call below is actually correct
         guard.format_as_btree_internal(level + 1, Some(split.left_block));
         {
             let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
             // insert separator with right child = split.right_block
             view.insert_entry(split.sep_key, split.right_block)?;
         }
-        Ok(())
+        Ok(new_root_block)
     }
 
     /// Insert a separator into this internal node, returning an optional split to bubble up.
@@ -1404,21 +1410,27 @@ mod btree_internal_tests {
             right_block: 4,
         };
 
-        // Make new root
-        internal.make_new_root(split).unwrap();
+        // Make new root on a newly allocated block.
+        let new_root = internal.make_new_root(split).unwrap();
+        assert_ne!(new_root.block_num, internal.block_id.block_num);
 
-        // Verify root structure
-        let guard = txn.pin_read_guard(&internal.block_id);
+        // Old root should remain unchanged.
+        let old_guard = txn.pin_read_guard(&internal.block_id);
+        let old_view = BTreeInternalPageView::new(old_guard, &internal.layout).unwrap();
+        assert!(matches!(old_view.btree_level(), 0));
+        assert_eq!(old_view.slot_count(), 2);
+
+        // New root should have one separator and two children.
+        let guard = txn.pin_read_guard(&new_root);
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
         assert!(matches!(view.btree_level(), 1));
         assert_eq!(view.slot_count(), 1);
 
-        // Separator points to left child
+        // Separator points to left child; rightmost points to right child.
         assert_eq!(
             view.get_entry(0).unwrap().child_block,
             internal.block_id.block_num
         );
-        // Rightmost points to right child
         assert_eq!(view.rightmost_child_block().unwrap(), 4);
     }
 
