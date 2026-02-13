@@ -53,37 +53,48 @@ mod free_list {
             ))
         }
 
-        #[cfg(test)]
-        fn mark_page_free(guard: &mut crate::page::PageWriteGuard<'_>, next_free: u32) {
-            let bytes = guard.bytes_mut();
-            bytes.fill(0);
-            bytes[0] = PageType::Free as u8;
-            bytes[Self::FREE_NEXT_OFFSET..Self::FREE_NEXT_OFFSET + 4]
-                .copy_from_slice(&next_free.to_le_bytes());
-            guard.mark_modified(guard.txn_id(), Lsn::MAX);
-        }
 
         pub(crate) fn allocate(txn: &Arc<Transaction>, file_name: &str) -> SimpleDBResult<BlockId> {
             let meta_block = Self::meta_block_id(file_name);
             let tx_id = txn.id();
 
             let meta_guard = txn.pin_write_guard(&meta_block);
-            meta_guard.mark_modified(tx_id, Lsn::MAX);
             let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
             let free_head = meta_view.first_free_block();
             if free_head == Self::NO_FREE_BLOCK {
+                // No free blocks, append new block to file
                 meta_view.update_crc32();
                 drop(meta_view);
                 return Ok(txn.append(file_name));
             }
 
+            // Read next free pointer from the block we're about to allocate
             let free_block = BlockId::new(file_name.to_string(), free_head as usize);
             let next_free = {
                 let free_guard = txn.pin_write_guard(&free_block);
                 Self::read_next_free_block(free_guard.bytes())?
             };
+
+            // Emit WAL record before mutation
+            let record = LogRecord::BTreeFreeListPop {
+                txnum: tx_id,
+                meta_block_id: meta_block.clone(),
+                block_id: free_block.clone(),
+                old_head: free_head,
+                new_head: next_free,
+                old_block_next: next_free,
+            };
+            let lsn = record.write_log_record(&txn.log_manager())?;
+
+            // Perform mutation
             meta_view.set_first_free_block(next_free);
             meta_view.update_crc32();
+            drop(meta_view);
+
+            // Mark meta page with actual LSN
+            let meta_guard = txn.pin_write_guard(&meta_block);
+            meta_guard.mark_modified(tx_id, lsn);
+
             Ok(free_block)
         }
 
@@ -101,16 +112,40 @@ mod free_list {
             let tx_id = txn.id();
 
             let meta_guard = txn.pin_write_guard(&meta_block);
-            meta_guard.mark_modified(tx_id, Lsn::MAX);
             let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
             let old_head = meta_view.first_free_block();
+            let new_head = block_num as u32;
 
             let target_block = BlockId::new(file_name.to_string(), block_num);
-            let mut target_guard = txn.pin_write_guard(&target_block);
-            Self::mark_page_free(&mut target_guard, old_head);
 
-            meta_view.set_first_free_block(block_num as u32);
+            // Emit WAL record before mutation
+            let record = LogRecord::BTreeFreeListPush {
+                txnum: tx_id,
+                meta_block_id: meta_block.clone(),
+                block_id: target_block.clone(),
+                old_head,
+                new_head,
+            };
+            let lsn = record.write_log_record(&txn.log_manager())?;
+
+            // Mark target block as free and link it to the free list
+            let mut target_guard = txn.pin_write_guard(&target_block);
+            let bytes = target_guard.bytes_mut();
+            bytes.fill(0); // Clear the page
+            bytes[0] = PageType::Free as u8; // Set page type discriminator
+            // Write next_free pointer at offset 4 (points to old free-list head)
+            bytes[Self::FREE_NEXT_OFFSET..Self::FREE_NEXT_OFFSET + 4]
+                .copy_from_slice(&old_head.to_le_bytes());
+            target_guard.mark_modified(tx_id, lsn);
+
+            meta_view.set_first_free_block(new_head);
             meta_view.update_crc32();
+            drop(meta_view);
+
+            // Mark meta page with actual LSN
+            let meta_guard = txn.pin_write_guard(&meta_block);
+            meta_guard.mark_modified(tx_id, lsn);
+
             Ok(())
         }
     }

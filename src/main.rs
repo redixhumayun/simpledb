@@ -10032,6 +10032,23 @@ enum LogRecord {
         old_tree_height: u16,
         new_tree_height: u16,
     },
+    /// Free-list pop: allocating a block from the free list
+    BTreeFreeListPop {
+        txnum: usize,
+        meta_block_id: BlockId,
+        block_id: BlockId,
+        old_head: u32,
+        new_head: u32,
+        old_block_next: u32,
+    },
+    /// Free-list push: deallocating a block to the free list
+    BTreeFreeListPush {
+        txnum: usize,
+        meta_block_id: BlockId,
+        block_id: BlockId,
+        old_head: u32,
+        new_head: u32,
+    },
 }
 
 impl Display for LogRecord {
@@ -10174,6 +10191,27 @@ impl Display for LogRecord {
             } => write!(
                 f,
                 "BTreeRootUpdate(txnum: {txnum}, meta: {meta_block_id:?}, old_root: {old_root_block}, new_root: {new_root_block}, old_height: {old_tree_height}, new_height: {new_tree_height})"
+            ),
+            LogRecord::BTreeFreeListPop {
+                txnum,
+                meta_block_id,
+                block_id,
+                old_head,
+                new_head,
+                old_block_next,
+            } => write!(
+                f,
+                "BTreeFreeListPop(txnum: {txnum}, meta: {meta_block_id:?}, block: {block_id:?}, old_head: {old_head}, new_head: {new_head}, old_next: {old_block_next})"
+            ),
+            LogRecord::BTreeFreeListPush {
+                txnum,
+                meta_block_id,
+                block_id,
+                old_head,
+                new_head,
+            } => write!(
+                f,
+                "BTreeFreeListPush(txnum: {txnum}, meta: {meta_block_id:?}, block: {block_id:?}, old_head: {old_head}, new_head: {new_head})"
             ),
         }
     }
@@ -10444,6 +10482,38 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_i32(&mut buf, *old_tree_height as i32);
                 push_i32(&mut buf, *new_tree_height as i32);
             }
+            LogRecord::BTreeFreeListPop {
+                txnum,
+                meta_block_id,
+                block_id,
+                old_head,
+                new_head,
+                old_block_next,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &meta_block_id.filename);
+                push_i32(&mut buf, meta_block_id.block_num as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *old_head as i32);
+                push_i32(&mut buf, *new_head as i32);
+                push_i32(&mut buf, *old_block_next as i32);
+            }
+            LogRecord::BTreeFreeListPush {
+                txnum,
+                meta_block_id,
+                block_id,
+                old_head,
+                new_head,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &meta_block_id.filename);
+                push_i32(&mut buf, meta_block_id.block_num as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *old_head as i32);
+                push_i32(&mut buf, *new_head as i32);
+            }
         }
         Ok(buf)
     }
@@ -10712,6 +10782,33 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 old_tree_height: read_usize(&value, &mut pos)? as u16,
                 new_tree_height: read_usize(&value, &mut pos)? as u16,
             }),
+            15 => Ok(LogRecord::BTreeFreeListPop {
+                txnum: read_usize(&value, &mut pos)?,
+                meta_block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                old_head: read_usize(&value, &mut pos)? as u32,
+                new_head: read_usize(&value, &mut pos)? as u32,
+                old_block_next: read_usize(&value, &mut pos)? as u32,
+            }),
+            16 => Ok(LogRecord::BTreeFreeListPush {
+                txnum: read_usize(&value, &mut pos)?,
+                meta_block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                old_head: read_usize(&value, &mut pos)? as u32,
+                new_head: read_usize(&value, &mut pos)? as u32,
+            }),
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -10948,6 +11045,39 @@ impl LogRecord {
                     + Self::INT_BYTES // old_tree_height
                     + Self::INT_BYTES // new_tree_height
             }
+            LogRecord::BTreeFreeListPop {
+                meta_block_id,
+                block_id,
+                ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + meta_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // old_head
+                    + Self::INT_BYTES // new_head
+                    + Self::INT_BYTES // old_block_next
+            }
+            LogRecord::BTreeFreeListPush {
+                meta_block_id,
+                block_id,
+                ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + meta_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // old_head
+                    + Self::INT_BYTES // new_head
+            }
         }
     }
 
@@ -10969,6 +11099,8 @@ impl LogRecord {
             LogRecord::BTreeInternalHeaderUpdate { .. } => 12,
             LogRecord::BTreePageSplit { .. } => 13,
             LogRecord::BTreeRootUpdate { .. } => 14,
+            LogRecord::BTreeFreeListPop { .. } => 15,
+            LogRecord::BTreeFreeListPush { .. } => 16,
         }
     }
 
@@ -10991,6 +11123,8 @@ impl LogRecord {
             LogRecord::BTreeInternalHeaderUpdate { txnum, .. } => *txnum,
             LogRecord::BTreePageSplit { txnum, .. } => *txnum,
             LogRecord::BTreeRootUpdate { txnum, .. } => *txnum,
+            LogRecord::BTreeFreeListPop { txnum, .. } => *txnum,
+            LogRecord::BTreeFreeListPush { txnum, .. } => *txnum,
         }
     }
 
@@ -11252,6 +11386,53 @@ impl LogRecord {
 
                 meta_view.update_crc32();
             }
+            LogRecord::BTreeFreeListPop { .. } => {
+                let LogRecord::BTreeFreeListPop {
+                    meta_block_id,
+                    block_id,
+                    old_head,
+                    old_block_next,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                // Restore meta to point to old head
+                let meta_guard = txn.pin_write_guard(meta_block_id);
+                meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
+                    .expect("meta page required for free-list pop undo");
+                meta_view.set_first_free_block(*old_head);
+
+                // Restore the allocated block as free with its old next pointer
+                let mut block_guard = txn.pin_write_guard(block_id);
+                let bytes = block_guard.bytes_mut();
+                bytes.fill(0);
+                bytes[0] = crate::page::PageType::Free as u8;
+                bytes[4..8].copy_from_slice(&old_block_next.to_le_bytes());
+                block_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+
+                meta_view.update_crc32();
+            }
+            LogRecord::BTreeFreeListPush { .. } => {
+                let LogRecord::BTreeFreeListPush {
+                    meta_block_id,
+                    old_head,
+                    ..
+                } = self
+                else {
+                    return;
+                };
+
+                // Restore meta to point to old head (before push)
+                let meta_guard = txn.pin_write_guard(meta_block_id);
+                meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
+                    .expect("meta page required for free-list push undo");
+                meta_view.set_first_free_block(*old_head);
+                meta_view.update_crc32();
+            }
         }
     }
 
@@ -11286,7 +11467,9 @@ impl LogRecord {
             | LogRecord::BTreeLeafHeaderUpdate { block_id, .. }
             | LogRecord::BTreeInternalHeaderUpdate { block_id, .. } => Some(block_id),
             LogRecord::BTreePageSplit { left_block_id, .. } => Some(left_block_id),
-            LogRecord::BTreeRootUpdate { .. } => None,
+            LogRecord::BTreeRootUpdate { .. }
+            | LogRecord::BTreeFreeListPop { .. }
+            | LogRecord::BTreeFreeListPush { .. } => None,
         }
     }
 
