@@ -165,6 +165,7 @@ mod split_wal {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn read_leaf_split_state(
         page_bytes: &[u8],
     ) -> SimpleDBResult<(Option<Vec<u8>>, Option<usize>, Option<usize>)> {

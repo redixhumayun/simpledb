@@ -2138,7 +2138,7 @@ impl<'a> HeapPageMut<'a> {
         if slot_len > self.body_bytes.len() {
             return Err("slot directory exceeds page body".into());
         }
-        let (line_ptr_bytes, record_bytes) = (&self.body_bytes[..]).split_at(slot_len);
+        let (line_ptr_bytes, record_bytes) = self.body_bytes[..].split_at(slot_len);
         let free_lower = self.header.as_ref().free_lower() as usize;
         let free_upper = self.header.as_ref().free_upper() as usize;
         let page_size = PAGE_SIZE_BYTES as usize;
@@ -2757,12 +2757,24 @@ impl<'a> PageWriteGuard<'a> {
 
     /// Formats the page as an empty heap page.
     pub fn format_as_heap(&mut self) {
+        let block_id = self.block_id().clone();
+        let txn_id = self.txn_id();
+
+        // Emit WAL BEFORE mutation
+        let record = crate::LogRecord::HeapPageFormatFresh {
+            txnum: txn_id,
+            block_id,
+        };
+        let lsn = record.write_log_record(&self.log_manager);
+
+        // Perform mutation
         let bytes = self.bytes_mut();
         bytes.fill(0);
-
         let mut header = HeapHeaderMut::new(&mut bytes[0..HeapPageMut::HEADER_SIZE]);
         header.init_heap();
-        self.mark_modified(self.txn_id(), Lsn::MAX);
+
+        // Mark with REAL LSN (not Lsn::MAX)
+        self.mark_modified(txn_id, lsn);
     }
 
     /// Formats the page as an empty B-tree leaf page.

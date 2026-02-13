@@ -8317,9 +8317,20 @@ impl RecordPage {
 
     /// Format the underlying page as a HeapPage
     pub fn format(&self) {
-        let mut guard = self.txn.pin_write_guard(&self.block_id);
+        let block_id = self.block_id.clone();
+        let txn_id = self.txn.tx_id;
+
+        // Emit HeapPageAppend
+        let record = LogRecord::HeapPageAppend {
+            txnum: txn_id as usize,
+            block_id: block_id.clone(),
+        };
+        let _lsn = record.write_log_record(&self.txn.log_manager());
+
+        // Format (emits HeapPageFormatFresh internally)
+        let mut guard = self.txn.pin_write_guard(&block_id);
         guard.format_as_heap();
-        guard.mark_modified(self.txn.tx_id as usize, Lsn::MAX);
+        // Note: mark_modified called inside format_as_heap with real LSN
     }
 
     /// Finds the next valid slot after the given slot.
@@ -9905,10 +9916,10 @@ impl RecoveryManager {
                     finished_txns.push(record.get_tx_num());
                 }
                 _ => {
-                    if !finished_txns.contains(&record.get_tx_num()) {
-                        if record.should_undo_during_recovery(tx, record_lsn) {
-                            record.undo(tx);
-                        }
+                    if !finished_txns.contains(&record.get_tx_num())
+                        && record.should_undo_during_recovery(tx, record_lsn)
+                    {
+                        record.undo(tx);
                     }
                 }
             }
@@ -10048,6 +10059,16 @@ enum LogRecord {
         block_id: BlockId,
         old_head: u32,
         new_head: u32,
+    },
+    /// Heap page append: logs page allocation (no undo needed)
+    HeapPageAppend {
+        txnum: usize,
+        block_id: BlockId,
+    },
+    /// Heap page format: logs fresh page formatting with zero-undo semantics
+    HeapPageFormatFresh {
+        txnum: usize,
+        block_id: BlockId,
     },
 }
 
@@ -10212,6 +10233,14 @@ impl Display for LogRecord {
             } => write!(
                 f,
                 "BTreeFreeListPush(txnum: {txnum}, meta: {meta_block_id:?}, block: {block_id:?}, old_head: {old_head}, new_head: {new_head})"
+            ),
+            LogRecord::HeapPageAppend { txnum, block_id } => write!(
+                f,
+                "HeapPageAppend(txnum: {txnum}, block: {block_id:?})"
+            ),
+            LogRecord::HeapPageFormatFresh { txnum, block_id } => write!(
+                f,
+                "HeapPageFormatFresh(txnum: {txnum}, block: {block_id:?})"
             ),
         }
     }
@@ -10512,6 +10541,16 @@ impl From<&LogRecord> for Vec<u8> {
                 push_i32(&mut buf, *old_head as i32);
                 push_i32(&mut buf, *new_head as i32);
             }
+            LogRecord::HeapPageAppend { txnum, block_id } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+            }
+            LogRecord::HeapPageFormatFresh { txnum, block_id } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+            }
         }
         buf
     }
@@ -10807,6 +10846,20 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 old_head: read_usize(&value, &mut pos)? as u32,
                 new_head: read_usize(&value, &mut pos)? as u32,
             }),
+            17 => Ok(LogRecord::HeapPageAppend {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+            }),
+            18 => Ok(LogRecord::HeapPageFormatFresh {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+            }),
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -11076,6 +11129,20 @@ impl LogRecord {
                     + Self::INT_BYTES // old_head
                     + Self::INT_BYTES // new_head
             }
+            LogRecord::HeapPageAppend { block_id, .. } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+            }
+            LogRecord::HeapPageFormatFresh { block_id, .. } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+            }
         }
     }
 
@@ -11099,6 +11166,8 @@ impl LogRecord {
             LogRecord::BTreeRootUpdate { .. } => 14,
             LogRecord::BTreeFreeListPop { .. } => 15,
             LogRecord::BTreeFreeListPush { .. } => 16,
+            LogRecord::HeapPageAppend { .. } => 17,
+            LogRecord::HeapPageFormatFresh { .. } => 18,
         }
     }
 
@@ -11123,6 +11192,8 @@ impl LogRecord {
             LogRecord::BTreeRootUpdate { txnum, .. } => *txnum,
             LogRecord::BTreeFreeListPop { txnum, .. } => *txnum,
             LogRecord::BTreeFreeListPush { txnum, .. } => *txnum,
+            LogRecord::HeapPageAppend { txnum, .. } => *txnum,
+            LogRecord::HeapPageFormatFresh { txnum, .. } => *txnum,
         }
     }
 
@@ -11431,6 +11502,15 @@ impl LogRecord {
                 meta_view.set_first_free_block(*old_head);
                 meta_view.update_crc32();
             }
+            LogRecord::HeapPageAppend { .. } => {
+                // No-op: heap has no free list
+            }
+            LogRecord::HeapPageFormatFresh { block_id, .. } => {
+                // Zero page bytes to mark as unformatted
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.bytes_mut().fill(0);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
         }
     }
 
@@ -11468,6 +11548,8 @@ impl LogRecord {
             LogRecord::BTreeRootUpdate { .. }
             | LogRecord::BTreeFreeListPop { .. }
             | LogRecord::BTreeFreeListPush { .. } => None,
+            LogRecord::HeapPageAppend { block_id, .. }
+            | LogRecord::HeapPageFormatFresh { block_id, .. } => Some(block_id),
         }
     }
 
@@ -11636,14 +11718,19 @@ mod recovery_manager_tests {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
         let layout = recovery_layout();
         let filename = generate_filename();
+
+        // Setup: format page in committed transaction
+        let setup_txn = db.new_tx();
+        let block = setup_txn.append(&filename);
+        format_heap(&setup_txn, &block);
+        setup_txn.commit().unwrap();
+
+        // Test: insert and rollback
         let txn = db.new_tx();
-        let block = txn.append(&filename);
-        format_heap(&txn, &block);
-
         insert_row(&txn, &block, &layout, 10, "alpha");
-
         txn.rollback().unwrap();
 
+        // Verify: page is formatted, insert is rolled back
         let check_txn = db.new_tx();
         let guard = check_txn.pin_read_guard(&block);
         let view = guard.into_heap_view(&layout).expect("heap view");
@@ -11697,15 +11784,21 @@ mod recovery_manager_tests {
         let layout = recovery_layout();
         let filename = generate_filename();
 
+        // Setup: format page in committed transaction
+        let setup_txn = db.new_tx();
+        let block = setup_txn.append(&filename);
+        format_heap(&setup_txn, &block);
+        setup_txn.commit().unwrap();
+
+        // Test: multiple operations and rollback
         let txn = db.new_tx();
-        let block = txn.append(&filename);
-        format_heap(&txn, &block);
         let slot1 = insert_row(&txn, &block, &layout, 1, "one");
         let slot2 = insert_row(&txn, &block, &layout, 2, "two");
         update_int_at(&txn, &block, &layout, slot1, 10);
         delete_slot(&txn, &block, &layout, slot2);
         txn.rollback().unwrap();
 
+        // Verify: page is formatted, all operations are rolled back
         let check_txn = db.new_tx();
         let guard = check_txn.pin_read_guard(&block);
         let view = guard.into_heap_view(&layout).expect("heap view");
