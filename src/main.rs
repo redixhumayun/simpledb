@@ -9983,6 +9983,8 @@ enum LogRecord {
         slot: usize,
         offset: usize,
         entry: Vec<u8>,
+        child_field_offset: usize,
+        old_children: Vec<usize>,
     },
     /// Physical B-tree internal delete: logs slot, offset, and entry bytes for inverse compaction
     BTreeInternalDelete {
@@ -9993,6 +9995,8 @@ enum LogRecord {
         key: Constant,        // for display/debugging
         child_block: usize,   // for display/debugging
         entry_bytes: Vec<u8>, // full entry bytes for physical undo
+        child_field_offset: usize,
+        old_children: Vec<usize>,
     },
     /// Leaf header structural update (high key / sibling / overflow)
     BTreeLeafHeaderUpdate {
@@ -10104,10 +10108,13 @@ impl Display for LogRecord {
                 slot,
                 offset,
                 entry,
+                old_children,
+                ..
             } => write!(
                 f,
-                "BTreeInternalInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {})",
-                entry.len()
+                "BTreeInternalInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {}, old_children: {})",
+                entry.len(),
+                old_children.len()
             ),
             LogRecord::BTreeInternalDelete {
                 txnum,
@@ -10116,10 +10123,12 @@ impl Display for LogRecord {
                 offset,
                 key,
                 child_block,
+                old_children,
                 ..
             } => write!(
                 f,
-                "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block})"
+                "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block}, old_children: {})",
+                old_children.len()
             ),
             LogRecord::BTreeLeafHeaderUpdate {
                 txnum,
@@ -10300,6 +10309,8 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 slot,
                 offset,
                 entry,
+                child_field_offset,
+                old_children,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
@@ -10307,6 +10318,11 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_i32(&mut buf, *slot as i32);
                 push_i32(&mut buf, *offset as i32);
                 push_bytes(&mut buf, entry);
+                push_i32(&mut buf, *child_field_offset as i32);
+                push_i32(&mut buf, old_children.len() as i32);
+                for child in old_children {
+                    push_i32(&mut buf, *child as i32);
+                }
             }
             LogRecord::BTreeInternalDelete {
                 txnum,
@@ -10316,6 +10332,8 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 key,
                 child_block,
                 entry_bytes,
+                child_field_offset,
+                old_children,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
@@ -10335,6 +10353,11 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 }
                 push_i32(&mut buf, *child_block as i32);
                 push_bytes(&mut buf, entry_bytes);
+                push_i32(&mut buf, *child_field_offset as i32);
+                push_i32(&mut buf, old_children.len() as i32);
+                for child in old_children {
+                    push_i32(&mut buf, *child as i32);
+                }
             }
             LogRecord::BTreeLeafHeaderUpdate {
                 txnum,
@@ -10560,6 +10583,15 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 slot: read_usize(&value, &mut pos)?,
                 offset: read_usize(&value, &mut pos)?,
                 entry: read_bytes(&value, &mut pos)?,
+                child_field_offset: read_usize(&value, &mut pos)?,
+                old_children: {
+                    let len = read_usize(&value, &mut pos)?;
+                    let mut children = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        children.push(read_usize(&value, &mut pos)?);
+                    }
+                    children
+                },
             }),
             10 => {
                 let txnum = read_usize(&value, &mut pos)?;
@@ -10578,6 +10610,12 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 };
                 let child_block = read_usize(&value, &mut pos)?;
                 let entry_bytes = read_bytes(&value, &mut pos)?;
+                let child_field_offset = read_usize(&value, &mut pos)?;
+                let old_children_len = read_usize(&value, &mut pos)?;
+                let mut old_children = Vec::with_capacity(old_children_len);
+                for _ in 0..old_children_len {
+                    old_children.push(read_usize(&value, &mut pos)?);
+                }
                 Ok(LogRecord::BTreeInternalDelete {
                     txnum,
                     block_id,
@@ -10586,6 +10624,8 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     key,
                     child_block,
                     entry_bytes,
+                    child_field_offset,
+                    old_children,
                 })
             }
             11 => {
@@ -10783,7 +10823,10 @@ impl LogRecord {
                     + entry_bytes.len()
             }
             LogRecord::BTreeInternalInsert {
-                block_id, entry, ..
+                block_id,
+                entry,
+                old_children,
+                ..
             } => {
                 base_size
                     + Self::TXNUM_SIZE
@@ -10794,11 +10837,15 @@ impl LogRecord {
                     + Self::OFFSET_SIZE
                     + Self::BYTES_LEN_SIZE
                     + entry.len()
+                    + Self::INT_BYTES // child_field_offset
+                    + Self::INT_BYTES // old_children len
+                    + old_children.len() * Self::INT_BYTES
             }
             LogRecord::BTreeInternalDelete {
                 block_id,
                 key,
                 entry_bytes,
+                old_children,
                 ..
             } => {
                 base_size
@@ -10812,6 +10859,9 @@ impl LogRecord {
                     + Self::INT_BYTES // child_block
                     + Self::BYTES_LEN_SIZE
                     + entry_bytes.len()
+                    + Self::INT_BYTES // child_field_offset
+                    + Self::INT_BYTES // old_children len
+                    + old_children.len() * Self::INT_BYTES
             }
             LogRecord::BTreeLeafHeaderUpdate {
                 block_id,
@@ -11029,12 +11079,20 @@ impl LogRecord {
                 }
             }
             LogRecord::BTreeInternalInsert { .. } => {
-                let LogRecord::BTreeInternalInsert { block_id, slot, .. } = self else {
+                let LogRecord::BTreeInternalInsert {
+                    block_id,
+                    slot,
+                    child_field_offset,
+                    old_children,
+                    ..
+                } = self
+                else {
                     return;
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
                     if page.undo_insert(*slot).is_ok() {
+                        let _ = page.restore_children_snapshot(*child_field_offset, old_children);
                         guard.mark_modified(txn.txn_id(), Lsn::MAX);
                     }
                 }
@@ -11045,6 +11103,8 @@ impl LogRecord {
                     slot,
                     offset,
                     entry_bytes,
+                    child_field_offset,
+                    old_children,
                     ..
                 } = self
                 else {
@@ -11053,6 +11113,7 @@ impl LogRecord {
                 let mut guard = txn.pin_write_guard(block_id);
                 if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
                     if page.undo_delete(*slot, *offset, entry_bytes).is_ok() {
+                        let _ = page.restore_children_snapshot(*child_field_offset, old_children);
                         guard.mark_modified(txn.txn_id(), Lsn::MAX);
                     }
                 }

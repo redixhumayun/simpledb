@@ -4624,6 +4624,19 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         BTreeInternalPageMut::new(self.guard.bytes_mut())
     }
 
+    fn capture_children_snapshot(&self) -> SimpleDBResult<Vec<usize>> {
+        let view = self.build_view()?;
+        let slot_count = view.slot_count();
+        let mut children = Vec::with_capacity(slot_count + 1);
+        for idx in 0..=slot_count {
+            let child = view
+                .child_at(self.layout, idx)
+                .ok_or("missing child pointer while capturing internal snapshot")?;
+            children.push(child);
+        }
+        Ok(children)
+    }
+
     // Read operations
     pub fn get_entry(&self, slot: SlotId) -> SimpleDBResult<BTreeInternalEntry> {
         let view = self.build_view()?;
@@ -4658,6 +4671,11 @@ impl<'a> BTreeInternalPageViewMut<'a> {
     // Write operations
     pub fn insert_entry(&mut self, key: Constant, child_block: usize) -> SimpleDBResult<SlotId> {
         let layout = self.layout;
+        let old_children = self.capture_children_snapshot()?;
+        let child_field_offset = self
+            .layout
+            .offset(BTREE_BLOCK_FIELD)
+            .ok_or("block field required for internal WAL logging")?;
 
         // Build page once, insert and capture snapshot
         let (slot, entry_snapshot) = {
@@ -4676,6 +4694,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             slot,
             offset: entry_snapshot.offset,
             entry: entry_snapshot.bytes,
+            child_field_offset,
+            old_children,
         };
         if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             let current = self.page_lsn.get().unwrap_or(0);
@@ -4689,6 +4709,11 @@ impl<'a> BTreeInternalPageViewMut<'a> {
 
     pub fn delete_entry(&mut self, slot: SlotId) -> SimpleDBResult<()> {
         let layout = self.layout;
+        let old_children = self.capture_children_snapshot()?;
+        let child_field_offset = self
+            .layout
+            .offset(BTREE_BLOCK_FIELD)
+            .ok_or("block field required for internal WAL logging")?;
 
         // Build page once, capture before-image and delete
         let (offset, entry_bytes, decoded_entry) = {
@@ -4711,6 +4736,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             key: decoded_entry.key,
             child_block: decoded_entry.child_block,
             entry_bytes,
+            child_field_offset,
+            old_children,
         };
         if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
             let current = self.page_lsn.get().unwrap_or(0);
@@ -6878,6 +6905,48 @@ impl<'a> BTreeInternalPageMut<'a> {
             self.set_rightmost_child_block(child);
         } else {
             return Err("child index out of bounds".into());
+        }
+        Ok(())
+    }
+
+    fn set_child_at_offset(
+        &mut self,
+        idx: usize,
+        child: usize,
+        child_field_offset: usize,
+    ) -> SimpleDBResult<()> {
+        let slot_count = self.header.as_ref().slot_count() as usize;
+        if idx < slot_count {
+            let mut parts = self.split()?;
+            let lp = parts.line_ptrs().as_ref().get(idx);
+            let entry_bytes = parts
+                .record_space()
+                .entry_bytes_mut(lp)
+                .ok_or("entry bytes not found")?;
+            if child_field_offset + 4 > entry_bytes.len() {
+                return Err("child field offset out of bounds".into());
+            }
+            entry_bytes[child_field_offset..child_field_offset + 4]
+                .copy_from_slice(&(child as i32).to_le_bytes());
+        } else if idx == slot_count {
+            self.set_rightmost_child_block(child);
+        } else {
+            return Err("child index out of bounds".into());
+        }
+        Ok(())
+    }
+
+    pub fn restore_children_snapshot(
+        &mut self,
+        child_field_offset: usize,
+        children: &[usize],
+    ) -> SimpleDBResult<()> {
+        let slot_count = self.header.as_ref().slot_count() as usize;
+        if children.len() != slot_count + 1 {
+            return Err("children snapshot length mismatch".into());
+        }
+        for (idx, child) in children.iter().copied().enumerate() {
+            self.set_child_at_offset(idx, child, child_field_offset)?;
         }
         Ok(())
     }
