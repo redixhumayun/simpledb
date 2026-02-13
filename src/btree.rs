@@ -311,9 +311,9 @@ impl BTreeIndex {
         &self.index_name
     }
 
-    fn update_meta(&mut self) -> Result<(), Box<dyn Error>> {
+    fn update_meta(&mut self, lsn: Lsn) -> Result<(), Box<dyn Error>> {
         let guard = self.txn.pin_write_guard(&self.meta_block);
-        guard.mark_modified(self.txn.id(), Lsn::MAX);
+        guard.mark_modified(self.txn.id(), lsn);
         let mut view = BTreeMetaPageViewMut::new(guard)?;
         view.set_tree_height(self.tree_height);
         view.set_root_block(self.root_block.block_num as u32);
@@ -336,11 +336,11 @@ impl BTreeIndex {
             old_tree_height,
             new_tree_height,
         };
-        let _ = record.write_log_record(&self.txn.log_manager());
+        let lsn = record.write_log_record(&self.txn.log_manager());
 
         self.root_block = BlockId::new(self.index_file_name.clone(), new_root_block);
         self.tree_height = new_tree_height;
-        self.update_meta()
+        self.update_meta(lsn)
     }
 }
 
