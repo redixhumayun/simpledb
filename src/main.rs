@@ -9860,7 +9860,7 @@ impl RecoveryManager {
     fn commit(&self) {
         self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
-        let lsn = record.write_log_record(&self.log_manager).unwrap();
+        let lsn = record.write_log_record(&self.log_manager);
         self.log_manager.lock().unwrap().flush_lsn(lsn);
     }
 
@@ -9885,7 +9885,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
+        let lsn = checkpoint_record.write_log_record(&self.log_manager);
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -9917,7 +9917,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
+        let lsn = checkpoint_record.write_log_record(&self.log_manager);
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -10217,10 +10217,8 @@ impl Display for LogRecord {
     }
 }
 
-impl TryInto<Vec<u8>> for &LogRecord {
-    type Error = Box<dyn Error>;
-
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+impl From<&LogRecord> for Vec<u8> {
+    fn from(val: &LogRecord) -> Self {
         fn push_i32(buf: &mut Vec<u8>, value: i32) {
             buf.extend_from_slice(&value.to_be_bytes());
         }
@@ -10235,9 +10233,9 @@ impl TryInto<Vec<u8>> for &LogRecord {
             buf.extend_from_slice(value);
         }
 
-        let mut buf = Vec::with_capacity(self.calculate_size());
-        push_i32(&mut buf, self.discriminant() as i32);
-        match self {
+        let mut buf = Vec::with_capacity(val.calculate_size());
+        push_i32(&mut buf, val.discriminant() as i32);
+        match val {
             LogRecord::Start(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Commit(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Rollback(txnum) => push_i32(&mut buf, *txnum as i32),
@@ -10515,7 +10513,7 @@ impl TryInto<Vec<u8>> for &LogRecord {
                 push_i32(&mut buf, *new_head as i32);
             }
         }
-        Ok(buf)
+        buf
     }
 }
 
@@ -11474,9 +11472,9 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
-        let bytes: Vec<u8> = self.try_into()?;
-        Ok(log_manager.lock().unwrap().append(bytes))
+    fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> Lsn {
+        let bytes: Vec<u8> = self.into();
+        log_manager.lock().unwrap().append(bytes)
     }
 
     /// Read the bytes from the log file and deserialize them into a [`LogRecord`]

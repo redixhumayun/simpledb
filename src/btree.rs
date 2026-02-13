@@ -53,7 +53,6 @@ mod free_list {
             ))
         }
 
-
         pub(crate) fn allocate(txn: &Arc<Transaction>, file_name: &str) -> SimpleDBResult<BlockId> {
             let meta_block = Self::meta_block_id(file_name);
             let tx_id = txn.id();
@@ -84,7 +83,7 @@ mod free_list {
                 new_head: next_free,
                 old_block_next: next_free,
             };
-            let lsn = record.write_log_record(&txn.log_manager())?;
+            let lsn = record.write_log_record(&txn.log_manager());
 
             // Perform mutation
             meta_view.set_first_free_block(next_free);
@@ -126,14 +125,14 @@ mod free_list {
                 old_head,
                 new_head,
             };
-            let lsn = record.write_log_record(&txn.log_manager())?;
+            let lsn = record.write_log_record(&txn.log_manager());
 
             // Mark target block as free and link it to the free list
             let mut target_guard = txn.pin_write_guard(&target_block);
             let bytes = target_guard.bytes_mut();
             bytes.fill(0); // Clear the page
             bytes[0] = PageType::Free as u8; // Set page type discriminator
-            // Write next_free pointer at offset 4 (points to old free-list head)
+                                             // Write next_free pointer at offset 4 (points to old free-list head)
             bytes[Self::FREE_NEXT_OFFSET..Self::FREE_NEXT_OFFSET + 4]
                 .copy_from_slice(&old_head.to_le_bytes());
             target_guard.mark_modified(tx_id, lsn);

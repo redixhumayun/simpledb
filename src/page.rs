@@ -1752,15 +1752,15 @@ impl<'a> BTreeMetaPageMut<'a> {
         Ok(Self { header, body_bytes })
     }
 
-    pub fn set_root_block(&mut self, root: u32) {
+    pub(super) fn set_root_block(&mut self, root: u32) {
         self.header.write(4, root.to_le_bytes());
     }
 
-    pub fn set_tree_height(&mut self, h: u16) {
+    pub(super) fn set_tree_height(&mut self, h: u16) {
         self.header.write(2, h.to_le_bytes());
     }
 
-    pub fn set_first_free_block(&mut self, first_free: u32) {
+    pub(super) fn set_first_free_block(&mut self, first_free: u32) {
         self.header.write(8, first_free.to_le_bytes());
     }
 
@@ -1842,11 +1842,11 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         Ok(Self { guard })
     }
 
-    pub fn set_root_block(&mut self, root: u32) {
+    pub(crate) fn set_root_block(&mut self, root: u32) {
         self.page_mut().set_root_block(root);
     }
 
-    pub fn set_tree_height(&mut self, h: u16) {
+    pub(crate) fn set_tree_height(&mut self, h: u16) {
         self.page_mut().set_tree_height(h);
     }
 
@@ -1854,7 +1854,7 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().header.as_ref().first_free_block()
     }
 
-    pub fn set_first_free_block(&mut self, first_free: u32) {
+    pub(crate) fn set_first_free_block(&mut self, first_free: u32) {
         self.page_mut().set_first_free_block(first_free);
     }
 
@@ -3678,9 +3678,8 @@ impl Drop for LogicalRowMut<'_> {
             },
         };
 
-        if let Ok(lsn) = record.write_log_record(&ctx.log_manager) {
-            ctx.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&ctx.log_manager);
+        ctx.update_page_lsn(lsn);
     }
 }
 
@@ -3844,11 +3843,10 @@ impl<'a> HeapPageViewMut<'a> {
             offset: before_image.offset,
             old_tuple: before_image.bytes,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
         let mut page = self.build_mut_page();
         let mut split_guard = page.split()?;
@@ -3896,11 +3894,10 @@ impl<'a> HeapPageViewMut<'a> {
                     relocated: false,
                     relocated_slot: None,
                 };
-                if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-                    let current = self.page_lsn.get().unwrap_or(0);
-                    if lsn > current {
-                        self.page_lsn.set(Some(lsn));
-                    }
+                let lsn = record.write_log_record(&self.guard.log_manager);
+                let current = self.page_lsn.get().unwrap_or(0);
+                if lsn > current {
+                    self.page_lsn.set(Some(lsn));
                 }
                 return Ok(());
             }
@@ -3922,11 +3919,10 @@ impl<'a> HeapPageViewMut<'a> {
             relocated: true,
             relocated_slot: Some(new_slot),
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
         Ok(())
     }
@@ -4383,11 +4379,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             offset: entry_snapshot.offset,
             entry: entry_snapshot.bytes,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
 
         Ok(slot)
@@ -4418,11 +4413,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             rid: decoded_entry.rid,
             entry_bytes,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
 
         Ok(())
@@ -4441,9 +4435,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4460,9 +4453,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4480,9 +4472,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4500,9 +4491,8 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4697,11 +4687,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             child_field_offset,
             old_children,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
 
         Ok(slot)
@@ -4739,11 +4728,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             child_field_offset,
             old_children,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            let current = self.page_lsn.get().unwrap_or(0);
-            if lsn > current {
-                self.page_lsn.set(Some(lsn));
-            }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        let current = self.page_lsn.get().unwrap_or(0);
+        if lsn > current {
+            self.page_lsn.set(Some(lsn));
         }
 
         Ok(())
@@ -4762,9 +4750,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4781,9 +4768,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4801,9 +4787,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
@@ -4821,9 +4806,8 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        if let Ok(lsn) = record.write_log_record(&self.guard.log_manager) {
-            self.update_page_lsn(lsn);
-        }
+        let lsn = record.write_log_record(&self.guard.log_manager);
+        self.update_page_lsn(lsn);
         Ok(())
     }
 
