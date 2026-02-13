@@ -64,7 +64,14 @@ mod free_list {
                 // No free blocks, append new block to file
                 meta_view.update_crc32();
                 drop(meta_view);
-                return Ok(txn.append(file_name));
+                let block_id = txn.append(file_name);
+                crate::LogRecord::BTreePageAppend {
+                    txnum: tx_id,
+                    meta_block_id: meta_block,
+                    block_id: block_id.clone(),
+                }
+                .write_log_record(&txn.log_manager());
+                return Ok(block_id);
             }
 
             // Read next free pointer from the block we're about to allocate
@@ -253,29 +260,44 @@ impl BTreeIndex {
             // Block 0: meta
             let meta_id = txn.append(&index_file_name);
             assert_eq!(meta_id.block_num, 0);
+            crate::LogRecord::BTreePageAppend {
+                txnum: txn.id(),
+                meta_block_id: meta_id.clone(),
+                block_id: meta_id.clone(),
+            }
+            .write_log_record(&txn.log_manager());
             {
                 let mut guard = txn.pin_write_guard(&meta_id);
                 guard.format_as_btree_meta(1, 1, 1, u32::MAX);
-                guard.mark_modified(txn.id(), Lsn::MAX);
             }
 
             // Block 1: root internal (level 0 -> children are leaves)
             let root_id = txn.append(&index_file_name);
             assert_eq!(root_id.block_num, 1);
+            crate::LogRecord::BTreePageAppend {
+                txnum: txn.id(),
+                meta_block_id: meta_id.clone(),
+                block_id: root_id.clone(),
+            }
+            .write_log_record(&txn.log_manager());
             {
                 let mut guard = txn.pin_write_guard(&root_id);
                 // rightmost child will point to first leaf (block 2)
                 guard.format_as_btree_internal(0, Some(2));
-                guard.mark_modified(txn.id(), Lsn::MAX);
             }
 
             // Block 2: first leaf
             let leaf_id = txn.append(&index_file_name);
             assert_eq!(leaf_id.block_num, 2);
+            crate::LogRecord::BTreePageAppend {
+                txnum: txn.id(),
+                meta_block_id: meta_id.clone(),
+                block_id: leaf_id.clone(),
+            }
+            .write_log_record(&txn.log_manager());
             {
                 let mut guard = txn.pin_write_guard(&leaf_id);
                 guard.format_as_btree_leaf(None);
-                guard.mark_modified(txn.id(), Lsn::MAX);
             }
             (root_id, 1)
         } else {

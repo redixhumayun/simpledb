@@ -2779,24 +2779,51 @@ impl<'a> PageWriteGuard<'a> {
 
     /// Formats the page as an empty B-tree leaf page.
     pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
+        let block_id = self.block_id().clone();
+        let txn_id = self.txn_id();
+
+        // Emit WAL BEFORE mutation
+        let record = crate::LogRecord::BTreeLeafFormatFresh {
+            txnum: txn_id,
+            block_id,
+            overflow_block,
+        };
+        let lsn = record.write_log_record(&self.log_manager);
+
+        // Perform mutation
         let bytes = self.bytes_mut();
         bytes.fill(0);
-
         let mut header = BTreeLeafHeaderMut::new(&mut bytes[0..BTreeLeafPageMut::HEADER_SIZE]);
         header.init_leaf(0, None, overflow_block.map(|b| b as u32));
-        self.mark_modified(self.txn_id(), Lsn::MAX);
+
+        // Mark with REAL LSN (not Lsn::MAX)
+        self.mark_modified(txn_id, lsn);
     }
 
     /// Formats the page as an empty B-tree internal page.
     /// `rightmost_child` seeds the only child when the node has zero separators.
     pub fn format_as_btree_internal(&mut self, level: u8, rightmost_child: Option<usize>) {
+        let block_id = self.block_id().clone();
+        let txn_id = self.txn_id();
+
+        // Emit WAL BEFORE mutation
+        let record = crate::LogRecord::BTreeInternalFormatFresh {
+            txnum: txn_id,
+            block_id,
+            level: level as u16,
+            rightmost_child: rightmost_child.unwrap_or(0),
+        };
+        let lsn = record.write_log_record(&self.log_manager);
+
+        // Perform mutation
         let bytes = self.bytes_mut();
         bytes.fill(0);
-
         let mut header =
             BTreeInternalHeaderMut::new(&mut bytes[0..BTreeInternalPageMut::HEADER_SIZE]);
         header.init_internal(level, rightmost_child.map(|c| c as u32));
-        self.mark_modified(self.txn_id(), Lsn::MAX);
+
+        // Mark with REAL LSN (not Lsn::MAX)
+        self.mark_modified(txn_id, lsn);
     }
 
     /// Formats the page as a B-tree meta page (block 0 in single-file layout).
@@ -2807,12 +2834,26 @@ impl<'a> PageWriteGuard<'a> {
         root_block: u32,
         first_free_block: u32,
     ) {
+        let block_id = self.block_id().clone();
+        let txn_id = self.txn_id();
+
+        // Emit WAL BEFORE mutation
+        let record = crate::LogRecord::BTreeMetaFormatFresh {
+            txnum: txn_id,
+            block_id,
+        };
+        let lsn = record.write_log_record(&self.log_manager);
+
+        // Perform mutation
         let bytes = self.bytes_mut();
         bytes.fill(0);
         let (hdr_bytes, body_bytes) = bytes.split_at_mut(BTreeMetaPage::HEADER_SIZE);
         let mut header = BTreeMetaHeaderMut::new(hdr_bytes);
         header.init_meta(version, tree_height, root_block, first_free_block);
         header.update_crc32(body_bytes);
+
+        // Mark with REAL LSN (not Lsn::MAX)
+        self.mark_modified(txn_id, lsn);
     }
 
     pub fn into_heap_view_mut(self, layout: &'a Layout) -> SimpleDBResult<HeapPageViewMut<'a>> {

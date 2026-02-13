@@ -10070,6 +10070,30 @@ enum LogRecord {
         txnum: usize,
         block_id: BlockId,
     },
+    /// BTree page append: logs page allocation (undo via free list)
+    BTreePageAppend {
+        txnum: usize,
+        meta_block_id: BlockId,
+        block_id: BlockId,
+    },
+    /// BTree meta page format: logs fresh meta page formatting
+    BTreeMetaFormatFresh {
+        txnum: usize,
+        block_id: BlockId,
+    },
+    /// BTree internal page format: logs fresh internal page formatting
+    BTreeInternalFormatFresh {
+        txnum: usize,
+        block_id: BlockId,
+        level: u16,
+        rightmost_child: usize,
+    },
+    /// BTree leaf page format: logs fresh leaf page formatting
+    BTreeLeafFormatFresh {
+        txnum: usize,
+        block_id: BlockId,
+        overflow_block: Option<usize>,
+    },
 }
 
 impl Display for LogRecord {
@@ -10241,6 +10265,35 @@ impl Display for LogRecord {
             LogRecord::HeapPageFormatFresh { txnum, block_id } => write!(
                 f,
                 "HeapPageFormatFresh(txnum: {txnum}, block: {block_id:?})"
+            ),
+            LogRecord::BTreePageAppend {
+                txnum,
+                meta_block_id,
+                block_id,
+            } => write!(
+                f,
+                "BTreePageAppend(txnum: {txnum}, meta: {meta_block_id:?}, block: {block_id:?})"
+            ),
+            LogRecord::BTreeMetaFormatFresh { txnum, block_id } => write!(
+                f,
+                "BTreeMetaFormatFresh(txnum: {txnum}, block: {block_id:?})"
+            ),
+            LogRecord::BTreeInternalFormatFresh {
+                txnum,
+                block_id,
+                level,
+                rightmost_child,
+            } => write!(
+                f,
+                "BTreeInternalFormatFresh(txnum: {txnum}, block: {block_id:?}, level: {level}, rightmost: {rightmost_child})"
+            ),
+            LogRecord::BTreeLeafFormatFresh {
+                txnum,
+                block_id,
+                overflow_block,
+            } => write!(
+                f,
+                "BTreeLeafFormatFresh(txnum: {txnum}, block: {block_id:?}, overflow: {overflow_block:?})"
             ),
         }
     }
@@ -10551,6 +10604,47 @@ impl From<&LogRecord> for Vec<u8> {
                 push_string(&mut buf, &block_id.filename);
                 push_i32(&mut buf, block_id.block_num as i32);
             }
+            LogRecord::BTreePageAppend {
+                txnum,
+                meta_block_id,
+                block_id,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &meta_block_id.filename);
+                push_i32(&mut buf, meta_block_id.block_num as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+            }
+            LogRecord::BTreeMetaFormatFresh { txnum, block_id } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+            }
+            LogRecord::BTreeInternalFormatFresh {
+                txnum,
+                block_id,
+                level,
+                rightmost_child,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *level as i32);
+                push_i32(&mut buf, *rightmost_child as i32);
+            }
+            LogRecord::BTreeLeafFormatFresh {
+                txnum,
+                block_id,
+                overflow_block,
+            } => {
+                push_i32(&mut buf, *txnum as i32);
+                push_string(&mut buf, &block_id.filename);
+                push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, if overflow_block.is_some() { 1 } else { 0 });
+                if let Some(overflow) = overflow_block {
+                    push_i32(&mut buf, *overflow as i32);
+                }
+            }
         }
         buf
     }
@@ -10860,6 +10954,51 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_usize(&value, &mut pos)?,
                 ),
             }),
+            19 => Ok(LogRecord::BTreePageAppend {
+                txnum: read_usize(&value, &mut pos)?,
+                meta_block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+            }),
+            20 => Ok(LogRecord::BTreeMetaFormatFresh {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+            }),
+            21 => Ok(LogRecord::BTreeInternalFormatFresh {
+                txnum: read_usize(&value, &mut pos)?,
+                block_id: BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                ),
+                level: read_usize(&value, &mut pos)? as u16,
+                rightmost_child: read_usize(&value, &mut pos)?,
+            }),
+            22 => {
+                let txnum = read_usize(&value, &mut pos)?;
+                let block_id = BlockId::new(
+                    read_string(&value, &mut pos)?,
+                    read_usize(&value, &mut pos)?,
+                );
+                let has_overflow = read_usize(&value, &mut pos)? != 0;
+                let overflow_block = if has_overflow {
+                    Some(read_usize(&value, &mut pos)?)
+                } else {
+                    None
+                };
+                Ok(LogRecord::BTreeLeafFormatFresh {
+                    txnum,
+                    block_id,
+                    overflow_block,
+                })
+            }
             _ => Err("Invalid log record type".into()),
         }
     }
@@ -11143,6 +11282,53 @@ impl LogRecord {
                     + block_id.filename.len()
                     + Self::BLOCK_NUM_SIZE
             }
+            LogRecord::BTreePageAppend {
+                meta_block_id,
+                block_id,
+                ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + meta_block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+            }
+            LogRecord::BTreeMetaFormatFresh { block_id, .. } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+            }
+            LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // level
+                    + Self::INT_BYTES // rightmost_child
+            }
+            LogRecord::BTreeLeafFormatFresh {
+                block_id,
+                overflow_block,
+                ..
+            } => {
+                base_size
+                    + Self::TXNUM_SIZE
+                    + Self::STR_LEN_SIZE
+                    + block_id.filename.len()
+                    + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // has_overflow flag
+                    + if overflow_block.is_some() {
+                        Self::INT_BYTES
+                    } else {
+                        0
+                    }
+            }
         }
     }
 
@@ -11168,6 +11354,10 @@ impl LogRecord {
             LogRecord::BTreeFreeListPush { .. } => 16,
             LogRecord::HeapPageAppend { .. } => 17,
             LogRecord::HeapPageFormatFresh { .. } => 18,
+            LogRecord::BTreePageAppend { .. } => 19,
+            LogRecord::BTreeMetaFormatFresh { .. } => 20,
+            LogRecord::BTreeInternalFormatFresh { .. } => 21,
+            LogRecord::BTreeLeafFormatFresh { .. } => 22,
         }
     }
 
@@ -11194,6 +11384,10 @@ impl LogRecord {
             LogRecord::BTreeFreeListPush { txnum, .. } => *txnum,
             LogRecord::HeapPageAppend { txnum, .. } => *txnum,
             LogRecord::HeapPageFormatFresh { txnum, .. } => *txnum,
+            LogRecord::BTreePageAppend { txnum, .. } => *txnum,
+            LogRecord::BTreeMetaFormatFresh { txnum, .. } => *txnum,
+            LogRecord::BTreeInternalFormatFresh { txnum, .. } => *txnum,
+            LogRecord::BTreeLeafFormatFresh { txnum, .. } => *txnum,
         }
     }
 
@@ -11511,6 +11705,48 @@ impl LogRecord {
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
             }
+            LogRecord::BTreePageAppend {
+                meta_block_id,
+                block_id,
+                ..
+            } => {
+                // Deallocate by pushing to free list
+                let meta_guard = txn.pin_write_guard(meta_block_id);
+                meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
+                    .expect("meta page required for btree page append undo");
+                let old_free_head = meta_view.first_free_block();
+
+                // Mark page as Free and link to old head
+                let mut block_guard = txn.pin_write_guard(block_id);
+                let bytes = block_guard.bytes_mut();
+                bytes.fill(0);
+                bytes[0] = crate::page::PageType::Free as u8;
+                bytes[4..8].copy_from_slice(&old_free_head.to_le_bytes());
+                block_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+
+                // Update meta to point to this page as new head
+                meta_view.set_first_free_block(block_id.block_num as u32);
+                meta_view.update_crc32();
+            }
+            LogRecord::BTreeMetaFormatFresh { block_id, .. } => {
+                // Zero page bytes to mark as unformatted
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.bytes_mut().fill(0);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
+                // Zero page bytes to mark as unformatted
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.bytes_mut().fill(0);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
+            LogRecord::BTreeLeafFormatFresh { block_id, .. } => {
+                // Zero page bytes to mark as unformatted
+                let mut guard = txn.pin_write_guard(block_id);
+                guard.bytes_mut().fill(0);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+            }
         }
     }
 
@@ -11549,7 +11785,11 @@ impl LogRecord {
             | LogRecord::BTreeFreeListPop { .. }
             | LogRecord::BTreeFreeListPush { .. } => None,
             LogRecord::HeapPageAppend { block_id, .. }
-            | LogRecord::HeapPageFormatFresh { block_id, .. } => Some(block_id),
+            | LogRecord::HeapPageFormatFresh { block_id, .. }
+            | LogRecord::BTreePageAppend { block_id, .. }
+            | LogRecord::BTreeMetaFormatFresh { block_id, .. }
+            | LogRecord::BTreeInternalFormatFresh { block_id, .. }
+            | LogRecord::BTreeLeafFormatFresh { block_id, .. } => Some(block_id),
         }
     }
 
