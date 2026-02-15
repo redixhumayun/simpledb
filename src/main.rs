@@ -8326,12 +8326,13 @@ impl RecordPage {
             txnum: txn_id as usize,
             block_id: block_id.clone(),
         };
-        record.write_log_record(&self.txn.log_manager())?;
+        let append_lsn = record.write_log_record(&self.txn.log_manager())?;
 
-        // Format (emits HeapPageFormatFresh internally)
         let mut guard = self.txn.pin_write_guard(&block_id);
+        guard.mark_modified(txn_id as usize, append_lsn);
+
+        // Format (emits HeapPageFormatFresh internally and overwrites with newer LSN)
         guard.format_as_heap()?;
-        // Note: mark_modified called inside format_as_heap with real LSN
         Ok(())
     }
 
