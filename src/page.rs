@@ -3816,8 +3816,8 @@ impl<'a> HeapPageViewMut<'a> {
         HeapPage::new(self.guard.bytes()).unwrap()
     }
 
-    fn build_mut_page(&mut self) -> HeapPageMut<'_> {
-        HeapPageMut::new(self.guard.bytes_mut()).unwrap()
+    fn build_mut_page(&mut self) -> SimpleDBResult<HeapPageMut<'_>> {
+        HeapPageMut::new(self.guard.bytes_mut())
     }
 
     /// Returns a logical row for the slot if it is live; otherwise `None`.
@@ -3834,7 +3834,7 @@ impl<'a> HeapPageViewMut<'a> {
     pub fn row_mut(&mut self, slot: SlotId) -> SimpleDBResult<Option<LogicalRowMut<'_>>> {
         //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
         let layout_clone = self.layout.clone();
-        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, slot)?;
         let row_log_context = RowLogContext::new(
             Arc::clone(&self.guard.log_manager),
             self.guard.block_id().clone(),
@@ -3870,7 +3870,7 @@ impl<'a> HeapPageViewMut<'a> {
 
     /// Inserts a raw tuple payload into the page and returns the allocated slot.
     fn insert_tuple(&mut self, bytes: &[u8]) -> SimpleDBResult<SlotId> {
-        let mut page = self.build_mut_page();
+        let mut page = self.build_mut_page()?;
         let mut split_guard = page.split()?;
         match split_guard.insert_tuple_fast(bytes)? {
             HeapInsert::Done(slot) => {
@@ -3888,7 +3888,7 @@ impl<'a> HeapPageViewMut<'a> {
 
     /// Deletes the tuple at `slot`, marking it free for reuse.
     pub fn delete_slot(&mut self, slot: SlotId) -> SimpleDBResult<()> {
-        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, slot)?;
         let record = LogRecord::HeapTupleDelete {
             txnum: self.guard.txn_id(),
             block_id: self.guard.block_id().clone(),
@@ -3901,7 +3901,7 @@ impl<'a> HeapPageViewMut<'a> {
         if lsn > current {
             self.page_lsn.set(Some(lsn));
         }
-        let mut page = self.build_mut_page();
+        let mut page = self.build_mut_page()?;
         let mut split_guard = page.split()?;
         split_guard.delete_slot(slot)?;
         self.dirty.set(true);
@@ -3918,10 +3918,10 @@ impl<'a> HeapPageViewMut<'a> {
             .try_into()
             .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
 
-        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), target_slot)?;
+        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, target_slot)?;
 
         {
-            let mut page = self.build_mut_page();
+            let mut page = self.build_mut_page()?;
             let mut split_guard = page.split()?;
             let mut lp = split_guard.line_ptrs().as_ref().get(target_slot);
             if !lp.is_live() {
@@ -3958,7 +3958,7 @@ impl<'a> HeapPageViewMut<'a> {
 
         // Tuple grew — need to relocate. Capture the new offset after insertion.
         let new_slot = self.insert_tuple(bytes)?;
-        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), new_slot)?;
+        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, new_slot)?;
         self.redirect_slot(target_slot, new_slot)?;
 
         let record = LogRecord::HeapTupleUpdate {
@@ -3982,7 +3982,7 @@ impl<'a> HeapPageViewMut<'a> {
 
     /// Marks `slot` as a redirect to `target`, used for tuple forwarding.
     fn redirect_slot(&mut self, slot: SlotId, target: SlotId) -> SimpleDBResult<()> {
-        let mut page = self.build_mut_page();
+        let mut page = self.build_mut_page()?;
         let mut split_guard = page.split()?;
         split_guard.redirect_slot(slot, target)?;
         self.dirty.set(true);
@@ -4004,7 +4004,7 @@ impl<'a> HeapPageViewMut<'a> {
         let slot = self.insert_tuple(&buf)?;
         self.dirty.set(true);
         let dirty = Rc::clone(&self.dirty);
-        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page(), slot)?;
+        let after_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, slot)?;
         let row_log_context = RowLogContext::new(
             Arc::clone(&self.guard.log_manager),
             self.guard.block_id().clone(),
@@ -4087,14 +4087,13 @@ impl<'a> HeapPageViewMut<'a> {
 impl Drop for HeapPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
-            let lsn = self.page_lsn.get();
-            if let Some(lsn) = lsn {
-                let mut page = self.build_mut_page();
+            let lsn = self.page_lsn.get().expect(
+                "WAL protocol violation: dirty page must have page_lsn set after WAL emission",
+            );
+            if let Ok(mut page) = self.build_mut_page() {
                 page.header.set_lsn(lsn as u64);
-                self.guard.mark_modified(self.guard.txn_id(), lsn);
-            } else {
-                self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
             }
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }
@@ -4557,14 +4556,13 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 impl Drop for BTreeLeafPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
-            if let Some(lsn) = self.page_lsn.get() {
-                if let Ok(mut page) = self.build_mut_page() {
-                    page.header.set_lsn(lsn as u64);
-                }
-                self.guard.mark_modified(self.guard.txn_id(), lsn);
-            } else {
-                self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+            let lsn = self.page_lsn.get().expect(
+                "WAL protocol violation: dirty page must have page_lsn set after WAL emission",
+            );
+            if let Ok(mut page) = self.build_mut_page() {
+                page.header.set_lsn(lsn as u64);
             }
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }
@@ -4872,14 +4870,13 @@ impl<'a> BTreeInternalPageViewMut<'a> {
 impl Drop for BTreeInternalPageViewMut<'_> {
     fn drop(&mut self) {
         if self.dirty.get() {
-            if let Some(lsn) = self.page_lsn.get() {
-                if let Ok(mut page) = self.build_mut_page() {
-                    page.header.set_lsn(lsn as u64);
-                }
-                self.guard.mark_modified(self.guard.txn_id(), lsn);
-            } else {
-                self.guard.mark_modified(self.guard.txn_id(), Lsn::MAX);
+            let lsn = self.page_lsn.get().expect(
+                "WAL protocol violation: dirty page must have page_lsn set after WAL emission",
+            );
+            if let Ok(mut page) = self.build_mut_page() {
+                page.header.set_lsn(lsn as u64);
             }
+            self.guard.mark_modified(self.guard.txn_id(), lsn);
         }
     }
 }

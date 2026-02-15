@@ -1163,7 +1163,6 @@ impl BTreeInternal {
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         // rightmost will be set after we compute child partitions
         new_guard.format_as_btree_internal(orig_view.btree_level(), None);
-        new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
 
         let split_record = LogRecord::BTreePageSplit {
@@ -1710,7 +1709,6 @@ impl BTreeLeaf {
         let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         new_guard.format_as_btree_leaf(overflow_block);
-        new_guard.mark_modified(txn_id, Lsn::MAX);
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let split_record = LogRecord::BTreePageSplit {
