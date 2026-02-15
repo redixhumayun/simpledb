@@ -21,6 +21,14 @@ struct SplitResult {
     right_block: usize,
 }
 
+/// Result of allocating a block from the free list or appending a new block.
+/// Contains the block ID and an optional LSN from BTreePageAppend (if appended).
+#[derive(Clone)]
+struct AllocatedBlock {
+    block_id: BlockId,
+    append_lsn: Option<Lsn>,
+}
+
 mod free_list {
     use super::*;
 
@@ -53,7 +61,10 @@ mod free_list {
             ))
         }
 
-        pub(crate) fn allocate(txn: &Arc<Transaction>, file_name: &str) -> SimpleDBResult<BlockId> {
+        pub(crate) fn allocate(
+            txn: &Arc<Transaction>,
+            file_name: &str,
+        ) -> SimpleDBResult<AllocatedBlock> {
             let meta_block = Self::meta_block_id(file_name);
             let tx_id = txn.id();
 
@@ -65,13 +76,16 @@ mod free_list {
                 meta_view.update_crc32();
                 drop(meta_view);
                 let block_id = txn.append(file_name);
-                crate::LogRecord::BTreePageAppend {
+                let append_lsn = crate::LogRecord::BTreePageAppend {
                     txnum: tx_id,
                     meta_block_id: meta_block,
                     block_id: block_id.clone(),
                 }
                 .write_log_record(&txn.log_manager())?;
-                return Ok(block_id);
+                return Ok(AllocatedBlock {
+                    block_id,
+                    append_lsn: Some(append_lsn),
+                });
             }
 
             // Read next free pointer from the block we're about to allocate
@@ -101,7 +115,10 @@ mod free_list {
             let meta_guard = txn.pin_write_guard(&meta_block);
             meta_guard.mark_modified(tx_id, lsn);
 
-            Ok(free_block)
+            Ok(AllocatedBlock {
+                block_id: free_block,
+                append_lsn: None,
+            })
         }
 
         #[cfg(test)]
@@ -960,7 +977,7 @@ mod btree_index_tests {
 
         // Pop from free list; allocator should return the same block.
         let reused = IndexFreeList::allocate(&index.txn, &index.index_file_name).unwrap();
-        assert_eq!(reused.block_num, spare.block_num);
+        assert_eq!(reused.block_id.block_num, spare.block_num);
 
         {
             let guard = index.txn.pin_read_guard(&index.meta_block);
@@ -1107,9 +1124,9 @@ mod btree_index_tests {
 
         // Free-list pop should reuse reclaimed page (head).
         let reused = IndexFreeList::allocate(&t3, &index_file_name).unwrap();
-        assert_eq!(reused.block_num, free_head as usize);
+        assert_eq!(reused.block_id.block_num, free_head as usize);
         assert!(
-            reused.block_num >= blocks_before && reused.block_num < blocks_after,
+            reused.block_id.block_num >= blocks_before && reused.block_id.block_num < blocks_after,
             "reused block should come from rollback-reclaimed split allocation range"
         );
     }
@@ -1160,8 +1177,11 @@ impl BTreeInternal {
             split_wal::read_internal_split_state(orig_guard.bytes())?;
         let mut orig_view = BTreeInternalPageViewMut::new(orig_guard, &self.layout)?;
 
-        let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut new_guard = self.txn.pin_write_guard(&new_block_id);
+        let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
+        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id);
+        if let Some(append_lsn) = allocated.append_lsn {
+            new_guard.mark_modified(txn_id, append_lsn);
+        }
         // rightmost will be set after we compute child partitions
         new_guard.format_as_btree_internal(orig_view.btree_level(), None)?;
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
@@ -1169,7 +1189,7 @@ impl BTreeInternal {
         let split_record = LogRecord::BTreePageSplit {
             txnum: txn_id,
             left_block_id: self.block_id.clone(),
-            right_block_id: new_block_id.clone(),
+            right_block_id: allocated.block_id.clone(),
             is_leaf: false,
             old_left_high_key,
             old_left_right_sibling: None,
@@ -1228,7 +1248,7 @@ impl BTreeInternal {
         orig_view.set_high_key(&sep_bytes)?;
         new_view.clear_high_key()?;
 
-        Ok(new_block_id)
+        Ok(allocated.block_id)
     }
 
     /// This method will search for a given key in the [BTreeInternal] node
@@ -1256,8 +1276,8 @@ impl BTreeInternal {
         };
 
         // Allocate a fresh root page and point its rightmost child at the left split child.
-        let new_root_block = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut guard = self.txn.pin_write_guard(&new_root_block);
+        let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
+        let mut guard = self.txn.pin_write_guard(&allocated.block_id);
         //  passing in split.left_block in the function call below is actually correct
         guard.format_as_btree_internal(level + 1, Some(split.left_block))?;
         {
@@ -1265,7 +1285,7 @@ impl BTreeInternal {
             // insert separator with right child = split.right_block
             view.insert_entry(split.sep_key, split.right_block)?;
         }
-        Ok(new_root_block)
+        Ok(allocated.block_id)
     }
 
     /// Insert a separator into this internal node, returning an optional split to bubble up.
@@ -1707,15 +1727,18 @@ impl BTreeLeaf {
             split_wal::read_leaf_split_state(orig_guard.bytes())?;
         let mut orig_view = orig_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
-        let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut new_guard = self.txn.pin_write_guard(&new_block_id);
+        let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
+        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id);
+        if let Some(append_lsn) = allocated.append_lsn {
+            new_guard.mark_modified(txn_id, append_lsn);
+        }
         new_guard.format_as_btree_leaf(overflow_block)?;
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let split_record = LogRecord::BTreePageSplit {
             txnum: txn_id,
             left_block_id: self.current_block_id.clone(),
-            right_block_id: new_block_id.clone(),
+            right_block_id: allocated.block_id.clone(),
             is_leaf: true,
             old_left_high_key,
             old_left_right_sibling,
@@ -1739,11 +1762,11 @@ impl BTreeLeaf {
         let sep_bytes: Vec<u8> = sep_key.try_into()?;
         // Left high key = separator, right link = new page (reuse existing guard)
         orig_view.set_high_key(&sep_bytes)?;
-        orig_view.set_right_sibling_block(Some(new_block_id.block_num))?;
+        orig_view.set_right_sibling_block(Some(allocated.block_id.block_num))?;
         new_view.set_right_sibling_block(old_right)?;
         new_view.clear_high_key()?;
 
-        Ok(new_block_id)
+        Ok(allocated.block_id)
     }
 
     /// Creates a new [BTreeLeaf] with the given transaction, block ID, layout, search key and filename
