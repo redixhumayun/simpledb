@@ -277,7 +277,7 @@ impl BTreeIndex {
             // Block 0: meta
             let meta_id = txn.append(&index_file_name);
             assert_eq!(meta_id.block_num, 0);
-            crate::LogRecord::BTreePageAppend {
+            let append_lsn = crate::LogRecord::BTreePageAppend {
                 txnum: txn.id(),
                 meta_block_id: meta_id.clone(),
                 block_id: meta_id.clone(),
@@ -285,13 +285,14 @@ impl BTreeIndex {
             .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&meta_id);
+                guard.mark_modified(txn.id(), append_lsn);
                 guard.format_as_btree_meta(1, 1, 1, u32::MAX)?;
             }
 
             // Block 1: root internal (level 0 -> children are leaves)
             let root_id = txn.append(&index_file_name);
             assert_eq!(root_id.block_num, 1);
-            crate::LogRecord::BTreePageAppend {
+            let append_lsn = crate::LogRecord::BTreePageAppend {
                 txnum: txn.id(),
                 meta_block_id: meta_id.clone(),
                 block_id: root_id.clone(),
@@ -299,6 +300,7 @@ impl BTreeIndex {
             .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&root_id);
+                guard.mark_modified(txn.id(), append_lsn);
                 // rightmost child will point to first leaf (block 2)
                 guard.format_as_btree_internal(0, Some(2))?;
             }
@@ -306,7 +308,7 @@ impl BTreeIndex {
             // Block 2: first leaf
             let leaf_id = txn.append(&index_file_name);
             assert_eq!(leaf_id.block_num, 2);
-            crate::LogRecord::BTreePageAppend {
+            let append_lsn = crate::LogRecord::BTreePageAppend {
                 txnum: txn.id(),
                 meta_block_id: meta_id.clone(),
                 block_id: leaf_id.clone(),
@@ -314,6 +316,7 @@ impl BTreeIndex {
             .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&leaf_id);
+                guard.mark_modified(txn.id(), append_lsn);
                 guard.format_as_btree_leaf(None)?;
             }
             (root_id, 1)
