@@ -1955,12 +1955,30 @@ impl<'a> HeapRecordSpaceMut<'a> {
         Self { bytes, base_offset }
     }
 
-    fn write_tuple(&mut self, offset: usize, tuple: &[u8]) {
+    fn write_tuple(&mut self, offset: usize, tuple: &[u8]) -> SimpleDBResult<()> {
         let relative = offset
             .checked_sub(self.base_offset)
-            .expect("tuple offset precedes record space");
-        let end = relative + tuple.len();
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!(
+                    "tuple offset {} precedes record space base {}",
+                    offset, self.base_offset
+                )
+                .into()
+            })?;
+        let end = relative
+            .checked_add(tuple.len())
+            .ok_or_else(|| -> Box<dyn Error> { "tuple end offset overflow".into() })?;
+        if end > self.bytes.len() {
+            return Err(format!(
+                "tuple write [{}, {}) exceeds record space length {}",
+                relative,
+                end,
+                self.bytes.len()
+            )
+            .into());
+        }
         self.bytes[relative..end].copy_from_slice(tuple);
+        Ok(())
     }
 }
 
@@ -2238,7 +2256,7 @@ impl<'a> HeapPageMut<'a> {
             .map_err(|_| "tuple offset larger than max offset")?;
         parts
             .record_space()
-            .write_tuple(old_offset as usize, old_tuple);
+            .write_tuple(old_offset as usize, old_tuple)?;
         parts
             .line_ptrs()
             .set(slot, LinePtr::new(old_offset, old_len, LineState::Live));
@@ -2275,7 +2293,9 @@ impl<'a> HeapPageMut<'a> {
         let offset: u16 = offset
             .try_into()
             .map_err(|_| "tuple offset larger than max offset")?;
-        parts.record_space().write_tuple(offset as usize, old_tuple);
+        parts
+            .record_space()
+            .write_tuple(offset as usize, old_tuple)?;
         parts
             .line_ptrs()
             .set(slot, LinePtr::new(offset, old_len, LineState::Live));
@@ -2355,7 +2375,7 @@ impl<'a> HeapPageParts<'a> {
                 return Err("insufficient free space".into());
             }
             let new_upper = upper - needed;
-            self.record_space.write_tuple(new_upper as usize, bytes);
+            self.record_space.write_tuple(new_upper as usize, bytes)?;
             self.line_ptrs
                 .set(slot, LinePtr::new(new_upper, needed, LineState::Live));
             self.header.set_free_upper(new_upper);
@@ -2394,7 +2414,7 @@ impl<'a> HeapPageParts<'a> {
             return Err("insufficient free space".into());
         }
         let new_upper = upper - needed;
-        self.record_space().write_tuple(new_upper as usize, bytes);
+        self.record_space().write_tuple(new_upper as usize, bytes)?;
         let slot = reservation.slot_idx;
         let expected = self
             .line_ptrs()
@@ -3943,7 +3963,7 @@ impl<'a> HeapPageViewMut<'a> {
             if bytes.len() <= current_len {
                 split_guard
                     .record_space()
-                    .write_tuple(lp.offset() as usize, bytes);
+                    .write_tuple(lp.offset() as usize, bytes)?;
                 lp.set_length(new_len);
                 split_guard.line_ptrs().set(target_slot, lp);
                 self.dirty.set(true);

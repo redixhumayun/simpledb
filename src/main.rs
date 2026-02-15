@@ -11528,7 +11528,6 @@ impl LogRecord {
                 // Check page type - if not IndexInternal, page was deallocated/unformatted by prior undo
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
                     .map_err(|e| format!("BTreeInternalInsert undo: failed to create internal page for block {:?}: {}", block_id, e))?;
-                // Undo insert may fail if prior undo operations already removed this entry
                 page.undo_insert(*slot)?;
                 page.restore_children_snapshot(*child_field_offset, old_children)
                     .map_err(|e| format!("BTreeInternalInsert undo: failed to restore children at offset {} in block {:?}: {}", child_field_offset, block_id, e))?;
