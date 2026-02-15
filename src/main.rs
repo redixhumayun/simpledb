@@ -28,7 +28,6 @@ pub use test_utils::TestDir;
 
 pub mod benchmark_framework;
 mod btree;
-mod blob_store;
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 mod intrusive_dll;
 mod page;
