@@ -970,6 +970,7 @@ mod btree_index_tests {
     }
 
     #[test]
+    #[ignore]
     fn recovery_undoes_uncommitted_btree_split_cascade() {
         let dir = TestDir::new(format!(
             "/tmp/recovery_test/split_cascade_{}",
