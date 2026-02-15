@@ -11401,7 +11401,7 @@ impl LogRecord {
             LogRecord::Checkpoint => Ok(()),  //  no-op
             LogRecord::HeapTupleInsert { .. } => {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
-                    return Err(format!("HeapTupleInsert: invalid record structure").into());
+                    return Err("HeapTupleInsert: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
@@ -11429,7 +11429,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("HeapTupleUpdate: invalid record structure").into());
+                    return Err("HeapTupleUpdate: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
@@ -11452,7 +11452,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("HeapTupleDelete: invalid record structure").into());
+                    return Err("HeapTupleDelete: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
@@ -11472,7 +11472,7 @@ impl LogRecord {
             }
             LogRecord::BTreeLeafInsert { .. } => {
                 let LogRecord::BTreeLeafInsert { block_id, slot, .. } = self else {
-                    return Err(format!("BTreeLeafInsert: invalid record structure").into());
+                    return Err("BTreeLeafInsert: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page =
@@ -11497,7 +11497,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeLeafDelete: invalid record structure").into());
+                    return Err("BTreeLeafDelete: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 // Check page type - if not IndexLeaf, page was deallocated/unformatted by prior undo
@@ -11522,7 +11522,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeInternalInsert: invalid record structure").into());
+                    return Err("BTreeInternalInsert: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 // Check page type - if not IndexInternal, page was deallocated/unformatted by prior undo
@@ -11546,7 +11546,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeInternalDelete: invalid record structure").into());
+                    return Err("BTreeInternalDelete: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
@@ -11565,7 +11565,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeLeafHeaderUpdate: invalid record structure").into());
+                    return Err("BTreeLeafHeaderUpdate: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let header = guard
@@ -11588,9 +11588,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(
-                        format!("BTreeInternalHeaderUpdate: invalid record structure").into(),
-                    );
+                    return Err("BTreeInternalHeaderUpdate: invalid record structure".into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
                 let header = guard.bytes_mut().get_mut(..old_header.len())
@@ -11611,7 +11609,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreePageSplit: invalid record structure").into());
+                    return Err("BTreePageSplit: invalid record structure".into());
                 };
 
                 // Restore left-page structural metadata (skip if page deallocated/unformatted).
@@ -11678,7 +11676,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeRootUpdate: invalid record structure").into());
+                    return Err("BTreeRootUpdate: invalid record structure".into());
                 };
 
                 let meta_guard = txn.pin_write_guard(meta_block_id);
@@ -11719,7 +11717,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeFreeListPop: invalid record structure").into());
+                    return Err("BTreeFreeListPop: invalid record structure".into());
                 };
 
                 // Restore meta to point to old head
@@ -11752,7 +11750,7 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return Err(format!("BTreeFreeListPush: invalid record structure").into());
+                    return Err("BTreeFreeListPush: invalid record structure".into());
                 };
 
                 // Restore meta to point to old head (before push)
