@@ -2776,7 +2776,7 @@ impl<'a> PageWriteGuard<'a> {
     }
 
     /// Formats the page as an empty heap page.
-    pub fn format_as_heap(&mut self) {
+    pub fn format_as_heap(&mut self) -> SimpleDBResult<()> {
         let block_id = self.block_id().clone();
         let txn_id = self.txn_id();
 
@@ -2785,7 +2785,7 @@ impl<'a> PageWriteGuard<'a> {
             txnum: txn_id,
             block_id,
         };
-        let lsn = record.write_log_record(&self.log_manager);
+        let lsn = record.write_log_record(&self.log_manager)?;
 
         // Perform mutation
         let bytes = self.bytes_mut();
@@ -2795,10 +2795,11 @@ impl<'a> PageWriteGuard<'a> {
 
         // Mark with REAL LSN (not Lsn::MAX)
         self.mark_modified(txn_id, lsn);
+        Ok(())
     }
 
     /// Formats the page as an empty B-tree leaf page.
-    pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) {
+    pub fn format_as_btree_leaf(&mut self, overflow_block: Option<usize>) -> SimpleDBResult<()> {
         let block_id = self.block_id().clone();
         let txn_id = self.txn_id();
 
@@ -2808,7 +2809,7 @@ impl<'a> PageWriteGuard<'a> {
             block_id,
             overflow_block,
         };
-        let lsn = record.write_log_record(&self.log_manager);
+        let lsn = record.write_log_record(&self.log_manager)?;
 
         // Perform mutation
         let bytes = self.bytes_mut();
@@ -2818,11 +2819,16 @@ impl<'a> PageWriteGuard<'a> {
 
         // Mark with REAL LSN (not Lsn::MAX)
         self.mark_modified(txn_id, lsn);
+        Ok(())
     }
 
     /// Formats the page as an empty B-tree internal page.
     /// `rightmost_child` seeds the only child when the node has zero separators.
-    pub fn format_as_btree_internal(&mut self, level: u8, rightmost_child: Option<usize>) {
+    pub fn format_as_btree_internal(
+        &mut self,
+        level: u8,
+        rightmost_child: Option<usize>,
+    ) -> SimpleDBResult<()> {
         let block_id = self.block_id().clone();
         let txn_id = self.txn_id();
 
@@ -2833,7 +2839,7 @@ impl<'a> PageWriteGuard<'a> {
             level: level as u16,
             rightmost_child: rightmost_child.unwrap_or(0),
         };
-        let lsn = record.write_log_record(&self.log_manager);
+        let lsn = record.write_log_record(&self.log_manager)?;
 
         // Perform mutation
         let bytes = self.bytes_mut();
@@ -2844,6 +2850,7 @@ impl<'a> PageWriteGuard<'a> {
 
         // Mark with REAL LSN (not Lsn::MAX)
         self.mark_modified(txn_id, lsn);
+        Ok(())
     }
 
     /// Formats the page as a B-tree meta page (block 0 in single-file layout).
@@ -2853,7 +2860,7 @@ impl<'a> PageWriteGuard<'a> {
         tree_height: u16,
         root_block: u32,
         first_free_block: u32,
-    ) {
+    ) -> SimpleDBResult<()> {
         let block_id = self.block_id().clone();
         let txn_id = self.txn_id();
 
@@ -2862,7 +2869,7 @@ impl<'a> PageWriteGuard<'a> {
             txnum: txn_id,
             block_id,
         };
-        let lsn = record.write_log_record(&self.log_manager);
+        let lsn = record.write_log_record(&self.log_manager)?;
 
         // Perform mutation
         let bytes = self.bytes_mut();
@@ -2874,6 +2881,7 @@ impl<'a> PageWriteGuard<'a> {
 
         // Mark with REAL LSN (not Lsn::MAX)
         self.mark_modified(txn_id, lsn);
+        Ok(())
     }
 
     /// Formats the page as a free-list page and links it to `next_free_block`.
@@ -3763,7 +3771,9 @@ impl Drop for LogicalRowMut<'_> {
             },
         };
 
-        let lsn = record.write_log_record(&ctx.log_manager);
+        let lsn = record
+            .write_log_record(&ctx.log_manager)
+            .expect("WAL write failure in LogicalRowMut::drop - cannot maintain consistency");
         ctx.update_page_lsn(lsn);
     }
 }
@@ -3928,7 +3938,7 @@ impl<'a> HeapPageViewMut<'a> {
             offset: before_image.offset,
             old_tuple: before_image.bytes,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -3979,7 +3989,7 @@ impl<'a> HeapPageViewMut<'a> {
                     relocated: false,
                     relocated_slot: None,
                 };
-                let lsn = record.write_log_record(&self.guard.log_manager);
+                let lsn = record.write_log_record(&self.guard.log_manager)?;
                 let current = self.page_lsn.get().unwrap_or(0);
                 if lsn > current {
                     self.page_lsn.set(Some(lsn));
@@ -4004,7 +4014,7 @@ impl<'a> HeapPageViewMut<'a> {
             relocated: true,
             relocated_slot: Some(new_slot),
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4463,7 +4473,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             offset: entry_snapshot.offset,
             entry: entry_snapshot.bytes,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4497,7 +4507,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             rid: decoded_entry.rid,
             entry_bytes,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4519,7 +4529,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4537,7 +4547,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4556,7 +4566,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4575,7 +4585,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4770,7 +4780,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             child_field_offset,
             old_children,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4811,7 +4821,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             child_field_offset,
             old_children,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4833,7 +4843,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4851,7 +4861,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4870,7 +4880,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4889,7 +4899,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
             old_header,
             new_header,
         };
-        let lsn = record.write_log_record(&self.guard.log_manager);
+        let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
     }
@@ -4927,7 +4937,7 @@ mod heap_page_view_tests {
     }
 
     fn format_heap_page(guard: &mut PageWriteGuard<'_>) {
-        guard.format_as_heap();
+        guard.format_as_heap().unwrap();
     }
 
     #[test]

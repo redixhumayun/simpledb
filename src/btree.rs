@@ -70,7 +70,7 @@ mod free_list {
                     meta_block_id: meta_block,
                     block_id: block_id.clone(),
                 }
-                .write_log_record(&txn.log_manager());
+                .write_log_record(&txn.log_manager())?;
                 return Ok(block_id);
             }
 
@@ -90,7 +90,7 @@ mod free_list {
                 new_head: next_free,
                 old_block_next: next_free,
             };
-            let lsn = record.write_log_record(&txn.log_manager());
+            let lsn = record.write_log_record(&txn.log_manager())?;
 
             // Perform mutation
             meta_view.set_first_free_block(next_free);
@@ -132,7 +132,7 @@ mod free_list {
                 old_head,
                 new_head,
             };
-            let lsn = record.write_log_record(&txn.log_manager());
+            let lsn = record.write_log_record(&txn.log_manager())?;
 
             // Mark target block as free and link it to the free list
             let mut target_guard = txn.pin_write_guard(&target_block);
@@ -265,10 +265,10 @@ impl BTreeIndex {
                 meta_block_id: meta_id.clone(),
                 block_id: meta_id.clone(),
             }
-            .write_log_record(&txn.log_manager());
+            .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&meta_id);
-                guard.format_as_btree_meta(1, 1, 1, u32::MAX);
+                guard.format_as_btree_meta(1, 1, 1, u32::MAX)?;
             }
 
             // Block 1: root internal (level 0 -> children are leaves)
@@ -279,11 +279,11 @@ impl BTreeIndex {
                 meta_block_id: meta_id.clone(),
                 block_id: root_id.clone(),
             }
-            .write_log_record(&txn.log_manager());
+            .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&root_id);
                 // rightmost child will point to first leaf (block 2)
-                guard.format_as_btree_internal(0, Some(2));
+                guard.format_as_btree_internal(0, Some(2))?;
             }
 
             // Block 2: first leaf
@@ -294,10 +294,10 @@ impl BTreeIndex {
                 meta_block_id: meta_id.clone(),
                 block_id: leaf_id.clone(),
             }
-            .write_log_record(&txn.log_manager());
+            .write_log_record(&txn.log_manager())?;
             {
                 let mut guard = txn.pin_write_guard(&leaf_id);
-                guard.format_as_btree_leaf(None);
+                guard.format_as_btree_leaf(None)?;
             }
             (root_id, 1)
         } else {
@@ -359,7 +359,7 @@ impl BTreeIndex {
             old_tree_height,
             new_tree_height,
         };
-        let lsn = record.write_log_record(&self.txn.log_manager());
+        let lsn = record.write_log_record(&self.txn.log_manager())?;
 
         self.root_block = BlockId::new(self.index_file_name.clone(), new_root_block);
         self.tree_height = new_tree_height;
@@ -1163,7 +1163,7 @@ impl BTreeInternal {
         let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
         // rightmost will be set after we compute child partitions
-        new_guard.format_as_btree_internal(orig_view.btree_level(), None);
+        new_guard.format_as_btree_internal(orig_view.btree_level(), None)?;
         let mut new_view = BTreeInternalPageViewMut::new(new_guard, &self.layout)?;
 
         let split_record = LogRecord::BTreePageSplit {
@@ -1176,7 +1176,7 @@ impl BTreeInternal {
             old_left_overflow: None,
             old_left_rightmost_child,
         };
-        let _ = split_record.write_log_record(&self.txn.log_manager());
+        split_record.write_log_record(&self.txn.log_manager())?;
 
         // Snapshot children array C0..Ck
         let orig_slot_count = orig_view.slot_count();
@@ -1259,7 +1259,7 @@ impl BTreeInternal {
         let new_root_block = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut guard = self.txn.pin_write_guard(&new_root_block);
         //  passing in split.left_block in the function call below is actually correct
-        guard.format_as_btree_internal(level + 1, Some(split.left_block));
+        guard.format_as_btree_internal(level + 1, Some(split.left_block))?;
         {
             let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
             // insert separator with right child = split.right_block
@@ -1709,7 +1709,7 @@ impl BTreeLeaf {
 
         let new_block_id = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut new_guard = self.txn.pin_write_guard(&new_block_id);
-        new_guard.format_as_btree_leaf(overflow_block);
+        new_guard.format_as_btree_leaf(overflow_block)?;
         let mut new_view = new_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let split_record = LogRecord::BTreePageSplit {
@@ -1722,7 +1722,7 @@ impl BTreeLeaf {
             old_left_overflow,
             old_left_rightmost_child: None,
         };
-        let _ = split_record.write_log_record(&self.txn.log_manager());
+        split_record.write_log_record(&self.txn.log_manager())?;
 
         // Preserve old right sibling so we can re-chain after the split.
         let old_right = orig_view.right_sibling_block();

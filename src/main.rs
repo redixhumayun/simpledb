@@ -7859,7 +7859,7 @@ impl TableScan {
                 "TableScan for {} is empty, allocating new block",
                 table_name
             );
-            scan.move_to_new_block();
+            scan.move_to_new_block().unwrap();
         } else {
             debug!(
                 "TableScan for {} is not empty, moving to block 0",
@@ -7879,12 +7879,13 @@ impl TableScan {
     }
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
-    fn move_to_new_block(&mut self) {
+    fn move_to_new_block(&mut self) -> SimpleDBResult<()> {
         let block = self.txn.append(&self.file_name);
         let record_page = RecordPage::new(Arc::clone(&self.txn), block, self.layout.clone());
-        record_page.format();
+        record_page.format()?;
         self.current_slot = None;
         self.record_page = Some(record_page);
+        Ok(())
     }
 
     /// Checks if the [`TableScan`] is at the last block in the file
@@ -8053,7 +8054,7 @@ impl UpdateScan for TableScan {
                 }
                 Err(_) => {
                     if self.at_last_block() {
-                        self.move_to_new_block();
+                        self.move_to_new_block()?;
                     } else {
                         self.move_to_block(
                             self.record_page.as_ref().unwrap().block_id.block_num + 1,
@@ -8316,7 +8317,7 @@ impl RecordPage {
     }
 
     /// Format the underlying page as a HeapPage
-    pub fn format(&self) {
+    pub fn format(&self) -> SimpleDBResult<()> {
         let block_id = self.block_id.clone();
         let txn_id = self.txn.tx_id;
 
@@ -8325,12 +8326,13 @@ impl RecordPage {
             txnum: txn_id as usize,
             block_id: block_id.clone(),
         };
-        let _lsn = record.write_log_record(&self.txn.log_manager());
+        record.write_log_record(&self.txn.log_manager())?;
 
         // Format (emits HeapPageFormatFresh internally)
         let mut guard = self.txn.pin_write_guard(&block_id);
-        guard.format_as_heap();
+        guard.format_as_heap()?;
         // Note: mark_modified called inside format_as_heap with real LSN
+        Ok(())
     }
 
     /// Finds the next valid slot after the given slot.
@@ -8755,7 +8757,7 @@ impl Transaction {
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     pub fn commit(&self) -> Result<(), Box<dyn Error>> {
-        self.recovery_manager.commit();
+        self.recovery_manager.commit()?;
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
         Ok(())
@@ -9868,11 +9870,12 @@ impl RecoveryManager {
     /// It flushes all the buffers associated with this transaction
     /// It creates and writes a new [`LogRecord::Commit`] record to the WAL
     /// It then forces a flush on the WAL to ensure logs are committed
-    fn commit(&self) {
+    fn commit(&self) -> SimpleDBResult<()> {
         self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
-        let lsn = record.write_log_record(&self.log_manager);
+        let lsn = record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
+        Ok(())
     }
 
     /// Rollback the [`Transaction`] associated with this [`RecoveryManager`] instance
@@ -9896,7 +9899,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(&self.log_manager);
+        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -9928,7 +9931,7 @@ impl RecoveryManager {
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
         let checkpoint_record = LogRecord::Checkpoint;
-        let lsn = checkpoint_record.write_log_record(&self.log_manager);
+        let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
@@ -11859,7 +11862,7 @@ impl LogRecord {
     }
 
     /// Serialize the log record to bytes and write it to the log file
-    fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> Lsn {
+    fn write_log_record(&self, log_manager: &Arc<Mutex<LogManager>>) -> SimpleDBResult<Lsn> {
         let bytes: Vec<u8> = self.into();
         log_manager.lock().unwrap().append(bytes)
     }
@@ -12702,17 +12705,18 @@ impl LogManager {
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
-    pub fn append(&mut self, log_record: Vec<u8>) -> Lsn {
+    pub fn append(&mut self, log_record: Vec<u8>) -> SimpleDBResult<Lsn> {
         let mut boundary = self.log_page.boundary();
         let bytes_needed = log_record.len() + WalPage::HEADER_BYTES;
         let page_capacity = self.log_page.capacity();
         let max_payload = page_capacity.saturating_sub(WalPage::HEADER_BYTES);
-        assert!(
-            bytes_needed <= max_payload,
-            "log record of {} bytes exceeds WAL capacity {}",
-            bytes_needed,
-            max_payload
-        );
+        if bytes_needed > max_payload {
+            return Err(format!(
+                "log record of {} bytes exceeds WAL capacity {}",
+                bytes_needed, max_payload
+            )
+            .into());
+        }
         if boundary.saturating_sub(bytes_needed) < WalPage::HEADER_BYTES {
             self.flush_to_disk();
             self.current_block = LogManager::append_new_block(
@@ -12727,7 +12731,7 @@ impl LogManager {
         self.log_page.write_record(record_pos, &log_record);
         self.log_page.set_boundary(record_pos);
         self.latest_lsn += 1;
-        self.latest_lsn
+        Ok(self.latest_lsn)
     }
 
     /// Append a new block to the file maintained by the log manager
@@ -12854,7 +12858,7 @@ mod log_manager_tests {
         dbg!("creating records");
         for i in start..=end {
             let record = create_log_record(&format!("record{i}"), i + 100);
-            let lsn = log_manager.lock().unwrap().append(record);
+            let lsn = log_manager.lock().unwrap().append(record).unwrap();
             print!("{lsn} ");
         }
         println!();
