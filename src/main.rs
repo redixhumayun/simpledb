@@ -28,6 +28,7 @@ pub use test_utils::TestDir;
 
 pub mod benchmark_framework;
 mod btree;
+mod blob_store;
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 mod intrusive_dll;
 mod page;
@@ -9890,7 +9891,7 @@ impl RecoveryManager {
             if let LogRecord::Start(_) = record {
                 return Ok(());
             }
-            record.undo(tx);
+            record.undo(tx)?;
         }
         //  Flush all data associated with this transaction
         self.buffer_manager.flush_all(self.tx_num);
@@ -9919,7 +9920,7 @@ impl RecoveryManager {
                     if !finished_txns.contains(&record.get_tx_num())
                         && record.should_undo_during_recovery(tx, record_lsn)
                     {
-                        record.undo(tx);
+                        record.undo(tx)?;
                     }
                 }
             }
@@ -11393,21 +11394,31 @@ impl LogRecord {
 
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
-    fn undo(&self, txn: &dyn TransactionOperations) {
+    fn undo(&self, txn: &dyn TransactionOperations) -> SimpleDBResult<()> {
         match self {
-            LogRecord::Start(_) => (),    //  no-op
-            LogRecord::Commit(_) => (),   //  no-op
-            LogRecord::Rollback(_) => (), //  no-op
-            LogRecord::Checkpoint => (),  //  no-op
+            LogRecord::Start(_) => Ok(()),    //  no-op
+            LogRecord::Commit(_) => Ok(()),   //  no-op
+            LogRecord::Rollback(_) => Ok(()), //  no-op
+            LogRecord::Checkpoint => Ok(()),  //  no-op
             LogRecord::HeapTupleInsert { .. } => {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
-                    return;
+                    return Err(format!("HeapTupleInsert: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
-                    .expect("heap page required for undo");
-                page.undo_insert(*slot).expect("undo heap tuple insert");
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
+                    format!(
+                        "HeapTupleInsert undo: failed to create heap page for block {:?}: {}",
+                        block_id, e
+                    )
+                })?;
+                page.undo_insert(*slot).map_err(|e| {
+                    format!(
+                        "HeapTupleInsert undo: failed to undo insert at slot {} in block {:?}: {}",
+                        slot, block_id, e
+                    )
+                })?;
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::HeapTupleUpdate { .. } => {
                 let LogRecord::HeapTupleUpdate {
@@ -11419,14 +11430,19 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("HeapTupleUpdate: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
-                    .expect("heap page required for undo");
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
+                    format!(
+                        "HeapTupleUpdate undo: failed to create heap page for block {:?}: {}",
+                        block_id, e
+                    )
+                })?;
                 page.undo_update(*slot, *old_offset, old_tuple, *relocated_slot)
-                    .expect("undo heap tuple update");
+                    .map_err(|e| format!("HeapTupleUpdate undo: failed to undo update at slot {} in block {:?}: {}", slot, block_id, e))?;
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::HeapTupleDelete { .. } => {
                 let LogRecord::HeapTupleDelete {
@@ -11437,25 +11453,41 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("HeapTupleDelete: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut())
-                    .expect("heap page required for undo");
-                page.undo_delete(*slot, *offset, old_tuple)
-                    .expect("undo heap tuple delete");
+                let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
+                    format!(
+                        "HeapTupleDelete undo: failed to create heap page for block {:?}: {}",
+                        block_id, e
+                    )
+                })?;
+                page.undo_delete(*slot, *offset, old_tuple).map_err(|e| {
+                    format!(
+                        "HeapTupleDelete undo: failed to undo delete at slot {} in block {:?}: {}",
+                        slot, block_id, e
+                    )
+                })?;
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeLeafInsert { .. } => {
                 let LogRecord::BTreeLeafInsert { block_id, slot, .. } = self else {
-                    return;
+                    return Err(format!("BTreeLeafInsert: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
-                    if page.undo_insert(*slot).is_ok() {
-                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                    }
-                }
+                let mut page =
+                    crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
+                        format!(
+                            "BTreeLeafInsert undo: failed to create leaf page for block {:?}: {}",
+                            block_id, e
+                        )
+                    })?;
+                // Undo insert may fail if prior undo operations already removed this entry
+                page.undo_insert(*slot)?;
+
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeLeafDelete { .. } => {
                 let LogRecord::BTreeLeafDelete {
@@ -11466,14 +11498,21 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeLeafDelete: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(guard.bytes_mut()) {
-                    if page.undo_delete(*slot, *offset, entry_bytes).is_ok() {
-                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                    }
-                }
+                // Check page type - if not IndexLeaf, page was deallocated/unformatted by prior undo
+                let mut page =
+                    crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
+                        format!(
+                            "BTreeLeafDelete undo: failed to create leaf page for block {:?}: {}",
+                            block_id, e
+                        )
+                    })?;
+                // Undo delete may fail if page structure changed by prior undo operations
+                page.undo_delete(*slot, *offset, entry_bytes)?;
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeInternalInsert { .. } => {
                 let LogRecord::BTreeInternalInsert {
@@ -11484,15 +11523,18 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeInternalInsert: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
-                    if page.undo_insert(*slot).is_ok() {
-                        let _ = page.restore_children_snapshot(*child_field_offset, old_children);
-                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                    }
-                }
+                // Check page type - if not IndexInternal, page was deallocated/unformatted by prior undo
+                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
+                    .map_err(|e| format!("BTreeInternalInsert undo: failed to create internal page for block {:?}: {}", block_id, e))?;
+                // Undo insert may fail if prior undo operations already removed this entry
+                page.undo_insert(*slot)?;
+                page.restore_children_snapshot(*child_field_offset, old_children)
+                    .map_err(|e| format!("BTreeInternalInsert undo: failed to restore children at offset {} in block {:?}: {}", child_field_offset, block_id, e))?;
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeInternalDelete { .. } => {
                 let LogRecord::BTreeInternalDelete {
@@ -11505,15 +11547,17 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeInternalDelete: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Ok(mut page) = crate::page::BTreeInternalPageMut::new(guard.bytes_mut()) {
-                    if page.undo_delete(*slot, *offset, entry_bytes).is_ok() {
-                        let _ = page.restore_children_snapshot(*child_field_offset, old_children);
-                        guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                    }
-                }
+                let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
+                    .map_err(|e| format!("BTreeInternalDelete undo: failed to create internal page for block {:?}: {}", block_id, e))?;
+                // Undo delete may fail if page structure changed by prior undo operations
+                page.undo_delete(*slot, *offset, entry_bytes)?;
+                page.restore_children_snapshot(*child_field_offset, old_children)
+                    .map_err(|e| format!("BTreeInternalDelete undo: failed to restore children at offset {} in block {:?}: {}", child_field_offset, block_id, e))?;
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeLeafHeaderUpdate { .. } => {
                 let LogRecord::BTreeLeafHeaderUpdate {
@@ -11522,13 +11566,21 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeLeafHeaderUpdate: invalid record structure").into());
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Some(header) = guard.bytes_mut().get_mut(..old_header.len()) {
-                    header.copy_from_slice(old_header);
-                    guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                }
+                let header = guard
+                    .bytes_mut()
+                    .get_mut(..old_header.len())
+                    .ok_or_else(|| {
+                        format!(
+                            "BTreeLeafHeaderUpdate undo: header slice out of bounds for block {:?}",
+                            block_id
+                        )
+                    })?;
+                header.copy_from_slice(old_header);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeInternalHeaderUpdate { .. } => {
                 let LogRecord::BTreeInternalHeaderUpdate {
@@ -11537,13 +11589,16 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(
+                        format!("BTreeInternalHeaderUpdate: invalid record structure").into(),
+                    );
                 };
                 let mut guard = txn.pin_write_guard(block_id);
-                if let Some(header) = guard.bytes_mut().get_mut(..old_header.len()) {
-                    header.copy_from_slice(old_header);
-                    guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                }
+                let header = guard.bytes_mut().get_mut(..old_header.len())
+                    .ok_or_else(|| format!("BTreeInternalHeaderUpdate undo: header slice out of bounds for block {:?}", block_id))?;
+                header.copy_from_slice(old_header);
+                guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreePageSplit { .. } => {
                 let LogRecord::BTreePageSplit {
@@ -11557,51 +11612,51 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreePageSplit: invalid record structure").into());
                 };
 
-                // Restore left-page structural metadata.
+                // Restore left-page structural metadata (skip if page deallocated/unformatted).
                 if *is_leaf {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    if let Ok(mut page) = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
-                    {
-                        match old_left_high_key {
-                            Some(bytes) => page
-                                .write_high_key(bytes)
-                                .expect("restore btree leaf high key during split undo"),
+                    let mut page = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
+                            .map_err(|e| format!("BTreePageSplit undo: failed to create leaf page for left block {:?}: {}", left_block_id, e))?;
+                    match old_left_high_key {
+                            Some(bytes) => page.write_high_key(bytes)
+                                .map_err(|e| format!("BTreePageSplit undo: failed to restore leaf high key for block {:?}: {}", left_block_id, e))?,
                             None => page.clear_high_key(),
                         }
-                        let rsib = old_left_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX);
-                        page.set_right_sibling_block(rsib);
-                        let overflow = *old_left_overflow;
-                        page.set_overflow_block(overflow)
-                            .expect("restore btree leaf overflow during split undo");
-                        left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                    }
+                    let rsib = old_left_right_sibling.map(|b| b as u32).unwrap_or(u32::MAX);
+                    page.set_right_sibling_block(rsib);
+                    let overflow = *old_left_overflow;
+                    page.set_overflow_block(overflow)
+                            .map_err(|e| format!("BTreePageSplit undo: failed to restore leaf overflow for block {:?}: {}", left_block_id, e))?;
+                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 } else {
                     let mut left_guard = txn.pin_write_guard(left_block_id);
-                    if let Ok(mut page) =
-                        crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
-                    {
-                        match old_left_high_key {
-                            Some(bytes) => page
-                                .write_high_key(bytes)
-                                .expect("restore btree internal high key during split undo"),
+                    let mut page = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
+                            .map_err(|e| format!("BTreePageSplit undo: failed to create internal page for left block {:?}: {}", left_block_id, e))?;
+                    match old_left_high_key {
+                            Some(bytes) => page.write_high_key(bytes)
+                                .map_err(|e| format!("BTreePageSplit undo: failed to restore internal high key for block {:?}: {}", left_block_id, e))?,
                             None => page.clear_high_key(),
                         }
-                        if let Some(rightmost) = old_left_rightmost_child {
-                            page.set_rightmost_child_block(*rightmost);
-                        }
-                        left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    if let Some(rightmost) = old_left_rightmost_child {
+                        page.set_rightmost_child_block(*rightmost);
                     }
+                    left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 }
 
                 // Deallocate right split page by pushing it onto the index free-list.
                 let meta_block = BlockId::new(left_block_id.filename.clone(), 0);
                 let meta_guard = txn.pin_write_guard(&meta_block);
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
-                    .expect("meta page required for split undo");
+                let mut meta_view =
+                    crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
+                        format!(
+                            "BTreePageSplit undo: failed to create meta page view: {}",
+                            e
+                        )
+                    })?;
                 let old_head = meta_view.first_free_block();
 
                 let mut right_guard = txn.pin_write_guard(right_block_id);
@@ -11613,6 +11668,7 @@ impl LogRecord {
 
                 meta_view.set_first_free_block(right_block_id.block_num as u32);
                 meta_view.update_crc32();
+                Ok(())
             }
             LogRecord::BTreeRootUpdate { .. } => {
                 let LogRecord::BTreeRootUpdate {
@@ -11623,13 +11679,18 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeRootUpdate: invalid record structure").into());
                 };
 
                 let meta_guard = txn.pin_write_guard(meta_block_id);
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
-                    .expect("meta page required for root-update undo");
+                let mut meta_view =
+                    crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
+                        format!(
+                            "BTreeRootUpdate undo: failed to create meta page view: {}",
+                            e
+                        )
+                    })?;
                 let old_free_head = meta_view.first_free_block();
                 meta_view.set_root_block(*old_root_block);
                 meta_view.set_tree_height(*old_tree_height);
@@ -11648,6 +11709,7 @@ impl LogRecord {
                 }
 
                 meta_view.update_crc32();
+                Ok(())
             }
             LogRecord::BTreeFreeListPop { .. } => {
                 let LogRecord::BTreeFreeListPop {
@@ -11658,14 +11720,19 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeFreeListPop: invalid record structure").into());
                 };
 
                 // Restore meta to point to old head
                 let meta_guard = txn.pin_write_guard(meta_block_id);
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
-                    .expect("meta page required for free-list pop undo");
+                let mut meta_view =
+                    crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
+                        format!(
+                            "BTreeFreeListPop undo: failed to create meta page view: {}",
+                            e
+                        )
+                    })?;
                 meta_view.set_first_free_block(*old_head);
 
                 // Restore the allocated block as free with its old next pointer
@@ -11677,6 +11744,7 @@ impl LogRecord {
                 block_guard.mark_modified(txn.txn_id(), Lsn::MAX);
 
                 meta_view.update_crc32();
+                Ok(())
             }
             LogRecord::BTreeFreeListPush { .. } => {
                 let LogRecord::BTreeFreeListPush {
@@ -11685,25 +11753,33 @@ impl LogRecord {
                     ..
                 } = self
                 else {
-                    return;
+                    return Err(format!("BTreeFreeListPush: invalid record structure").into());
                 };
 
                 // Restore meta to point to old head (before push)
                 let meta_guard = txn.pin_write_guard(meta_block_id);
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
-                    .expect("meta page required for free-list push undo");
+                let mut meta_view =
+                    crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
+                        format!(
+                            "BTreeFreeListPush undo: failed to create meta page view: {}",
+                            e
+                        )
+                    })?;
                 meta_view.set_first_free_block(*old_head);
                 meta_view.update_crc32();
+                Ok(())
             }
             LogRecord::HeapPageAppend { .. } => {
                 // No-op: heap has no free list
+                Ok(())
             }
             LogRecord::HeapPageFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
                 let mut guard = txn.pin_write_guard(block_id);
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreePageAppend {
                 meta_block_id,
@@ -11713,8 +11789,13 @@ impl LogRecord {
                 // Deallocate by pushing to free list
                 let meta_guard = txn.pin_write_guard(meta_block_id);
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
-                let mut meta_view = crate::page::BTreeMetaPageViewMut::new(meta_guard)
-                    .expect("meta page required for btree page append undo");
+                let mut meta_view =
+                    crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
+                        format!(
+                            "BTreePageAppend undo: failed to create meta page view: {}",
+                            e
+                        )
+                    })?;
                 let old_free_head = meta_view.first_free_block();
 
                 // Mark page as Free and link to old head
@@ -11728,24 +11809,28 @@ impl LogRecord {
                 // Update meta to point to this page as new head
                 meta_view.set_first_free_block(block_id.block_num as u32);
                 meta_view.update_crc32();
+                Ok(())
             }
             LogRecord::BTreeMetaFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
                 let mut guard = txn.pin_write_guard(block_id);
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
                 let mut guard = txn.pin_write_guard(block_id);
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
             LogRecord::BTreeLeafFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
                 let mut guard = txn.pin_write_guard(block_id);
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                Ok(())
             }
         }
     }
