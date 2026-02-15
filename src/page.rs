@@ -6437,7 +6437,9 @@ impl<'a> BTreeLeafPageMut<'a> {
             let current_lower = self.header.as_ref().free_lower();
             let new_lower = current_lower
                 .checked_add(LinePtrBytes::LINE_PTR_BYTES as u16)
-                .expect("free_lower overflow during undo");
+                .ok_or_else(|| -> Box<dyn Error> {
+                    "free_lower overflow during undo delete".into()
+                })?;
             self.header.set_free_lower(new_lower);
         }
 
@@ -7112,7 +7114,9 @@ impl<'a> BTreeInternalPageMut<'a> {
             let current_lower = self.header.as_ref().free_lower();
             let new_lower = current_lower
                 .checked_add(LinePtrBytes::LINE_PTR_BYTES as u16)
-                .expect("free_lower overflow during undo");
+                .ok_or_else(|| -> Box<dyn Error> {
+                    "free_lower overflow during undo delete".into()
+                })?;
             self.header.set_free_lower(new_lower);
         }
 
