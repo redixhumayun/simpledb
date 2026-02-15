@@ -9983,9 +9983,9 @@ enum LogRecord {
         block_id: BlockId,
         slot: usize,
         offset: usize,
-        key: Constant,        // for display/debugging
-        rid: RID,             // for display/debugging
-        entry_bytes: Vec<u8>, // full entry bytes for physical undo
+        key: Constant,
+        rid: RID,
+        entry_bytes: Vec<u8>,
     },
     /// Physical entry-level B-tree internal insert: logs entry bytes for undo
     BTreeInternalInsert {
@@ -10003,9 +10003,9 @@ enum LogRecord {
         block_id: BlockId,
         slot: usize,
         offset: usize,
-        key: Constant,        // for display/debugging
-        child_block: usize,   // for display/debugging
-        entry_bytes: Vec<u8>, // full entry bytes for physical undo
+        key: Constant,
+        child_block: usize,
+        entry_bytes: Vec<u8>,
         child_field_offset: usize,
         old_children: Vec<usize>,
     },
@@ -10030,9 +10030,9 @@ enum LogRecord {
         right_block_id: BlockId,
         is_leaf: bool,
         old_left_high_key: Option<Vec<u8>>,
-        old_left_right_sibling: Option<usize>,   // leaf-only
-        old_left_overflow: Option<usize>,        // leaf-only
-        old_left_rightmost_child: Option<usize>, // internal-only
+        old_left_right_sibling: Option<usize>,
+        old_left_overflow: Option<usize>,
+        old_left_rightmost_child: Option<usize>,
     },
     /// Root metadata transition emitted for root split/rewrite.
     BTreeRootUpdate {
