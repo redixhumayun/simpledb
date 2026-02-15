@@ -84,3 +84,7 @@ python3 scripts/run_all_benchmarks.py 50 12 output.json
 ### Roadmap
 
 See the full project roadmap in [docs/ROADMAP.md](docs/ROADMAP.md).
+
+### WAL Documentation
+
+See [docs/WAL.md](docs/WAL.md) for WAL architecture, recovery model, invariants, tradeoffs, and current gaps.
