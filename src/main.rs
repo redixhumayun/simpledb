@@ -11657,11 +11657,7 @@ impl LogRecord {
                 let old_head = meta_view.first_free_block();
 
                 let mut right_guard = txn.pin_write_guard(right_block_id);
-                let bytes = right_guard.bytes_mut();
-                bytes.fill(0);
-                bytes[0] = crate::page::PageType::Free as u8;
-                bytes[4..8].copy_from_slice(&old_head.to_le_bytes());
-                right_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                right_guard.format_as_free(old_head, Lsn::MAX);
 
                 meta_view.set_first_free_block(right_block_id.block_num as u32);
                 meta_view.update_crc32();
@@ -11697,11 +11693,7 @@ impl LogRecord {
                     let new_root =
                         BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
                     let mut new_root_guard = txn.pin_write_guard(&new_root);
-                    let bytes = new_root_guard.bytes_mut();
-                    bytes.fill(0);
-                    bytes[0] = crate::page::PageType::Free as u8;
-                    bytes[4..8].copy_from_slice(&old_free_head.to_le_bytes());
-                    new_root_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                    new_root_guard.format_as_free(old_free_head, Lsn::MAX);
                     meta_view.set_first_free_block(*new_root_block);
                 }
 
@@ -11734,11 +11726,7 @@ impl LogRecord {
 
                 // Restore the allocated block as free with its old next pointer
                 let mut block_guard = txn.pin_write_guard(block_id);
-                let bytes = block_guard.bytes_mut();
-                bytes.fill(0);
-                bytes[0] = crate::page::PageType::Free as u8;
-                bytes[4..8].copy_from_slice(&old_block_next.to_le_bytes());
-                block_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                block_guard.format_as_free(*old_block_next, Lsn::MAX);
 
                 meta_view.update_crc32();
                 Ok(())
@@ -11797,11 +11785,7 @@ impl LogRecord {
 
                 // Mark page as Free and link to old head
                 let mut block_guard = txn.pin_write_guard(block_id);
-                let bytes = block_guard.bytes_mut();
-                bytes.fill(0);
-                bytes[0] = crate::page::PageType::Free as u8;
-                bytes[4..8].copy_from_slice(&old_free_head.to_le_bytes());
-                block_guard.mark_modified(txn.txn_id(), Lsn::MAX);
+                block_guard.format_as_free(old_free_head, Lsn::MAX);
 
                 // Update meta to point to this page as new head
                 meta_view.set_first_free_block(block_id.block_num as u32);

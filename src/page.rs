@@ -2856,6 +2856,18 @@ impl<'a> PageWriteGuard<'a> {
         self.mark_modified(txn_id, lsn);
     }
 
+    /// Formats the page as a free-list page and links it to `next_free_block`.
+    pub fn format_as_free(&mut self, next_free_block: u32, lsn: Lsn) {
+        let txn_id = self.txn_id();
+        let bytes = self.bytes_mut();
+        bytes.fill(0);
+        bytes[0] = PageType::Free as u8;
+        let mut header = FreePageHeaderMut::new(bytes);
+        header.set_next_free_block(next_free_block);
+        header.set_lsn(lsn as u64);
+        self.mark_modified(txn_id, lsn);
+    }
+
     pub fn into_heap_view_mut(self, layout: &'a Layout) -> SimpleDBResult<HeapPageViewMut<'a>> {
         HeapPageViewMut::new(self, layout)
     }
