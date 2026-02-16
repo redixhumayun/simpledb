@@ -5548,7 +5548,7 @@ mod btree_page_tests {
 
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
             view.insert_entry(Constant::Int(10), RID::new(1, 0))
@@ -5797,7 +5797,7 @@ mod btree_page_tests {
         let layout = btree_leaf_layout_int();
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
             let mut inserted = 0;
@@ -5836,7 +5836,7 @@ mod btree_page_tests {
         let block_id = txn.append(&filename);
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
             for i in 0..20 {
@@ -5882,7 +5882,7 @@ mod btree_page_tests {
         let block_id = txn.append(&filename);
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
             for i in 0..10 {
@@ -5924,7 +5924,7 @@ mod btree_page_tests {
         let layout = btree_internal_layout_int();
         {
             let mut guard = txn.pin_write_guard(&block_id);
-            guard.format_as_btree_internal(2, Some(0));
+            guard.format_as_btree_internal(2, Some(0)).unwrap();
             let mut view =
                 BTreeInternalPageViewMut::new(guard, &layout).expect("create internal view");
 

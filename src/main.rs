@@ -8424,7 +8424,7 @@ mod record_page_tests {
         }
         let block_id = txn.append("test_file");
         let record_page = RecordPage::new(txn, block_id, layout);
-        record_page.format();
+        record_page.format().unwrap();
 
         //  Create a bunch of records using insert_with_values
         let mut inserted_slots = Vec::new();
@@ -8887,7 +8887,7 @@ mod transaction_tests {
     }
 
     fn init_txn_row(mut guard: PageWriteGuard<'_>, layout: &Layout, int_val: i32, str_val: &str) {
-        guard.format_as_heap();
+        guard.format_as_heap().unwrap();
         let mut view = guard
             .into_heap_view_mut(layout)
             .expect("heap page view mut");
@@ -11897,7 +11897,7 @@ mod recovery_manager_tests {
 
     fn format_heap(txn: &Arc<Transaction>, block: &BlockId) {
         let mut guard = txn.pin_write_guard(block);
-        guard.format_as_heap();
+        guard.format_as_heap().unwrap();
     }
 
     fn insert_row(

@@ -1409,7 +1409,7 @@ mod btree_internal_tests {
         assert_eq!(meta.block_num, 0);
         {
             let mut guard = tx.pin_write_guard(&meta);
-            guard.format_as_btree_meta(1, 1, 1, u32::MAX);
+            guard.format_as_btree_meta(1, 1, 1, u32::MAX).unwrap();
             guard.mark_modified(tx.id(), Lsn::MAX);
         }
 
@@ -1418,7 +1418,9 @@ mod btree_internal_tests {
 
         // Format the page as internal node
         let mut guard = tx.pin_write_guard(&block);
-        guard.format_as_btree_internal(0, Some(dummy_child.block_num));
+        guard
+            .format_as_btree_internal(0, Some(dummy_child.block_num))
+            .unwrap();
         guard.mark_modified(tx.id(), Lsn::MAX);
         drop(guard);
 
@@ -2084,14 +2086,16 @@ mod btree_leaf_tests {
         // Keep block 0 as meta so split allocation can safely consult free-list metadata.
         {
             let mut guard = txn.pin_write_guard(&meta);
-            guard.format_as_btree_meta(1, 1, block.block_num as u32, u32::MAX);
+            guard
+                .format_as_btree_meta(1, 1, block.block_num as u32, u32::MAX)
+                .unwrap();
             guard.mark_modified(txn.id(), Lsn::MAX);
         }
 
         // Format the page as a leaf using new page format
         {
             let mut guard = txn.pin_write_guard(&block);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(txn.id(), Lsn::MAX);
         }
 
@@ -2206,7 +2210,7 @@ mod btree_leaf_tests {
         let block = t1.append(&filename);
         {
             let mut guard = t1.pin_write_guard(&block);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(t1.id(), crate::Lsn::MAX);
         }
         {
@@ -2283,7 +2287,7 @@ mod btree_leaf_tests {
             let block = t1.append(&filename);
             {
                 let mut guard = t1.pin_write_guard(&block);
-                guard.format_as_btree_leaf(None);
+                guard.format_as_btree_leaf(None).unwrap();
                 guard.mark_modified(t1.id(), crate::Lsn::MAX);
             }
             {
@@ -2357,7 +2361,7 @@ mod btree_leaf_tests {
         let block = t1.append(&filename);
         {
             let mut guard = t1.pin_write_guard(&block);
-            guard.format_as_btree_leaf(None);
+            guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(t1.id(), crate::Lsn::MAX);
         }
         let slot_to_delete;
@@ -2433,7 +2437,7 @@ mod btree_leaf_tests {
             let block = t1.append(&filename);
             {
                 let mut guard = t1.pin_write_guard(&block);
-                guard.format_as_btree_leaf(None);
+                guard.format_as_btree_leaf(None).unwrap();
             }
             let slot_to_delete = {
                 let guard = t1.pin_write_guard(&block);
