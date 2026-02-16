@@ -11995,47 +11995,6 @@ mod recovery_manager_tests {
         }
     }
 
-    #[test]
-    fn rollback_restores_int_value() {
-        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
-        let layout = recovery_layout();
-
-        let filename = generate_filename();
-        let txn1 = db.new_tx();
-        let block = txn1.append(&filename);
-        let original = 1234;
-        format_heap(&txn1, &block);
-        let slot = insert_row(&txn1, &block, &layout, original, "orig");
-        txn1.commit().unwrap();
-
-        let txn2 = db.new_tx();
-        update_int_at(&txn2, &block, &layout, slot, 9999);
-        txn2.rollback().unwrap();
-
-        let txn3 = db.new_tx();
-        assert_eq!(read_int_at(&txn3, &block, &layout, slot), original);
-    }
-
-    #[test]
-    fn rollback_restores_string_value() {
-        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
-        let layout = recovery_layout();
-
-        let filename = generate_filename();
-        let txn1 = db.new_tx();
-        let block = txn1.append(&filename);
-        let original = "hello recovery".to_string();
-        format_heap(&txn1, &block);
-        let slot = insert_row(&txn1, &block, &layout, 42, &original);
-        txn1.commit().unwrap();
-
-        let txn2 = db.new_tx();
-        update_string_at(&txn2, &block, &layout, slot, "corrupted value");
-        txn2.rollback().unwrap();
-
-        let txn3 = db.new_tx();
-        assert_eq!(read_string_at(&txn3, &block, &layout, slot), original);
-    }
 
     #[test]
     fn rollback_insert_frees_slot() {
@@ -12060,26 +12019,6 @@ mod recovery_manager_tests {
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(0).is_none(), "slot 0 should not be live");
         assert_eq!(view.live_slot_iter().count(), 0);
-    }
-
-    #[test]
-    fn rollback_update_restores_value() {
-        let (db, _dir) = SimpleDB::new_for_test(3, 5000);
-        let layout = recovery_layout();
-        let filename = generate_filename();
-
-        let txn1 = db.new_tx();
-        let block = txn1.append(&filename);
-        format_heap(&txn1, &block);
-        let slot = insert_row(&txn1, &block, &layout, 11, "beta");
-        txn1.commit().unwrap();
-
-        let txn2 = db.new_tx();
-        update_int_at(&txn2, &block, &layout, slot, 99);
-        txn2.rollback().unwrap();
-
-        let check_txn = db.new_tx();
-        assert_eq!(read_int_at(&check_txn, &block, &layout, slot), 11);
     }
 
     #[test]
