@@ -537,7 +537,6 @@ pub(crate) mod test_helpers {
         let slot = match split_guard.insert_tuple_fast(tuple)? {
             HeapInsert::Done(slot) => slot,
             HeapInsert::Reserved(reservation) => {
-                drop(split_guard);
                 let mut split_guard = page.split()?;
                 split_guard.insert_tuple_slow(reservation, tuple)?
             }
@@ -2949,7 +2948,6 @@ mod page_tests {
         let slot = match split_guard.insert_tuple_fast(tuple)? {
             HeapInsert::Done(slot) => slot,
             HeapInsert::Reserved(reservation) => {
-                drop(split_guard);
                 let mut split_guard = page.split()?;
                 split_guard.insert_tuple_slow(reservation, tuple)?
             }
@@ -5051,7 +5049,7 @@ mod btree_page_tests {
     ) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPage::HEADER_SIZE as usize);
+            let (header_bytes, _) = bytes.split_at_mut(BTreeLeafPage::HEADER_SIZE);
             let mut header = BTreeLeafHeaderMut::new(header_bytes);
             header.init_leaf(level, right_sibling, overflow_block);
         }
@@ -5061,7 +5059,7 @@ mod btree_page_tests {
     fn init_btree_internal_bytes(level: u8, rightmost_child: Option<u32>) -> Vec<u8> {
         let mut bytes = zeroed_page_bytes();
         {
-            let (header_bytes, _) = bytes.split_at_mut(BTreeInternalPage::HEADER_SIZE as usize);
+            let (header_bytes, _) = bytes.split_at_mut(BTreeInternalPage::HEADER_SIZE);
             let mut header = BTreeInternalHeaderMut::new(header_bytes);
             header.init_internal(level, rightmost_child);
         }

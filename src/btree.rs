@@ -432,7 +432,7 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
         loop {
             let block = self.current_block.clone()?;
             let guard = self.txn.pin_read_guard(&block);
-            let view = guard.into_btree_leaf_page_view(&self.layout).ok()?;
+            let view = guard.into_btree_leaf_page_view(self.layout).ok()?;
 
             // Hop right if we’re past this page’s high key
             if let Some(hk) = view.high_key() {
@@ -457,8 +457,8 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                     if entry.key < *self.lower {
                         continue;
                     }
-                    if let Some(ref up) = self.upper {
-                        if entry.key >= **up {
+                    if let Some(up) = self.upper {
+                        if entry.key >= *up {
                             self.current_block = None;
                             return None;
                         }
@@ -836,7 +836,7 @@ mod btree_index_tests {
                 _ => panic!("expected int keys"),
             })
             .collect();
-        assert!(collected_b.iter().all(|&v| v >= 10 && v < 50));
+        assert!(collected_b.iter().all(|&v| (10..50).contains(&v)));
         let mut sorted_b = collected_b.clone();
         sorted_b.sort();
         assert_eq!(collected_b, sorted_b);

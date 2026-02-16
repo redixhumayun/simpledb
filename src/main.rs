@@ -9330,7 +9330,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id), layout.as_ref());
-        assert_eq!(snapshot.int_val, num_of_txns as i32);
+        assert_eq!(snapshot.int_val, num_of_txns);
     }
 
     #[test]
@@ -12479,12 +12479,12 @@ mod buffer_list_tests {
         };
         // TODO: rework this test to go through RecordPage/PageView once higher layers migrate
         {
-            let mut page = Page::new();
+            let page = Page::new();
             buffer_manager
                 .file_manager()
                 .lock()
                 .unwrap()
-                .write(&block_id, &mut page);
+                .write(&block_id, &page);
         }
         assert!(buffer_list.get_buffer(&block_id).is_none());
 
@@ -12548,8 +12548,8 @@ mod buffer_manager_tests {
         }
 
         write_row(&buffer_manager, &layout, &block_ids[0], 1);
-        for idx in 1..block_ids.len() {
-            write_row(&buffer_manager, &layout, &block_ids[idx], idx as i32);
+        for (idx, block_id) in block_ids.iter().enumerate().skip(1) {
+            write_row(&buffer_manager, &layout, block_id, idx as i32);
         }
 
         write_row(&buffer_manager, &layout, &block_ids[0], 100);
@@ -13403,7 +13403,7 @@ mod durability_tests {
         .expect("initialize heap row");
 
         // Phase 1: Write data without sync and simulate a crash which will discard all unsynced data
-        mock_fs.write(&block_id, &mut page);
+        mock_fs.write(&block_id, &page);
 
         mock_fs.simulate_crash();
         mock_fs.restore_from_crash();
@@ -13443,7 +13443,7 @@ mod durability_tests {
         .expect("initialize heap row");
 
         // Phase 1: Write data AND sync
-        mock_fs.write(&block_id, &mut page);
+        mock_fs.write(&block_id, &page);
         mock_fs.sync("test_file");
         mock_fs.sync_directory();
 
