@@ -11826,6 +11826,21 @@ impl LogRecord {
         txn: &dyn TransactionOperations,
         record_lsn: Lsn,
     ) -> bool {
+        // Special cases: multi-page and append operations bypass LSN gate
+        match self {
+            // Multi-page operation: affects left, right, and meta pages
+            // Always undo for unfinished txns (can't rely on single-page LSN check)
+            LogRecord::BTreePageSplit { .. } => return true,
+
+            // Append operations: freshly appended pages may not have reliable header LSN
+            // Bypass LSN gate to ensure undo/deallocation happens for unfinished txns
+            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => return true,
+
+            // All other operations use standard LSN-based gating
+            _ => {}
+        }
+
+        // Standard LSN-based gating for single-page operations
         let Some(block_id) = self.undo_block_id() else {
             return true;
         };
