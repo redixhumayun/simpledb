@@ -4589,10 +4589,6 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         self.update_page_lsn(lsn);
         Ok(())
     }
-
-    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
-        self.guard.mark_modified(txn_id, lsn);
-    }
 }
 
 impl Drop for BTreeLeafPageViewMut<'_> {
@@ -4902,10 +4898,6 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         let lsn = record.write_log_record(&self.guard.log_manager)?;
         self.update_page_lsn(lsn);
         Ok(())
-    }
-
-    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
-        self.guard.mark_modified(txn_id, lsn);
     }
 }
 
