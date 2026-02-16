@@ -11995,7 +11995,6 @@ mod recovery_manager_tests {
         }
     }
 
-
     #[test]
     fn rollback_insert_frees_slot() {
         let (db, _dir) = SimpleDB::new_for_test(3, 5000);
