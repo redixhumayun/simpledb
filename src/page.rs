@@ -103,19 +103,13 @@ mod crc {
 }
 
 /// Lightweight header view for free pages.
-#[allow(dead_code)]
 pub struct FreePageHeaderRef<'a> {
     bytes: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> FreePageHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
-    }
-
-    pub fn next_free_block(&self) -> u32 {
-        u32::from_le_bytes(self.bytes[4..8].try_into().unwrap())
     }
 
     pub fn lsn(&self) -> u64 {
@@ -124,12 +118,10 @@ impl<'a> FreePageHeaderRef<'a> {
 }
 
 /// Lightweight mutable header view for free pages.
-#[allow(dead_code)]
 pub struct FreePageHeaderMut<'a> {
     bytes: &'a mut [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> FreePageHeaderMut<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
         Self { bytes }
@@ -145,12 +137,10 @@ impl<'a> FreePageHeaderMut<'a> {
 }
 
 /// Lightweight header view for overflow pages.
-#[allow(dead_code)]
 pub struct OverflowPageHeaderRef<'a> {
     bytes: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> OverflowPageHeaderRef<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
