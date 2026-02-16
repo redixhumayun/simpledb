@@ -80,13 +80,7 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Build (release)
-      run: |
-        echo "$PATH"
-        which cargo
-        cargo --version
-        which uv
-        uv --version
-        cargo build --release
+      run: cargo build --release
 
     - name: Run all benchmarks (auto-discovery)
       run: python3 scripts/run_all_benchmarks.py 100 12 all_benchmarks.json
