@@ -1283,6 +1283,9 @@ impl BTreeInternal {
         // Allocate a fresh root page and point its rightmost child at the left split child.
         let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
         let mut guard = self.txn.pin_write_guard(&allocated.block_id);
+        if let Some(append_lsn) = allocated.append_lsn {
+            guard.mark_modified(self.txn.id(), append_lsn);
+        }
         //  passing in split.left_block in the function call below is actually correct
         guard.format_as_btree_internal(level + 1, Some(split.left_block))?;
         {
@@ -1752,7 +1755,9 @@ impl BTreeLeaf {
             old_left_overflow,
             old_left_rightmost_child: None,
         };
-        split_record.write_log_record(&self.txn.log_manager())?;
+        let split_lsn = split_record.write_log_record(&self.txn.log_manager())?;
+        orig_view.update_page_lsn(split_lsn);
+        new_view.update_page_lsn(split_lsn);
 
         // Preserve old right sibling so we can re-chain after the split.
         let old_right = orig_view.right_sibling_block();
