@@ -4402,7 +4402,7 @@ impl<'a> BTreeLeafPageViewMut<'a> {
         self.guard.bytes()[..BTreeLeafPage::HEADER_SIZE].to_vec()
     }
 
-    fn update_page_lsn(&self, lsn: Lsn) {
+    pub(crate) fn update_page_lsn(&self, lsn: Lsn) {
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));
@@ -4696,7 +4696,7 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         self.guard.bytes()[..BTreeInternalPage::HEADER_SIZE].to_vec()
     }
 
-    fn update_page_lsn(&self, lsn: Lsn) {
+    pub(crate) fn update_page_lsn(&self, lsn: Lsn) {
         let current = self.page_lsn.get().unwrap_or(0);
         if lsn > current {
             self.page_lsn.set(Some(lsn));

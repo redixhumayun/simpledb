@@ -1199,7 +1199,9 @@ impl BTreeInternal {
             old_left_overflow: None,
             old_left_rightmost_child,
         };
-        split_record.write_log_record(&self.txn.log_manager())?;
+        let split_lsn = split_record.write_log_record(&self.txn.log_manager())?;
+        orig_view.update_page_lsn(split_lsn);
+        new_view.update_page_lsn(split_lsn);
 
         // Snapshot children array C0..Ck
         let orig_slot_count = orig_view.slot_count();
