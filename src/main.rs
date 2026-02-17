@@ -12893,7 +12893,7 @@ impl FileSystemInterface for FileManager {
             }
             Err(e) => panic!("Failed to read from file {e}"),
         }
-        let buf: &[u8; 4096] = buf.as_slice().try_into().unwrap();
+        let buf: &[u8; crate::page::PAGE_SIZE_BYTES as usize] = buf.as_slice().try_into().unwrap();
         *page = Page::from_bytes(*buf);
     }
 
