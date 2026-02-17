@@ -34,6 +34,7 @@ mod page;
 mod parser;
 mod replacement;
 use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
+pub use crate::page::PAGE_SIZE_BYTES;
 mod buffer_manager;
 
 pub type Lsn = usize;

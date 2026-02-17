@@ -587,7 +587,7 @@ fn render_wal_comparison(results: &[WalResult]) {
 fn main() {
     let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
     let filter_ref = filter.as_deref();
-    let block_size = 4096;
+    let block_size = simpledb::PAGE_SIZE_BYTES as usize;
 
     // Cap iterations for fsync-heavy phases (3-5) to avoid excessive runtime.
     // Phases 3-5 involve real fsync operations which have constant ~2-4ms cost.
