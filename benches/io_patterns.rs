@@ -121,7 +121,7 @@ fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        file_manager.write(&BlockId::new(file.to_string(), block_num), &mut page);
+        file_manager.write(&BlockId::new(file.to_string(), block_num), &page);
     }
 }
 
@@ -178,7 +178,7 @@ fn sequential_write(num_blocks: usize, iterations: usize) -> BenchResult {
             for i in 0..num_blocks {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), i);
-                fm.write(&block_id, &mut page);
+                fm.write(&block_id, &page);
             }
         },
     )
@@ -233,7 +233,7 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
             for (i, &block_idx) in random_indices.iter().enumerate() {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), block_idx);
-                fm.write(&block_id, &mut page);
+                fm.write(&block_id, &page);
             }
         },
     )
@@ -252,7 +252,7 @@ fn wal_append_no_fsync(iterations: usize) -> BenchResult {
     benchmark("WAL append (no fsync)", iterations, 2, || {
         for _ in 0..total_ops {
             let record = make_wal_record(100);
-            let lsn = log.lock().unwrap().append(record);
+            let lsn = log.lock().unwrap().append(record).unwrap();
             policy.record(lsn, &log);
         }
         policy.finish_batch(&log);
@@ -271,7 +271,7 @@ fn wal_append_immediate_fsync(iterations: usize) -> BenchResult {
     benchmark("WAL append + immediate fsync", iterations, 2, || {
         for _ in 0..total_ops {
             let record = make_wal_record(100);
-            let lsn = log.lock().unwrap().append(record);
+            let lsn = log.lock().unwrap().append(record).unwrap();
             policy.record(lsn, &log);
         }
         policy.finish_batch(&log);
@@ -295,7 +295,7 @@ fn wal_group_commit(batch_size: usize, iterations: usize) -> BenchResult {
         || {
             for _ in 0..total_ops {
                 let record = make_wal_record(100);
-                let lsn = log.lock().unwrap().append(record);
+                let lsn = log.lock().unwrap().append(record).unwrap();
                 policy.record(lsn, &log);
             }
             policy.finish_batch(&log);
@@ -353,9 +353,9 @@ fn mixed_workload(
                     db.file_manager.lock().unwrap().read(&block_id, &mut page);
                 } else {
                     write_i32_at(page.bytes_mut(), 60, i as i32);
-                    db.file_manager.lock().unwrap().write(&block_id, &mut page);
+                    db.file_manager.lock().unwrap().write(&block_id, &page);
                     let record = make_wal_record(100);
-                    let lsn = log.lock().unwrap().append(record);
+                    let lsn = log.lock().unwrap().append(record).unwrap();
                     policy.record(lsn, &log);
                 }
             }
@@ -408,9 +408,9 @@ fn concurrent_io_shared(
                                 fm.lock().unwrap().read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &mut page);
+                                fm.lock().unwrap().write(&block_id, &page);
                                 let record = make_wal_record(100);
-                                let lsn = log.lock().unwrap().append(record);
+                                let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
                             }
                         }
@@ -468,9 +468,9 @@ fn concurrent_io_sharded(
                                 fm.lock().unwrap().read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &mut page);
+                                fm.lock().unwrap().write(&block_id, &page);
                                 let record = make_wal_record(100);
-                                let lsn = log.lock().unwrap().append(record);
+                                let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
                             }
                         }
@@ -527,11 +527,11 @@ fn random_write_durability(
 
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 {
-                    fm.lock().unwrap().write(&block_id, &mut page);
+                    fm.lock().unwrap().write(&block_id, &page);
                 }
 
                 let record = make_wal_record(100);
-                let lsn = log.lock().unwrap().append(record);
+                let lsn = log.lock().unwrap().append(record).unwrap();
                 wal_policy.record(lsn, &log);
 
                 data_policy.record(&file, &fm);

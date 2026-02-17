@@ -36,7 +36,7 @@ fn precreate_blocks(db: &SimpleDB, file: &str, count: usize) {
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        file_manager.write(&BlockId::new(file.clone(), block_num), &mut page);
+        file_manager.write(&BlockId::new(file.clone(), block_num), &page);
     }
 }
 
@@ -1175,7 +1175,7 @@ fn run_fixed_workload_with_pool_size(
         let block_id = BlockId::new(test_file.clone(), i);
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, i as i32);
-        db.file_manager.lock().unwrap().write(&block_id, &mut page);
+        db.file_manager.lock().unwrap().write(&block_id, &page);
     }
 
     // Pre-generate random sequence

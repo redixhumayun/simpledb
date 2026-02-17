@@ -12,6 +12,7 @@
 5. [Typed page layouts for B-Tree nodes](https://github.com/redixhumayun/simpledb/issues/61) - Give index pages dedicated headers/slot structures instead of reusing heap metadata
 6. [Integrate WAL logging with typed page views](https://github.com/redixhumayun/simpledb/issues/62) - Add write-ahead logging to view-based mutations (HeapPageViewMut, BTreePageViewMut) for crash recovery and durability
 7. [Implement dense variable-length heap tuples](https://github.com/redixhumayun/simpledb/issues/64) - Switch heap tuple encoding to dense payloads with dynamic offsets to eliminate wasted space from fixed slot sizes
+8. [WAL page reclaim/reuse semantics for non-fresh page repurpose](https://github.com/redixhumayun/simpledb/issues/69) - Define and enforce correct undo/recovery behavior when reused pages are reformatted (beyond `*FormatFresh`)
 
 ### Buffer Management
 1. [Implement ReadHandle and WriteHandle for type-safe buffer access](https://github.com/redixhumayun/simpledb/issues/29) - Compile-time enforcement of read/write access and integrated lock management
