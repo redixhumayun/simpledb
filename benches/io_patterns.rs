@@ -244,8 +244,9 @@ fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> Bench
         iterations,
         2,
         || {
-            let random_indices: Vec<usize> =
-                (0..total_ops).map(|_| rng.next_range(working_set)).collect();
+            let random_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &block_idx in &random_indices {
@@ -271,8 +272,9 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
         iterations,
         2,
         || {
-            let random_indices: Vec<usize> =
-                (0..total_ops).map(|_| rng.next_range(working_set)).collect();
+            let random_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for (i, &block_idx) in random_indices.iter().enumerate() {
@@ -676,7 +678,9 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
                     thread::spawn(move || {
                         let mut page = Page::new();
                         for i in 0..blocks_per_stream {
-                            fm.lock().unwrap().read(&BlockId::new(file.clone(), i), &mut page);
+                            fm.lock()
+                                .unwrap()
+                                .read(&BlockId::new(file.clone(), i), &mut page);
                         }
                     })
                 })
@@ -992,12 +996,21 @@ fn main() {
 
         // Phase 7: Cache-adverse variants
         results.push(onepass_seq_scan(io_cfg.working_set_blocks, iterations));
-        results.push(low_locality_rand_read(io_cfg.working_set_blocks, iterations));
+        results.push(low_locality_rand_read(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
         results.push(multi_stream_scan(4, io_cfg.working_set_blocks, iterations));
 
         // Phase 8: Cache-evict variants
-        results.push(onepass_seq_scan_evict(io_cfg.working_set_blocks, iterations));
-        results.push(low_locality_rand_read_evict(io_cfg.working_set_blocks, iterations));
+        results.push(onepass_seq_scan_evict(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
+        results.push(low_locality_rand_read_evict(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
 
         // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
@@ -1348,7 +1361,10 @@ fn main() {
         cache_adverse_results.push(onepass_seq_scan(io_cfg.working_set_blocks, iterations));
     }
     if should_run("lo_loc_rand", filter_ref) {
-        cache_adverse_results.push(low_locality_rand_read(io_cfg.working_set_blocks, iterations));
+        cache_adverse_results.push(low_locality_rand_read(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
     }
     if should_run("multi_stream", filter_ref) {
         cache_adverse_results.push(multi_stream_scan(4, io_cfg.working_set_blocks, iterations));
@@ -1361,10 +1377,9 @@ fn main() {
         );
         let mut throughput_rows = Vec::new();
         for result in &cache_adverse_results {
-            let throughput_mb =
-                (io_cfg.working_set_blocks * block_size) as f64
-                    / result.mean.as_secs_f64()
-                    / 1_000_000.0;
+            let throughput_mb = (io_cfg.working_set_blocks * block_size) as f64
+                / result.mean.as_secs_f64()
+                / 1_000_000.0;
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),
                 throughput: throughput_mb,
@@ -1380,10 +1395,16 @@ fn main() {
     let mut evict_results = Vec::new();
 
     if should_run("onepass_seq_evict", filter_ref) {
-        evict_results.push(onepass_seq_scan_evict(io_cfg.working_set_blocks, iterations));
+        evict_results.push(onepass_seq_scan_evict(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
     }
     if should_run("lo_loc_rand_evict", filter_ref) {
-        evict_results.push(low_locality_rand_read_evict(io_cfg.working_set_blocks, iterations));
+        evict_results.push(low_locality_rand_read_evict(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
     }
 
     if !evict_results.is_empty() {
@@ -1393,10 +1414,9 @@ fn main() {
         );
         let mut throughput_rows = Vec::new();
         for result in &evict_results {
-            let throughput_mb =
-                (io_cfg.working_set_blocks * block_size) as f64
-                    / result.mean.as_secs_f64()
-                    / 1_000_000.0;
+            let throughput_mb = (io_cfg.working_set_blocks * block_size) as f64
+                / result.mean.as_secs_f64()
+                / 1_000_000.0;
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),
                 throughput: throughput_mb,
