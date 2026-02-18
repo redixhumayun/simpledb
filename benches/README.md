@@ -162,6 +162,15 @@ To refresh the raw benchmark logs and the summary tables above:
    python3 scripts/bench/render_replacement_policy_docs.py --platforms macos linux
    ```
 
+3. Generate buffer-pool scaling charts:
+   ```bash
+   uv run python scripts/bench/generate_scaling_charts.py --platform macos
+   uv run python scripts/bench/generate_scaling_charts.py --platform linux
+   ```
+   Charts are written to:
+   - `docs/benchmarks/charts/macos/`
+   - `docs/benchmarks/charts/linux/`
+
 Step (1) captures both the JSON payload (for table generation) and the exact `cargo bench` log (for the per-platform markdown files). 
 
 Step (2) rewrites:
@@ -271,6 +280,20 @@ For each regime, the script writes:
 - `buffered_<regime>.json`
 - `direct_<regime>.json`
 - `compare_<regime>.md`
+
+### Generate Direct-vs-Buffered I/O Charts
+
+After a regime-matrix run completes, generate the compact I/O chart deck:
+
+```bash
+uv run python scripts/bench/generate_io_mode_charts.py \
+  results/regime_capped_YYYYMMDD_HHMMSS
+```
+
+Charts are written to:
+- `docs/benchmarks/charts/io_mode/io_mode_hot.png`
+- `docs/benchmarks/charts/io_mode/io_mode_pressure.png`
+- `docs/benchmarks/charts/io_mode/io_mode_thrash.png`
 
 ### Interpreting results
 
