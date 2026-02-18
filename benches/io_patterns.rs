@@ -609,14 +609,15 @@ fn total_ram_bytes() -> u64 {
 }
 
 fn resolve_working_set_blocks(regime: &str, page_bytes: u64) -> usize {
-    let ram = total_ram_bytes();
-    let ratio: f64 = match regime {
-        "hot" => 0.25,
-        "pressure" => 1.0,
-        "thrash" => 2.0,
+    let target_bytes: u64 = match regime {
+        // Fixed capped defaults for practical runtime.
+        "hot" => 64 * 1024 * 1024,          // 64 MiB
+        "pressure" => 512 * 1024 * 1024,    // 512 MiB
+        "thrash" => 2 * 1024 * 1024 * 1024, // 2 GiB
         other => panic!("unknown regime: {}", other),
     };
-    ((ram as f64 * ratio) / page_bytes as f64) as usize
+    let blocks = target_bytes / page_bytes.max(1);
+    blocks.max(1) as usize
 }
 
 struct IoBenchConfig {

@@ -17,10 +17,10 @@ For each regime in [hot, pressure, thrash]:
   - Compare pair via compare_benchmarks.py → <output_dir>/compare_<regime>.md
   - Print per-regime and aggregate summary.
 
-Regime definitions (resolved at runtime by the bench binary using /proc/meminfo):
-  hot      = 0.25 × RAM
-  pressure = 1.0  × RAM
-  thrash   = 2.0  × RAM
+Regime definitions (fixed capped defaults resolved by the bench binary):
+  hot      = 64 MiB working set
+  pressure = 512 MiB working set
+  thrash   = 2 GiB working set
 """
 
 import json
