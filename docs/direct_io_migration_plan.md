@@ -381,6 +381,20 @@ cargo bench --bench io_patterns \
   -- 10 12 --working-set-blocks 500000
 ```
 
+Optional knobs to keep runtime bounded while using large working sets:
+
+- `--phase1-ops <N>`: operation count for Phase 1 (`seq_*`, `rand_*`)
+- `--mixed-ops <N>`: operation count for mixed R/W phase
+- `--durability-ops <N>`: operation count for durability phase
+
+Example:
+
+```bash
+cargo bench --bench io_patterns \
+  --no-default-features --features replacement_lru --features page-4k --features direct-io \
+  -- 10 12 --regime pressure --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000 --json
+```
+
 #### Interpreting results
 
 - **hot regime:** working set fits in page cache. Buffered I/O benefits from cache warmth across

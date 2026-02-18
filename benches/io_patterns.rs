@@ -141,45 +141,45 @@ fn make_wal_record(size: usize) -> Vec<u8> {
 // ============================================================================
 // Filter tokens: seq_read, seq_write, rand_read, rand_write
 
-fn sequential_read(num_blocks: usize, iterations: usize) -> BenchResult {
+fn sequential_read(working_set: usize, total_ops: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = format!("seqread_{}", num_blocks);
+    let file = format!("seqread_{}", working_set);
 
     // Pre-create blocks
-    precreate_blocks_direct(&db, &file, num_blocks);
+    precreate_blocks_direct(&db, &file, working_set);
 
     benchmark(
-        &format!("Sequential Read ({} blocks)", num_blocks),
+        &format!("Sequential Read (K={}, {} ops)", working_set, total_ops),
         iterations,
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
-            for i in 0..num_blocks {
-                let block_id = BlockId::new(file.clone(), i);
+            for i in 0..total_ops {
+                let block_id = BlockId::new(file.clone(), i % working_set);
                 fm.read(&block_id, &mut page);
             }
         },
     )
 }
 
-fn sequential_write(num_blocks: usize, iterations: usize) -> BenchResult {
+fn sequential_write(working_set: usize, total_ops: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = format!("seqwrite_{}", num_blocks);
+    let file = format!("seqwrite_{}", working_set);
 
     // Pre-create blocks
-    precreate_blocks_direct(&db, &file, num_blocks);
+    precreate_blocks_direct(&db, &file, working_set);
 
     benchmark(
-        &format!("Sequential Write ({} blocks)", num_blocks),
+        &format!("Sequential Write (K={}, {} ops)", working_set, total_ops),
         iterations,
         2,
         || {
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
-            for i in 0..num_blocks {
+            for i in 0..total_ops {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                let block_id = BlockId::new(file.clone(), i);
+                let block_id = BlockId::new(file.clone(), i % working_set);
                 fm.write(&block_id, &page);
             }
         },
@@ -317,13 +317,13 @@ struct WalResult {
 
 fn mixed_workload(
     read_pct: usize,
+    working_set: usize,
     total_ops: usize,
     flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let working_set = total_ops;
-    let file = format!("mixedfile_{}", working_set);
+    let file = format!("mixedfile_{}_{}", working_set, total_ops);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
@@ -493,14 +493,14 @@ fn concurrent_io_sharded(
 // ============================================================================
 
 fn random_write_durability(
+    working_set: usize,
     total_ops: usize,
     wal_policy: WALFlushPolicy,
     data_policy: DataSyncPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let working_set = total_ops.max(10_000); // at least 10k * 4KB ~= 40MB to avoid trivial cache reuse
-    let file = format!("randwrite_durable_{}", working_set);
+    let file = format!("randwrite_durable_{}_{}", working_set, total_ops);
 
     // Pre-create blocks to avoid extension cost during timed section
     precreate_blocks_direct(&db, &file, working_set);
@@ -619,15 +619,25 @@ fn resolve_working_set_blocks(regime: &str, page_bytes: u64) -> usize {
     ((ram as f64 * ratio) / page_bytes as f64) as usize
 }
 
+struct IoBenchConfig {
+    working_set_blocks: usize,
+    regime_label: String,
+    phase1_ops: usize,
+    mixed_ops: usize,
+    durability_ops: usize,
+}
+
 /// Parse io_patterns-specific flags from argv (second pass after parse_bench_args).
-/// Returns (working_set_blocks, regime_label).
-/// Precedence: --working-set-blocks wins over --regime; default is 1000 blocks.
-fn parse_io_args() -> (usize, String) {
+/// Precedence: --working-set-blocks wins over --regime for working-set sizing.
+fn parse_io_args() -> IoBenchConfig {
     let args: Vec<String> = env::args().collect();
     let page_bytes = simpledb::PAGE_SIZE_BYTES as u64;
 
     let mut explicit_blocks: Option<usize> = None;
     let mut regime: Option<String> = None;
+    let mut phase1_ops = 1000usize;
+    let mut mixed_ops = 500usize;
+    let mut durability_ops = 1000usize;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -639,17 +649,37 @@ fn parse_io_args() -> (usize, String) {
             if let Some(val) = iter.next() {
                 regime = Some(val.clone());
             }
+        } else if arg == "--phase1-ops" {
+            if let Some(val) = iter.next() {
+                phase1_ops = val.parse().unwrap_or(phase1_ops);
+            }
+        } else if arg == "--mixed-ops" {
+            if let Some(val) = iter.next() {
+                mixed_ops = val.parse().unwrap_or(mixed_ops);
+            }
+        } else if arg == "--durability-ops" {
+            if let Some(val) = iter.next() {
+                durability_ops = val.parse().unwrap_or(durability_ops);
+            }
         }
     }
 
-    if let Some(n) = explicit_blocks {
-        return (n, format!("custom({})", n));
-    }
-    if let Some(r) = regime {
+    let (working_set_blocks, regime_label) = if let Some(n) = explicit_blocks {
+        (n, format!("custom({})", n))
+    } else if let Some(r) = regime {
         let blocks = resolve_working_set_blocks(&r, page_bytes);
-        return (blocks, r);
+        (blocks, r)
+    } else {
+        (1000, "default".to_string())
+    };
+
+    IoBenchConfig {
+        working_set_blocks,
+        regime_label,
+        phase1_ops,
+        mixed_ops,
+        durability_ops,
     }
-    (1000, "default".to_string())
 }
 
 // ============================================================================
@@ -658,7 +688,7 @@ fn parse_io_args() -> (usize, String) {
 
 fn main() {
     let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
-    let (working_set_blocks, regime_label) = parse_io_args();
+    let io_cfg = parse_io_args();
     let filter_ref = filter.as_deref();
     let block_size = simpledb::PAGE_SIZE_BYTES as usize;
 
@@ -671,10 +701,10 @@ fn main() {
     if json_output {
         // Phase 1 - no filters in JSON mode
         let mut results = vec![
-            sequential_read(working_set_blocks, iterations),
-            sequential_write(working_set_blocks, iterations),
-            random_read(working_set_blocks, working_set_blocks, iterations),
-            random_write(working_set_blocks, working_set_blocks, iterations),
+            sequential_read(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
+            sequential_write(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
+            random_read(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
+            random_write(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
         ];
 
         // Phase 3 - no filters in JSON mode (use fsync_iterations)
@@ -697,7 +727,8 @@ fn main() {
             ] {
                 results.push(mixed_workload(
                     read_pct,
-                    working_set_blocks,
+                    io_cfg.working_set_blocks,
+                    io_cfg.mixed_ops,
                     policy,
                     fsync_iterations,
                 ));
@@ -731,13 +762,15 @@ fn main() {
 
         // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
-            working_set_blocks,
+            io_cfg.working_set_blocks,
+            io_cfg.durability_ops,
             WALFlushPolicy::Immediate,
             DataSyncPolicy::None,
             fsync_iterations,
         ));
         results.push(random_write_durability(
-            working_set_blocks,
+            io_cfg.working_set_blocks,
+            io_cfg.durability_ops,
             WALFlushPolicy::Immediate,
             DataSyncPolicy::Immediate,
             fsync_iterations,
@@ -750,7 +783,7 @@ fn main() {
 
     // Human-readable mode
     let ram_bytes = total_ram_bytes();
-    let working_set_bytes = working_set_blocks * block_size;
+    let working_set_bytes = io_cfg.working_set_blocks * block_size;
     println!("SimpleDB I/O Performance Benchmark Suite");
     println!("=========================================");
     println!(
@@ -769,13 +802,16 @@ fn main() {
         ram_bytes,
         ram_bytes as f64 / (1u64 << 30) as f64
     );
-    println!("Regime:              {}", regime_label);
+    println!("Regime:              {}", io_cfg.regime_label);
     println!(
         "Working set:         {} blocks = {} bytes ({:.1} MiB)",
-        working_set_blocks,
+        io_cfg.working_set_blocks,
         working_set_bytes,
         working_set_bytes as f64 / (1u64 << 20) as f64
     );
+    println!("Phase 1 ops:         {}", io_cfg.phase1_ops);
+    println!("Mixed ops:           {}", io_cfg.mixed_ops);
+    println!("Durability ops:      {}", io_cfg.durability_ops);
     println!(
         "Direct I/O:          {}",
         if cfg!(feature = "direct-io") {
@@ -795,22 +831,30 @@ fn main() {
     let mut phase1_results = Vec::new();
 
     if should_run("seq_read", filter_ref) {
-        phase1_results.push(sequential_read(working_set_blocks, iterations));
+        phase1_results.push(sequential_read(
+            io_cfg.working_set_blocks,
+            io_cfg.phase1_ops,
+            iterations,
+        ));
     }
     if should_run("seq_write", filter_ref) {
-        phase1_results.push(sequential_write(working_set_blocks, iterations));
+        phase1_results.push(sequential_write(
+            io_cfg.working_set_blocks,
+            io_cfg.phase1_ops,
+            iterations,
+        ));
     }
     if should_run("rand_read", filter_ref) {
         phase1_results.push(random_read(
-            working_set_blocks,
-            working_set_blocks,
+            io_cfg.working_set_blocks,
+            io_cfg.phase1_ops,
             iterations,
         ));
     }
     if should_run("rand_write", filter_ref) {
         phase1_results.push(random_write(
-            working_set_blocks,
-            working_set_blocks,
+            io_cfg.working_set_blocks,
+            io_cfg.phase1_ops,
             iterations,
         ));
     }
@@ -824,7 +868,7 @@ fn main() {
     if !phase1_results.is_empty() {
         let mut throughput_rows = Vec::new();
         for result in &phase1_results {
-            let ops = working_set_blocks;
+            let ops = io_cfg.phase1_ops;
             let throughput_mb = (ops * block_size) as f64 / result.mean.as_secs_f64() / 1_000_000.0;
             let iops = ops as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
@@ -904,7 +948,8 @@ fn main() {
             if should_run(&token, filter_ref) {
                 mixed_results.push(mixed_workload(
                     read_pct,
-                    working_set_blocks,
+                    io_cfg.working_set_blocks,
+                    io_cfg.mixed_ops,
                     policy,
                     fsync_iterations,
                 ));
@@ -916,7 +961,7 @@ fn main() {
         render_latency_section(
             &format!(
                 "Phase 4: Mixed Read/Write Workloads ({} ops)",
-                working_set_blocks
+                io_cfg.mixed_ops
             ),
             &mixed_results,
         );
@@ -924,7 +969,7 @@ fn main() {
         // Throughput
         let mut throughput_rows = Vec::new();
         for result in &mixed_results {
-            let ops_per_sec = working_set_blocks as f64 / result.mean.as_secs_f64();
+            let ops_per_sec = io_cfg.mixed_ops as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),
                 throughput: ops_per_sec,
@@ -1012,7 +1057,7 @@ fn main() {
     // Phase 6: Random Write Durability (WAL + data sync combinations)
     // Filter tokens: durability_wal_immediate_data_nosync, durability_wal_immediate_data_fsync
     let mut durability_results = Vec::new();
-    let durability_ops = working_set_blocks;
+    let durability_ops = io_cfg.durability_ops;
 
     for (wal_policy, wal_name) in [(WALFlushPolicy::Immediate, "wal_immediate")] {
         for (data_policy, data_name) in [
@@ -1022,6 +1067,7 @@ fn main() {
             let token = format!("durability_{}_{}", wal_name, data_name);
             if should_run(&token, filter_ref) {
                 durability_results.push(random_write_durability(
+                    io_cfg.working_set_blocks,
                     durability_ops,
                     wal_policy.clone(),
                     data_policy.clone(),
