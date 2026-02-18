@@ -1,5 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use simpledb::{
         benchmark, parse_bench_args, print_header, render_throughput_section, should_run,
         BenchResult, ThroughputRow,
     },
+    direct_io_fallback_count,
     test_utils::generate_random_number,
     BlockId, LogManager, Page, SimpleDB, TestDir,
 };
@@ -141,7 +143,7 @@ fn make_wal_record(size: usize) -> Vec<u8> {
 
 fn sequential_read(num_blocks: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "seqread".to_string();
+    let file = format!("seqread_{}", num_blocks);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, num_blocks);
@@ -163,7 +165,7 @@ fn sequential_read(num_blocks: usize, iterations: usize) -> BenchResult {
 
 fn sequential_write(num_blocks: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "seqwrite".to_string();
+    let file = format!("seqwrite_{}", num_blocks);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, num_blocks);
@@ -186,7 +188,7 @@ fn sequential_write(num_blocks: usize, iterations: usize) -> BenchResult {
 
 fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "randread".to_string();
+    let file = format!("randread_{}", working_set);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
@@ -213,7 +215,7 @@ fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> Bench
 
 fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "randwrite".to_string();
+    let file = format!("randwrite_{}", working_set);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
@@ -320,8 +322,8 @@ fn mixed_workload(
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "mixedfile".to_string();
-    let working_set = 100;
+    let working_set = total_ops;
+    let file = format!("mixedfile_{}", working_set);
 
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
@@ -497,8 +499,8 @@ fn random_write_durability(
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let file = "randwrite_durable".to_string();
-    let working_set = 10_000; // 10k * 4KB ~= 40MB, large enough to avoid trivial cache reuse
+    let working_set = total_ops.max(10_000); // at least 10k * 4KB ~= 40MB to avoid trivial cache reuse
+    let file = format!("randwrite_durable_{}", working_set);
 
     // Pre-create blocks to avoid extension cost during timed section
     precreate_blocks_direct(&db, &file, working_set);
@@ -581,11 +583,82 @@ fn render_wal_comparison(results: &[WalResult]) {
 }
 
 // ============================================================================
+// RAM detection and regime resolution
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+fn total_ram_bytes() -> u64 {
+    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn total_ram_bytes() -> u64 {
+    0
+}
+
+fn resolve_working_set_blocks(regime: &str, page_bytes: u64) -> usize {
+    let ram = total_ram_bytes();
+    let ratio: f64 = match regime {
+        "hot" => 0.25,
+        "pressure" => 1.0,
+        "thrash" => 2.0,
+        other => panic!("unknown regime: {}", other),
+    };
+    ((ram as f64 * ratio) / page_bytes as f64) as usize
+}
+
+/// Parse io_patterns-specific flags from argv (second pass after parse_bench_args).
+/// Returns (working_set_blocks, regime_label).
+/// Precedence: --working-set-blocks wins over --regime; default is 1000 blocks.
+fn parse_io_args() -> (usize, String) {
+    let args: Vec<String> = env::args().collect();
+    let page_bytes = simpledb::PAGE_SIZE_BYTES as u64;
+
+    let mut explicit_blocks: Option<usize> = None;
+    let mut regime: Option<String> = None;
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--working-set-blocks" {
+            if let Some(val) = iter.next() {
+                explicit_blocks = val.parse().ok();
+            }
+        } else if arg == "--regime" {
+            if let Some(val) = iter.next() {
+                regime = Some(val.clone());
+            }
+        }
+    }
+
+    if let Some(n) = explicit_blocks {
+        return (n, format!("custom({})", n));
+    }
+    if let Some(r) = regime {
+        let blocks = resolve_working_set_blocks(&r, page_bytes);
+        return (blocks, r);
+    }
+    (1000, "default".to_string())
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 fn main() {
     let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
+    let (working_set_blocks, regime_label) = parse_io_args();
     let filter_ref = filter.as_deref();
     let block_size = simpledb::PAGE_SIZE_BYTES as usize;
 
@@ -598,10 +671,10 @@ fn main() {
     if json_output {
         // Phase 1 - no filters in JSON mode
         let mut results = vec![
-            sequential_read(1000, iterations),
-            sequential_write(1000, iterations),
-            random_read(1000, 1000, iterations),
-            random_write(1000, 1000, iterations),
+            sequential_read(working_set_blocks, iterations),
+            sequential_write(working_set_blocks, iterations),
+            random_read(working_set_blocks, working_set_blocks, iterations),
+            random_write(working_set_blocks, working_set_blocks, iterations),
         ];
 
         // Phase 3 - no filters in JSON mode (use fsync_iterations)
@@ -622,7 +695,12 @@ fn main() {
                     last_lsn: None,
                 },
             ] {
-                results.push(mixed_workload(read_pct, 500, policy, fsync_iterations));
+                results.push(mixed_workload(
+                    read_pct,
+                    working_set_blocks,
+                    policy,
+                    fsync_iterations,
+                ));
             }
         }
 
@@ -651,15 +729,15 @@ fn main() {
             }
         }
 
-        // Phase 6 - random write durability (use fsync_iterations, 1000 ops)
+        // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
-            1000,
+            working_set_blocks,
             WALFlushPolicy::Immediate,
             DataSyncPolicy::None,
             fsync_iterations,
         ));
         results.push(random_write_durability(
-            1000,
+            working_set_blocks,
             WALFlushPolicy::Immediate,
             DataSyncPolicy::Immediate,
             fsync_iterations,
@@ -670,13 +748,9 @@ fn main() {
         return;
     }
 
-    // Cap iterations for fsync-heavy phases (3-5) to avoid excessive runtime.
-    // Phases 3-5 involve real fsync operations which have constant ~2-4ms cost.
-    // At 100 iterations, these phases would perform 50,000+ fsyncs (~10 minutes).
-    // 5 iterations provides statistical validity without excessive runtime.
-    let fsync_iterations = iterations.min(5);
-
     // Human-readable mode
+    let ram_bytes = total_ram_bytes();
+    let working_set_bytes = working_set_blocks * block_size;
     println!("SimpleDB I/O Performance Benchmark Suite");
     println!("=========================================");
     println!(
@@ -689,9 +763,29 @@ fn main() {
             fsync_iterations
         );
     }
-    println!("Block size: {} bytes", block_size);
+    println!("Block size:          {} bytes", block_size);
     println!(
-        "Environment: {} ({})",
+        "Total RAM:           {} bytes ({:.1} GiB)",
+        ram_bytes,
+        ram_bytes as f64 / (1u64 << 30) as f64
+    );
+    println!("Regime:              {}", regime_label);
+    println!(
+        "Working set:         {} blocks = {} bytes ({:.1} MiB)",
+        working_set_blocks,
+        working_set_bytes,
+        working_set_bytes as f64 / (1u64 << 20) as f64
+    );
+    println!(
+        "Direct I/O:          {}",
+        if cfg!(feature = "direct-io") {
+            "enabled"
+        } else {
+            "disabled (buffered)"
+        }
+    );
+    println!(
+        "Environment:         {} ({})",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
@@ -701,16 +795,24 @@ fn main() {
     let mut phase1_results = Vec::new();
 
     if should_run("seq_read", filter_ref) {
-        phase1_results.push(sequential_read(1000, iterations));
+        phase1_results.push(sequential_read(working_set_blocks, iterations));
     }
     if should_run("seq_write", filter_ref) {
-        phase1_results.push(sequential_write(1000, iterations));
+        phase1_results.push(sequential_write(working_set_blocks, iterations));
     }
     if should_run("rand_read", filter_ref) {
-        phase1_results.push(random_read(1000, 1000, iterations));
+        phase1_results.push(random_read(
+            working_set_blocks,
+            working_set_blocks,
+            iterations,
+        ));
     }
     if should_run("rand_write", filter_ref) {
-        phase1_results.push(random_write(1000, 1000, iterations));
+        phase1_results.push(random_write(
+            working_set_blocks,
+            working_set_blocks,
+            iterations,
+        ));
     }
 
     render_latency_section(
@@ -722,7 +824,7 @@ fn main() {
     if !phase1_results.is_empty() {
         let mut throughput_rows = Vec::new();
         for result in &phase1_results {
-            let ops = 1000; // All Phase 1 benchmarks use 1000 operations
+            let ops = working_set_blocks;
             let throughput_mb = (ops * block_size) as f64 / result.mean.as_secs_f64() / 1_000_000.0;
             let iops = ops as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
@@ -800,21 +902,29 @@ fn main() {
         ] {
             let token = format!("mixed_{}r_{}", read_pct, policy_name);
             if should_run(&token, filter_ref) {
-                mixed_results.push(mixed_workload(read_pct, 500, policy, fsync_iterations));
+                mixed_results.push(mixed_workload(
+                    read_pct,
+                    working_set_blocks,
+                    policy,
+                    fsync_iterations,
+                ));
             }
         }
     }
 
     if !mixed_results.is_empty() {
         render_latency_section(
-            "Phase 4: Mixed Read/Write Workloads (500 ops)",
+            &format!(
+                "Phase 4: Mixed Read/Write Workloads ({} ops)",
+                working_set_blocks
+            ),
             &mixed_results,
         );
 
         // Throughput
         let mut throughput_rows = Vec::new();
         for result in &mixed_results {
-            let ops_per_sec = 500.0 / result.mean.as_secs_f64();
+            let ops_per_sec = working_set_blocks as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),
                 throughput: ops_per_sec,
@@ -902,7 +1012,7 @@ fn main() {
     // Phase 6: Random Write Durability (WAL + data sync combinations)
     // Filter tokens: durability_wal_immediate_data_nosync, durability_wal_immediate_data_fsync
     let mut durability_results = Vec::new();
-    let durability_ops = 1000;
+    let durability_ops = working_set_blocks;
 
     for (wal_policy, wal_name) in [(WALFlushPolicy::Immediate, "wal_immediate")] {
         for (data_policy, data_name) in [
@@ -923,7 +1033,7 @@ fn main() {
 
     if !durability_results.is_empty() {
         render_latency_section(
-            "Phase 6: Random Write Durability (1000 ops)",
+            &format!("Phase 6: Random Write Durability ({} ops)", durability_ops),
             &durability_results,
         );
 
@@ -943,5 +1053,17 @@ fn main() {
         );
     }
 
+    let fallbacks = direct_io_fallback_count();
+    if cfg!(feature = "direct-io") {
+        println!(
+            "Direct I/O fallbacks: {} ({})",
+            fallbacks,
+            if fallbacks == 0 {
+                "O_DIRECT engaged on all data files"
+            } else {
+                "some files fell back to buffered mode — check stderr for details"
+            }
+        );
+    }
     println!("All benchmarks completed!");
 }

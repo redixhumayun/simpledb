@@ -5,6 +5,7 @@ pub struct BenchResult {
     pub operation: String,
     pub mean: Duration,
     pub median: Duration,
+    pub p95: Duration,
     pub std_dev: Duration,
     pub iterations: usize,
 }
@@ -13,20 +14,23 @@ impl fmt::Display for BenchResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:60} | {:>10.2?} | {:>10.2?} | {:>10.2?} | {:>8}",
-            self.operation, self.mean, self.median, self.std_dev, self.iterations
+            "{:60} | {:>10.2?} | {:>10.2?} | {:>10.2?} | {:>10.2?} | {:>8}",
+            self.operation, self.mean, self.median, self.p95, self.std_dev, self.iterations
         )
     }
 }
 
 impl BenchResult {
-    /// Convert benchmark result to JSON format compatible with github-action-benchmark
-    /// Returns JSON object with name, unit, and value (mean time in nanoseconds)
+    /// Convert benchmark result to JSON format compatible with github-action-benchmark.
+    /// `value` is mean (ns) for backward compat; p50/p95/std_dev added as extra fields.
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"name":"{}","unit":"ns","value":{}}}"#,
+            r#"{{"name":"{}","unit":"ns","value":{},"p50":{},"p95":{},"std_dev":{}}}"#,
             self.operation,
-            self.mean.as_nanos()
+            self.mean.as_nanos(),
+            self.median.as_nanos(),
+            self.p95.as_nanos(),
+            self.std_dev.as_nanos(),
         )
     }
 }
@@ -91,6 +95,7 @@ where
         let mid2 = durations[iterations / 2].as_nanos();
         Duration::from_nanos(((mid1 + mid2) / 2) as u64)
     };
+    let p95 = durations[(iterations * 95 / 100).min(iterations - 1)];
 
     // Simple std deviation calculation
     let variance: f64 = if iterations > 1 {
@@ -108,6 +113,7 @@ where
         operation: name.to_string(),
         mean,
         median,
+        p95,
         std_dev,
         iterations,
     }
@@ -115,10 +121,10 @@ where
 
 pub fn print_header() {
     println!(
-        "{:60} | {:>10} | {:>10} | {:>10} | {:>8}",
-        "Operation", "Mean", "Median", "StdDev", "Iters"
+        "{:60} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}",
+        "Operation", "Mean", "Median", "p95", "StdDev", "Iters"
     );
-    println!("{}", "-".repeat(120));
+    println!("{}", "-".repeat(133));
 }
 
 pub struct ThroughputRow {

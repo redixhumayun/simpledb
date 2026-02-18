@@ -230,3 +230,164 @@ Direct I/O is **not yet suitable as the default** for this codebase:
 2. Evaluate buffer pool sizing — a larger pool reduces the advantage of OS caching and makes
    direct I/O more competitive.
 3. Re-run after any buffer pool improvements to get an updated signal.
+
+### Implementation Notes: Regime-Based Validation
+
+To validate direct-I/O benefits under realistic memory pressure, benchmark each workload across
+three working-set regimes, then compare buffered vs direct-io in each regime.
+
+#### Regime definitions
+
+- `cache-hot`: working set ~= `0.25 x RAM`
+- `cache-pressure`: working set ~= `1.0 x RAM`
+- `cache-thrashing`: working set ~= `2.0 x RAM`
+
+#### Working-set sizing formula
+
+Use page-size-aware sizing:
+
+- `ram_bytes = host_total_memory_bytes`
+- `page_bytes = PAGE_SIZE_BYTES`
+- `target_bytes = ram_bytes * regime_ratio`
+- `working_set_blocks = floor(target_bytes / page_bytes)`
+
+#### Benchmark harness updates required
+
+`benches/io_patterns.rs` should be parameterized so workloads no longer rely on hardcoded
+working sets (`100`, `1000`, `10_000` blocks). Add either:
+
+- `--working-set-blocks <N>` (preferred for reproducibility), or
+- `--regime hot|pressure|thrash` (resolved to block count at runtime using RAM detection).
+
+Recommended precedence:
+
+1. If `--working-set-blocks` is provided, use it exactly.
+2. Else if `--regime` is provided, derive `working_set_blocks` from RAM and page size.
+3. Else keep current default sizes.
+
+Rationale: `--regime` makes routine runs easy and machine-adaptive; `--working-set-blocks`
+preserves exact reproducibility for comparisons and CI reruns.
+
+Apply this to:
+
+- Phase 1: `seq_read`, `seq_write`, `rand_read`, `rand_write`
+- Mixed R/W workloads
+- Random write durability workload
+
+#### Execution matrix
+
+For each selected workload, run:
+
+1. `buffered x cache-hot`
+2. `buffered x cache-pressure`
+3. `buffered x cache-thrashing`
+4. `direct-io x cache-hot`
+5. `direct-io x cache-pressure`
+6. `direct-io x cache-thrashing`
+
+This yields `workload x 3 regimes x 2 modes`, with repeated iterations per cell for stable stats.
+
+#### Run hygiene and reporting
+
+- Use unique data filenames per run cell to avoid cross-run cache contamination.
+- Capture and report: RAM size, computed `working_set_blocks`, page size feature, filesystem/device,
+  and whether any direct-I/O fallback occurred.
+- Report p50/p95 and standard deviation in addition to mean.
+
+---
+
+### Running the Regime Matrix
+
+#### Prerequisites
+
+- Rust toolchain with the project's required feature flags available.
+- Python 3 (no third-party packages required).
+- Run from the repository root.
+
+#### Command
+
+```bash
+python3 scripts/run_regime_matrix.py [iterations] [output_dir]
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `iterations` | 50 | Iterations per benchmark cell (fsync-heavy workloads are capped at 5 internally) |
+| `output_dir` | `regime_matrix_results` | Directory where JSON and comparison files are written |
+
+Example:
+
+```bash
+python3 scripts/run_regime_matrix.py 50 results/regime_$(date +%Y%m%d)
+```
+
+#### What the script does
+
+For each regime in `[hot, pressure, thrash]`:
+
+1. Runs the buffered build of `io_patterns` and saves results to `<output_dir>/buffered_<regime>.json`.
+2. Runs the direct-io build of `io_patterns` and saves results to `<output_dir>/direct_<regime>.json`.
+3. Compares the pair with `compare_benchmarks.py` and writes `<output_dir>/compare_<regime>.md`.
+
+After all regimes, prints an aggregate summary (faster / neutral / slower counts per regime).
+
+#### Output files
+
+| File | Contents |
+|---|---|
+| `buffered_<regime>.json` | Raw benchmark results for buffered mode in that regime |
+| `direct_<regime>.json` | Raw benchmark results for direct-io mode in that regime |
+| `compare_<regime>.md` | Markdown comparison table with mean, p50, p95, std_dev columns |
+
+#### Runtime estimate
+
+Working-set sizes are derived from total RAM at runtime (Linux: `/proc/meminfo`).
+On this machine (62.6 GiB RAM, ext4 on `/dev/md2`):
+
+| Regime | Working set | Approx. runtime per cell (50 iters) |
+|---|---|---|
+| `hot` | ~15.6 GiB (0.25 × RAM) | several minutes |
+| `pressure` | ~62.6 GiB (1.0 × RAM) | long — requires evicting page cache |
+| `thrash` | ~125 GiB (2.0 × RAM) | very long — exceeds RAM, heavy swap/I/O |
+
+> **Note:** The `thrash` regime may take an extremely long time or OOM on machines where
+> `2 × RAM` worth of blocks cannot be pre-created. Consider using `--working-set-blocks`
+> to set an explicit cap.
+
+#### Running a single cell manually
+
+To run one (regime, mode) pair outside the matrix script:
+
+```bash
+# Buffered, hot regime
+cargo bench --bench io_patterns \
+  --no-default-features --features replacement_lru --features page-4k \
+  -- 50 12 --regime hot --json > buffered_hot.json
+
+# Direct-io, hot regime
+cargo bench --bench io_patterns \
+  --no-default-features --features replacement_lru --features page-4k --features direct-io \
+  -- 50 12 --regime hot --json > direct_hot.json
+
+# Compare
+python3 scripts/compare_benchmarks.py buffered_hot.json direct_hot.json compare_hot.md
+```
+
+Use `--working-set-blocks <N>` instead of `--regime` for a reproducible fixed size:
+
+```bash
+cargo bench --bench io_patterns \
+  --no-default-features --features replacement_lru --features page-4k \
+  -- 10 12 --working-set-blocks 500000
+```
+
+#### Interpreting results
+
+- **hot regime:** working set fits in page cache. Buffered I/O benefits from cache warmth across
+  iterations; direct-io hits storage every time. Expect buffered to win.
+- **pressure regime:** working set ~= RAM. Cache hit rate degrades; the gap between modes narrows.
+- **thrash regime:** working set exceeds RAM. Page cache provides no benefit; direct-io eliminates
+  double-buffering overhead. Expect direct-io to be competitive or faster.
+
+Direct-io fallback status is printed at the end of each human-readable run. If any file fell back
+to buffered mode, a `[direct-io:fallback]` diagnostic is emitted to stderr at open time.

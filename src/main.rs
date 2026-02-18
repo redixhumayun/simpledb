@@ -12927,6 +12927,15 @@ fn desired_mode_for_class(class: FileClass) -> IoMode {
     }
 }
 
+/// Global counter incremented each time a direct-I/O open falls back to buffered.
+/// Readable via `direct_io_fallback_count()`.
+static DIRECT_IO_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Return the number of direct-I/O fallbacks that have occurred in this process.
+pub fn direct_io_fallback_count() -> usize {
+    DIRECT_IO_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Open a file with the appropriate I/O mode for its class.
 ///
 /// Falls back to buffered mode if `O_DIRECT` open fails with an
@@ -12960,6 +12969,7 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
                 })
             }
             Err(ref e) if is_direct_io_unsupported(e) => {
+                DIRECT_IO_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "[direct-io:fallback] file={} requested=direct effective=buffered reason=\"{}\"",
                     path.file_name().unwrap_or_default().to_string_lossy(),
