@@ -37,4 +37,9 @@ page-4k = []
 page-8k = []
 page-1m = []
 
+# Enable direct I/O (O_DIRECT) for data files. WAL always uses buffered I/O.
+# Linux-only in this phase. Default builds remain fully buffered.
+direct-io = []
+
 [dependencies]
+libc = "0.2"

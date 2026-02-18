@@ -149,3 +149,84 @@ Exit criteria:
 
 4. Risk: throughput regression for mixed workloads.
    - Mitigation: keep feature-gated rollout and benchmark before defaulting.
+
+---
+
+## Phase 4 Signoff — Benchmark Results
+
+### Environment
+
+| Property | Value |
+|---|---|
+| OS / kernel | Linux 6.8.0-100-generic |
+| CPU | Intel Xeon E3-1275 v5 @ 3.60GHz |
+| Storage / filesystem | ext4 on `/dev/md2` (RAID) |
+| Page size | 4096 bytes (`page-4k` feature) |
+| Buffer replacement | LRU (`replacement_lru` feature) |
+| Buffered build flags | `--no-default-features --features replacement_lru --features page-4k` |
+| Direct build flags | above + `--features direct-io` |
+| Iterations | 50 (fsync-heavy phases capped at 5) |
+| O_DIRECT fallback | None — O_DIRECT engaged on all data files |
+
+### A/B Comparison
+
+Base = buffered, PR = direct-io.
+
+| Benchmark | Buffered | Direct | Change | Status |
+|---|---|---|---:|---|
+| Sequential Read (1000 blocks) | 5.05ms | 25.08ms | +396% | ⚠️ slower |
+| Sequential Write (1000 blocks) | 4.39ms | 26.87ms | +512% | ⚠️ slower |
+| Random Read (K=1000, 1000 ops) | 4.67ms | 93.01ms | +1893% | ⚠️ slower |
+| Random Write (K=1000, 1000 ops) | 4.41ms | 26.46ms | +500% | ⚠️ slower |
+| WAL append (no fsync) | 230.81ms | 227.22ms | -2% | ✅ |
+| WAL append + immediate fsync | 892.31ms | 900.53ms | +1% | ✅ |
+| WAL group commit (batch=10) | 1.11s | 1.09s | -2% | ✅ |
+| WAL group commit (batch=50) | 402.51ms | 424.03ms | +5% | ✅ |
+| WAL group commit (batch=100) | 310.10ms | 307.33ms | -1% | ✅ |
+| Mixed 70/30R/W no-fsync | 44.09ms | 76.11ms | +73% | ⚠️ slower |
+| Mixed 70/30R/W immediate-fsync | 1.37s | 1.34s | -2% | ✅ |
+| Mixed 50/50R/W no-fsync | 68.80ms | 100.54ms | +46% | ⚠️ slower |
+| Mixed 50/50R/W immediate-fsync | 2.22s | 2.53s | +14% | ⚠️ slower |
+| Mixed 10/90R/W no-fsync | 110.95ms | 139.86ms | +26% | ⚠️ slower |
+| Mixed 10/90R/W immediate-fsync | 3.93s | 4.11s | +5% | ✅ |
+| Random Write durability (WAL fsync, no data fsync) | 8.83s | 9.14s | +3% | ✅ |
+| Random Write durability (WAL fsync + data fsync) | 12.21s | 9.65s | -21% | 🚀 faster |
+
+WAL benchmarks omitted from table body above; all WAL results were within ±5% (expected — WAL always runs in buffered mode regardless of feature).
+
+### Analysis
+
+**Why Phase 1 shows large regressions:**
+The benchmark working set (1000 blocks × 4 KB = 4 MB) fits entirely in the OS page cache.
+With buffered I/O, after the first iteration the entire working set is cache-resident and subsequent
+reads are served from RAM at memory bandwidth speeds. With O_DIRECT the page cache is bypassed
+on every iteration, so every read and write traverses the full I/O stack to the storage device.
+The regression is an artifact of the micro-benchmark structure, not a signal about production behaviour.
+
+**WAL is unaffected:** WAL always uses buffered I/O regardless of the `direct-io` feature.
+All WAL-only benchmarks are within noise (±5%).
+
+**Random Write durability with data fsync is 21% faster:** When data pages are fsynced after
+every write, buffered I/O must write dirty pages through the page cache and then flush them to
+disk (two passes through the I/O subsystem). O_DIRECT writes go directly to the device in one
+pass, making the fsync effectively a no-op for already-durable data. This is the workload
+profile where direct I/O is expected to provide a real benefit.
+
+**Production expectation:** In a database with a working set larger than available RAM,
+buffered-I/O hit rates drop and direct I/O becomes competitive or faster by eliminating
+double-buffering overhead. This benchmark does not represent that regime.
+
+### Signoff Decision
+
+Direct I/O is **not yet suitable as the default** for this codebase:
+
+- The current buffer pool is small (tunable via `num_buffers`); most reads bypass the pool
+  and the page cache is doing effective caching work that direct I/O discards.
+- Benefit materialises only when working sets exceed RAM or when data fsyncs are frequent.
+
+**Recommended next steps before promoting to default:**
+
+1. Run A/B with a working set larger than available RAM to observe the cache-pressure regime.
+2. Evaluate buffer pool sizing — a larger pool reduces the advantage of OS caching and makes
+   direct I/O more competitive.
+3. Re-run after any buffer pool improvements to get an updated signal.
