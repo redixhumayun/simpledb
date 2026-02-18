@@ -55,15 +55,15 @@ I'm not sure of the below explanation. It's a conclusion I arrived at while chat
 cargo bench --bench simple_bench -- 50
 
 # SQL benchmarks - run only INSERT
-cargo bench --bench simple_bench -- 50 "INSERT"
+cargo bench --bench simple_bench -- 50 --filter "INSERT"
 
 # Buffer pool benchmarks - run all
 cargo bench --bench buffer_pool -- 50 12
 
 # Buffer pool benchmarks - run only Random K=10
-cargo bench --bench buffer_pool -- 50 12 "Random (K=10,"
+cargo bench --bench buffer_pool -- 50 12 --filter "Random (K=10,"
 # Buffer pool benchmarks - run only the 8-thread pin workload
-cargo bench --bench buffer_pool -- 100 12 pin:t8
+cargo bench --bench buffer_pool -- 100 12 --filter pin:t8
 ```
 
 ## Replacement Policy Summary
@@ -173,15 +173,15 @@ Step (2) rewrites:
 Filter using substring matching on benchmark names (Phase 1-4) or case tokens (Phase 5):
 
 ```bash
-# Syntax: -- <iterations> [num_buffers] [filter]
-cargo bench --bench buffer_pool -- 100 12 "Pin/Unpin"      # Phase 1: Pin/Unpin only
-cargo bench --bench buffer_pool -- 100 12 "Zipfian"        # Phase 2+4: Zipfian tests
-cargo bench --bench buffer_pool -- 100 12 "Random (K=10,"  # Specific K value (not K=100)
-cargo bench --bench simple_bench -- 100 "SELECT"           # Both SELECT benchmarks
+# Syntax: -- <iterations> [num_buffers] --filter <pattern>
+cargo bench --bench buffer_pool -- 100 12 --filter "Pin/Unpin"      # Phase 1: Pin/Unpin only
+cargo bench --bench buffer_pool -- 100 12 --filter "Zipfian"        # Phase 2+4: Zipfian tests
+cargo bench --bench buffer_pool -- 100 12 --filter "Random (K=10,"  # Specific K value (not K=100)
+cargo bench --bench simple_bench -- 100 --filter "SELECT"           # Both SELECT benchmarks
 
 # Phase 5 case tokens (no quotes needed):
-cargo bench --bench buffer_pool -- 200 12 pin:t4           # Multi-threaded pin, 4 threads
-cargo bench --bench buffer_pool -- 200 12 hotset:t8_k4     # Hot-set contention, 8 threads, K=4
+cargo bench --bench buffer_pool -- 200 12 --filter pin:t4           # Multi-threaded pin, 4 threads
+cargo bench --bench buffer_pool -- 200 12 --filter hotset:t8_k4     # Hot-set contention, 8 threads, K=4
 ```
 
 **Use case:** Isolate specific workloads for profiling (flamegraphs, perf analysis) without noise from other benchmarks.
@@ -216,7 +216,7 @@ cargo bench --bench buffer_pool -- 50 12 --json
 ```bash
 # These produce identical output (all benchmarks):
 cargo bench --bench buffer_pool -- 50 12 --json
-cargo bench --bench buffer_pool -- 50 12 --json "Random"
+cargo bench --bench buffer_pool -- 50 12 --json --filter "Random"
 ```
 
 ## CI Integration

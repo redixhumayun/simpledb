@@ -40,19 +40,46 @@ pub fn parse_bench_args() -> (usize, usize, bool, Option<String>) {
     let mut numeric_args = Vec::new();
     let mut json_output = false;
     let mut filter: Option<String> = None;
+    let mut i = 1usize;
 
-    // Collect all numeric args, check for flags, and capture filter string
-    for arg in args.iter().skip(1) {
+    while i < args.len() {
+        let arg = &args[i];
         if arg == "--json" {
             json_output = true;
-        } else if !arg.starts_with("--") {
-            if let Ok(n) = arg.parse::<usize>() {
-                numeric_args.push(n);
-            } else {
-                // Non-numeric, non-flag argument is treated as filter
-                filter = Some(arg.clone());
-            }
+            i += 1;
+            continue;
         }
+        if arg == "--filter" {
+            let Some(value) = args.get(i + 1) else {
+                panic!("--filter requires a value");
+            };
+            if value.starts_with("--") {
+                panic!("--filter requires a non-flag value");
+            }
+            filter = Some(value.clone());
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--") {
+            // Unknown flag: skip optional value if present.
+            if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if let Ok(n) = arg.parse::<usize>() {
+            numeric_args.push(n);
+            i += 1;
+            continue;
+        }
+
+        panic!(
+            "unexpected positional argument '{}'; use --filter <pattern> for benchmark filtering",
+            arg
+        );
     }
 
     let iterations = numeric_args.first().copied().unwrap_or(10);
