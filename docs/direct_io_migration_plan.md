@@ -238,17 +238,16 @@ three working-set regimes, then compare buffered vs direct-io in each regime.
 
 #### Regime definitions
 
-- `cache-hot`: working set ~= `0.25 x RAM`
-- `cache-pressure`: working set ~= `1.0 x RAM`
-- `cache-thrashing`: working set ~= `2.0 x RAM`
+- `cache-hot`: fixed `64 MiB` working set
+- `cache-pressure`: fixed `512 MiB` working set
+- `cache-thrashing`: fixed `2 GiB` working set
 
 #### Working-set sizing formula
 
-Use page-size-aware sizing:
+Use page-size-aware sizing from fixed byte caps:
 
-- `ram_bytes = host_total_memory_bytes`
 - `page_bytes = PAGE_SIZE_BYTES`
-- `target_bytes = ram_bytes * regime_ratio`
+- `target_bytes = regime_fixed_bytes`
 - `working_set_blocks = floor(target_bytes / page_bytes)`
 
 #### Benchmark harness updates required
@@ -257,15 +256,15 @@ Use page-size-aware sizing:
 working sets (`100`, `1000`, `10_000` blocks). Add either:
 
 - `--working-set-blocks <N>` (preferred for reproducibility), or
-- `--regime hot|pressure|thrash` (resolved to block count at runtime using RAM detection).
+- `--regime hot|pressure|thrash` (resolved to block count from fixed capped sizes).
 
 Recommended precedence:
 
 1. If `--working-set-blocks` is provided, use it exactly.
-2. Else if `--regime` is provided, derive `working_set_blocks` from RAM and page size.
+2. Else if `--regime` is provided, derive `working_set_blocks` from fixed regime bytes and page size.
 3. Else keep current default sizes.
 
-Rationale: `--regime` makes routine runs easy and machine-adaptive; `--working-set-blocks`
+Rationale: fixed regimes keep matrix runtime practical and comparable across machines; `--working-set-blocks`
 preserves exact reproducibility for comparisons and CI reruns.
 
 Apply this to:
@@ -307,18 +306,29 @@ This yields `workload x 3 regimes x 2 modes`, with repeated iterations per cell 
 #### Command
 
 ```bash
-python3 scripts/run_regime_matrix.py [iterations] [output_dir]
+python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy] [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
 ```
 
 | Argument | Default | Description |
 |---|---|---|
 | `iterations` | 50 | Iterations per benchmark cell (fsync-heavy workloads are capped at 5 internally) |
 | `output_dir` | `regime_matrix_results` | Directory where JSON and comparison files are written |
+| `--profile` | `capped` | `capped` uses fixed 64MiB/512MiB/2GiB regimes, `heavy` uses larger fixed tiers (8GiB/16GiB/32GiB at `page-4k`) |
+| `--phase1-ops` | `1000` | Operation count for Phase 1 |
+| `--mixed-ops` | `500` | Operation count for mixed R/W phase |
+| `--durability-ops` | `1000` | Operation count for durability phase |
 
 Example:
 
 ```bash
 python3 scripts/run_regime_matrix.py 50 results/regime_$(date +%Y%m%d)
+```
+
+Heavy example (recommended bounded ops):
+
+```bash
+python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
+  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
 ```
 
 #### What the script does
@@ -341,18 +351,25 @@ After all regimes, prints an aggregate summary (faster / neutral / slower counts
 
 #### Runtime estimate
 
-Working-set sizes are derived from total RAM at runtime (Linux: `/proc/meminfo`).
-On this machine (62.6 GiB RAM, ext4 on `/dev/md2`):
+Working-set sizes are fixed caps and page-size-aware.
+With `page-4k`:
 
 | Regime | Working set | Approx. runtime per cell (50 iters) |
 |---|---|---|
-| `hot` | ~15.6 GiB (0.25 × RAM) | several minutes |
-| `pressure` | ~62.6 GiB (1.0 × RAM) | long — requires evicting page cache |
-| `thrash` | ~125 GiB (2.0 × RAM) | very long — exceeds RAM, heavy swap/I/O |
+| `hot` | 64 MiB (`16,384` blocks) | short |
+| `pressure` | 512 MiB (`131,072` blocks) | moderate |
+| `thrash` | 2 GiB (`524,288` blocks) | longer, but practical |
 
-> **Note:** The `thrash` regime may take an extremely long time or OOM on machines where
-> `2 × RAM` worth of blocks cannot be pre-created. Consider using `--working-set-blocks`
-> to set an explicit cap.
+Heavy profile (`--profile heavy`) uses:
+
+| Regime | Working set (`page-4k`) |
+|---|---|
+| `hot` | 8 GiB (`2,097,152` blocks) |
+| `pressure` | 16 GiB (`4,194,304` blocks) |
+| `thrash` | 32 GiB (`8,388,608` blocks) |
+
+> **Note:** If the fixed `thrash` setting is still too slow for your environment, use
+> `--working-set-blocks` to set an explicit lower cap.
 
 #### Running a single cell manually
 
@@ -399,9 +416,8 @@ cargo bench --bench io_patterns \
 
 - **hot regime:** working set fits in page cache. Buffered I/O benefits from cache warmth across
   iterations; direct-io hits storage every time. Expect buffered to win.
-- **pressure regime:** working set ~= RAM. Cache hit rate degrades; the gap between modes narrows.
-- **thrash regime:** working set exceeds RAM. Page cache provides no benefit; direct-io eliminates
-  double-buffering overhead. Expect direct-io to be competitive or faster.
+- **pressure regime:** cache pressure increases and buffered benefits shrink; the gap between modes narrows.
+- **thrash regime:** high pressure where page-cache wins are limited; direct-io may become competitive.
 
 Direct-io fallback status is printed at the end of each human-readable run. If any file fell back
 to buffered mode, a `[direct-io:fallback]` diagnostic is emitted to stderr at open time.

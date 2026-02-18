@@ -1,28 +1,7 @@
 #!/usr/bin/env python3
-"""
-Run the regime-based validation matrix: 3 regimes × 2 I/O modes (buffered / direct-io).
+"""Run the regime-based validation matrix: 3 regimes × 2 I/O modes."""
 
-Usage:
-    python3 run_regime_matrix.py [iterations] [output_dir]
-
-Arguments:
-    iterations  - Iterations per benchmark cell (default: 50)
-    output_dir  - Directory for JSON and comparison outputs (default: regime_matrix_results)
-
-For each regime in [hot, pressure, thrash]:
-  - Run buffered build:   cargo bench --bench io_patterns --no-default-features
-                            --features replacement_lru --features page-4k
-                            -- <iters> 12 --regime <regime> --json
-  - Run direct-io build:  same + --features direct-io
-  - Compare pair via compare_benchmarks.py → <output_dir>/compare_<regime>.md
-  - Print per-regime and aggregate summary.
-
-Regime definitions (fixed capped defaults resolved by the bench binary):
-  hot      = 64 MiB working set
-  pressure = 512 MiB working set
-  thrash   = 2 GiB working set
-"""
-
+import argparse
 import json
 import subprocess
 import sys
@@ -38,6 +17,29 @@ BASE_FEATURES = [
 ]
 
 DIRECT_EXTRA = ["--features", "direct-io"]
+
+HEAVY_PROFILE_BLOCKS = {
+    # 8 GiB / 16 GiB / 32 GiB with 4KiB pages
+    "hot": 2_097_152,
+    "pressure": 4_194_304,
+    "thrash": 8_388_608,
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("iterations", nargs="?", type=int, default=50)
+    parser.add_argument("output_dir", nargs="?", default="regime_matrix_results")
+    parser.add_argument(
+        "--profile",
+        choices=["capped", "heavy"],
+        default="capped",
+        help="Regime profile. capped uses bench defaults; heavy uses large fixed working-set blocks.",
+    )
+    parser.add_argument("--phase1-ops", type=int, default=1000)
+    parser.add_argument("--mixed-ops", type=int, default=500)
+    parser.add_argument("--durability-ops", type=int, default=1000)
+    return parser.parse_args()
 
 
 def detect_filesystem():
@@ -70,13 +72,32 @@ def format_ns(ns):
         return f"{ns / 1_000_000_000:.2f}s"
 
 
-def run_bench_cell(regime, iterations, features_extra, label):
+def run_bench_cell(regime, iterations, features_extra, label, args):
     """Run io_patterns bench for one (regime, mode) cell. Returns list of result dicts."""
+    bench_args = [str(iterations), "12", "--json"]
+    if args.profile == "heavy":
+        bench_args.extend(
+            ["--working-set-blocks", str(HEAVY_PROFILE_BLOCKS[regime])]
+        )
+    else:
+        bench_args.extend(["--regime", regime])
+    bench_args.extend(
+        [
+            "--phase1-ops",
+            str(args.phase1_ops),
+            "--mixed-ops",
+            str(args.mixed_ops),
+            "--durability-ops",
+            str(args.durability_ops),
+        ]
+    )
+
     cmd = (
         ["cargo", "bench", "--bench", "io_patterns"]
         + BASE_FEATURES
         + features_extra
-        + ["--", str(iterations), "12", "--regime", regime, "--json"]
+        + ["--"]
+        + bench_args
     )
     print(f"  [{label}] running: {' '.join(cmd)}", file=sys.stderr)
     try:
@@ -129,13 +150,21 @@ def summarise_regime(regime, buffered, direct):
 
 
 def main():
-    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 50
-    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("regime_matrix_results")
+    args = parse_args()
+    iterations = args.iterations
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     filesystem = detect_filesystem()
     print(f"Regime matrix: {iterations} iterations, output → {output_dir}", file=sys.stderr)
+    print(f"Profile: {args.profile}", file=sys.stderr)
     print(f"Regimes: {REGIMES}", file=sys.stderr)
+    if args.profile == "heavy":
+        print(f"Heavy working-set blocks: {HEAVY_PROFILE_BLOCKS}", file=sys.stderr)
+    print(
+        f"Ops: phase1={args.phase1_ops}, mixed={args.mixed_ops}, durability={args.durability_ops}",
+        file=sys.stderr,
+    )
     print(f"Filesystem/device: {filesystem}", file=sys.stderr)
 
     all_buffered = {}
@@ -146,13 +175,13 @@ def main():
 
         # Buffered
         buffered_file = output_dir / f"buffered_{regime}.json"
-        buffered = run_bench_cell(regime, iterations, [], "buffered")
+        buffered = run_bench_cell(regime, iterations, [], "buffered", args)
         buffered_file.write_text(json.dumps(buffered, indent=2))
         print(f"  Saved: {buffered_file}", file=sys.stderr)
 
         # Direct-io
         direct_file = output_dir / f"direct_{regime}.json"
-        direct = run_bench_cell(regime, iterations, DIRECT_EXTRA, "direct-io")
+        direct = run_bench_cell(regime, iterations, DIRECT_EXTRA, "direct-io", args)
         direct_file.write_text(json.dumps(direct, indent=2))
         print(f"  Saved: {direct_file}", file=sys.stderr)
 

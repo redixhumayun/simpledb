@@ -219,6 +219,55 @@ cargo bench --bench buffer_pool -- 50 12 --json
 cargo bench --bench buffer_pool -- 50 12 --json --filter "Random"
 ```
 
+## Direct I/O Regime Matrix
+
+Use `scripts/run_regime_matrix.py` to run buffered vs direct-io across three regimes and
+generate side-by-side comparison reports.
+
+```bash
+# Syntax:
+# python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy]
+#                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
+```
+
+### Quick run (default profile)
+
+```bash
+python3 scripts/run_regime_matrix.py 10 results/regime_capped_$(date +%Y%m%d)
+```
+
+Default `capped` profile (`page-4k`):
+- `hot`: 64 MiB (`16,384` blocks)
+- `pressure`: 512 MiB (`131,072` blocks)
+- `thrash`: 2 GiB (`524,288` blocks)
+
+### Heavy run (larger working sets)
+
+```bash
+python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
+  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
+```
+
+Heavy profile (`page-4k`):
+- `hot`: 8 GiB (`2,097,152` blocks)
+- `pressure`: 16 GiB (`4,194,304` blocks)
+- `thrash`: 32 GiB (`8,388,608` blocks)
+
+### Output files
+
+For each regime, the script writes:
+- `buffered_<regime>.json`
+- `direct_<regime>.json`
+- `compare_<regime>.md`
+
+### Interpreting results
+
+- Focus first on `compare_<regime>.md` and aggregate summary (`faster / neutral / slower`).
+- For this codebase, direct-io is expected to lose in cache-friendly read-heavy paths.
+- A consistent win in `Random Write durability ... data-fsync` indicates benefit in
+  forced-durability workloads.
+- Promote direct-io defaults only if wins are broad in your target workloads/hardware.
+
 ## CI Integration
 
 **Files:**
