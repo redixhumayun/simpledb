@@ -34,11 +34,15 @@ def parse_args():
         "--profile",
         choices=["capped", "heavy"],
         default="capped",
-        help="Regime profile. capped uses bench defaults; heavy uses large fixed working-set blocks.",
+        help=(
+            "Regime profile. "
+            "capped = quick guardrail (regime-derived working sets, ops scale with regime). "
+            "heavy = decision-grade signal (large fixed working sets, explicit high ops)."
+        ),
     )
-    parser.add_argument("--phase1-ops", type=int, default=1000)
-    parser.add_argument("--mixed-ops", type=int, default=500)
-    parser.add_argument("--durability-ops", type=int, default=1000)
+    parser.add_argument("--phase1-ops", type=int, default=None)
+    parser.add_argument("--mixed-ops", type=int, default=None)
+    parser.add_argument("--durability-ops", type=int, default=None)
     return parser.parse_args()
 
 
@@ -80,17 +84,25 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
             ["--working-set-blocks", str(HEAVY_PROFILE_BLOCKS[regime])]
         )
     else:
+        # capped uses regime-derived working sets.
         bench_args.extend(["--regime", regime])
-    bench_args.extend(
-        [
-            "--phase1-ops",
-            str(args.phase1_ops),
-            "--mixed-ops",
-            str(args.mixed_ops),
-            "--durability-ops",
-            str(args.durability_ops),
-        ]
-    )
+
+    # Preserve io_patterns regime auto-scaling by only passing op flags when
+    # explicitly set (or intentionally fixed by the heavy profile).
+    phase1_ops = args.phase1_ops
+    mixed_ops = args.mixed_ops
+    durability_ops = args.durability_ops
+    if args.profile == "heavy":
+        phase1_ops = phase1_ops if phase1_ops is not None else 20_000
+        mixed_ops = mixed_ops if mixed_ops is not None else 10_000
+        durability_ops = durability_ops if durability_ops is not None else 5_000
+
+    if phase1_ops is not None:
+        bench_args.extend(["--phase1-ops", str(phase1_ops)])
+    if mixed_ops is not None:
+        bench_args.extend(["--mixed-ops", str(mixed_ops)])
+    if durability_ops is not None:
+        bench_args.extend(["--durability-ops", str(durability_ops)])
 
     cmd = (
         ["cargo", "bench", "--bench", "io_patterns"]
@@ -161,10 +173,22 @@ def main():
     print(f"Regimes: {REGIMES}", file=sys.stderr)
     if args.profile == "heavy":
         print(f"Heavy working-set blocks: {HEAVY_PROFILE_BLOCKS}", file=sys.stderr)
-    print(
-        f"Ops: phase1={args.phase1_ops}, mixed={args.mixed_ops}, durability={args.durability_ops}",
-        file=sys.stderr,
-    )
+    if args.profile == "heavy":
+        phase1_info = args.phase1_ops if args.phase1_ops is not None else 20_000
+        mixed_info = args.mixed_ops if args.mixed_ops is not None else 10_000
+        durability_info = args.durability_ops if args.durability_ops is not None else 5_000
+        print(
+            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info} (heavy explicit)",
+            file=sys.stderr,
+        )
+    else:
+        phase1_info = "auto" if args.phase1_ops is None else str(args.phase1_ops)
+        mixed_info = "auto" if args.mixed_ops is None else str(args.mixed_ops)
+        durability_info = "auto" if args.durability_ops is None else str(args.durability_ops)
+        print(
+            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}",
+            file=sys.stderr,
+        )
     print(f"Filesystem/device: {filesystem}", file=sys.stderr)
 
     all_buffered = {}

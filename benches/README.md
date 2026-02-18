@@ -230,25 +230,37 @@ generate side-by-side comparison reports.
 #                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
 ```
 
-### Quick run (default profile)
+### Profile intent
+
+| Profile | Purpose | Working set | Ops |
+|---|---|---|---|
+| `capped` | Quick guardrail — fast CI gate | Regime-derived (64 MiB / 512 MiB / 2 GiB) | Auto-scaled to working set |
+| `heavy` | Decision-grade signal — pre-merge signoff | Fixed large (8 / 16 / 32 GiB) | Explicit high values |
+
+### Quick run (capped profile)
 
 ```bash
 python3 scripts/run_regime_matrix.py 10 results/regime_capped_$(date +%Y%m%d)
 ```
 
-Default `capped` profile (`page-4k`):
+`capped` profile working sets (`page-4k`):
 - `hot`: 64 MiB (`16,384` blocks)
 - `pressure`: 512 MiB (`131,072` blocks)
 - `thrash`: 2 GiB (`524,288` blocks)
 
-### Heavy run (larger working sets)
+Ops auto-scale with working set when `--regime` is used (and not explicitly overridden):
+- `phase1-ops` = `working_set_blocks` (one unique touch per block per iteration)
+- `mixed-ops` = `working_set_blocks / 2`
+- `durability-ops` = `working_set_blocks`
+
+### Heavy run (decision-grade signal)
 
 ```bash
 python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
   --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
 ```
 
-Heavy profile (`page-4k`):
+`heavy` profile working sets (`page-4k`):
 - `hot`: 8 GiB (`2,097,152` blocks)
 - `pressure`: 16 GiB (`4,194,304` blocks)
 - `thrash`: 32 GiB (`8,388,608` blocks)

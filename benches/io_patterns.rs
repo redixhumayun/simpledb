@@ -1,6 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use std::env;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -8,8 +9,8 @@ use std::time::Duration;
 use simpledb::FileSystemInterface;
 use simpledb::{
     benchmark_framework::{
-        benchmark, parse_bench_args, print_header, render_throughput_section, should_run,
-        BenchResult, ThroughputRow,
+        benchmark, benchmark_with_teardown, parse_bench_args, print_header,
+        render_throughput_section, should_run, BenchResult, ThroughputRow,
     },
     direct_io_fallback_count,
     test_utils::generate_random_number,
@@ -137,6 +138,48 @@ fn make_wal_record(size: usize) -> Vec<u8> {
 }
 
 // ============================================================================
+// Fast RNG (xorshift64) — used for per-iteration sequence generation.
+// Seeded once from /dev/urandom so each iteration sees different access patterns.
+// ============================================================================
+
+struct FastRng(u64);
+
+impl FastRng {
+    fn new() -> Self {
+        Self(generate_random_number() as u64 | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_range(&mut self, n: usize) -> usize {
+        (self.next_u64() as usize) % n
+    }
+}
+
+// ============================================================================
+// Cache eviction helper (Linux only)
+// ============================================================================
+
+/// Drop a file's pages from the OS page cache via posix_fadvise(POSIX_FADV_DONTNEED).
+/// Used in cache-evict benchmark variants to ensure a cold cache before each iteration.
+#[cfg(target_os = "linux")]
+fn posix_fadvise_dontneed(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) {
+        unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+}
+
+// ============================================================================
 // Phase 1: Sequential vs Random I/O Patterns
 // ============================================================================
 // Filter tokens: seq_read, seq_write, rand_read, rand_write
@@ -193,16 +236,16 @@ fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> Bench
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
 
-    // Pre-generate random sequence
-    let random_indices: Vec<usize> = (0..total_ops)
-        .map(|_| generate_random_number() % working_set)
-        .collect();
+    // Seed RNG once; indices are re-generated each iteration for fresh access patterns.
+    let mut rng = FastRng::new();
 
     benchmark(
         &format!("Random Read (K={}, {} ops)", working_set, total_ops),
         iterations,
         2,
         || {
+            let random_indices: Vec<usize> =
+                (0..total_ops).map(|_| rng.next_range(working_set)).collect();
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &block_idx in &random_indices {
@@ -220,16 +263,16 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
 
-    // Pre-generate random sequence
-    let random_indices: Vec<usize> = (0..total_ops)
-        .map(|_| generate_random_number() % working_set)
-        .collect();
+    // Seed RNG once; indices are re-generated each iteration for fresh access patterns.
+    let mut rng = FastRng::new();
 
     benchmark(
         &format!("Random Write (K={}, {} ops)", working_set, total_ops),
         iterations,
         2,
         || {
+            let random_indices: Vec<usize> =
+                (0..total_ops).map(|_| rng.next_range(working_set)).collect();
             let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for (i, &block_idx) in random_indices.iter().enumerate() {
@@ -328,23 +371,24 @@ fn mixed_workload(
     // Pre-create blocks
     precreate_blocks_direct(&db, &file, working_set);
 
-    // Pre-generate operation sequence
-    let ops: Vec<bool> = (0..total_ops)
-        .map(|_| (generate_random_number() % 100) < read_pct)
-        .collect();
-
-    let block_indices: Vec<usize> = (0..total_ops)
-        .map(|_| generate_random_number() % working_set)
-        .collect();
-
     let log = db.log_manager();
     let policy_label = flush_policy.label();
+
+    // Seed RNG once; ops and indices re-generated each iteration for fresh access patterns.
+    let mut rng = FastRng::new();
 
     benchmark(
         &format!("Mixed {}/{}R/W {}", read_pct, 100 - read_pct, policy_label),
         iterations,
         2,
         || {
+            let ops: Vec<bool> = (0..total_ops)
+                .map(|_| rng.next_range(100) < read_pct)
+                .collect();
+            let block_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
+
             let mut page = Page::new();
             let mut policy = flush_policy.clone();
 
@@ -373,12 +417,16 @@ fn mixed_workload(
 fn concurrent_io_shared(
     num_threads: usize,
     ops_per_thread: usize,
+    working_set_blocks: usize,
     flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
     let file = "concurrent_shared".to_string();
-    let total_blocks = num_threads * 100;
+    // Bound file precreation to blocks that can actually be touched in one run.
+    // This avoids multi-GiB untimed setup in large regimes when ops/thread is small.
+    let max_touchable = num_threads.saturating_mul(ops_per_thread).max(1);
+    let total_blocks = working_set_blocks.min(max_touchable).max(1);
 
     // Pre-size file (critical!)
     precreate_blocks_direct(&db, &file, total_blocks);
@@ -431,11 +479,15 @@ fn concurrent_io_shared(
 fn concurrent_io_sharded(
     num_threads: usize,
     ops_per_thread: usize,
+    working_set_blocks: usize,
     flush_policy: WALFlushPolicy,
     iterations: usize,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
-    let blocks_per_file = 100;
+    // Per shard, cap precreation to the max blocks addressable by this workload.
+    // Each thread uses i % blocks_per_file for exactly ops_per_thread operations.
+    let target_per_file = (working_set_blocks / num_threads).max(1);
+    let blocks_per_file = target_per_file.min(ops_per_thread).max(1);
 
     // Pre-create separate file for each thread
     for tid in 0..num_threads {
@@ -505,20 +557,22 @@ fn random_write_durability(
     // Pre-create blocks to avoid extension cost during timed section
     precreate_blocks_direct(&db, &file, working_set);
 
-    // Pre-generate random indices (reuse across iterations for deterministic workloads)
-    let block_indices: Vec<usize> = (0..total_ops)
-        .map(|_| generate_random_number() % working_set)
-        .collect();
-
     let log = db.log_manager();
     let policy_label = wal_policy.label();
     let data_label = data_policy.label();
+
+    // Seed RNG once; indices re-generated each iteration for fresh access patterns.
+    let mut rng = FastRng::new();
 
     benchmark(
         &format!("Random Write durability {} {}", policy_label, data_label),
         iterations,
         2,
         || {
+            let block_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
+
             let mut page = Page::new();
             let mut wal_policy = wal_policy.clone();
             let mut data_policy = data_policy.clone();
@@ -540,6 +594,158 @@ fn random_write_durability(
             }
 
             wal_policy.finish_batch(&log);
+        },
+    )
+}
+
+// ============================================================================
+// Phase 7: Cache-Adverse I/O Variants
+// ============================================================================
+// Filter tokens: onepass_seq, lo_loc_rand, multi_stream
+
+/// One-pass sequential scan: read all `working_set` blocks once per iteration.
+/// Every iteration starts fresh from block 0; no temporal reuse.
+fn onepass_seq_scan(working_set: usize, iterations: usize) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("onepass_seq_{}", working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+
+    benchmark(
+        &format!("One-pass Seq Scan (K={})", working_set),
+        iterations,
+        1,
+        || {
+            let mut fm = db.file_manager.lock().unwrap();
+            let mut page = Page::new();
+            for i in 0..working_set {
+                fm.read(&BlockId::new(file.clone(), i), &mut page);
+            }
+        },
+    )
+}
+
+/// Low-locality random read: Fisher-Yates shuffle of all blocks, re-randomized each iteration.
+/// Each block is touched exactly once per iteration; access order changes every run.
+fn low_locality_rand_read(working_set: usize, iterations: usize) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("lo_loc_rand_{}", working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+
+    let mut rng = FastRng::new();
+
+    benchmark(
+        &format!("Low-locality Rand Read (K={})", working_set),
+        iterations,
+        1,
+        || {
+            // Fisher-Yates shuffle: produces a full permutation of [0, working_set).
+            let mut indices: Vec<usize> = (0..working_set).collect();
+            for i in (1..working_set).rev() {
+                let j = rng.next_range(i + 1);
+                indices.swap(i, j);
+            }
+            let mut fm = db.file_manager.lock().unwrap();
+            let mut page = Page::new();
+            for &idx in &indices {
+                fm.read(&BlockId::new(file.clone(), idx), &mut page);
+            }
+        },
+    )
+}
+
+/// Multi-stream sequential scan: `num_streams` threads each do a full sequential pass over
+/// their own file. Aggregate footprint = `working_set` blocks, split across streams.
+fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let blocks_per_stream = (working_set / num_streams).max(1);
+
+    for s in 0..num_streams {
+        let file = format!("multi_stream_{}_{}", num_streams, s);
+        precreate_blocks_direct(&db, &file, blocks_per_stream);
+    }
+
+    benchmark(
+        &format!("Multi-stream Scan {}x{}blk", num_streams, blocks_per_stream),
+        iterations,
+        1,
+        || {
+            let handles: Vec<_> = (0..num_streams)
+                .map(|s| {
+                    let file = format!("multi_stream_{}_{}", num_streams, s);
+                    let fm = Arc::clone(&db.file_manager);
+                    thread::spawn(move || {
+                        let mut page = Page::new();
+                        for i in 0..blocks_per_stream {
+                            fm.lock().unwrap().read(&BlockId::new(file.clone(), i), &mut page);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+    )
+}
+
+// ============================================================================
+// Phase 8: Cache-Evict Variants (Linux only; posix_fadvise DONTNEED between iters)
+// ============================================================================
+// Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+
+/// One-pass sequential scan with cache eviction between iterations.
+fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult {
+    let (db, test_dir) = setup_io_test();
+    let file_name = format!("onepass_seq_evict_{}", working_set);
+    let file_path: PathBuf = test_dir.path.join(&file_name);
+    precreate_blocks_direct(&db, &file_name, working_set);
+
+    benchmark_with_teardown(
+        &format!("One-pass Seq Scan+Evict (K={})", working_set),
+        iterations,
+        1,
+        || {
+            let mut fm = db.file_manager.lock().unwrap();
+            let mut page = Page::new();
+            for i in 0..working_set {
+                fm.read(&BlockId::new(file_name.clone(), i), &mut page);
+            }
+        },
+        || {
+            #[cfg(target_os = "linux")]
+            posix_fadvise_dontneed(&file_path);
+        },
+    )
+}
+
+/// Low-locality random read with cache eviction between iterations.
+fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchResult {
+    let (db, test_dir) = setup_io_test();
+    let file_name = format!("lo_loc_rand_evict_{}", working_set);
+    let file_path: PathBuf = test_dir.path.join(&file_name);
+    precreate_blocks_direct(&db, &file_name, working_set);
+
+    let mut rng = FastRng::new();
+
+    benchmark_with_teardown(
+        &format!("Low-locality Rand Read+Evict (K={})", working_set),
+        iterations,
+        1,
+        || {
+            let mut indices: Vec<usize> = (0..working_set).collect();
+            for i in (1..working_set).rev() {
+                let j = rng.next_range(i + 1);
+                indices.swap(i, j);
+            }
+            let mut fm = db.file_manager.lock().unwrap();
+            let mut page = Page::new();
+            for &idx in &indices {
+                fm.read(&BlockId::new(file_name.clone(), idx), &mut page);
+            }
+        },
+        || {
+            #[cfg(target_os = "linux")]
+            posix_fadvise_dontneed(&file_path);
         },
     )
 }
@@ -639,6 +845,9 @@ fn parse_io_args() -> IoBenchConfig {
     let mut phase1_ops = 1000usize;
     let mut mixed_ops = 500usize;
     let mut durability_ops = 1000usize;
+    let mut phase1_ops_explicit = false;
+    let mut mixed_ops_explicit = false;
+    let mut durability_ops_explicit = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -653,17 +862,25 @@ fn parse_io_args() -> IoBenchConfig {
         } else if arg == "--phase1-ops" {
             if let Some(val) = iter.next() {
                 phase1_ops = val.parse().unwrap_or(phase1_ops);
+                phase1_ops_explicit = true;
             }
         } else if arg == "--mixed-ops" {
             if let Some(val) = iter.next() {
                 mixed_ops = val.parse().unwrap_or(mixed_ops);
+                mixed_ops_explicit = true;
             }
         } else if arg == "--durability-ops" {
             if let Some(val) = iter.next() {
                 durability_ops = val.parse().unwrap_or(durability_ops);
+                durability_ops_explicit = true;
             }
         }
     }
+
+    // Regime-derived sizing: when --regime is set (not --working-set-blocks) and ops are
+    // not explicitly overridden, scale ops to working_set_blocks so hot/pressure/thrash
+    // materially changes reuse distance rather than just the modulo range.
+    let regime_was_set = regime.is_some() && explicit_blocks.is_none();
 
     let (working_set_blocks, regime_label) = if let Some(n) = explicit_blocks {
         (n, format!("custom({})", n))
@@ -673,6 +890,16 @@ fn parse_io_args() -> IoBenchConfig {
     } else {
         (1000, "default".to_string())
     };
+
+    if regime_was_set && !phase1_ops_explicit {
+        phase1_ops = working_set_blocks;
+    }
+    if regime_was_set && !mixed_ops_explicit {
+        mixed_ops = (working_set_blocks / 2).max(1);
+    }
+    if regime_was_set && !durability_ops_explicit {
+        durability_ops = working_set_blocks;
+    }
 
     IoBenchConfig {
         working_set_blocks,
@@ -749,17 +976,28 @@ fn main() {
                 results.push(concurrent_io_shared(
                     threads,
                     100,
+                    io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
                 ));
                 results.push(concurrent_io_sharded(
                     threads,
                     100,
+                    io_cfg.working_set_blocks,
                     policy,
                     fsync_iterations,
                 ));
             }
         }
+
+        // Phase 7: Cache-adverse variants
+        results.push(onepass_seq_scan(io_cfg.working_set_blocks, iterations));
+        results.push(low_locality_rand_read(io_cfg.working_set_blocks, iterations));
+        results.push(multi_stream_scan(4, io_cfg.working_set_blocks, iterations));
+
+        // Phase 8: Cache-evict variants
+        results.push(onepass_seq_scan_evict(io_cfg.working_set_blocks, iterations));
+        results.push(low_locality_rand_read_evict(io_cfg.working_set_blocks, iterations));
 
         // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
@@ -1004,6 +1242,7 @@ fn main() {
                 concurrent_results.push(concurrent_io_shared(
                     threads,
                     100,
+                    io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
                 ));
@@ -1014,6 +1253,7 @@ fn main() {
                 concurrent_results.push(concurrent_io_sharded(
                     threads,
                     100,
+                    io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
                 ));
@@ -1098,6 +1338,73 @@ fn main() {
             "Phase 6: Random Write Durability Throughput",
             &throughput_rows,
         );
+    }
+
+    // Phase 7: Cache-Adverse I/O
+    // Filter tokens: onepass_seq, lo_loc_rand, multi_stream
+    let mut cache_adverse_results = Vec::new();
+
+    if should_run("onepass_seq", filter_ref) {
+        cache_adverse_results.push(onepass_seq_scan(io_cfg.working_set_blocks, iterations));
+    }
+    if should_run("lo_loc_rand", filter_ref) {
+        cache_adverse_results.push(low_locality_rand_read(io_cfg.working_set_blocks, iterations));
+    }
+    if should_run("multi_stream", filter_ref) {
+        cache_adverse_results.push(multi_stream_scan(4, io_cfg.working_set_blocks, iterations));
+    }
+
+    if !cache_adverse_results.is_empty() {
+        render_latency_section(
+            "Phase 7: Cache-Adverse I/O (one-pass, low-locality, multi-stream)",
+            &cache_adverse_results,
+        );
+        let mut throughput_rows = Vec::new();
+        for result in &cache_adverse_results {
+            let throughput_mb =
+                (io_cfg.working_set_blocks * block_size) as f64
+                    / result.mean.as_secs_f64()
+                    / 1_000_000.0;
+            throughput_rows.push(ThroughputRow {
+                label: result.operation.clone(),
+                throughput: throughput_mb,
+                unit: "MB/s".to_string(),
+                mean_duration: result.mean,
+            });
+        }
+        render_throughput_section("Phase 7: Cache-Adverse Throughput", &throughput_rows);
+    }
+
+    // Phase 8: Cache-Evict Variants (Linux only)
+    // Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+    let mut evict_results = Vec::new();
+
+    if should_run("onepass_seq_evict", filter_ref) {
+        evict_results.push(onepass_seq_scan_evict(io_cfg.working_set_blocks, iterations));
+    }
+    if should_run("lo_loc_rand_evict", filter_ref) {
+        evict_results.push(low_locality_rand_read_evict(io_cfg.working_set_blocks, iterations));
+    }
+
+    if !evict_results.is_empty() {
+        render_latency_section(
+            "Phase 8: Cache-Evict Variants (posix_fadvise DONTNEED between iterations)",
+            &evict_results,
+        );
+        let mut throughput_rows = Vec::new();
+        for result in &evict_results {
+            let throughput_mb =
+                (io_cfg.working_set_blocks * block_size) as f64
+                    / result.mean.as_secs_f64()
+                    / 1_000_000.0;
+            throughput_rows.push(ThroughputRow {
+                label: result.operation.clone(),
+                throughput: throughput_mb,
+                unit: "MB/s".to_string(),
+                mean_duration: result.mean,
+            });
+        }
+        render_throughput_section("Phase 8: Cache-Evict Throughput", &throughput_rows);
     }
 
     let fallbacks = direct_io_fallback_count();

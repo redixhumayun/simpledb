@@ -146,6 +146,65 @@ where
     }
 }
 
+/// Like [`benchmark`] but calls `teardown` after each iteration (outside the timed section).
+/// Use this for cache-evict variants where cache must be dropped between measurements.
+pub fn benchmark_with_teardown<F, T>(
+    name: &str,
+    iterations: usize,
+    warmup: usize,
+    mut operation: F,
+    mut teardown: T,
+) -> BenchResult
+where
+    F: FnMut(),
+    T: FnMut(),
+{
+    let mut durations = Vec::with_capacity(iterations);
+
+    for _ in 0..warmup {
+        operation();
+        teardown();
+    }
+
+    for _ in 0..iterations {
+        let start = Instant::now();
+        operation();
+        durations.push(start.elapsed());
+        teardown();
+    }
+
+    durations.sort();
+    let mean = durations.iter().sum::<Duration>() / iterations as u32;
+    let median = if iterations % 2 == 1 {
+        durations[iterations / 2]
+    } else {
+        let mid1 = durations[iterations / 2 - 1].as_nanos();
+        let mid2 = durations[iterations / 2].as_nanos();
+        Duration::from_nanos(((mid1 + mid2) / 2) as u64)
+    };
+    let p95 = durations[(iterations * 95 / 100).min(iterations - 1)];
+
+    let variance: f64 = if iterations > 1 {
+        durations
+            .iter()
+            .map(|d| (d.as_nanos() as f64 - mean.as_nanos() as f64).powi(2))
+            .sum::<f64>()
+            / (iterations as f64 - 1.0)
+    } else {
+        0.0
+    };
+    let std_dev = Duration::from_nanos(variance.sqrt() as u64);
+
+    BenchResult {
+        operation: name.to_string(),
+        mean,
+        median,
+        p95,
+        std_dev,
+        iterations,
+    }
+}
+
 pub fn print_header() {
     println!(
         "{:60} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}",
