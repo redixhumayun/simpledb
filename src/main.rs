@@ -12842,9 +12842,24 @@ enum IoMode {
 struct OpenFile {
     file: File,
     mode: IoMode,
+    #[cfg(target_os = "linux")]
+    scratch: Option<AlignedBuf>,
 }
 
 impl OpenFile {
+    fn new(file: File, mode: IoMode) -> Self {
+        Self {
+            file,
+            mode,
+            #[cfg(target_os = "linux")]
+            scratch: if mode == IoMode::Direct {
+                Some(AlignedBuf::new_zeroed())
+            } else {
+                None
+            },
+        }
+    }
+
     /// Read exactly one page from the file at the current seek position.
     /// Uses an aligned intermediate buffer when the mode is `Direct`.
     fn read_page(&mut self) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
@@ -12861,8 +12876,12 @@ impl OpenFile {
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let mut buf = AlignedBuf::new_zeroed();
-                    match self.file.read_exact(buf.as_mut_slice()) {
+                    let file = &mut self.file;
+                    let buf = self
+                        .scratch
+                        .as_mut()
+                        .expect("direct mode requires aligned scratch buffer");
+                    match file.read_exact(buf.as_mut_slice()) {
                         Ok(_) => (),
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                             buf.as_mut_slice().fill(0)
@@ -12888,9 +12907,13 @@ impl OpenFile {
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let mut buf = AlignedBuf::new_zeroed();
+                    let file = &mut self.file;
+                    let buf = self
+                        .scratch
+                        .as_mut()
+                        .expect("direct mode requires aligned scratch buffer");
                     buf.as_mut_slice().copy_from_slice(data);
-                    self.file.write_all(buf.as_slice()).unwrap();
+                    file.write_all(buf.as_slice()).unwrap();
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("Direct I/O is only supported on Linux")
@@ -12958,12 +12981,7 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
             .open(path);
 
         match result {
-            Ok(file) => {
-                return Ok(OpenFile {
-                    file,
-                    mode: IoMode::Direct,
-                })
-            }
+            Ok(file) => return Ok(OpenFile::new(file, IoMode::Direct)),
             Err(ref e) if is_direct_io_unsupported(e) => {
                 DIRECT_IO_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -12985,10 +13003,7 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
         .create(true)
         .truncate(false)
         .open(path)?;
-    Ok(OpenFile {
-        file,
-        mode: IoMode::Buffered,
-    })
+    Ok(OpenFile::new(file, IoMode::Buffered))
 }
 
 /// Returns `true` for open-time errors that indicate direct I/O is unsupported
@@ -13006,6 +13021,7 @@ fn is_direct_io_unsupported(e: &io::Error) -> bool {
 /// Both the buffer address and its size are `PAGE_SIZE_BYTES`, satisfying
 /// the alignment/length constraints imposed by `O_DIRECT`.
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct AlignedBuf {
     ptr: *mut u8,
     size: usize,
@@ -13087,18 +13103,15 @@ impl FileManager {
         })
     }
 
-    /// Get a cloned `OpenFile` for the given filename, opening it on first access.
-    fn get_file(&mut self, filename: &str) -> OpenFile {
+    /// Access an `OpenFile` for the given filename, opening it on first access.
+    fn with_open_file<R>(&mut self, filename: &str, f: impl FnOnce(&mut OpenFile) -> R) -> R {
         let full_path = self.db_directory.join(filename);
-        let full_path_str = full_path.to_string_lossy().to_string();
-        let of = self.open_files.entry(full_path_str).or_insert_with(|| {
+        let key = full_path.to_string_lossy().to_string();
+        let of = self.open_files.entry(key).or_insert_with(|| {
             let class = classify_file(filename);
             open_with_fallback(&full_path, class).expect("Failed to open file")
         });
-        OpenFile {
-            file: of.file.try_clone().unwrap(),
-            mode: of.mode,
-        }
+        f(of)
     }
 }
 impl FileSystemInterface for FileManager {
@@ -13107,23 +13120,26 @@ impl FileSystemInterface for FileManager {
     }
 
     fn length(&mut self, filename: String) -> usize {
-        let of = self.get_file(&filename);
-        let metadata = of.file.metadata().unwrap();
-        (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        self.with_open_file(&filename, |of| {
+            let metadata = of.file.metadata().unwrap();
+            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        })
     }
 
     fn read(&mut self, block_id: &BlockId, page: &mut Page) {
-        let mut of = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-        *page = Page::from_bytes(of.read_page());
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            *page = Page::from_bytes(of.read_page());
+        });
     }
 
     fn write(&mut self, block_id: &BlockId, page: &Page) {
-        let mut of = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-        of.write_page(page.bytes());
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            of.write_page(page.bytes());
+        });
     }
 
     fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
@@ -13132,10 +13148,11 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
-        let mut of = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-        buf.copy_from_slice(&of.read_page());
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            buf.copy_from_slice(&of.read_page());
+        });
     }
 
     fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
@@ -13144,31 +13161,34 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
-        let mut of = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-        of.write_page(buf);
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            of.write_page(buf);
+        });
     }
 
     /// Append a new empty block to the file
     fn append(&mut self, filename: String) -> BlockId {
         let new_blk_num = self.length(filename.clone());
         let block_id = BlockId::new(filename.clone(), new_blk_num);
-        let mut of = self.get_file(&filename);
-        of.file
-            .seek(io::SeekFrom::Start(
-                (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-            ))
-            .unwrap();
         let zeros = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        of.write_page(&zeros);
+        self.with_open_file(&filename, |of| {
+            of.file
+                .seek(io::SeekFrom::Start(
+                    (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
+                ))
+                .unwrap();
+            of.write_page(&zeros);
+        });
         block_id
     }
 
     /// Sync the file with the disk to ensure durability
     fn sync(&mut self, filename: &str) {
-        let of = self.get_file(filename);
-        of.file.sync_all().unwrap();
+        self.with_open_file(filename, |of| {
+            of.file.sync_all().unwrap();
+        });
     }
 
     /// Sync the directory with the disk to ensure durability
@@ -13441,7 +13461,7 @@ mod file_manager_tests {
         let (_temp_dir, mut file_manager) = setup();
 
         let filename = "test_file";
-        file_manager.get_file(filename);
+        file_manager.with_open_file(filename, |_| ());
 
         let full_path = file_manager.db_directory.join(filename);
         let full_path_str = full_path.to_string_lossy().to_string();
