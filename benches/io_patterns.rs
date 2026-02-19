@@ -173,9 +173,14 @@ impl FastRng {
 fn posix_fadvise_dontneed(path: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
     if let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) {
-        unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
+        let ret = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        debug_assert_eq!(
+            ret,
+            0,
+            "posix_fadvise(POSIX_FADV_DONTNEED) failed for {} with errno {}",
+            path.display(),
+            ret
+        );
     }
 }
 
@@ -877,6 +882,20 @@ fn parse_io_args() -> IoBenchConfig {
             if let Some(val) = iter.next() {
                 durability_ops = val.parse().unwrap_or(durability_ops);
                 durability_ops_explicit = true;
+            }
+        } else if arg == "--json" {
+            // Handled by parse_bench_args (first pass).
+        } else if arg == "--filter" {
+            // Handled by parse_bench_args (first pass).
+            let _ = iter.next();
+        } else if arg.starts_with("--") {
+            eprintln!("warning: unknown flag: {}", arg);
+            if iter
+                .clone()
+                .next()
+                .is_some_and(|next| !next.starts_with("--"))
+            {
+                let _ = iter.next();
             }
         }
     }

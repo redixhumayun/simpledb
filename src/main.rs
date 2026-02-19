@@ -12850,13 +12850,13 @@ impl OpenFile {
     fn read_page(&mut self) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
         match self.mode {
             IoMode::Buffered => {
-                let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+                let mut buf = [0u8; crate::page::PAGE_SIZE_BYTES as usize];
                 match self.file.read_exact(&mut buf) {
                     Ok(_) => (),
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => buf.fill(0),
                     Err(e) => panic!("Failed to read from file: {e}"),
                 }
-                buf.try_into().unwrap()
+                buf
             }
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
@@ -12943,14 +12943,10 @@ pub fn direct_io_fallback_count() -> usize {
 /// propagated.  The returned `OpenFile.mode` always reflects the mode that
 /// actually succeeded.
 fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
-    // Always call desired_mode_for_class so `class` and the function are not
-    // flagged as unused in non-direct-io builds.  The underscore prefix on
-    // `_desired` suppresses the unused-variable lint when the cfg block below
-    // does not compile.
-    let _desired = desired_mode_for_class(class);
+    let desired = desired_mode_for_class(class);
 
     #[cfg(all(target_os = "linux", feature = "direct-io"))]
-    if _desired == IoMode::Direct {
+    if desired == IoMode::Direct {
         use std::os::unix::fs::OpenOptionsExt;
 
         let result = OpenOptions::new()
@@ -12980,6 +12976,8 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
             Err(e) => return Err(e),
         }
     }
+    #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+    let _ = desired;
 
     let file = OpenOptions::new()
         .read(true)
@@ -13412,9 +13410,20 @@ mod mock_file_manager {
 
 #[cfg(test)]
 mod file_manager_tests {
+    #[cfg(feature = "direct-io")]
+    use std::sync::atomic::Ordering;
+    #[cfg(feature = "direct-io")]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{test_utils::TestDir, FileManager, FileSystemInterface};
+    #[cfg(feature = "direct-io")]
+    use crate::DIRECT_IO_FALLBACK_COUNT;
+    use crate::{classify_file, test_utils::TestDir, FileClass, FileManager, FileSystemInterface};
+    #[cfg(feature = "direct-io")]
+    use crate::{direct_io_fallback_count, PAGE_SIZE_BYTES};
+
+    #[cfg(feature = "direct-io")]
+    static COUNTER_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn setup() -> (TestDir, FileManager) {
         let timestamp = SystemTime::now()
@@ -13453,6 +13462,43 @@ mod file_manager_tests {
         let block_id_2 = file_manager.append(filename.clone());
         assert_eq!(block_id_2.block_num, 1);
         assert_eq!(file_manager.length(filename), 2);
+    }
+
+    #[test]
+    fn test_classify_file_routes_wal_and_data() {
+        assert_eq!(classify_file("simpledb.log"), FileClass::Wal);
+        assert_eq!(classify_file("table.tbl"), FileClass::Data);
+    }
+
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    #[test]
+    fn test_direct_io_mode_round_trip_write_then_read() {
+        let (_temp_dir, mut file_manager) = setup();
+        let filename = "direct_io_round_trip".to_string();
+        let block_id = file_manager.append(filename);
+
+        let mut write_buf = [0u8; PAGE_SIZE_BYTES as usize];
+        for (idx, b) in write_buf.iter_mut().enumerate() {
+            *b = (idx % 251) as u8;
+        }
+        file_manager.write_raw(&block_id, &write_buf);
+
+        let mut read_buf = [0u8; PAGE_SIZE_BYTES as usize];
+        file_manager.read_raw(&block_id, &mut read_buf);
+        assert_eq!(read_buf, write_buf);
+    }
+
+    #[cfg(feature = "direct-io")]
+    #[test]
+    fn test_direct_io_fallback_counter_is_observable() {
+        let _guard = COUNTER_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let before = direct_io_fallback_count();
+        DIRECT_IO_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert!(direct_io_fallback_count() >= before + 1);
+        DIRECT_IO_FALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

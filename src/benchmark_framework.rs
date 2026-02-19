@@ -113,37 +113,7 @@ where
         durations.push(start.elapsed());
     }
 
-    durations.sort();
-    let mean = durations.iter().sum::<Duration>() / iterations as u32;
-    let median = if iterations % 2 == 1 {
-        durations[iterations / 2]
-    } else {
-        let mid1 = durations[iterations / 2 - 1].as_nanos();
-        let mid2 = durations[iterations / 2].as_nanos();
-        Duration::from_nanos(((mid1 + mid2) / 2) as u64)
-    };
-    let p95 = durations[(iterations * 95 / 100).min(iterations - 1)];
-
-    // Simple std deviation calculation
-    let variance: f64 = if iterations > 1 {
-        durations
-            .iter()
-            .map(|d| (d.as_nanos() as f64 - mean.as_nanos() as f64).powi(2))
-            .sum::<f64>()
-            / (iterations as f64 - 1.0)
-    } else {
-        0.0
-    };
-    let std_dev = Duration::from_nanos(variance.sqrt() as u64);
-
-    BenchResult {
-        operation: name.to_string(),
-        mean,
-        median,
-        p95,
-        std_dev,
-        iterations,
-    }
+    compute_stats(name, durations)
 }
 
 /// Like [`benchmark`] but calls `teardown` after each iteration (outside the timed section).
@@ -173,6 +143,11 @@ where
         teardown();
     }
 
+    compute_stats(name, durations)
+}
+
+fn compute_stats(name: &str, mut durations: Vec<Duration>) -> BenchResult {
+    let iterations = durations.len();
     durations.sort();
     let mean = durations.iter().sum::<Duration>() / iterations as u32;
     let median = if iterations % 2 == 1 {

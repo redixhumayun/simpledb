@@ -47,6 +47,9 @@ There is a test suite which provides basic coverage to ensure the code still wor
 
    cargo test --no-default-features --features replacement_sieve --features page-4k
    # Verify build works and tests pass
+
+   cargo test --no-default-features --features replacement_lru --features page-4k --features direct-io
+   # Verify direct-io build works and tests pass
    ```
 
 5. **Run benchmarks before committing**
