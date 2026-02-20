@@ -40,3 +40,4 @@
 3. [Simplify Arc/Mutex usage and clarify multi-threading boundaries](https://github.com/redixhumayun/simpledb/issues/31) - Remove unnecessary synchronization overhead and improve code clarity
 4. [Tracking: Performance Alignment Plan](https://github.com/redixhumayun/simpledb/issues/46) - Stabilize benchmarking infrastructure, add instrumentation for latency/queue metrics, implement admission control and background maintenance
 5. [Evaluate planner plan ownership and reduce Arc usage](https://github.com/redixhumayun/simpledb/issues/50) - Audit Arc<dyn Plan> usage and prototype alternatives (Rc, owned structs) to clarify single-thread semantics and reduce overhead
+6. [Add async I/O queue-depth benchmarks for direct vs buffered](https://github.com/redixhumayun/simpledb/issues/77) - Introduce async-capable I/O benchmarking path (qd=1/4/16/32) to evaluate direct-I/O competitiveness with in-flight concurrency

@@ -10,5 +10,6 @@ perf.*
 *.svg
 .DS_Store
 /output
+/results
 docs/local.md
 docs/sharded/**/*

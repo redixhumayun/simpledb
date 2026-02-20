@@ -33,8 +33,8 @@ mod intrusive_dll;
 mod page;
 mod parser;
 mod replacement;
-use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
 pub use crate::page::PAGE_SIZE_BYTES;
+use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
 mod buffer_manager;
 
 pub type Lsn = usize;
@@ -12818,11 +12818,262 @@ pub trait FileSystemInterface: std::fmt::Debug {
     fn sync_directory(&mut self);
 }
 
+// ---------------------------------------------------------------------------
+// I/O mode abstraction – Phase 1 + 2
+// ---------------------------------------------------------------------------
+
+/// Classifies a database file as WAL or data for I/O-mode routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileClass {
+    Wal,
+    Data,
+}
+
+/// The I/O mode a file was opened with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "direct-io"), allow(dead_code))]
+enum IoMode {
+    Buffered,
+    Direct,
+}
+
+/// A file handle together with the effective I/O mode it was opened in.
+#[derive(Debug)]
+struct OpenFile {
+    file: File,
+    mode: IoMode,
+    #[cfg(target_os = "linux")]
+    scratch: Option<AlignedBuf>,
+}
+
+impl OpenFile {
+    fn new(file: File, mode: IoMode) -> Self {
+        Self {
+            file,
+            mode,
+            #[cfg(target_os = "linux")]
+            scratch: if mode == IoMode::Direct {
+                Some(AlignedBuf::new_zeroed())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Read exactly one page from the file at the current seek position.
+    /// Uses an aligned intermediate buffer when the mode is `Direct`.
+    fn read_page(&mut self) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
+        match self.mode {
+            IoMode::Buffered => {
+                let mut buf = [0u8; crate::page::PAGE_SIZE_BYTES as usize];
+                match self.file.read_exact(&mut buf) {
+                    Ok(_) => (),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => buf.fill(0),
+                    Err(e) => panic!("Failed to read from file: {e}"),
+                }
+                buf
+            }
+            IoMode::Direct => {
+                #[cfg(target_os = "linux")]
+                {
+                    let file = &mut self.file;
+                    let buf = self
+                        .scratch
+                        .as_mut()
+                        .expect("direct mode requires aligned scratch buffer");
+                    match file.read_exact(buf.as_mut_slice()) {
+                        Ok(_) => (),
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            buf.as_mut_slice().fill(0)
+                        }
+                        Err(e) => panic!("Failed to read from file (direct I/O): {e}"),
+                    }
+                    buf.as_slice().try_into().unwrap()
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("Direct I/O is only supported on Linux")
+            }
+        }
+    }
+
+    /// Write exactly one page to the file at the current seek position.
+    /// Uses an aligned intermediate buffer when the mode is `Direct`.
+    fn write_page(&mut self, data: &[u8]) {
+        debug_assert_eq!(data.len(), crate::page::PAGE_SIZE_BYTES as usize);
+        match self.mode {
+            IoMode::Buffered => {
+                self.file.write_all(data).unwrap();
+            }
+            IoMode::Direct => {
+                #[cfg(target_os = "linux")]
+                {
+                    let file = &mut self.file;
+                    let buf = self
+                        .scratch
+                        .as_mut()
+                        .expect("direct mode requires aligned scratch buffer");
+                    buf.as_mut_slice().copy_from_slice(data);
+                    file.write_all(buf.as_slice()).unwrap();
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("Direct I/O is only supported on Linux")
+            }
+        }
+    }
+}
+
+/// Classify a filename as WAL or data.
+fn classify_file(filename: &str) -> FileClass {
+    if filename == SimpleDB::LOG_FILE {
+        FileClass::Wal
+    } else {
+        FileClass::Data
+    }
+}
+
+/// Return the desired I/O mode for a file class, keyed on the `direct-io` feature.
+///
+/// - `direct-io` enabled:  Data → Direct, Wal → Buffered
+/// - `direct-io` disabled: everything → Buffered
+fn desired_mode_for_class(class: FileClass) -> IoMode {
+    #[cfg(feature = "direct-io")]
+    {
+        match class {
+            FileClass::Data => IoMode::Direct,
+            FileClass::Wal => IoMode::Buffered,
+        }
+    }
+    #[cfg(not(feature = "direct-io"))]
+    {
+        let _ = class;
+        IoMode::Buffered
+    }
+}
+
+/// Global counter incremented each time a direct-I/O open falls back to buffered.
+/// Readable via `direct_io_fallback_count()`.
+static DIRECT_IO_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Return the number of direct-I/O fallbacks that have occurred in this process.
+pub fn direct_io_fallback_count() -> usize {
+    DIRECT_IO_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Open a file with the appropriate I/O mode for its class.
+///
+/// Falls back to buffered mode if `O_DIRECT` open fails with an
+/// unsupported-flag error (`EINVAL` / `EOPNOTSUPP`).  Other errors are
+/// propagated.  The returned `OpenFile.mode` always reflects the mode that
+/// actually succeeded.
+fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
+    let desired = desired_mode_for_class(class);
+
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    if desired == IoMode::Direct {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let result = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_DIRECT)
+            .open(path);
+
+        match result {
+            Ok(file) => return Ok(OpenFile::new(file, IoMode::Direct)),
+            Err(ref e) if is_direct_io_unsupported(e) => {
+                DIRECT_IO_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[direct-io:fallback] file={} requested=direct effective=buffered reason=\"{}\"",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    e
+                );
+                // fall through to buffered open below
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+    let _ = desired;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    Ok(OpenFile::new(file, IoMode::Buffered))
+}
+
+/// Returns `true` for open-time errors that indicate direct I/O is unsupported
+/// by the filesystem or device.  Do **not** use for read/write errors.
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+fn is_direct_io_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+/// Page-aligned heap allocation for direct I/O.
+///
+/// Both the buffer address and its size are `PAGE_SIZE_BYTES`, satisfying
+/// the alignment/length constraints imposed by `O_DIRECT`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AlignedBuf {
+    ptr: *mut u8,
+    size: usize,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(target_os = "linux")]
+impl AlignedBuf {
+    /// Allocate a zeroed, page-aligned buffer of exactly `PAGE_SIZE_BYTES`.
+    fn new_zeroed() -> Self {
+        let size = crate::page::PAGE_SIZE_BYTES as usize;
+        let layout = std::alloc::Layout::from_size_align(size, size).unwrap();
+        // SAFETY: layout has non-zero size and valid alignment; we check for null.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Self { ptr, size, layout }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr is valid, aligned, non-null, `size` bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is valid, aligned, non-null, `size` bytes; exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: allocated with this exact layout; drop called exactly once.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+    }
+}
+
+// SAFETY: AlignedBuf exclusively owns its allocation.
+#[cfg(target_os = "linux")]
+unsafe impl Send for AlignedBuf {}
+
+// ---------------------------------------------------------------------------
+// End I/O mode abstraction
+// ---------------------------------------------------------------------------
+
 /// The file manager struct that manages the files in the database
 #[derive(Debug)]
 struct FileManager {
     db_directory: PathBuf,
-    open_files: HashMap<String, File>,
+    open_files: HashMap<String, OpenFile>,
     directory_fd: File,
 }
 
@@ -12852,23 +13103,15 @@ impl FileManager {
         })
     }
 
-    /// Get the file handle for the file with the given filename or create it if it doesn't exist
-    fn get_file(&mut self, filename: &str) -> File {
+    /// Access an `OpenFile` for the given filename, opening it on first access.
+    fn with_open_file<R>(&mut self, filename: &str, f: impl FnOnce(&mut OpenFile) -> R) -> R {
         let full_path = self.db_directory.join(filename);
-        let full_path_str = full_path.to_string_lossy().to_string();
-        self.open_files
-            .entry(full_path_str)
-            .or_insert_with(|| {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(full_path)
-                    .expect("Failed to open file")
-            })
-            .try_clone()
-            .unwrap()
+        let key = full_path.to_string_lossy().to_string();
+        let of = self.open_files.entry(key).or_insert_with(|| {
+            let class = classify_file(filename);
+            open_with_fallback(&full_path, class).expect("Failed to open file")
+        });
+        f(of)
     }
 }
 impl FileSystemInterface for FileManager {
@@ -12877,34 +13120,26 @@ impl FileSystemInterface for FileManager {
     }
 
     fn length(&mut self, filename: String) -> usize {
-        let file = self.get_file(&filename);
-        let metadata = file.metadata().unwrap();
-        (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        self.with_open_file(&filename, |of| {
+            let metadata = of.file.metadata().unwrap();
+            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        })
     }
 
     fn read(&mut self, block_id: &BlockId, page: &mut Page) {
-        let mut file = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        file.seek(io::SeekFrom::Start(offset)).unwrap();
-        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        match file.read_exact(&mut buf) {
-            Ok(_) => (),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                buf.fill(0);
-            }
-            Err(e) => panic!("Failed to read from file {e}"),
-        }
-        let buf: &[u8; crate::page::PAGE_SIZE_BYTES as usize] = buf.as_slice().try_into().unwrap();
-        *page = Page::from_bytes(*buf);
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            *page = Page::from_bytes(of.read_page());
+        });
     }
 
     fn write(&mut self, block_id: &BlockId, page: &Page) {
-        let mut file = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        file.seek(io::SeekFrom::Start(offset)).unwrap();
-        let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        buf.copy_from_slice(page.bytes());
-        file.write_all(&buf).unwrap();
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            of.write_page(page.bytes());
+        });
     }
 
     fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
@@ -12913,16 +13148,11 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
-        let mut file = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        file.seek(io::SeekFrom::Start(offset)).unwrap();
-        match file.read_exact(buf) {
-            Ok(_) => (),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                buf.fill(0);
-            }
-            Err(e) => panic!("Failed to read from file {e}"),
-        }
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            buf.copy_from_slice(&of.read_page());
+        });
     }
 
     fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
@@ -12931,30 +13161,34 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
-        let mut file = self.get_file(&block_id.filename);
         let offset = block_offset(block_id.block_num);
-        file.seek(io::SeekFrom::Start(offset)).unwrap();
-        file.write_all(buf).unwrap();
+        self.with_open_file(&block_id.filename, |of| {
+            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
+            of.write_page(buf);
+        });
     }
 
     /// Append a new empty block to the file
     fn append(&mut self, filename: String) -> BlockId {
         let new_blk_num = self.length(filename.clone());
         let block_id = BlockId::new(filename.clone(), new_blk_num);
-        let mut file = self.get_file(&filename);
-        file.seek(io::SeekFrom::Start(
-            (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-        ))
-        .unwrap();
-        let buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        file.write_all(&buf).unwrap();
+        let zeros = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
+        self.with_open_file(&filename, |of| {
+            of.file
+                .seek(io::SeekFrom::Start(
+                    (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
+                ))
+                .unwrap();
+            of.write_page(&zeros);
+        });
         block_id
     }
 
     /// Sync the file with the disk to ensure durability
     fn sync(&mut self, filename: &str) {
-        let file = self.get_file(filename);
-        file.sync_all().unwrap();
+        self.with_open_file(filename, |of| {
+            of.file.sync_all().unwrap();
+        });
     }
 
     /// Sync the directory with the disk to ensure durability
@@ -13196,9 +13430,20 @@ mod mock_file_manager {
 
 #[cfg(test)]
 mod file_manager_tests {
+    #[cfg(feature = "direct-io")]
+    use std::sync::atomic::Ordering;
+    #[cfg(feature = "direct-io")]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{test_utils::TestDir, FileManager, FileSystemInterface};
+    #[cfg(feature = "direct-io")]
+    use crate::DIRECT_IO_FALLBACK_COUNT;
+    use crate::{classify_file, test_utils::TestDir, FileClass, FileManager, FileSystemInterface};
+    #[cfg(feature = "direct-io")]
+    use crate::{direct_io_fallback_count, PAGE_SIZE_BYTES};
+
+    #[cfg(feature = "direct-io")]
+    static COUNTER_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn setup() -> (TestDir, FileManager) {
         let timestamp = SystemTime::now()
@@ -13216,7 +13461,7 @@ mod file_manager_tests {
         let (_temp_dir, mut file_manager) = setup();
 
         let filename = "test_file";
-        file_manager.get_file(filename);
+        file_manager.with_open_file(filename, |_| ());
 
         let full_path = file_manager.db_directory.join(filename);
         let full_path_str = full_path.to_string_lossy().to_string();
@@ -13237,6 +13482,43 @@ mod file_manager_tests {
         let block_id_2 = file_manager.append(filename.clone());
         assert_eq!(block_id_2.block_num, 1);
         assert_eq!(file_manager.length(filename), 2);
+    }
+
+    #[test]
+    fn test_classify_file_routes_wal_and_data() {
+        assert_eq!(classify_file("simpledb.log"), FileClass::Wal);
+        assert_eq!(classify_file("table.tbl"), FileClass::Data);
+    }
+
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    #[test]
+    fn test_direct_io_mode_round_trip_write_then_read() {
+        let (_temp_dir, mut file_manager) = setup();
+        let filename = "direct_io_round_trip".to_string();
+        let block_id = file_manager.append(filename);
+
+        let mut write_buf = [0u8; PAGE_SIZE_BYTES as usize];
+        for (idx, b) in write_buf.iter_mut().enumerate() {
+            *b = (idx % 251) as u8;
+        }
+        file_manager.write_raw(&block_id, &write_buf);
+
+        let mut read_buf = [0u8; PAGE_SIZE_BYTES as usize];
+        file_manager.read_raw(&block_id, &mut read_buf);
+        assert_eq!(read_buf, write_buf);
+    }
+
+    #[cfg(feature = "direct-io")]
+    #[test]
+    fn test_direct_io_fallback_counter_is_observable() {
+        let _guard = COUNTER_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let before = direct_io_fallback_count();
+        DIRECT_IO_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert!(direct_io_fallback_count() >= before + 1);
+        DIRECT_IO_FALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

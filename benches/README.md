@@ -55,15 +55,15 @@ I'm not sure of the below explanation. It's a conclusion I arrived at while chat
 cargo bench --bench simple_bench -- 50
 
 # SQL benchmarks - run only INSERT
-cargo bench --bench simple_bench -- 50 "INSERT"
+cargo bench --bench simple_bench -- 50 --filter "INSERT"
 
 # Buffer pool benchmarks - run all
 cargo bench --bench buffer_pool -- 50 12
 
 # Buffer pool benchmarks - run only Random K=10
-cargo bench --bench buffer_pool -- 50 12 "Random (K=10,"
+cargo bench --bench buffer_pool -- 50 12 --filter "Random (K=10,"
 # Buffer pool benchmarks - run only the 8-thread pin workload
-cargo bench --bench buffer_pool -- 100 12 pin:t8
+cargo bench --bench buffer_pool -- 100 12 --filter pin:t8
 ```
 
 ## Replacement Policy Summary
@@ -162,6 +162,15 @@ To refresh the raw benchmark logs and the summary tables above:
    python3 scripts/bench/render_replacement_policy_docs.py --platforms macos linux
    ```
 
+3. Generate buffer-pool scaling charts:
+   ```bash
+   uv run python scripts/bench/generate_scaling_charts.py --platform macos
+   uv run python scripts/bench/generate_scaling_charts.py --platform linux
+   ```
+   Charts are written to:
+   - `docs/benchmarks/charts/macos/`
+   - `docs/benchmarks/charts/linux/`
+
 Step (1) captures both the JSON payload (for table generation) and the exact `cargo bench` log (for the per-platform markdown files). 
 
 Step (2) rewrites:
@@ -173,15 +182,15 @@ Step (2) rewrites:
 Filter using substring matching on benchmark names (Phase 1-4) or case tokens (Phase 5):
 
 ```bash
-# Syntax: -- <iterations> [num_buffers] [filter]
-cargo bench --bench buffer_pool -- 100 12 "Pin/Unpin"      # Phase 1: Pin/Unpin only
-cargo bench --bench buffer_pool -- 100 12 "Zipfian"        # Phase 2+4: Zipfian tests
-cargo bench --bench buffer_pool -- 100 12 "Random (K=10,"  # Specific K value (not K=100)
-cargo bench --bench simple_bench -- 100 "SELECT"           # Both SELECT benchmarks
+# Syntax: -- <iterations> [num_buffers] --filter <pattern>
+cargo bench --bench buffer_pool -- 100 12 --filter "Pin/Unpin"      # Phase 1: Pin/Unpin only
+cargo bench --bench buffer_pool -- 100 12 --filter "Zipfian"        # Phase 2+4: Zipfian tests
+cargo bench --bench buffer_pool -- 100 12 --filter "Random (K=10,"  # Specific K value (not K=100)
+cargo bench --bench simple_bench -- 100 --filter "SELECT"           # Both SELECT benchmarks
 
 # Phase 5 case tokens (no quotes needed):
-cargo bench --bench buffer_pool -- 200 12 pin:t4           # Multi-threaded pin, 4 threads
-cargo bench --bench buffer_pool -- 200 12 hotset:t8_k4     # Hot-set contention, 8 threads, K=4
+cargo bench --bench buffer_pool -- 200 12 --filter pin:t4           # Multi-threaded pin, 4 threads
+cargo bench --bench buffer_pool -- 200 12 --filter hotset:t8_k4     # Hot-set contention, 8 threads, K=4
 ```
 
 **Use case:** Isolate specific workloads for profiling (flamegraphs, perf analysis) without noise from other benchmarks.
@@ -216,8 +225,83 @@ cargo bench --bench buffer_pool -- 50 12 --json
 ```bash
 # These produce identical output (all benchmarks):
 cargo bench --bench buffer_pool -- 50 12 --json
-cargo bench --bench buffer_pool -- 50 12 --json "Random"
+cargo bench --bench buffer_pool -- 50 12 --json --filter "Random"
 ```
+
+## Direct I/O Regime Matrix
+
+Use `scripts/run_regime_matrix.py` to run buffered vs direct-io across three regimes and
+generate side-by-side comparison reports.
+
+```bash
+# Syntax:
+# python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy]
+#                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
+```
+
+### Profile intent
+
+| Profile | Purpose | Working set | Ops |
+|---|---|---|---|
+| `capped` | Quick guardrail — fast CI gate | Regime-derived (64 MiB / 512 MiB / 2 GiB) | Auto-scaled to working set |
+| `heavy` | Decision-grade signal — pre-merge signoff | Fixed large (8 / 16 / 32 GiB) | Explicit high values |
+
+### Quick run (capped profile)
+
+```bash
+python3 scripts/run_regime_matrix.py 10 results/regime_capped_$(date +%Y%m%d)
+```
+
+`capped` profile working sets (`page-4k`):
+- `hot`: 64 MiB (`16,384` blocks)
+- `pressure`: 512 MiB (`131,072` blocks)
+- `thrash`: 2 GiB (`524,288` blocks)
+
+Ops auto-scale with working set when `--regime` is used (and not explicitly overridden):
+- `phase1-ops` = `working_set_blocks` (one unique touch per block per iteration)
+- `mixed-ops` = `working_set_blocks / 2`
+- `durability-ops` = `working_set_blocks`
+
+### Heavy run (decision-grade signal)
+
+```bash
+python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
+  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
+```
+
+`heavy` profile working sets (`page-4k`):
+- `hot`: 8 GiB (`2,097,152` blocks)
+- `pressure`: 16 GiB (`4,194,304` blocks)
+- `thrash`: 32 GiB (`8,388,608` blocks)
+
+### Output files
+
+For each regime, the script writes:
+- `buffered_<regime>.json`
+- `direct_<regime>.json`
+- `compare_<regime>.md`
+
+### Generate Direct-vs-Buffered I/O Charts
+
+After a regime-matrix run completes, generate the compact I/O chart deck:
+
+```bash
+uv run python scripts/bench/generate_io_mode_charts.py \
+  results/regime_capped_YYYYMMDD_HHMMSS
+```
+
+Charts are written to:
+- `docs/benchmarks/charts/io_mode/io_mode_hot.png`
+- `docs/benchmarks/charts/io_mode/io_mode_pressure.png`
+- `docs/benchmarks/charts/io_mode/io_mode_thrash.png`
+
+### Interpreting results
+
+- Focus first on `compare_<regime>.md` and aggregate summary (`faster / neutral / slower`).
+- For this codebase, direct-io is expected to lose in cache-friendly read-heavy paths.
+- A consistent win in `Random Write durability ... data-fsync` indicates benefit in
+  forced-durability workloads.
+- Promote direct-io defaults only if wins are broad in your target workloads/hardware.
 
 ## CI Integration
 

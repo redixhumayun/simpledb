@@ -31,7 +31,7 @@ Look at the [benchmarks README](benches/README.md) for more details.
 
 Run an individual buffer-pool workload (useful for profiling):
 ```bash
-cargo bench --bench buffer_pool -- 100 12 pin:t8   # Only the 8-thread pin benchmark
+cargo bench --bench buffer_pool -- 100 12 --filter pin:t8   # Only the 8-thread pin benchmark
 ```
 
 #### CI Benchmark Tracking
