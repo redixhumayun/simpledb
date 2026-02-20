@@ -843,6 +843,7 @@ struct IoBenchConfig {
     phase1_ops: usize,
     mixed_ops: usize,
     durability_ops: usize,
+    concurrent_ops: usize,
 }
 
 /// Parse io_patterns-specific flags from argv (second pass after parse_bench_args).
@@ -856,9 +857,11 @@ fn parse_io_args() -> IoBenchConfig {
     let mut phase1_ops = 1000usize;
     let mut mixed_ops = 500usize;
     let mut durability_ops = 1000usize;
+    let mut concurrent_ops = 100usize;
     let mut phase1_ops_explicit = false;
     let mut mixed_ops_explicit = false;
     let mut durability_ops_explicit = false;
+    let mut concurrent_ops_explicit = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -884,6 +887,11 @@ fn parse_io_args() -> IoBenchConfig {
             if let Some(val) = iter.next() {
                 durability_ops = val.parse().unwrap_or(durability_ops);
                 durability_ops_explicit = true;
+            }
+        } else if arg == "--concurrent-ops" {
+            if let Some(val) = iter.next() {
+                concurrent_ops = val.parse().unwrap_or(concurrent_ops);
+                concurrent_ops_explicit = true;
             }
         } else if arg == "--json" {
             // Handled by parse_bench_args (first pass).
@@ -925,6 +933,9 @@ fn parse_io_args() -> IoBenchConfig {
     if regime_was_set && !durability_ops_explicit {
         durability_ops = working_set_blocks;
     }
+    if regime_was_set && !concurrent_ops_explicit {
+        concurrent_ops = working_set_blocks;
+    }
 
     IoBenchConfig {
         working_set_blocks,
@@ -932,6 +943,7 @@ fn parse_io_args() -> IoBenchConfig {
         phase1_ops,
         mixed_ops,
         durability_ops,
+        concurrent_ops,
     }
 }
 
@@ -1000,14 +1012,14 @@ fn main() {
             ] {
                 results.push(concurrent_io_shared(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
                 ));
                 results.push(concurrent_io_sharded(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy,
                     fsync_iterations,
@@ -1087,6 +1099,7 @@ fn main() {
     println!("Phase 1 ops:         {}", io_cfg.phase1_ops);
     println!("Mixed ops:           {}", io_cfg.mixed_ops);
     println!("Durability ops:      {}", io_cfg.durability_ops);
+    println!("Concurrent ops:      {}", io_cfg.concurrent_ops);
     println!(
         "Direct I/O:          {}",
         if cfg!(feature = "direct-io") {
@@ -1277,7 +1290,7 @@ fn main() {
             if should_run(&shared_token, filter_ref) {
                 concurrent_results.push(concurrent_io_shared(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
@@ -1288,7 +1301,7 @@ fn main() {
             if should_run(&sharded_token, filter_ref) {
                 concurrent_results.push(concurrent_io_sharded(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
@@ -1299,7 +1312,10 @@ fn main() {
 
     if !concurrent_results.is_empty() {
         render_latency_section(
-            "Phase 5: Concurrent I/O Stress Test (100 ops/thread)",
+            &format!(
+                "Phase 5: Concurrent I/O Stress Test ({} ops/thread)",
+                io_cfg.concurrent_ops
+            ),
             &concurrent_results,
         );
 
@@ -1319,7 +1335,7 @@ fn main() {
                 1
             };
 
-            let total_ops = threads * 100;
+            let total_ops = threads * io_cfg.concurrent_ops;
             let ops_per_sec = total_ops as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),

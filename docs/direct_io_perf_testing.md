@@ -16,8 +16,9 @@ This doc summarizes how to interpret direct-vs-buffered results from `benches/io
 ## Workload/Regime Caveats
 
 ### Truly regime-independent phase
-1. Phase 5 (Concurrent I/O stress) does not scale with `working_set`.
-2. It uses fixed block counts (`num_threads * 100` or `blocks_per_file = 100`) independent of regime.
+1. Phase 5 (Concurrent I/O stress) defaults to 100 ops/thread but is now configurable via `--concurrent-ops`.
+2. Working-set blocks still come from `--regime` / `--working-set-blocks`; only ops/thread was fixed.
+3. When `--regime` is set without an explicit `--concurrent-ops`, ops/thread auto-scales to `working_set_blocks`.
 
 ### Weakly regime-sensitive phases
 1. Phase 1 (seq/rand): `working_set` changes index range, but touched pages per run are capped by fixed `phase1_ops`.
@@ -69,9 +70,7 @@ No, not as primary evidence.
 3. Promote direct I/O defaults only if wins are broad on real workload shapes.
 
 ## Concrete Changes Proposed
-1. Make Phase 5 regime-aware (`benches/io_patterns.rs`):
-   - Replace fixed concurrent footprints (`num_threads * 100`, `blocks_per_file = 100`) with values derived from `working_set_blocks`.
-   - Keep configuration profile-driven; avoid adding new per-phase CLI knobs.
+1. ~~Make Phase 5 regime-aware~~ **Done**: `--concurrent-ops` flag added to `io_patterns` and threaded through `run_regime_matrix.py` and `profile_io_pair.sh`. Auto-scales to `working_set_blocks` when `--regime` is set without an explicit override.
 
 2. Stop reusing identical random/index sequences across iterations (`benches/io_patterns.rs`):
    - Affected phases: Phase 1 random, Phase 4 mixed, Phase 6 durability.

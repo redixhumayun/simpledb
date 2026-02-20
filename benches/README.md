@@ -237,6 +237,7 @@ generate side-by-side comparison reports.
 # Syntax:
 # python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy]
 #                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
+#                                      [--concurrent-ops N]
 ```
 
 ### Profile intent
@@ -261,12 +262,13 @@ Ops auto-scale with working set when `--regime` is used (and not explicitly over
 - `phase1-ops` = `working_set_blocks` (one unique touch per block per iteration)
 - `mixed-ops` = `working_set_blocks / 2`
 - `durability-ops` = `working_set_blocks`
+- `concurrent-ops` = `working_set_blocks` (ops per thread for Phase 5)
 
 ### Heavy run (decision-grade signal)
 
 ```bash
 python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
-  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
+  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000 --concurrent-ops 1000
 ```
 
 `heavy` profile working sets (`page-4k`):
