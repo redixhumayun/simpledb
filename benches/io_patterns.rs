@@ -703,6 +703,7 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
 // Filter tokens: onepass_seq_evict, lo_loc_rand_evict
 
 /// One-pass sequential scan with cache eviction between iterations.
+#[cfg(target_os = "linux")]
 fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult {
     let (db, test_dir) = setup_io_test();
     let file_name = format!("onepass_seq_evict_{}", working_set);
@@ -728,6 +729,7 @@ fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult 
 }
 
 /// Low-locality random read with cache eviction between iterations.
+#[cfg(target_os = "linux")]
 fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchResult {
     let (db, test_dir) = setup_io_test();
     let file_name = format!("lo_loc_rand_evict_{}", working_set);
@@ -1021,11 +1023,13 @@ fn main() {
         ));
         results.push(multi_stream_scan(4, io_cfg.working_set_blocks, iterations));
 
-        // Phase 8: Cache-evict variants
+        // Phase 8: Cache-evict variants (Linux only — posix_fadvise DONTNEED unavailable elsewhere)
+        #[cfg(target_os = "linux")]
         results.push(onepass_seq_scan_evict(
             io_cfg.working_set_blocks,
             iterations,
         ));
+        #[cfg(target_os = "linux")]
         results.push(low_locality_rand_read_evict(
             io_cfg.working_set_blocks,
             iterations,
@@ -1409,41 +1413,44 @@ fn main() {
         render_throughput_section("Phase 7: Cache-Adverse Throughput", &throughput_rows);
     }
 
-    // Phase 8: Cache-Evict Variants (Linux only)
+    // Phase 8: Cache-Evict Variants (Linux only — posix_fadvise DONTNEED unavailable elsewhere)
     // Filter tokens: onepass_seq_evict, lo_loc_rand_evict
-    let mut evict_results = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let mut evict_results = Vec::new();
 
-    if should_run("onepass_seq_evict", filter_ref) {
-        evict_results.push(onepass_seq_scan_evict(
-            io_cfg.working_set_blocks,
-            iterations,
-        ));
-    }
-    if should_run("lo_loc_rand_evict", filter_ref) {
-        evict_results.push(low_locality_rand_read_evict(
-            io_cfg.working_set_blocks,
-            iterations,
-        ));
-    }
-
-    if !evict_results.is_empty() {
-        render_latency_section(
-            "Phase 8: Cache-Evict Variants (posix_fadvise DONTNEED between iterations)",
-            &evict_results,
-        );
-        let mut throughput_rows = Vec::new();
-        for result in &evict_results {
-            let throughput_mb = (io_cfg.working_set_blocks * block_size) as f64
-                / result.mean.as_secs_f64()
-                / 1_000_000.0;
-            throughput_rows.push(ThroughputRow {
-                label: result.operation.clone(),
-                throughput: throughput_mb,
-                unit: "MB/s".to_string(),
-                mean_duration: result.mean,
-            });
+        if should_run("onepass_seq_evict", filter_ref) {
+            evict_results.push(onepass_seq_scan_evict(
+                io_cfg.working_set_blocks,
+                iterations,
+            ));
         }
-        render_throughput_section("Phase 8: Cache-Evict Throughput", &throughput_rows);
+        if should_run("lo_loc_rand_evict", filter_ref) {
+            evict_results.push(low_locality_rand_read_evict(
+                io_cfg.working_set_blocks,
+                iterations,
+            ));
+        }
+
+        if !evict_results.is_empty() {
+            render_latency_section(
+                "Phase 8: Cache-Evict Variants (posix_fadvise DONTNEED between iterations)",
+                &evict_results,
+            );
+            let mut throughput_rows = Vec::new();
+            for result in &evict_results {
+                let throughput_mb = (io_cfg.working_set_blocks * block_size) as f64
+                    / result.mean.as_secs_f64()
+                    / 1_000_000.0;
+                throughput_rows.push(ThroughputRow {
+                    label: result.operation.clone(),
+                    throughput: throughput_mb,
+                    unit: "MB/s".to_string(),
+                    mean_duration: result.mean,
+                });
+            }
+            render_throughput_section("Phase 8: Cache-Evict Throughput", &throughput_rows);
+        }
     }
 
     let fallbacks = direct_io_fallback_count();
