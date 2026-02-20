@@ -47,21 +47,35 @@ Practical interpretation:
 
 ## Where to implement
 
-### Layer 1: File manager (required)
+### Layer 1: Switch FM to positional I/O (prerequisite)
 
-Add async-capable APIs in `FileSystemInterface`/`FileManager` (or parallel trait) to submit multiple operations and collect completions.
+Migrate `FileManager` from `seek + read/write` to `read_at`/`write_at`
+(`std::os::unix::fs::FileExt`). Restructure the global mutex to cover only the
+`HashMap` lookup, releasing it before the blocking syscall. See the "Prerequisite"
+section below for full details.
 
-Options:
-1. Linux-first `io_uring` backend.
-2. Interim worker-pool + blocking pread/pwrite backend (portable, simpler).
+This is required before any async work and should be done first.
 
-### Layer 2: Buffer manager miss path (incremental)
+### Layer 2: io_uring backend + buffer manager prefetch window
 
-Support prefetch windows for scans / miss-heavy paths so multiple page reads can be outstanding.
+Add an io_uring submission/completion interface at the FM layer and use it in the
+buffer manager miss path to issue multiple page reads simultaneously. When the buffer
+manager has N cache misses, submit all N reads to io_uring upfront and block for
+completions — giving QD=N without async/await anywhere in the stack.
 
-### Layer 3: Executor scan operators (optional in phase 1)
+Options for the FM backend:
+1. Linux-first `io_uring`.
+2. Portable fallback: worker-pool + blocking `pread`/`pwrite` (simpler, still achieves
+   QD=N via thread concurrency, but conflates threading with async I/O).
 
-Pipeline page processing with prefetch to overlap CPU and storage latency.
+The minimum useful increment is Layers 1+2 together. Layer 1 alone changes nothing
+observable at the storage level.
+
+### Layer 3: Executor scan operators (optional)
+
+Pipeline CPU processing of page N with I/O for page N+1 by making scan operators
+aware of in-flight reads. This is where async/await or explicit coroutines would be
+needed. Much more invasive — deferred until Layers 1+2 are validated.
 
 ## Benchmark additions
 
@@ -96,9 +110,9 @@ Run with:
 
 ## Implementation phases
 
-1. Phase 1: add async/batched file I/O abstraction and microbenchmarks.
-2. Phase 2: add buffer-manager prefetch window support.
-3. Phase 3: evaluate optional scan-operator pipeline integration.
+1. Phase 1: migrate FM to `read_at`/`write_at`, restructure mutex scope.
+2. Phase 2: add io_uring backend at FM layer + buffer manager prefetch window; add queue-depth benchmarks.
+3. Phase 3: evaluate scan-operator pipeline integration (async/await, overlapping CPU and I/O).
 
 ## Prerequisite: switch from seek+read to pread/pwrite
 
