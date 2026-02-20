@@ -99,104 +99,46 @@ No, not as primary evidence.
      - `capped` = quick guardrail
      - `heavy` = decision-grade signal.
 
-## Compact Chart Deck Plan (Direct vs Buffered)
-Goal: produce a small, shareable chart set that emphasizes decision-relevant direct-vs-buffered behavior without adding framework complexity.
+## Minimal Profiling Toolkit (Buffered vs Direct)
+Goal: collect enough signal to explain behavior differences without over-instrumenting.
 
-### Scope
-1. Use existing regime-matrix JSON artifacts (`buffered_<regime>.json`, `direct_<regime>.json`).
-2. Build charts from JSON only (do not parse markdown reports).
-3. Start with fixed benchmark allowlist (no dynamic categorization in v1).
+### Minimum tools
+1. `iostat -x 1`
+   - Device-level throughput/latency/utilization (`rkB/s`, `wkB/s`, `await`, `aqu-sz`, `%util`).
+2. `pidstat -d -u -r -h 1 -p <bench_pid>`
+   - Per-process I/O, CPU, memory/faults.
+3. `vmstat 1`
+   - System memory/writeback pressure (`wa`, `bi`, `bo`) to interpret buffered-path effects.
+4. Benchmark run metadata (`run_manifest.json` + compare markdown headers)
+   - Exact commands, iterations, ops, profile, cgroup context, features.
 
-### Benchmarks to chart (11 rows)
-1. Core read/write path:
-   - `Sequential Read`
-   - `Random Read`
-   - `Sequential Write`
-   - `Random Write`
-2. Durability path:
-   - `Random Write durability immediate-fsync data-nosync`
-   - `Random Write durability immediate-fsync data-fsync`
-3. Cache-adverse path:
-   - `One-pass Seq Scan`
-   - `Low-locality Rand Read`
-   - `One-pass Seq Scan+Evict`
-   - `Low-locality Rand Read+Evict`
-   - `Multi-stream Scan`
+### Why `iostat` alone is not enough
+1. `iostat` is device-aggregate only; it does not attribute I/O to your benchmark PID.
+2. Buffered I/O can be served from page cache (app busy, disk quiet), then flushed later by kernel threads.
+3. Journal/writeback activity can dominate `await/%util` while not appearing as direct app syscalls.
 
-### Chart structure
-1. Per-regime grouped bar charts:
-   - Y-axis: latency (ms, lower is better)
-   - X-axis: benchmark names
-   - Two bars per benchmark: `buffered`, `direct`
+### Shared-device caveat (even on benchmark-only machines)
+1. Kernel flusher threads and filesystem journal I/O are still separate actors.
+2. This I/O is workload-induced, but attribution differs from process-issued I/O.
+3. Pairing device + process + memory/writeback views avoids false conclusions.
 
-### Output location
-1. Write chart images under `docs/benchmarks/charts/io_mode/`.
-2. Keep naming deterministic, for example:
-   - `io_mode_hot.png`
-   - `io_mode_pressure.png`
-   - `io_mode_thrash.png`
+### Capture pattern
+1. Start samplers before launching the benchmark:
+   - `iostat -x 1 > iostat.log`
+   - `vmstat 1 > vmstat.log`
+2. Launch benchmark, grab PID, then:
+   - `pidstat -d -u -r -h 1 -p <pid> > pidstat.log`
+3. Stop samplers immediately after benchmark exit.
+4. Store logs under the same run directory as result JSON/markdown artifacts.
 
-### Rendering command
-1. Generate charts from a completed regime-matrix results directory:
-   ```bash
-   uv run python scripts/bench/generate_io_mode_charts.py \
-     results/regime_capped_YYYYMMDD_HHMMSS
-   ```
+### Profiling workflow (recommended)
+1. Profile one benchmark case at a time (single benchmark row + single regime).
+2. For each case, run buffered and direct as two separate runs with identical args.
+3. Capture `iostat`/`pidstat`/`vmstat` only during that run window.
+4. Repeat each buffered/direct pair 3-5 times; compare medians instead of single runs.
+5. Move to the next benchmark case only after collecting a complete pair set.
 
-### Non-goals (v1)
-1. No thread/concurrency sweep charts.
-2. No WAL-focused charts (WAL path remains buffered by design).
-3. No CLI knob expansion beyond selecting input results directory.
-
-## Experiment: 1 GiB cgroup Memory Limit (Linux)
-Goal: evaluate direct-vs-buffered behavior under explicit memory pressure without creating very large datasets.
-
-### Why
-1. Machine RAM is large (for example 64 GiB), so capped working sets may stay cache-friendly.
-2. A cgroup memory cap creates a smaller effective memory budget (including page cache) for the benchmark process.
-3. This should make `pressure`/`thrash` regimes more representative of constrained deployments.
-
-### Setup (one-time per session)
-```bash
-sudo mkdir -p /sys/fs/cgroup/simpledb-io
-echo $((1024*1024*1024)) | sudo tee /sys/fs/cgroup/simpledb-io/memory.max
-echo 0 | sudo tee /sys/fs/cgroup/simpledb-io/memory.swap.max
-```
-
-### Run benchmark matrix inside cgroup
-```bash
-sudo systemd-run --scope -p MemoryMax=1G -p MemorySwapMax=0 \
-  python3 scripts/run_regime_matrix.py 10 results/regime_capped_$(date +%Y%m%d_%H%M%S)_1g \
-  --profile capped
-```
-
-If faster turnaround is needed, pin explicit ops:
-```bash
-sudo systemd-run --scope -p MemoryMax=1G -p MemorySwapMax=0 \
-  python3 scripts/run_regime_matrix.py 3 results/regime_capped_$(date +%Y%m%d_%H%M%S)_1g_quick \
-  --profile capped --phase1-ops 1000 --mixed-ops 500 --durability-ops 1000
-```
-
-### Generate compact charts
-```bash
-uv run python scripts/bench/generate_io_mode_charts.py \
-  results/regime_capped_YYYYMMDD_HHMMSS_1g
-```
-
-### Compare against uncapped baseline
-1. Use the same command/ops/iterations with and without cgroup limit.
-2. Compare `compare_hot.md`, `compare_pressure.md`, `compare_thrash.md` pairs.
-3. Focus on:
-   - Phase 6 durability rows (`data-fsync`, `data-nosync`)
-   - Phase 7/8 cache-adverse rows
-   - Read-heavy Phase 1 rows for gap narrowing under pressure.
-
-### Expected behavior
-1. `hot` may remain similar.
-2. `pressure` and `thrash` should slow down and show higher variance.
-3. Direct may become more competitive, but broad wins are not guaranteed.
-
-### Cleanup
-```bash
-sudo rmdir /sys/fs/cgroup/simpledb-io 2>/dev/null || true
-```
+### Case selection order
+1. Phase 6 durability rows first (`data-fsync`, `data-nosync`).
+2. Cache-adverse rows next (one-pass, low-locality, multi-stream).
+3. A few simple Phase 1 rows as control/sanity checks.
