@@ -13,6 +13,26 @@ Add a minimal async/batched I/O path and targeted benchmarks that measure perfor
 
 Primary question: does direct I/O become more competitive when we overlap I/O and raise outstanding requests?
 
+## Concurrency Model Matrix
+
+Queue-depth outcomes depend on both file-manager serialization and API shape.
+
+```text
+                     API: Sync/blocking              API: Async/batched
+FM serialized     A) QD ~1 mostly                 B) Some QD possible
+(global lock)     - simple                         - only if lock not held across wait
+                  - weak Direct I/O gains          - lock contention still caps scaling
+
+FM de-serialized  C) QD from many threads         D) Best QD/scaling
+(no hot lock)     - helps MT workloads             - single-thread can pipeline
+                  - single-thread still ~1         - strongest Direct I/O upside
+```
+
+Practical interpretation:
+1. For single-thread 4KiB request loops, only **D** is expected to materially shift direct-vs-buffered outcomes.
+2. **C** helps mainly when workloads already have concurrent callers.
+3. **B** can improve queue depth only if submit and wait are decoupled (do not hold a global lock while waiting).
+
 ## Scope
 
 1. Add async-capable read/write interface at file-manager layer.
