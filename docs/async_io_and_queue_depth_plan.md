@@ -99,16 +99,58 @@ I/O is in flight. Much more invasive — deferred until Layers 1+2 are validated
 
 ## Benchmark additions
 
-Add an async-focused suite (or extension of `io_patterns`) with:
+### Micro-benchmarks (FM layer, existing + extensions)
+
+Extend `io_patterns` with queue-depth variants that exercise the FM directly:
 
 1. `seq_read_qd{1,4,16,32}`
 2. `rand_read_qd{1,4,16,32}`
 3. `multistream_scan_qd{1,4,16,32}`
 
+These measure raw FM throughput and validate the io_uring backend in isolation.
+They bypass the buffer manager and scan operators.
+
 Output metrics:
 1. Mean / p50 / p95 latency
 2. Throughput (IOPS, MB/s)
 3. Optional queue-depth utilization stats (submitted vs completed)
+
+### Macro-benchmarks (full stack)
+
+Micro-benchmarks cannot validate Layer 2 — they bypass the buffer manager and scan
+operator, which are the layers that prefetch hints flow through. Full-stack benchmarks
+are required to measure the actual end-to-end effect of prefetching.
+
+All macro-benchmarks must size the working set relative to the buffer pool to force
+real I/O. Suggested parameter: 1x, 2x, 4x buffer pool size (analogous to
+`hot/pressure/thrash` regimes).
+
+Benchmarks:
+
+1. **Full table scan**: `SELECT * FROM t` on a large table. Working set > buffer pool
+   so every `pin()` is a miss. Sequential access, directly exercises prefetch.
+   Primary benchmark for Layer 2 validation.
+
+2. **Scan with aggregation**: `SELECT COUNT(*), SUM(col) FROM t`. Same I/O pattern
+   as above with added CPU work per row. Useful baseline for Layer 3 (does CPU
+   overlap with I/O?).
+
+3. **External sort**: sort a large table that spills to disk. Exercises both read and
+   write prefetch paths on large sequential runs.
+
+4. **Nested loop join**: sequential outer scan + restarting inner scan. Tests prefetch
+   correctness under repeated sequential access and buffer pool eviction pressure from
+   two concurrent scan streams.
+
+Comparison axes for all macro-benchmarks:
+- Buffered vs direct I/O
+- Prefetch window size (none, 4, 16, 32 pages)
+- Working set size (1x, 2x, 4x buffer pool)
+
+Output metrics:
+- Total query time
+- Throughput (rows/sec, MB/s)
+- Buffer pool miss rate (to confirm I/O is actually being exercised)
 
 ## Experiment matrix
 
