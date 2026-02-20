@@ -56,26 +56,46 @@ section below for full details.
 
 This is required before any async work and should be done first.
 
-### Layer 2: io_uring backend + buffer manager prefetch window
+### Layer 2: io_uring backend + explicit prefetch hints
 
-Add an io_uring submission/completion interface at the FM layer and use it in the
-buffer manager miss path to issue multiple page reads simultaneously. When the buffer
-manager has N cache misses, submit all N reads to io_uring upfront and block for
-completions — giving QD=N without async/await anywhere in the stack.
+Two components, both required for this layer to be useful:
+
+**2a — FM io_uring backend**: add a batched submission/completion interface to
+`FileManager`. Caller submits a list of (block_id, buffer) pairs; FM issues all of
+them to io_uring and blocks until all completions are harvested. QD = batch size.
 
 Options for the FM backend:
 1. Linux-first `io_uring`.
 2. Portable fallback: worker-pool + blocking `pread`/`pwrite` (simpler, still achieves
    QD=N via thread concurrency, but conflates threading with async I/O).
 
+**2b — Prefetch hints at the scan operator layer**: the buffer manager does not detect
+access patterns — that responsibility belongs to the layer that has the knowledge.
+Scan operators know they are sequential before iteration begins. They issue an explicit
+prefetch hint:
+
+```
+buffer_manager.prefetch(file, start_block, count)
+```
+
+The BM allocates frames, submits the batch read to the FM io_uring interface, and
+blocks until complete. Subsequent `pin()` calls for those blocks are cache hits.
+
+This requires a small addition to each scan operator type (one call before iteration),
+but no async/await and no changes to the iterator protocol.
+
+Heuristic detection inside the BM is explicitly rejected: it is reactive (misses the
+first window), wrong for concurrent scans on the same file, and encodes access-pattern
+knowledge in the wrong layer.
+
 The minimum useful increment is Layers 1+2 together. Layer 1 alone changes nothing
 observable at the storage level.
 
 ### Layer 3: Executor scan operators (optional)
 
-Pipeline CPU processing of page N with I/O for page N+1 by making scan operators
-aware of in-flight reads. This is where async/await or explicit coroutines would be
-needed. Much more invasive — deferred until Layers 1+2 are validated.
+Overlap CPU processing of page N with I/O for page N+1. Requires scan operators to
+be async-aware (async/await or explicit coroutines) so the iterator can yield while
+I/O is in flight. Much more invasive — deferred until Layers 1+2 are validated.
 
 ## Benchmark additions
 
