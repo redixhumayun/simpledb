@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -143,6 +144,65 @@ def run_compare(base_file, pr_file, out_file, label=None):
     return out_file.read_text() if out_file.exists() else ""
 
 
+def build_run_metadata(args, iterations, output_dir, filesystem):
+    """Build run metadata shared by manifest + compare markdown headers."""
+    if args.profile == "heavy":
+        phase1_ops = args.phase1_ops if args.phase1_ops is not None else 20_000
+        mixed_ops = args.mixed_ops if args.mixed_ops is not None else 10_000
+        durability_ops = args.durability_ops if args.durability_ops is not None else 5_000
+    else:
+        phase1_ops = "auto" if args.phase1_ops is None else args.phase1_ops
+        mixed_ops = "auto" if args.mixed_ops is None else args.mixed_ops
+        durability_ops = "auto" if args.durability_ops is None else args.durability_ops
+
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "iterations": iterations,
+        "profile": args.profile,
+        "regimes": REGIMES,
+        "ops": {
+            "phase1": phase1_ops,
+            "mixed": mixed_ops,
+            "durability": durability_ops,
+        },
+        "filesystem_device": filesystem,
+        "output_dir": str(output_dir),
+        "base_features": BASE_FEATURES,
+        "direct_extra_features": DIRECT_EXTRA,
+    }
+
+
+def render_compare_metadata_md(metadata, regime):
+    """Render a compact metadata section for compare markdown files."""
+    ops = metadata["ops"]
+    lines = [
+        "### Run Metadata",
+        "",
+        f"- Generated (UTC): `{metadata['generated_at_utc']}`",
+        f"- Regime: `{regime}`",
+        f"- Iterations: `{metadata['iterations']}`",
+        f"- Profile: `{metadata['profile']}`",
+        f"- Ops: `phase1={ops['phase1']}, mixed={ops['mixed']}, durability={ops['durability']}`",
+        f"- Filesystem/device: `{metadata['filesystem_device']}`",
+        f"- Output dir: `{metadata['output_dir']}`",
+        f"- Base features: `{' '.join(metadata['base_features'])}`",
+        f"- Direct extra features: `{' '.join(metadata['direct_extra_features'])}`",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def prepend_compare_metadata(compare_file, metadata, regime):
+    """Prepend run metadata to a generated compare markdown file."""
+    if not compare_file.exists():
+        return
+    original = compare_file.read_text()
+    header = render_compare_metadata_md(metadata, regime)
+    compare_file.write_text(header + original)
+
+
 def summarise_regime(regime, buffered, direct):
     """Print a compact per-regime delta table to stderr."""
     direct_map = {r["name"]: r["value"] for r in direct}
@@ -190,6 +250,8 @@ def main():
             file=sys.stderr,
         )
     print(f"Filesystem/device: {filesystem}", file=sys.stderr)
+    metadata = build_run_metadata(args, iterations, output_dir, filesystem)
+    (output_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2))
 
     all_buffered = {}
     all_direct = {}
@@ -212,6 +274,7 @@ def main():
         # Compare
         compare_file = output_dir / f"compare_{regime}.md"
         run_compare(buffered_file, direct_file, compare_file, label=regime)
+        prepend_compare_metadata(compare_file, metadata, regime)
         print(f"  Comparison: {compare_file}", file=sys.stderr)
 
         summarise_regime(regime, buffered, direct)
