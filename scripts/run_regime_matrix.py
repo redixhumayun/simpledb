@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -65,6 +67,50 @@ def detect_filesystem():
     return "unknown"
 
 
+def detect_cgroup_context():
+    """Detect cgroup v2 context and memory/swap/cpu limits for this process."""
+    context = {
+        "detected": False,
+        "path": None,
+        "memory_max": None,
+        "memory_swap_max": None,
+        "memory_current": None,
+        "cpu_max": None,
+        "limited": False,
+    }
+    try:
+        cgroup_line = None
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                cgroup_line = line
+                break
+        if cgroup_line is None:
+            return context
+
+        rel_path = cgroup_line.split("::", 1)[1].strip()
+        cgroup_path = Path("/sys/fs/cgroup") / rel_path.lstrip("/")
+        if not cgroup_path.exists():
+            return context
+
+        def read_val(name):
+            p = cgroup_path / name
+            return p.read_text().strip() if p.exists() else None
+
+        context["detected"] = True
+        context["path"] = rel_path
+        context["memory_max"] = read_val("memory.max")
+        context["memory_swap_max"] = read_val("memory.swap.max")
+        context["memory_current"] = read_val("memory.current")
+        context["cpu_max"] = read_val("cpu.max")
+        context["limited"] = (
+            context["memory_max"] not in (None, "max")
+            or context["memory_swap_max"] not in (None, "max")
+        )
+    except Exception:
+        pass
+    return context
+
+
 def format_ns(ns):
     """Convert nanoseconds to human-readable format."""
     if ns < 1_000:
@@ -78,7 +124,7 @@ def format_ns(ns):
 
 
 def run_bench_cell(regime, iterations, features_extra, label, args):
-    """Run io_patterns bench for one (regime, mode) cell. Returns list of result dicts."""
+    """Run io_patterns bench for one (regime, mode) cell."""
     bench_args = [str(iterations), "12", "--json"]
     if args.profile == "heavy":
         bench_args.extend(
@@ -112,7 +158,8 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
         + ["--"]
         + bench_args
     )
-    print(f"  [{label}] running: {' '.join(cmd)}", file=sys.stderr)
+    cmd_str = shlex.join(cmd)
+    print(f"  [{label}] running: {cmd_str}", file=sys.stderr)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as e:
@@ -126,7 +173,7 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
         line = line.strip()
         if line.startswith("[") and line.endswith("]"):
             try:
-                return json.loads(line)
+                return json.loads(line), cmd_str
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"Bad JSON from {label}/{regime}: {exc}") from exc
 
@@ -134,14 +181,15 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
 
 
 def run_compare(base_file, pr_file, out_file, label=None):
-    """Call compare_benchmarks.py and return the markdown text."""
+    """Call compare_benchmarks.py and return (markdown text, exact command)."""
     cmd = ["python3", "scripts/compare_benchmarks.py", str(base_file), str(pr_file), str(out_file)]
     if label:
         cmd.append(label)
+    cmd_str = shlex.join(cmd)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"WARNING: compare_benchmarks.py failed: {result.stderr}", file=sys.stderr)
-    return out_file.read_text() if out_file.exists() else ""
+    return (out_file.read_text() if out_file.exists() else ""), cmd_str
 
 
 def build_run_metadata(args, iterations, output_dir, filesystem):
@@ -157,6 +205,8 @@ def build_run_metadata(args, iterations, output_dir, filesystem):
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "script_invocation": shlex.join([sys.executable, *sys.argv]),
+        "cwd": os.getcwd(),
         "iterations": iterations,
         "profile": args.profile,
         "regimes": REGIMES,
@@ -166,15 +216,19 @@ def build_run_metadata(args, iterations, output_dir, filesystem):
             "durability": durability_ops,
         },
         "filesystem_device": filesystem,
+        "cgroup": detect_cgroup_context(),
         "output_dir": str(output_dir),
         "base_features": BASE_FEATURES,
         "direct_extra_features": DIRECT_EXTRA,
+        "commands": {},
     }
 
 
 def render_compare_metadata_md(metadata, regime):
     """Render a compact metadata section for compare markdown files."""
     ops = metadata["ops"]
+    cgroup = metadata.get("cgroup", {})
+    cmd_set = metadata.get("commands", {}).get(regime, {})
     lines = [
         "### Run Metadata",
         "",
@@ -185,12 +239,32 @@ def render_compare_metadata_md(metadata, regime):
         f"- Ops: `phase1={ops['phase1']}, mixed={ops['mixed']}, durability={ops['durability']}`",
         f"- Filesystem/device: `{metadata['filesystem_device']}`",
         f"- Output dir: `{metadata['output_dir']}`",
+        f"- Script invocation: `{metadata.get('script_invocation', '')}`",
         f"- Base features: `{' '.join(metadata['base_features'])}`",
         f"- Direct extra features: `{' '.join(metadata['direct_extra_features'])}`",
-        "",
-        "---",
-        "",
     ]
+    if cgroup.get("detected"):
+        lines.extend(
+            [
+                f"- Cgroup path: `{cgroup.get('path')}`",
+                (
+                    f"- Cgroup memory: `memory.max={cgroup.get('memory_max')}, "
+                    f"memory.swap.max={cgroup.get('memory_swap_max')}, "
+                    f"memory.current={cgroup.get('memory_current')}`"
+                ),
+                f"- Cgroup CPU: `cpu.max={cgroup.get('cpu_max')}`",
+                f"- Cgroup limited: `{cgroup.get('limited')}`",
+            ]
+        )
+    if cmd_set:
+        lines.extend(
+            [
+                f"- Buffered command: `{cmd_set.get('buffered', '')}`",
+                f"- Direct command: `{cmd_set.get('direct', '')}`",
+                f"- Compare command: `{cmd_set.get('compare', '')}`",
+            ]
+        )
+    lines.extend(["", "---", ""])
     return "\n".join(lines)
 
 
@@ -261,19 +335,25 @@ def main():
 
         # Buffered
         buffered_file = output_dir / f"buffered_{regime}.json"
-        buffered = run_bench_cell(regime, iterations, [], "buffered", args)
+        buffered, buffered_cmd = run_bench_cell(regime, iterations, [], "buffered", args)
         buffered_file.write_text(json.dumps(buffered, indent=2))
         print(f"  Saved: {buffered_file}", file=sys.stderr)
 
         # Direct-io
         direct_file = output_dir / f"direct_{regime}.json"
-        direct = run_bench_cell(regime, iterations, DIRECT_EXTRA, "direct-io", args)
+        direct, direct_cmd = run_bench_cell(regime, iterations, DIRECT_EXTRA, "direct-io", args)
         direct_file.write_text(json.dumps(direct, indent=2))
         print(f"  Saved: {direct_file}", file=sys.stderr)
 
         # Compare
         compare_file = output_dir / f"compare_{regime}.md"
-        run_compare(buffered_file, direct_file, compare_file, label=regime)
+        _, compare_cmd = run_compare(buffered_file, direct_file, compare_file, label=regime)
+        metadata["commands"][regime] = {
+            "buffered": buffered_cmd,
+            "direct": direct_cmd,
+            "compare": compare_cmd,
+        }
+        (output_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2))
         prepend_compare_metadata(compare_file, metadata, regime)
         print(f"  Comparison: {compare_file}", file=sys.stderr)
 
