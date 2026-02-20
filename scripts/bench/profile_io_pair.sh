@@ -17,6 +17,7 @@ FILTER="seq_read"
 PHASE1_OPS=50
 MIXED_OPS=50
 DURABILITY_OPS=50
+CONCURRENT_OPS=100
 INTERVAL=1
 REPEATS=1
 OUTPUT_DIR="results/profile_io_pair_$(date +%Y%m%d_%H%M%S)"
@@ -36,6 +37,7 @@ Options:
   --phase1-ops <n>           Fixed phase1 ops (default: 50).
   --mixed-ops <n>            Fixed mixed ops (default: 50).
   --durability-ops <n>       Fixed durability ops (default: 50).
+  --concurrent-ops <n>       Fixed ops per thread for concurrent phases (default: 100).
   --interval <sec>           Sampling interval for iostat/vmstat/pidstat (default: 1).
   --repeats <n>              Number of buffered/direct pairs (default: 1).
   -h, --help                 Show help.
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --phase1-ops) PHASE1_OPS="$2"; shift 2 ;;
     --mixed-ops) MIXED_OPS="$2"; shift 2 ;;
     --durability-ops) DURABILITY_OPS="$2"; shift 2 ;;
+    --concurrent-ops) CONCURRENT_OPS="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --repeats) REPEATS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -106,6 +109,7 @@ filter=$FILTER
 phase1_ops=$PHASE1_OPS
 mixed_ops=$MIXED_OPS
 durability_ops=$DURABILITY_OPS
+concurrent_ops=$CONCURRENT_OPS
 interval=$INTERVAL
 repeats=$REPEATS
 EOF
@@ -139,6 +143,7 @@ run_case() {
     --phase1-ops "$PHASE1_OPS"
     --mixed-ops "$MIXED_OPS"
     --durability-ops "$DURABILITY_OPS"
+    --concurrent-ops "$CONCURRENT_OPS"
     --filter "$FILTER"
   )
 
