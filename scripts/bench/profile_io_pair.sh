@@ -13,7 +13,7 @@ set -euo pipefail
 ITERATIONS=10
 NUM_BUFFERS=12
 REGIME="hot"
-FILTER="Sequential Read"
+FILTER="seq_read"
 PHASE1_OPS=50
 MIXED_OPS=50
 DURABILITY_OPS=50
@@ -31,7 +31,8 @@ Options:
   --iterations <n>           Iterations passed to io_patterns (default: 10).
   --num-buffers <n>          Buffer count arg (default: 12).
   --regime <name>            hot|pressure|thrash (default: hot).
-  --filter <pattern>         io_patterns --filter value (default: "Sequential Read").
+  --filter <pattern>         io_patterns filter token (default: "seq_read").
+                             Common labels like "Sequential Read" are auto-mapped.
   --phase1-ops <n>           Fixed phase1 ops (default: 50).
   --mixed-ops <n>            Fixed mixed ops (default: 50).
   --durability-ops <n>       Fixed durability ops (default: 50).
@@ -42,7 +43,7 @@ Options:
 Example:
   scripts/bench/profile_io_pair.sh \
     --regime hot \
-    --filter "Sequential Read" \
+    --filter seq_read \
     --iterations 10 \
     --repeats 3
 EOF
@@ -69,12 +70,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+normalize_filter() {
+  local raw="$1"
+  local lower="${raw,,}"
+  case "$lower" in
+    "sequential read") echo "seq_read" ;;
+    "sequential write") echo "seq_write" ;;
+    "random read") echo "rand_read" ;;
+    "random write") echo "rand_write" ;;
+    "one-pass seq scan") echo "onepass_seq" ;;
+    "low-locality rand read") echo "lo_loc_rand" ;;
+    "multi-stream scan") echo "multi_stream" ;;
+    *) echo "$raw" ;;
+  esac
+}
+
 for tool in cargo iostat vmstat pidstat pgrep; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Missing required tool: $tool" >&2
     exit 1
   fi
 done
+
+FILTER="$(normalize_filter "$FILTER")"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -98,25 +116,6 @@ stop_sampler() {
     kill "$pid" >/dev/null 2>&1 || true
     wait "$pid" 2>/dev/null || true
   fi
-}
-
-wait_for_io_patterns_pid() {
-  local timeout_sec="${1:-60}"
-  local started_at
-  started_at="$(date +%s)"
-  local pid=""
-
-  while true; do
-    pid="$(pgrep -f "target/release/deps/io_patterns-.*--regime ${REGIME}.*--bench" | tail -n1 || true)"
-    if [[ -n "$pid" ]]; then
-      echo "$pid"
-      return 0
-    fi
-    if (( $(date +%s) - started_at >= timeout_sec )); then
-      return 1
-    fi
-    sleep 0.2
-  done
 }
 
 run_case() {
@@ -154,23 +153,12 @@ run_case() {
 
   vmstat "$INTERVAL" > "$case_dir/vmstat.log" 2>&1 &
   local vmstat_pid=$!
+  pidstat -d -u -r -h "$INTERVAL" -G "io_patterns" > "$case_dir/pidstat.log" 2>&1 &
+  local pidstat_pid=$!
 
   "${cmd[@]}" > "$case_dir/bench.stdout.log" 2> "$case_dir/bench.stderr.log" &
   local bench_pid=$!
   echo "$bench_pid" > "$case_dir/bench_runner_pid.txt"
-
-  local pidstat_pid=""
-  local target_pid=""
-  if target_pid="$(wait_for_io_patterns_pid 60)"; then
-    echo "$target_pid" > "$case_dir/bench_target_pid.txt"
-    pidstat -d -u -r -h "$INTERVAL" -p "$target_pid" > "$case_dir/pidstat.log" 2>&1 &
-    pidstat_pid=$!
-  else
-    echo "warning: io_patterns child PID not found; using bench runner pid=$bench_pid" \
-      > "$case_dir/pidstat_warning.txt"
-    pidstat -d -u -r -h "$INTERVAL" -p "$bench_pid" > "$case_dir/pidstat.log" 2>&1 &
-    pidstat_pid=$!
-  fi
 
   local exit_code=0
   if ! wait "$bench_pid"; then
