@@ -99,3 +99,53 @@ Run with:
 1. Phase 1: add async/batched file I/O abstraction and microbenchmarks.
 2. Phase 2: add buffer-manager prefetch window support.
 3. Phase 3: evaluate optional scan-operator pipeline integration.
+
+## Prerequisite: switch from seek+read to pread/pwrite
+
+Before any async work, the FM should be migrated from `seek + read/write` to positional
+I/O (`pread`/`pwrite`). In Rust this is `std::os::unix::fs::FileExt::read_at`/`write_at`.
+
+### Why this matters
+
+The global `Mutex` wrapping `FileManager` is currently held across the full seek→read/write
+sequence. That means concurrent threads queue behind the lock for the entire NVMe round-trip
+(~70-100µs per 4K random read on the PM9A1), giving QD=1 from the storage device's perspective
+regardless of thread count.
+
+With `read_at`/`write_at`, the file offset is passed as an argument — no shared fd position
+state. The lock only needs to cover the `HashMap` lookup to retrieve the file descriptor.
+The blocking syscall then happens outside the lock, allowing concurrent threads to have
+multiple requests in flight simultaneously.
+
+```
+seek + read:  lock → seek → [hold across blocking read] → unlock   (QD = 1)
+read_at:      lock → lookup fd → unlock → read_at(fd, buf, offset) (QD = N threads)
+```
+
+### Scope
+
+- Applies to both `IoMode::Buffered` and `IoMode::Direct` — the serialization problem is
+  identical for both paths. Do not limit this to the direct I/O path.
+- `read_at`/`write_at` are POSIX and available on Linux and macOS. No platform gating needed.
+  Only `O_DIRECT` itself remains Linux-gated.
+- `append` is the exception: it is an inherently read-modify sequence (query length → write
+  at that offset) and must still hold the lock across both steps to prevent two threads
+  appending to the same offset.
+
+### Implementation note
+
+`FileSystemInterface::read` and `write` currently take `&mut self`. To release the lock
+before the I/O syscall, these methods need to become `&self` with interior mutability on
+the open file handles (e.g. wrapping each `OpenFile` in a `Mutex` or using `RwLock`).
+This is a trait signature change that ripples through all implementors.
+
+### Effect on benchmarks
+
+- Single-threaded benchmarks (`sequential_read`, `random_read`, etc.): no improvement.
+  One thread, no contention, pread vs seek+read is equivalent.
+- Concurrent benchmarks (`concurrent_io_shared`, `concurrent_io_sharded`,
+  `multi_stream_scan`): meaningful improvement for direct I/O, where there is no page
+  cache to absorb misses. Threads will actually reach the NVMe simultaneously.
+
+This change moves the FM from quadrant A to quadrant C in the concurrency matrix above.
+io_uring (quadrant D) is still needed for single-thread pipelining.
