@@ -17,7 +17,7 @@ use simpledb::{
     BlockId, LogManager, Page, SimpleDB, TestDir,
 };
 
-type BenchFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+type BenchFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
 
 type Lsn = usize;
 
@@ -102,7 +102,6 @@ impl DataSyncPolicy {
         match self {
             DataSyncPolicy::None => (),
             DataSyncPolicy::Immediate => {
-                let mut fm = fm.lock().unwrap();
                 fm.sync(file);
                 fm.sync_directory();
             }
@@ -119,12 +118,10 @@ fn setup_io_test() -> (SimpleDB, TestDir) {
 }
 
 fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
-    let mut file_manager = db.file_manager.lock().unwrap();
-
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        file_manager.write(&BlockId::new(file.to_string(), block_num), &page);
+        db.file_manager.write(&BlockId::new(file.to_string(), block_num), &page);
     }
 }
 
@@ -201,11 +198,10 @@ fn sequential_read(working_set: usize, total_ops: usize, iterations: usize) -> B
         iterations,
         2,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..total_ops {
                 let block_id = BlockId::new(file.clone(), i % working_set);
-                fm.read(&block_id, &mut page);
+                db.file_manager.read(&block_id, &mut page);
             }
         },
     )
@@ -223,12 +219,11 @@ fn sequential_write(working_set: usize, total_ops: usize, iterations: usize) -> 
         iterations,
         2,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..total_ops {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), i % working_set);
-                fm.write(&block_id, &page);
+                db.file_manager.write(&block_id, &page);
             }
         },
     )
@@ -252,11 +247,10 @@ fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> Bench
             let random_indices: Vec<usize> = (0..total_ops)
                 .map(|_| rng.next_range(working_set))
                 .collect();
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &block_idx in &random_indices {
                 let block_id = BlockId::new(file.clone(), block_idx);
-                fm.read(&block_id, &mut page);
+                db.file_manager.read(&block_id, &mut page);
             }
         },
     )
@@ -280,12 +274,11 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
             let random_indices: Vec<usize> = (0..total_ops)
                 .map(|_| rng.next_range(working_set))
                 .collect();
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for (i, &block_idx) in random_indices.iter().enumerate() {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), block_idx);
-                fm.write(&block_id, &page);
+                db.file_manager.write(&block_id, &page);
             }
         },
     )
@@ -403,10 +396,10 @@ fn mixed_workload(
                 let block_id = BlockId::new(file.clone(), block_indices[i]);
 
                 if is_read {
-                    db.file_manager.lock().unwrap().read(&block_id, &mut page);
+                    db.file_manager.read(&block_id, &mut page);
                 } else {
                     write_i32_at(page.bytes_mut(), 60, i as i32);
-                    db.file_manager.lock().unwrap().write(&block_id, &page);
+                    db.file_manager.write(&block_id, &page);
                     let record = make_wal_record(100);
                     let lsn = log.lock().unwrap().append(record).unwrap();
                     policy.record(lsn, &log);
@@ -462,10 +455,10 @@ fn concurrent_io_shared(
 
                             // 70% read / 30% write
                             if (i % 10) < 7 {
-                                fm.lock().unwrap().read(&block_id, &mut page);
+                                fm.read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &page);
+                                fm.write(&block_id, &page);
                                 let record = make_wal_record(100);
                                 let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
@@ -526,10 +519,10 @@ fn concurrent_io_sharded(
 
                             // 70% read / 30% write
                             if (i % 10) < 7 {
-                                fm.lock().unwrap().read(&block_id, &mut page);
+                                fm.read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &page);
+                                fm.write(&block_id, &page);
                                 let record = make_wal_record(100);
                                 let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
@@ -589,9 +582,7 @@ fn random_write_durability(
                 let block_id = BlockId::new(file.clone(), block_num);
 
                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                {
-                    fm.lock().unwrap().write(&block_id, &page);
-                }
+                fm.write(&block_id, &page);
 
                 let record = make_wal_record(100);
                 let lsn = log.lock().unwrap().append(record).unwrap();
@@ -622,10 +613,9 @@ fn onepass_seq_scan(working_set: usize, iterations: usize) -> BenchResult {
         iterations,
         1,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..working_set {
-                fm.read(&BlockId::new(file.clone(), i), &mut page);
+                db.file_manager.read(&BlockId::new(file.clone(), i), &mut page);
             }
         },
     )
@@ -651,10 +641,9 @@ fn low_locality_rand_read(working_set: usize, iterations: usize) -> BenchResult 
                 let j = rng.next_range(i + 1);
                 indices.swap(i, j);
             }
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &idx in &indices {
-                fm.read(&BlockId::new(file.clone(), idx), &mut page);
+                db.file_manager.read(&BlockId::new(file.clone(), idx), &mut page);
             }
         },
     )
@@ -683,9 +672,7 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
                     thread::spawn(move || {
                         let mut page = Page::new();
                         for i in 0..blocks_per_stream {
-                            fm.lock()
-                                .unwrap()
-                                .read(&BlockId::new(file.clone(), i), &mut page);
+                            fm.read(&BlockId::new(file.clone(), i), &mut page);
                         }
                     })
                 })
@@ -715,10 +702,9 @@ fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult 
         iterations,
         1,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..working_set {
-                fm.read(&BlockId::new(file_name.clone(), i), &mut page);
+                db.file_manager.read(&BlockId::new(file_name.clone(), i), &mut page);
             }
         },
         || {
@@ -748,10 +734,9 @@ fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchR
                 let j = rng.next_range(i + 1);
                 indices.swap(i, j);
             }
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &idx in &indices {
-                fm.read(&BlockId::new(file_name.clone(), idx), &mut page);
+                db.file_manager.read(&BlockId::new(file_name.clone(), idx), &mut page);
             }
         },
         || {
@@ -792,9 +777,7 @@ fn multi_stream_scan_evict(num_streams: usize, working_set: usize, iterations: u
                     thread::spawn(move || {
                         let mut page = Page::new();
                         for i in 0..blocks_per_stream {
-                            fm.lock()
-                                .unwrap()
-                                .read(&BlockId::new(name.clone(), i), &mut page);
+                            fm.read(&BlockId::new(name.clone(), i), &mut page);
                         }
                     })
                 })

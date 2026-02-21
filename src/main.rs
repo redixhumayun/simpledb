@@ -9,14 +9,16 @@ use std::{
     fmt::Display,
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{self, Read, Seek, Write},
+    io,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 pub mod test_utils;
 pub use btree::BTreeIndex;
 use parser::{
@@ -41,7 +43,7 @@ pub type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 //  Shared filesystem trait object used across the database components
-type SharedFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+type SharedFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
 
 /// The database struct
 pub struct SimpleDB {
@@ -63,9 +65,7 @@ impl SimpleDB {
         clean: bool,
         lock_timeout_ms: u64,
     ) -> Self {
-        let file_manager: SharedFS = Arc::new(Mutex::new(Box::new(
-            FileManager::new(&path, clean).unwrap(),
-        )));
+        let file_manager: SharedFS = Arc::new(FileManager::new(&path, clean).unwrap());
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             Self::LOG_FILE,
@@ -8840,24 +8840,20 @@ impl Transaction {
 
     /// Get the size of this file in blocks
     fn size(&self, file_name: &str) -> usize {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .length(file_name.to_string())
+        self.file_manager.length(file_name.to_string())
     }
 
     /// Append a block to the file
     fn append(&self, file_name: &str) -> BlockId {
-        let mut file_manager = self.file_manager.lock().unwrap();
-        let block_id = file_manager.append(file_name.to_string());
+        let block_id = self.file_manager.append(file_name.to_string());
         let page = Page::new();
-        file_manager.write(&block_id, &page);
+        self.file_manager.write(&block_id, &page);
         block_id
     }
 
     /// Get the block size
     pub fn block_size(&self) -> usize {
-        self.file_manager.lock().unwrap().block_size()
+        self.file_manager.block_size()
     }
 }
 #[cfg(test)]
@@ -12403,7 +12399,7 @@ mod buffer_list_tests {
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
         let file_manager: super::SharedFS =
-            Arc::new(Mutex::new(Box::new(FileManager::new(&dir, true).unwrap())));
+            Arc::new(FileManager::new(&dir, true).unwrap());
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -12419,11 +12415,7 @@ mod buffer_list_tests {
         // TODO: rework this test to go through RecordPage/PageView once higher layers migrate
         {
             let page = Page::new();
-            buffer_manager
-                .file_manager()
-                .lock()
-                .unwrap()
-                .write(&block_id, &page);
+            buffer_manager.file_manager().write(&block_id, &page);
         }
         assert!(buffer_list.get_buffer(&block_id).is_none());
 
@@ -12482,7 +12474,7 @@ mod buffer_manager_tests {
 
         let mut block_ids = Vec::new();
         for _ in 0..4 {
-            let block = file_manager.lock().unwrap().append(file.clone());
+            let block = file_manager.append(file.clone());
             block_ids.push(block);
         }
 
@@ -12529,10 +12521,7 @@ mod buffer_manager_tests {
 
         let blocks: Vec<BlockId> = (0..num_blocks)
             .map(|i| {
-                let block = file_manager
-                    .lock()
-                    .unwrap()
-                    .append("stressfile".to_string());
+                let block = file_manager.append("stressfile".to_string());
                 write_row(&buffer_manager, layout.as_ref(), &block, i as i32);
                 block
             })
@@ -12613,7 +12602,7 @@ pub struct LogManager {
 impl LogManager {
     pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
         let mut log_page = WalPage::new();
-        let log_size = file_manager.lock().unwrap().length(log_file.to_string());
+        let log_size = file_manager.length(log_file.to_string());
         let current_block = if log_size == 0 {
             LogManager::append_new_block(&file_manager, log_file, &mut log_page)
         } else {
@@ -12621,10 +12610,7 @@ impl LogManager {
                 filename: log_file.to_string(),
                 block_num: log_size - 1,
             };
-            file_manager
-                .lock()
-                .unwrap()
-                .read_raw(&block, log_page.bytes_mut());
+            file_manager.read_raw(&block, log_page.bytes_mut());
             block
         };
         Self {
@@ -12647,14 +12633,9 @@ impl LogManager {
     /// Write the bytes from log_page to disk for the current_block
     /// Update the last_saved_lsn before returning
     fn flush_to_disk(&mut self) {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .write_raw(&self.current_block, self.log_page.bytes());
-
-        self.file_manager.lock().unwrap().sync(&self.log_file);
-        self.file_manager.lock().unwrap().sync_directory();
-
+        self.file_manager.write_raw(&self.current_block, self.log_page.bytes());
+        self.file_manager.sync(&self.log_file);
+        self.file_manager.sync_directory();
         self.last_saved_lsn = self.latest_lsn;
     }
 
@@ -12696,12 +12677,9 @@ impl LogManager {
         log_file: &str,
         log_page: &mut WalPage,
     ) -> BlockId {
-        let block_id = file_manager.lock().unwrap().append(log_file.to_string());
+        let block_id = file_manager.append(log_file.to_string());
         log_page.reset();
-        file_manager
-            .lock()
-            .unwrap()
-            .write_raw(&block_id, log_page.bytes());
+        file_manager.write_raw(&block_id, log_page.bytes());
         block_id
     }
 
@@ -12727,10 +12705,7 @@ pub struct LogIterator {
 impl LogIterator {
     pub fn new(file_manager: SharedFS, current_block: BlockId, latest_lsn: Lsn) -> Self {
         let mut page = WalPage::new();
-        file_manager
-            .lock()
-            .unwrap()
-            .read_raw(&current_block, page.bytes_mut());
+        file_manager.read_raw(&current_block, page.bytes_mut());
         let boundary = page.boundary();
 
         Self {
@@ -12744,10 +12719,7 @@ impl LogIterator {
     }
 
     pub fn move_to_block(&mut self) {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .read_raw(&self.current_block, self.page.bytes_mut());
+        self.file_manager.read_raw(&self.current_block, self.page.bytes_mut());
         self.boundary = self.page.boundary();
         self.current_pos = self.boundary;
     }
@@ -12806,16 +12778,16 @@ impl BlockId {
 pub type Page = crate::page::PageBytes;
 
 /// Trait defining the file system interface for database operations
-pub trait FileSystemInterface: std::fmt::Debug {
+pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
-    fn length(&mut self, filename: String) -> usize;
-    fn read(&mut self, block_id: &BlockId, page: &mut Page);
-    fn write(&mut self, block_id: &BlockId, page: &Page);
-    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]);
-    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]);
-    fn append(&mut self, filename: String) -> BlockId;
-    fn sync(&mut self, filename: &str);
-    fn sync_directory(&mut self);
+    fn length(&self, filename: String) -> usize;
+    fn read(&self, block_id: &BlockId, page: &mut Page);
+    fn write(&self, block_id: &BlockId, page: &Page);
+    fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]);
+    fn write_raw(&self, block_id: &BlockId, buf: &[u8]);
+    fn append(&self, filename: String) -> BlockId;
+    fn sync(&self, filename: &str);
+    fn sync_directory(&self);
 }
 
 // ---------------------------------------------------------------------------
@@ -12842,8 +12814,9 @@ enum IoMode {
 struct OpenFile {
     file: File,
     mode: IoMode,
-    #[cfg(target_os = "linux")]
-    scratch: Option<AlignedBuf>,
+    /// Serialises the length-query → write-at sequence for append operations.
+    /// Only `append` holds this lock; all other methods bypass it.
+    append_mu: Mutex<()>,
 }
 
 impl OpenFile {
@@ -12851,22 +12824,17 @@ impl OpenFile {
         Self {
             file,
             mode,
-            #[cfg(target_os = "linux")]
-            scratch: if mode == IoMode::Direct {
-                Some(AlignedBuf::new_zeroed())
-            } else {
-                None
-            },
+            append_mu: Mutex::new(()),
         }
     }
 
-    /// Read exactly one page from the file at the current seek position.
-    /// Uses an aligned intermediate buffer when the mode is `Direct`.
-    fn read_page(&mut self) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
+    /// Read exactly one page from the file at `offset`.
+    /// Uses the thread-local aligned buffer when the mode is `Direct`.
+    fn read_page_at(&self, offset: u64) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
         match self.mode {
             IoMode::Buffered => {
                 let mut buf = [0u8; crate::page::PAGE_SIZE_BYTES as usize];
-                match self.file.read_exact(&mut buf) {
+                match self.file.read_exact_at(&mut buf, offset) {
                     Ok(_) => (),
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => buf.fill(0),
                     Err(e) => panic!("Failed to read from file: {e}"),
@@ -12876,19 +12844,17 @@ impl OpenFile {
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let file = &mut self.file;
-                    let buf = self
-                        .scratch
-                        .as_mut()
-                        .expect("direct mode requires aligned scratch buffer");
-                    match file.read_exact(buf.as_mut_slice()) {
-                        Ok(_) => (),
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            buf.as_mut_slice().fill(0)
+                    DIRECT_IO_SCRATCH.with(|cell| {
+                        let mut buf = cell.borrow_mut();
+                        match self.file.read_exact_at(buf.as_mut_slice(), offset) {
+                            Ok(_) => (),
+                            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                                buf.as_mut_slice().fill(0)
+                            }
+                            Err(e) => panic!("Failed to read from file (direct I/O): {e}"),
                         }
-                        Err(e) => panic!("Failed to read from file (direct I/O): {e}"),
-                    }
-                    buf.as_slice().try_into().unwrap()
+                        buf.as_slice().try_into().unwrap()
+                    })
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("Direct I/O is only supported on Linux")
@@ -12896,24 +12862,22 @@ impl OpenFile {
         }
     }
 
-    /// Write exactly one page to the file at the current seek position.
-    /// Uses an aligned intermediate buffer when the mode is `Direct`.
-    fn write_page(&mut self, data: &[u8]) {
+    /// Write exactly one page to the file at `offset`.
+    /// Uses the thread-local aligned buffer when the mode is `Direct`.
+    fn write_page_at(&self, offset: u64, data: &[u8]) {
         debug_assert_eq!(data.len(), crate::page::PAGE_SIZE_BYTES as usize);
         match self.mode {
             IoMode::Buffered => {
-                self.file.write_all(data).unwrap();
+                self.file.write_all_at(data, offset).unwrap();
             }
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let file = &mut self.file;
-                    let buf = self
-                        .scratch
-                        .as_mut()
-                        .expect("direct mode requires aligned scratch buffer");
-                    buf.as_mut_slice().copy_from_slice(data);
-                    file.write_all(buf.as_slice()).unwrap();
+                    DIRECT_IO_SCRATCH.with(|cell| {
+                        let mut buf = cell.borrow_mut();
+                        buf.as_mut_slice().copy_from_slice(data);
+                        self.file.write_all_at(buf.as_slice(), offset).unwrap();
+                    });
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("Direct I/O is only supported on Linux")
@@ -13065,6 +13029,15 @@ impl Drop for AlignedBuf {
 #[cfg(target_os = "linux")]
 unsafe impl Send for AlignedBuf {}
 
+// Per-thread aligned buffer for direct I/O.  Reused across calls to avoid
+// a page-aligned allocation on every read/write.  Only initialised on threads
+// that actually perform direct I/O.
+#[cfg(target_os = "linux")]
+thread_local! {
+    static DIRECT_IO_SCRATCH: RefCell<AlignedBuf> =
+        RefCell::new(AlignedBuf::new_zeroed());
+}
+
 // ---------------------------------------------------------------------------
 // End I/O mode abstraction
 // ---------------------------------------------------------------------------
@@ -13073,7 +13046,8 @@ unsafe impl Send for AlignedBuf {}
 #[derive(Debug)]
 struct FileManager {
     db_directory: PathBuf,
-    open_files: HashMap<String, OpenFile>,
+    /// Read-locked for lookup (common path); write-locked only on first open of a file.
+    open_files: RwLock<HashMap<String, Arc<OpenFile>>>,
     directory_fd: File,
 }
 
@@ -13098,20 +13072,33 @@ impl FileManager {
 
         Ok(Self {
             db_directory: db_path,
-            open_files: HashMap::new(),
+            open_files: RwLock::new(HashMap::new()),
             directory_fd,
         })
     }
 
-    /// Access an `OpenFile` for the given filename, opening it on first access.
-    fn with_open_file<R>(&mut self, filename: &str, f: impl FnOnce(&mut OpenFile) -> R) -> R {
+    /// Return a handle to the `OpenFile` for `filename`, opening it on first access.
+    /// Common path (file already open): takes a shared read lock, no blocking between readers.
+    /// Slow path (first access): upgrades to write lock to insert the new entry.
+    fn get_open_file(&self, filename: &str) -> Arc<OpenFile> {
         let full_path = self.db_directory.join(filename);
-        let key = full_path.to_string_lossy().to_string();
-        let of = self.open_files.entry(key).or_insert_with(|| {
+        let key = full_path.to_string_lossy().into_owned();
+
+        // Fast path: file already open — shared read lock, multiple threads proceed concurrently.
+        {
+            let map = self.open_files.read().unwrap();
+            if let Some(of) = map.get(&key) {
+                return Arc::clone(of);
+            }
+        }
+
+        // Slow path: first access — write lock to insert.
+        let mut map = self.open_files.write().unwrap();
+        // Re-check after acquiring write lock (another thread may have inserted between the two locks).
+        Arc::clone(map.entry(key).or_insert_with(|| {
             let class = classify_file(filename);
-            open_with_fallback(&full_path, class).expect("Failed to open file")
-        });
-        f(of)
+            Arc::new(open_with_fallback(&full_path, class).expect("Failed to open file"))
+        }))
     }
 }
 impl FileSystemInterface for FileManager {
@@ -13119,80 +13106,69 @@ impl FileSystemInterface for FileManager {
         crate::page::PAGE_SIZE_BYTES as usize
     }
 
-    fn length(&mut self, filename: String) -> usize {
-        self.with_open_file(&filename, |of| {
-            let metadata = of.file.metadata().unwrap();
-            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
-        })
+    fn length(&self, filename: String) -> usize {
+        let of = self.get_open_file(&filename);
+        let metadata = of.file.metadata().unwrap();
+        (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
     }
 
-    fn read(&mut self, block_id: &BlockId, page: &mut Page) {
+    fn read(&self, block_id: &BlockId, page: &mut Page) {
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            *page = Page::from_bytes(of.read_page());
-        });
+        let of = self.get_open_file(&block_id.filename);
+        *page = Page::from_bytes(of.read_page_at(offset));
     }
 
-    fn write(&mut self, block_id: &BlockId, page: &Page) {
+    fn write(&self, block_id: &BlockId, page: &Page) {
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            of.write_page(page.bytes());
-        });
+        let of = self.get_open_file(&block_id.filename);
+        of.write_page_at(offset, page.bytes());
     }
 
-    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
+    fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]) {
         assert_eq!(
             buf.len(),
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            buf.copy_from_slice(&of.read_page());
-        });
+        let of = self.get_open_file(&block_id.filename);
+        buf.copy_from_slice(&of.read_page_at(offset));
     }
 
-    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
+    fn write_raw(&self, block_id: &BlockId, buf: &[u8]) {
         assert_eq!(
             buf.len(),
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            of.write_page(buf);
-        });
+        let of = self.get_open_file(&block_id.filename);
+        of.write_page_at(offset, buf);
     }
 
-    /// Append a new empty block to the file
-    fn append(&mut self, filename: String) -> BlockId {
-        let new_blk_num = self.length(filename.clone());
-        let block_id = BlockId::new(filename.clone(), new_blk_num);
+    /// Append a new empty block to the file.
+    /// Holds `append_mu` across the length-query → write-at sequence to prevent
+    /// two concurrent appenders writing to the same offset.
+    fn append(&self, filename: String) -> BlockId {
+        let of = self.get_open_file(&filename);
+        let _guard = of.append_mu.lock().unwrap();
+        let new_blk_num = {
+            let metadata = of.file.metadata().unwrap();
+            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        };
+        let block_id = BlockId::new(filename, new_blk_num);
         let zeros = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        self.with_open_file(&filename, |of| {
-            of.file
-                .seek(io::SeekFrom::Start(
-                    (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-                ))
-                .unwrap();
-            of.write_page(&zeros);
-        });
+        let offset = block_offset(new_blk_num);
+        of.write_page_at(offset, &zeros);
         block_id
     }
 
-    /// Sync the file with the disk to ensure durability
-    fn sync(&mut self, filename: &str) {
-        self.with_open_file(filename, |of| {
-            of.file.sync_all().unwrap();
-        });
+    fn sync(&self, filename: &str) {
+        let of = self.get_open_file(filename);
+        of.file.sync_all().unwrap();
     }
 
-    /// Sync the directory with the disk to ensure durability
-    fn sync_directory(&mut self) {
+    fn sync_directory(&self) {
         self.directory_fd.sync_all().unwrap();
     }
 }
@@ -13230,18 +13206,25 @@ mod mock_file_manager {
     }
 
     #[derive(Debug)]
-    pub struct MockFileManager {
+    struct MockInner {
         files: HashMap<String, MockFile>,
         directory_synced: bool,
         crashed: bool,
     }
 
+    #[derive(Debug)]
+    pub struct MockFileManager {
+        inner: std::sync::Mutex<MockInner>,
+    }
+
     impl MockFileManager {
         pub fn new() -> Self {
             Self {
-                files: HashMap::new(),
-                directory_synced: false,
-                crashed: false,
+                inner: std::sync::Mutex::new(MockInner {
+                    files: HashMap::new(),
+                    directory_synced: false,
+                    crashed: false,
+                }),
             }
         }
 
@@ -13251,40 +13234,39 @@ mod mock_file_manager {
 
         /// Simulate a system crash - discards all unsynced data
         /// Files with unsynced directory entries disappear entirely
-        pub fn simulate_crash(&mut self) {
-            if !self.directory_synced {
-                self.files.clear();
+        pub fn simulate_crash(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.directory_synced {
+                inner.files.clear();
             } else {
-                for (_filename, file) in self.files.iter_mut() {
+                for (_filename, file) in inner.files.iter_mut() {
                     file.blocks.retain(|block| block.synced);
-                    file.file_synced = false; // Reset sync state after crash
+                    file.file_synced = false;
                 }
             }
-
-            self.crashed = true;
+            inner.crashed = true;
         }
 
-        pub fn restore_from_crash(&mut self) {
-            self.crashed = false;
+        pub fn restore_from_crash(&self) {
+            self.inner.lock().unwrap().crashed = false;
         }
 
-        fn ensure_file_exists(&mut self, filename: &str) {
-            if !self.files.contains_key(filename) {
-                self.files.insert(
+        fn ensure_file_exists(inner: &mut MockInner, filename: &str) {
+            if !inner.files.contains_key(filename) {
+                inner.files.insert(
                     filename.to_string(),
                     MockFile {
                         blocks: Vec::new(),
                         file_synced: false,
                     },
                 );
-                self.directory_synced = false;
+                inner.directory_synced = false;
             }
         }
 
-        fn ensure_block_exists(&mut self, filename: &str, block_num: usize) {
-            self.ensure_file_exists(filename);
-            let file = self.files.get_mut(filename).unwrap();
-
+        fn ensure_block_exists(inner: &mut MockInner, filename: &str, block_num: usize) {
+            Self::ensure_file_exists(inner, filename);
+            let file = inner.files.get_mut(filename).unwrap();
             while file.blocks.len() <= block_num {
                 file.blocks.push(MockBlock {
                     data: Self::fresh_page_bytes(),
@@ -13299,24 +13281,28 @@ mod mock_file_manager {
             crate::page::PAGE_SIZE_BYTES as usize
         }
 
-        fn length(&mut self, filename: String) -> usize {
-            self.files
+        fn length(&self, filename: String) -> usize {
+            self.inner
+                .lock()
+                .unwrap()
+                .files
                 .get(&filename)
                 .map_or(0, |file| file.blocks.len())
         }
 
-        fn read(&mut self, block_id: &BlockId, page: &mut Page) {
-            if self.crashed {
+        fn read(&self, block_id: &BlockId, page: &mut Page) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot read from crashed file system");
             }
 
-            if !self.files.contains_key(&block_id.filename) {
+            if !inner.files.contains_key(&block_id.filename) {
                 *page = Page::new();
                 return;
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get(&block_id.filename).unwrap();
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
@@ -13328,24 +13314,26 @@ mod mock_file_manager {
             }
         }
 
-        fn write(&mut self, block_id: &BlockId, page: &Page) {
-            if self.crashed {
+        fn write(&self, block_id: &BlockId, page: &Page) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot write to crashed file system");
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get_mut(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get_mut(&block_id.filename).unwrap();
             let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
             buf.copy_from_slice(page.bytes());
 
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf,
-                synced: false, // Write only goes to buffer, not synced
+                synced: false,
             };
         }
 
-        fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
-            if self.crashed {
+        fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot read from crashed file system");
             }
             assert_eq!(
@@ -13354,13 +13342,13 @@ mod mock_file_manager {
                 "raw read buffer must be PAGE_SIZE_BYTES"
             );
 
-            if !self.files.contains_key(&block_id.filename) {
+            if !inner.files.contains_key(&block_id.filename) {
                 buf.copy_from_slice(&Self::fresh_page_bytes());
                 return;
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get(&block_id.filename).unwrap();
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
@@ -13370,8 +13358,9 @@ mod mock_file_manager {
             }
         }
 
-        fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
-            if self.crashed {
+        fn write_raw(&self, block_id: &BlockId, buf: &[u8]) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot write to crashed file system");
             }
             assert_eq!(
@@ -13380,24 +13369,23 @@ mod mock_file_manager {
                 "raw write buffer must be PAGE_SIZE_BYTES"
             );
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get_mut(&block_id.filename).unwrap();
-
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get_mut(&block_id.filename).unwrap();
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf.to_vec(),
                 synced: false,
             };
         }
 
-        fn append(&mut self, filename: String) -> BlockId {
-            if self.crashed {
+        fn append(&self, filename: String) -> BlockId {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot append to crashed file system");
             }
 
-            self.ensure_file_exists(&filename);
-            let file = self.files.get_mut(&filename).unwrap();
+            Self::ensure_file_exists(&mut inner, &filename);
+            let file = inner.files.get_mut(&filename).unwrap();
             let block_num = file.blocks.len();
-
             file.blocks.push(MockBlock {
                 data: Self::fresh_page_bytes(),
                 synced: false,
@@ -13406,12 +13394,13 @@ mod mock_file_manager {
             BlockId::new(filename, block_num)
         }
 
-        fn sync(&mut self, filename: &str) {
-            if self.crashed {
+        fn sync(&self, filename: &str) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot sync crashed file system");
             }
 
-            if let Some(file) = self.files.get_mut(filename) {
+            if let Some(file) = inner.files.get_mut(filename) {
                 for block in file.blocks.iter_mut() {
                     block.synced = true;
                 }
@@ -13419,11 +13408,12 @@ mod mock_file_manager {
             }
         }
 
-        fn sync_directory(&mut self) {
-            if self.crashed {
+        fn sync_directory(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot sync crashed file manager");
             }
-            self.directory_synced = true;
+            inner.directory_synced = true;
         }
     }
 }
@@ -13458,19 +13448,20 @@ mod file_manager_tests {
 
     #[test]
     fn test_file_creation() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
 
         let filename = "test_file";
-        file_manager.with_open_file(filename, |_| ());
+        // Trigger file creation via append (opens the file)
+        file_manager.append(filename.to_string());
 
         let full_path = file_manager.db_directory.join(filename);
         let full_path_str = full_path.to_string_lossy().to_string();
-        assert!(file_manager.open_files.contains_key(&full_path_str));
+        assert!(file_manager.open_files.read().unwrap().contains_key(&full_path_str));
     }
 
     #[test]
     fn test_append_and_length() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
 
         let filename = "testfile".to_string();
         assert_eq!(file_manager.length(filename.clone()), 0);
@@ -13493,7 +13484,7 @@ mod file_manager_tests {
     #[cfg(all(feature = "direct-io", target_os = "linux"))]
     #[test]
     fn test_direct_io_mode_round_trip_write_then_read() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
         let filename = "direct_io_round_trip".to_string();
         let block_id = file_manager.append(filename);
 
@@ -13541,7 +13532,7 @@ mod durability_tests {
 
     #[test]
     fn test_mock_filesystem_demonstrates_durability_flaw() {
-        let mut mock_fs = MockFileManager::new();
+        let mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
@@ -13581,7 +13572,7 @@ mod durability_tests {
 
     #[test]
     fn test_mock_filesystem_with_sync_preserves_data() {
-        let mut mock_fs = MockFileManager::new();
+        let mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();

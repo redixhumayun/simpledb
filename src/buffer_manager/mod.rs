@@ -218,10 +218,7 @@ impl BufferFrame {
                 }
                 PageType::Free => {}
             }
-            self.file_manager
-                .lock()
-                .unwrap()
-                .write(&block_id, &page_guard);
+            self.file_manager.write(&block_id, &page_guard);
             meta.txn = None;
             meta.lsn = None;
         }
@@ -231,10 +228,7 @@ impl BufferFrame {
         self.flush_locked(meta);
         meta.block_id = Some(block_id.clone());
         let mut page_guard = self.page.write().unwrap();
-        self.file_manager
-            .lock()
-            .unwrap()
-            .read(block_id, &mut page_guard);
+        self.file_manager.read(block_id, &mut page_guard);
         match page_guard.peek_page_type().unwrap() {
             PageType::Heap => {
                 let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
