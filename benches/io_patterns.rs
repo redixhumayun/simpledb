@@ -700,7 +700,7 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
 // ============================================================================
 // Phase 8: Cache-Evict Variants (Linux only; posix_fadvise DONTNEED between iters)
 // ============================================================================
-// Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+// Filter tokens: onepass_seq_evict, lo_loc_rand_evict, multi_stream_evict
 
 /// One-pass sequential scan with cache eviction between iterations.
 #[cfg(target_os = "linux")]
@@ -757,6 +757,56 @@ fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchR
         || {
             #[cfg(target_os = "linux")]
             posix_fadvise_dontneed(&file_path);
+        },
+    )
+}
+
+/// Multi-stream sequential scan with cache eviction between iterations.
+/// Each stream scans its own file; all files are evicted from page cache after
+/// each iteration. Forces real NVMe reads on every iteration, making FM-level
+/// lock contention visible even under buffered I/O.
+#[cfg(target_os = "linux")]
+fn multi_stream_scan_evict(num_streams: usize, working_set: usize, iterations: usize) -> BenchResult {
+    let (db, test_dir) = setup_io_test();
+    let blocks_per_stream = (working_set / num_streams).max(1);
+
+    let file_names: Vec<String> = (0..num_streams)
+        .map(|s| format!("multi_stream_evict_{}_{}", num_streams, s))
+        .collect();
+    let file_paths: Vec<PathBuf> = file_names.iter().map(|f| test_dir.path.join(f)).collect();
+
+    for name in &file_names {
+        precreate_blocks_direct(&db, name, blocks_per_stream);
+    }
+
+    benchmark_with_teardown(
+        &format!("Multi-stream Scan+Evict {}x{}blk", num_streams, blocks_per_stream),
+        iterations,
+        1,
+        || {
+            let handles: Vec<_> = file_names
+                .iter()
+                .map(|name| {
+                    let name = name.clone();
+                    let fm = Arc::clone(&db.file_manager);
+                    thread::spawn(move || {
+                        let mut page = Page::new();
+                        for i in 0..blocks_per_stream {
+                            fm.lock()
+                                .unwrap()
+                                .read(&BlockId::new(name.clone(), i), &mut page);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        || {
+            for path in &file_paths {
+                posix_fadvise_dontneed(path);
+            }
         },
     )
 }
@@ -1046,6 +1096,8 @@ fn main() {
             io_cfg.working_set_blocks,
             iterations,
         ));
+        #[cfg(target_os = "linux")]
+        results.push(multi_stream_scan_evict(4, io_cfg.working_set_blocks, iterations));
 
         // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
@@ -1430,7 +1482,7 @@ fn main() {
     }
 
     // Phase 8: Cache-Evict Variants (Linux only — posix_fadvise DONTNEED unavailable elsewhere)
-    // Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+    // Filter tokens: onepass_seq_evict, lo_loc_rand_evict, multi_stream_evict
     #[cfg(target_os = "linux")]
     {
         let mut evict_results = Vec::new();
@@ -1443,6 +1495,13 @@ fn main() {
         }
         if should_run("lo_loc_rand_evict", filter_ref) {
             evict_results.push(low_locality_rand_read_evict(
+                io_cfg.working_set_blocks,
+                iterations,
+            ));
+        }
+        if should_run("multi_stream_evict", filter_ref) {
+            evict_results.push(multi_stream_scan_evict(
+                4,
                 io_cfg.working_set_blocks,
                 iterations,
             ));
