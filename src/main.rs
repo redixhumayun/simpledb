@@ -7844,9 +7844,13 @@ pub struct TableScan {
     record_page: Option<RecordPage>,
     current_slot: Option<usize>,
     table_name: String,
+    prefetch_window: usize,
+    next_prefetch_block: usize,
 }
 
 impl TableScan {
+    const PREFETCH_WINDOW_BLOCKS: usize = 16;
+
     pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
         let file_name = format!("{table_name}.tbl");
@@ -7857,6 +7861,8 @@ impl TableScan {
             record_page: None,
             current_slot: None,
             table_name: table_name.to_string(),
+            prefetch_window: Self::PREFETCH_WINDOW_BLOCKS,
+            next_prefetch_block: 1,
         };
 
         if scan.txn.size(&file_name) == 0 {
@@ -7875,12 +7881,38 @@ impl TableScan {
         scan
     }
 
+    fn maybe_prefetch_from(&mut self, current_block: usize) {
+        if self.prefetch_window == 0 {
+            return;
+        }
+        if self.next_prefetch_block > current_block {
+            return;
+        }
+        let file_size = self.txn.size(&self.file_name);
+        let start = current_block.saturating_add(1);
+        if start >= file_size {
+            return;
+        }
+
+        let available = file_size - start;
+        let count = available.min(self.prefetch_window);
+        if count == 0 {
+            return;
+        }
+
+        self.txn
+            .buffer_manager()
+            .prefetch(&self.file_name, start, count);
+        self.next_prefetch_block = start.saturating_add(count);
+    }
+
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
     pub fn move_to_block(&mut self, block_num: usize) {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
+        self.maybe_prefetch_from(block_num);
     }
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
@@ -7900,6 +7932,7 @@ impl TableScan {
 
     /// Moves the [`RecordPage`] to the start of the file
     pub fn move_to_start(&mut self) {
+        self.next_prefetch_block = 1;
         self.move_to_block(0);
     }
 
@@ -8011,7 +8044,7 @@ impl Scan for TableScan {
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
-        self.move_to_block(0);
+        self.move_to_start();
         Ok(())
     }
 }
@@ -12437,9 +12470,14 @@ pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
 
 #[cfg(test)]
 mod buffer_manager_tests {
-    use std::{sync::Arc, thread};
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
 
-    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Schema, SimpleDB};
+    use crate::{
+        page::test_helpers, BlockId, BufferManager, Layout, Lsn, Page, Schema, SimpleDB,
+    };
 
     const BUFFER_FIELD: &str = "val";
 
@@ -12465,6 +12503,13 @@ mod buffer_manager_tests {
         }
         buffer.set_modified(0, Lsn::MAX);
         buffer_manager.unpin(buffer);
+    }
+
+    fn write_row_direct(file_manager: &crate::SharedFS, layout: &Layout, block_id: &BlockId, value: i32) {
+        let mut page = Page::new();
+        test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
+            .expect("initialize heap page");
+        file_manager.write(block_id, &page);
     }
 
     #[test]
@@ -12589,6 +12634,129 @@ mod buffer_manager_tests {
                 "Buffer pool inconsistent: expected 4 available buffers, got {available}"
             );
         }
+    }
+
+    #[test]
+    fn test_prefetch_turns_following_pins_into_hits() {
+        let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
+        db.buffer_manager.enable_stats();
+        db.buffer_manager.reset_stats();
+
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = buffer_layout();
+        let file = "prefetch_single.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..8)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, &layout, &block, i);
+                block
+            })
+            .collect();
+
+        let installed = buffer_manager.prefetch(&file, 0, 3);
+        assert_eq!(installed, 3, "expected to prefetch first 3 blocks");
+
+        buffer_manager.reset_stats();
+        for block in blocks.iter().take(installed) {
+            let buffer = buffer_manager.pin(block).expect("pin prefetched block");
+            let value = {
+                let page = buffer.read_page();
+                test_helpers::read_single_int_field(&page, &layout, BUFFER_FIELD)
+                    .expect("read prefetched row")
+            };
+            buffer_manager.unpin(buffer);
+            assert_eq!(value, block.block_num as i32);
+        }
+
+        let (hits, misses) = buffer_manager
+            .get_stats()
+            .expect("buffer stats should be enabled");
+        assert!(
+            hits >= installed,
+            "expected >= {} hits after prefetch, got {}",
+            installed,
+            hits
+        );
+        assert_eq!(
+            misses, 0,
+            "prefetched blocks should not miss immediately after prefetch"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_prefetch_same_range_preserves_invariants() {
+        let pool_size = 8usize;
+        let (db, _test_dir) = SimpleDB::new_for_test(pool_size, 5000);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = Arc::new(buffer_layout());
+        let file = "prefetch_concurrent.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..16)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, layout.as_ref(), &block, i);
+                block
+            })
+            .collect();
+        let blocks = Arc::new(blocks);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let run_worker = |worker_id: usize,
+                          bm: Arc<BufferManager>,
+                          blocks: Arc<Vec<BlockId>>,
+                          layout: Arc<Layout>,
+                          file: String,
+                          barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                let _installed = bm.prefetch(&file, 0, 8);
+                barrier.wait();
+
+                for idx in 0..8 {
+                    let block = &blocks[idx];
+                    let buffer = bm.pin(block).expect("pin block after concurrent prefetch");
+                    let value = {
+                        let page = buffer.read_page();
+                        test_helpers::read_single_int_field(&page, layout.as_ref(), BUFFER_FIELD)
+                            .expect("read concurrent prefetched row")
+                    };
+                    bm.unpin(buffer);
+                    assert_eq!(value, idx as i32, "worker {} saw wrong value", worker_id);
+                }
+            })
+        };
+
+        let t1 = run_worker(
+            1,
+            Arc::clone(&buffer_manager),
+            Arc::clone(&blocks),
+            Arc::clone(&layout),
+            file.clone(),
+            Arc::clone(&barrier),
+        );
+        let t2 = run_worker(
+            2,
+            Arc::clone(&buffer_manager),
+            Arc::clone(&blocks),
+            Arc::clone(&layout),
+            file,
+            Arc::clone(&barrier),
+        );
+
+        barrier.wait();
+        barrier.wait();
+        t1.join().expect("worker 1 panicked");
+        t2.join().expect("worker 2 panicked");
+
+        buffer_manager.assert_buffer_count_invariant();
+        assert_eq!(
+            buffer_manager.available(),
+            pool_size,
+            "all buffers must be unpinned after concurrent prefetch test"
+        );
     }
 }
 
