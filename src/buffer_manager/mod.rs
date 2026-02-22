@@ -27,7 +27,7 @@ use crate::{
     page::PageType,
     page::{BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
     replacement::PolicyState,
-    BlockId, LogManager, Lsn, Page, SharedFS,
+    BatchReadReq, BlockId, LogManager, Lsn, Page, SharedFS,
 };
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
@@ -352,6 +352,11 @@ impl LatchTableGuard {
     }
 }
 
+struct PrefetchReservation {
+    block_id: BlockId,
+    frame_idx: usize,
+}
+
 #[derive(Debug)]
 pub struct BufferManager {
     file_manager: SharedFS,
@@ -413,6 +418,24 @@ impl BufferManager {
         (h as usize) & (Self::SHARDS - 1)
     }
 
+    fn resident_frame_if_present(
+        &self,
+        block_id: &BlockId,
+        shard_index: usize,
+    ) -> Option<Arc<BufferFrame>> {
+        let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
+        match resident_guard.get(block_id) {
+            Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
+                Some(frame_ptr) => Some(frame_ptr),
+                None => {
+                    resident_guard.remove(block_id);
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
     pub fn enable_stats(&self) {
         let _ = self.stats.set(Arc::new(BufferStats::new()));
     }
@@ -441,6 +464,115 @@ impl BufferManager {
 
     pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
         Arc::clone(&self.log_manager)
+    }
+
+    /// Best-effort prefetch for a sequential block range.
+    ///
+    /// Never blocks waiting for frames: reserves as many frames as are currently
+    /// evictable, submits one batch read, then installs pages with a resident recheck.
+    pub fn prefetch(&self, file: &str, start_block: usize, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let mut reservations: Vec<PrefetchReservation> = Vec::new();
+        let mut reqs: Vec<BatchReadReq> = Vec::new();
+
+        for block_num in start_block..start_block.saturating_add(count) {
+            let block_id = BlockId::new(file.to_string(), block_num);
+            let shard_index = self.shard_index(&block_id);
+            let latch_table_guard =
+                LatchTableGuard::new(&self.latch_shards, &block_id, shard_index);
+            let _block_latch = latch_table_guard.lock();
+
+            if self
+                .resident_frame_if_present(&block_id, shard_index)
+                .is_some()
+            {
+                continue;
+            }
+
+            let (frame_idx, mut meta_guard) = match self.evict_frame() {
+                Some(victim) => victim,
+                None => break, // best-effort: do not block waiting for frames
+            };
+            let frame = Arc::clone(&self.buffer_pool[frame_idx]);
+
+            if let Some(old) = meta_guard.block_id.clone() {
+                let old_shard = self.shard_index(&old);
+                self.resident_shards[old_shard].lock().unwrap().remove(&old);
+            }
+            frame.flush_locked(&mut meta_guard);
+            meta_guard.block_id = None;
+            meta_guard.txn = None;
+            meta_guard.lsn = None;
+
+            let became_pinned = meta_guard.pin();
+            debug_assert!(became_pinned, "reserved prefetch frame must have zero pins");
+            drop(meta_guard);
+            self.num_available.fetch_sub(1, Ordering::AcqRel);
+
+            reservations.push(PrefetchReservation {
+                block_id: block_id.clone(),
+                frame_idx,
+            });
+            reqs.push(BatchReadReq { block_id });
+        }
+
+        if reqs.is_empty() {
+            return 0;
+        }
+
+        let mut pages: Vec<Page> = (0..reqs.len()).map(|_| Page::new()).collect();
+        self.file_manager.read_batch(&reqs, &mut pages);
+
+        let mut installed = 0usize;
+
+        for (idx, reservation) in reservations.into_iter().enumerate() {
+            let shard_index = self.shard_index(&reservation.block_id);
+            let latch_table_guard =
+                LatchTableGuard::new(&self.latch_shards, &reservation.block_id, shard_index);
+            let _block_latch = latch_table_guard.lock();
+            let frame = Arc::clone(&self.buffer_pool[reservation.frame_idx]);
+
+            let already_resident = self
+                .resident_frame_if_present(&reservation.block_id, shard_index)
+                .is_some();
+
+            if !already_resident {
+                {
+                    let mut meta_guard = frame.lock_meta();
+                    let mut page_guard = frame.write_page();
+                    *page_guard = std::mem::take(&mut pages[idx]);
+                    meta_guard.block_id = Some(reservation.block_id.clone());
+                    meta_guard.txn = None;
+                    meta_guard.lsn = None;
+                }
+                self.policy
+                    .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
+                self.resident_shards[shard_index]
+                    .lock()
+                    .unwrap()
+                    .insert(reservation.block_id, Arc::downgrade(&frame));
+                installed += 1;
+            } else {
+                // LRU/SIEVE remove victims from list during eviction. Reinsert free
+                // frames into replacement state even if this prefetch becomes redundant.
+                self.policy
+                    .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
+            }
+
+            let became_unpinned = {
+                let mut meta_guard = frame.lock_meta();
+                meta_guard.unpin()
+            };
+            if became_unpinned {
+                self.num_available.fetch_add(1, Ordering::AcqRel);
+                self.cond.notify_all();
+            }
+        }
+
+        installed
     }
 
     pub(crate) fn flush_all(&self, txn_num: usize) {
