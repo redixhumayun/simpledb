@@ -3087,18 +3087,16 @@ impl TupleRef<'_> {
     }
 }
 
-#[allow(dead_code)]
-struct NullBitmap<'a> {
+pub(crate) struct NullBitmap<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> NullBitmap<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
 
-    #[allow(dead_code)]
-    fn is_null(&self, col_idx: usize) -> bool {
+    pub(crate) fn is_null(&self, col_idx: usize) -> bool {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
         let mask = 1u8 << bit;
@@ -3106,25 +3104,24 @@ impl<'a> NullBitmap<'a> {
     }
 }
 
-struct NullBitmapMut<'a> {
+pub(crate) struct NullBitmapMut<'a> {
     bytes: &'a mut [u8],
 }
 
 impl<'a> NullBitmapMut<'a> {
-    fn new(bytes: &'a mut [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a mut [u8]) -> Self {
         Self { bytes }
     }
 
-    #[allow(unused)]
-    fn set_null(&mut self, col_idx: usize) {
+    pub(crate) fn set_null(&mut self, col_idx: usize) {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
         let mask = 1u8 << bit;
         self.bytes[byte] |= mask;
     }
 
-    #[allow(dead_code)]
-    fn clear(&mut self, col_idx: usize) {
+    #[cfg(test)]
+    pub(crate) fn clear_null(&mut self, col_idx: usize) {
         let byte = col_idx / 8;
         let bit = col_idx % 8;
         let mask = 1u8 << bit;
@@ -3159,7 +3156,7 @@ mod bitmap_tests {
             bitmap.set_null(0);
             bitmap.set_null(9);
             bitmap.set_null(7);
-            bitmap.clear(7);
+            bitmap.clear_null(7);
         }
         let bitmap = NullBitmap::new(&bytes);
         assert!(bitmap.is_null(0));
@@ -3670,8 +3667,7 @@ impl<'a> LogicalRowMut<'a> {
     }
 
     /// Materialize all fields, update the target field, and re-encode densely.
-    /// The payload slice must be large enough to hold the re-encoded result
-    /// (pre-allocated with `max_encoded_size()` bytes).
+    /// The payload slice must have enough slack (UPDATE_SLACK bytes) for the new encoding.
     pub fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
         let field_idx = self.layout.column_idx(column_name)?;
         // Snapshot current values via dense decode
@@ -4007,8 +4003,8 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Encodes `values` as a dense heap tuple and inserts it, writing a WAL insert record.
-    /// The buffer is padded to `max_encoded_size()` so that in-place updates (set_int/set_string)
-    /// always fit within the allocated tuple until Phase 4 introduces redirect chains.
+    /// Each tuple is allocated `payload_len + UPDATE_SLACK` bytes so that minor field growth
+    /// (up to UPDATE_SLACK bytes) fits in-place without a redirect chain.
     pub fn insert_row_values(&mut self, values: &[Constant]) -> SimpleDBResult<SlotId> {
         let payload = self.layout.encode_payload(values);
         self.insert_row_values_raw(payload)
@@ -4063,13 +4059,15 @@ impl<'a> HeapPageViewMut<'a> {
 
     /// Read-modify-write: change one field in `slot`, re-encode densely, write via `update_tuple`.
     /// Handles slot redirection if the new tuple is larger than the current allocation.
-    pub fn update_field(
+    ///
+    /// Not public API — used internally by `RecordPage::set_int`/`set_string`. Will be eliminated
+    /// once `LogicalRowMut::set_column` gains redirect support (see UPDATE_SLACK discussion).
+    pub(crate) fn update_field(
         &mut self,
         slot: SlotId,
         field_name: &str,
         value: Option<Constant>,
     ) -> SimpleDBResult<()> {
-        // Read all current field values (borrows released at end of block).
         let mut values: Vec<Option<Constant>> = {
             let live_slot = self
                 .resolve_live_slot_id(slot)
@@ -4087,13 +4085,11 @@ impl<'a> HeapPageViewMut<'a> {
                 _ => return Err("slot not live after resolution".into()),
             }
         };
-
         let field_idx = self
             .layout
             .column_idx(field_name)
             .ok_or_else(|| format!("field '{field_name}' not found in schema"))?;
         values[field_idx] = value;
-
         let payload = self.layout.encode_payload_with_nulls(&values);
         let payload_len = payload.len();
         let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
@@ -5043,14 +5039,19 @@ mod heap_page_view_tests {
             ])
             .expect("insert new row");
         assert_eq!(slot, 0);
-        view.update_field(slot, "id", Some(Constant::Int(777)))
-            .expect("update int column");
-        view.update_field(slot, "name", Some(Constant::String("toast".to_string())))
-            .expect("update string column");
-        view.update_field(slot, "score", None)
-            .expect("mark score as NULL");
+        {
+            let mut row = view
+                .row_mut(slot)
+                .expect("row_mut ok")
+                .expect("slot exists");
+            row.set_column("id", &Constant::Int(777))
+                .expect("update id");
+            row.set_column("name", &Constant::String("toast".to_string()))
+                .expect("update name");
+            row.set_null("score").expect("set score null");
+        }
 
-        // After update_field the slot may have been redirected; read via view.row which follows redirects.
+        // Read via view.row after the mutable borrow is released.
         let row = view.row(slot).expect("read updated slot 0");
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
         assert_eq!(

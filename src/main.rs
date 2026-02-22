@@ -34,7 +34,7 @@ mod page;
 mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
-use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage};
 mod buffer_manager;
 
 pub type Lsn = usize;
@@ -8067,12 +8067,7 @@ impl UpdateScan for TableScan {
                 iterations <= 10000,
                 "Table scan insert_values failed for {iterations} iterations"
             );
-            match self
-                .record_page
-                .as_ref()
-                .unwrap()
-                .insert_with_values(values)
-            {
+            match self.record_page.as_ref().unwrap().insert_values(values) {
                 Ok(slot) => {
                     self.current_slot = Some(slot);
                     break;
@@ -8390,7 +8385,7 @@ impl RecordPage {
     }
 
     /// Inserts a new record with the given values (in schema field order) and returns its slot ID.
-    pub fn insert_with_values(&self, values: &[Constant]) -> Result<usize, Box<dyn Error>> {
+    pub fn insert_values(&self, values: &[Constant]) -> Result<usize, Box<dyn Error>> {
         if values.len() != self.layout.schema.fields.len() {
             return Err("value count must match schema field count".into());
         }
@@ -8430,7 +8425,7 @@ mod record_page_tests {
         let record_page = RecordPage::new(txn, block_id, layout);
         record_page.format().unwrap();
 
-        //  Create a bunch of records using insert_with_values
+        //  Create a bunch of records using insert_values
         let mut inserted_slots = Vec::new();
         loop {
             let number = (generate_random_number() % 100) + 1;
@@ -8439,7 +8434,7 @@ mod record_page_tests {
                 Constant::String(format!("rec{number}")),
             ];
 
-            match record_page.insert_with_values(&values) {
+            match record_page.insert_values(&values) {
                 Ok(slot) => inserted_slots.push(slot),
                 Err(_) => break, // page full
             }
@@ -8505,8 +8500,11 @@ impl Layout {
         None
     }
 
-    /// Worst-case payload size for a fixed-layout record (BTree entries, planner estimates).
-    /// Equals INT_BYTES base + sum of per-field max sizes.
+    /// Worst-case payload size for a schema, assuming all fields are non-NULL and strings are
+    /// at their declared maximum length.
+    ///
+    /// Used by BTree page capacity checks (`is_full`) and planner `records_per_block` estimates.
+    /// Heap tuples use actual dense sizes — this function is NOT used for heap allocation.
     pub fn max_encoded_size(&self) -> usize {
         let mut size = Self::INT_BYTES;
         for f in &self.schema.fields {
@@ -8517,11 +8515,6 @@ impl Layout {
             }
         }
         size
-    }
-
-    #[allow(dead_code)]
-    fn num_of_columns(&self) -> usize {
-        self.schema.fields.len()
     }
 
     fn field_info(&self, field: &str) -> Option<&FieldInfo> {
@@ -8577,24 +8570,27 @@ impl Layout {
     pub fn encode_payload_with_nulls(&self, values: &[Option<Constant>]) -> Vec<u8> {
         let n = self.schema.fields.len();
         let bitmap_bytes = n.div_ceil(8);
-        let mut bitmap = vec![0u8; bitmap_bytes];
+        let mut bitmap_buf = vec![0u8; bitmap_bytes];
         let mut data: Vec<u8> = Vec::new();
-        for (i, value) in values.iter().enumerate() {
-            match value {
-                None => {
-                    bitmap[i / 8] |= 1 << (i % 8);
-                }
-                Some(Constant::Int(v)) => {
-                    data.extend_from_slice(&v.to_le_bytes());
-                }
-                Some(Constant::String(s)) => {
-                    data.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    data.extend_from_slice(s.as_bytes());
+        {
+            let mut bitmap = NullBitmapMut::new(&mut bitmap_buf);
+            for (i, value) in values.iter().enumerate() {
+                match value {
+                    None => {
+                        bitmap.set_null(i);
+                    }
+                    Some(Constant::Int(v)) => {
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    Some(Constant::String(s)) => {
+                        data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        data.extend_from_slice(s.as_bytes());
+                    }
                 }
             }
         }
-        bitmap.extend(data);
-        bitmap
+        bitmap_buf.extend(data);
+        bitmap_buf
     }
 
     /// Decode a single field from a dense heap payload.
@@ -8603,14 +8599,14 @@ impl Layout {
         let n = self.schema.fields.len();
         let bitmap_bytes = n.div_ceil(8);
         let field_idx = self.column_index.get(field_name).copied()?;
-        // Check null bit
-        if payload[field_idx / 8] & (1 << (field_idx % 8)) != 0 {
+        let bitmap = NullBitmap::new(&payload[..bitmap_bytes]);
+        if bitmap.is_null(field_idx) {
             return None;
         }
         // Scan preceding non-null fields to find this field's byte offset
         let mut offset = bitmap_bytes;
         for i in 0..field_idx {
-            if payload[i / 8] & (1 << (i % 8)) != 0 {
+            if bitmap.is_null(i) {
                 continue; // null field — no bytes
             }
             let fname = &self.schema.fields[i];
