@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+use io_uring::{opcode, types, IoUring};
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::{
     any::Any,
     cell::{Cell, RefCell},
@@ -17,8 +23,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 pub mod test_utils;
 pub use btree::BTreeIndex;
 use parser::{
@@ -12398,8 +12402,7 @@ mod buffer_list_tests {
     #[test]
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
-        let file_manager: super::SharedFS =
-            Arc::new(FileManager::new(&dir, true).unwrap());
+        let file_manager: super::SharedFS = Arc::new(FileManager::new(&dir, true).unwrap());
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -12633,7 +12636,8 @@ impl LogManager {
     /// Write the bytes from log_page to disk for the current_block
     /// Update the last_saved_lsn before returning
     fn flush_to_disk(&mut self) {
-        self.file_manager.write_raw(&self.current_block, self.log_page.bytes());
+        self.file_manager
+            .write_raw(&self.current_block, self.log_page.bytes());
         self.file_manager.sync(&self.log_file);
         self.file_manager.sync_directory();
         self.last_saved_lsn = self.latest_lsn;
@@ -12719,7 +12723,8 @@ impl LogIterator {
     }
 
     pub fn move_to_block(&mut self) {
-        self.file_manager.read_raw(&self.current_block, self.page.bytes_mut());
+        self.file_manager
+            .read_raw(&self.current_block, self.page.bytes_mut());
         self.boundary = self.page.boundary();
         self.current_pos = self.boundary;
     }
@@ -12777,6 +12782,11 @@ impl BlockId {
 /// Page backed by the new layout; alias to the RawPage bytes type.
 pub type Page = crate::page::PageBytes;
 
+#[derive(Debug, Clone)]
+pub struct BatchReadReq {
+    pub block_id: BlockId,
+}
+
 /// Trait defining the file system interface for database operations
 pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
@@ -12785,6 +12795,16 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn write(&self, block_id: &BlockId, page: &Page);
     fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]);
     fn write_raw(&self, block_id: &BlockId, buf: &[u8]);
+    fn read_batch(&self, reqs: &[BatchReadReq], pages: &mut [Page]) {
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch read request/page length mismatch"
+        );
+        for (req, page) in reqs.iter().zip(pages.iter_mut()) {
+            self.read(&req.block_id, page);
+        }
+    }
     fn append(&self, filename: String) -> BlockId;
     fn sync(&self, filename: &str);
     fn sync_directory(&self);
@@ -12914,8 +12934,8 @@ fn desired_mode_for_class(class: FileClass) -> IoMode {
     }
 }
 
-/// Global counter incremented each time a direct-I/O open falls back to buffered.
-/// Readable via `direct_io_fallback_count()`.
+/// Legacy counter for direct-I/O fallback events.
+/// In the current hard-default direct-I/O policy this should remain zero.
 static DIRECT_IO_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Return the number of direct-I/O fallbacks that have occurred in this process.
@@ -12923,40 +12943,25 @@ pub fn direct_io_fallback_count() -> usize {
     DIRECT_IO_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Open a file with the appropriate I/O mode for its class.
+/// Open a file with the configured I/O mode for its class.
 ///
-/// Falls back to buffered mode if `O_DIRECT` open fails with an
-/// unsupported-flag error (`EINVAL` / `EOPNOTSUPP`).  Other errors are
-/// propagated.  The returned `OpenFile.mode` always reflects the mode that
-/// actually succeeded.
-fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
+/// In `direct-io` builds, data files are opened with `O_DIRECT` and open
+/// failures are returned to the caller (no buffered fallback).
+fn open_with_mode(path: &Path, class: FileClass) -> io::Result<OpenFile> {
     let desired = desired_mode_for_class(class);
 
     #[cfg(all(target_os = "linux", feature = "direct-io"))]
     if desired == IoMode::Direct {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let result = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .custom_flags(libc::O_DIRECT)
-            .open(path);
-
-        match result {
-            Ok(file) => return Ok(OpenFile::new(file, IoMode::Direct)),
-            Err(ref e) if is_direct_io_unsupported(e) => {
-                DIRECT_IO_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                eprintln!(
-                    "[direct-io:fallback] file={} requested=direct effective=buffered reason=\"{}\"",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    e
-                );
-                // fall through to buffered open below
-            }
-            Err(e) => return Err(e),
-        }
+            .open(path)?;
+        return Ok(OpenFile::new(file, IoMode::Direct));
     }
     #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
     let _ = desired;
@@ -12968,16 +12973,6 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
         .truncate(false)
         .open(path)?;
     Ok(OpenFile::new(file, IoMode::Buffered))
-}
-
-/// Returns `true` for open-time errors that indicate direct I/O is unsupported
-/// by the filesystem or device.  Do **not** use for read/write errors.
-#[cfg(all(target_os = "linux", feature = "direct-io"))]
-fn is_direct_io_unsupported(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-    )
 }
 
 /// Page-aligned heap allocation for direct I/O.
@@ -13038,6 +13033,21 @@ thread_local! {
         RefCell::new(AlignedBuf::new_zeroed());
 }
 
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+const IO_URING_QUEUE_DEPTH: u32 = 256;
+
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+struct IoUringEngine {
+    ring: Mutex<IoUring>,
+}
+
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+impl std::fmt::Debug for IoUringEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringEngine").finish_non_exhaustive()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // End I/O mode abstraction
 // ---------------------------------------------------------------------------
@@ -13049,6 +13059,8 @@ struct FileManager {
     /// Read-locked for lookup (common path); write-locked only on first open of a file.
     open_files: RwLock<HashMap<String, Arc<OpenFile>>>,
     directory_fd: File,
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    io_uring: IoUringEngine,
 }
 
 impl FileManager {
@@ -13069,11 +13081,21 @@ impl FileManager {
         }
 
         let directory_fd = File::open(&db_path)?;
+        #[cfg(all(target_os = "linux", feature = "direct-io"))]
+        let io_uring = IoUring::new(IO_URING_QUEUE_DEPTH).map_err(|e| {
+            io::Error::other(format!(
+                "direct-io build requires io_uring initialization: {e}"
+            ))
+        })?;
 
         Ok(Self {
             db_directory: db_path,
             open_files: RwLock::new(HashMap::new()),
             directory_fd,
+            #[cfg(all(target_os = "linux", feature = "direct-io"))]
+            io_uring: IoUringEngine {
+                ring: Mutex::new(io_uring),
+            },
         })
     }
 
@@ -13097,8 +13119,113 @@ impl FileManager {
         // Re-check after acquiring write lock (another thread may have inserted between the two locks).
         Arc::clone(map.entry(key).or_insert_with(|| {
             let class = classify_file(filename);
-            Arc::new(open_with_fallback(&full_path, class).expect("Failed to open file"))
+            Arc::new(open_with_mode(&full_path, class).expect("Failed to open file"))
         }))
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+    fn read_page_sync(&self, block_id: &BlockId, page: &mut Page) {
+        let offset = block_offset(block_id.block_num);
+        let of = self.get_open_file(&block_id.filename);
+        *page = Page::from_bytes(of.read_page_at(offset));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    fn submit_direct_reads_uring(
+        &self,
+        reqs: &[BatchReadReq],
+        direct_indices: &[usize],
+        direct_files: &[Arc<OpenFile>],
+        offsets: &[u64],
+        pages: &mut [Page],
+    ) {
+        assert_eq!(direct_indices.len(), direct_files.len());
+        assert_eq!(direct_indices.len(), offsets.len());
+
+        let mut aligned_bufs: Vec<AlignedBuf> = Vec::with_capacity(direct_indices.len());
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(direct_indices.len());
+        let mut fds: Vec<i32> = Vec::with_capacity(direct_indices.len());
+
+        for pos in 0..direct_indices.len() {
+            aligned_bufs.push(AlignedBuf::new_zeroed());
+            let bytes = aligned_bufs[pos].as_mut_slice();
+            iovecs.push(libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            });
+            fds.push(direct_files[pos].file.as_raw_fd());
+        }
+
+        let mut ring = self.io_uring.ring.lock().unwrap();
+        let mut submitted = 0usize;
+        while submitted < direct_indices.len() {
+            let mut queued = 0usize;
+            {
+                let mut sq = ring.submission();
+                while submitted + queued < direct_indices.len() && !sq.is_full() {
+                    let request_pos = submitted + queued;
+                    let sqe = opcode::Readv::new(
+                        types::Fd(fds[request_pos]),
+                        &iovecs[request_pos] as *const libc::iovec,
+                        1,
+                    )
+                    .offset(offsets[request_pos])
+                    .build()
+                    .user_data(request_pos as u64);
+                    // SAFETY: `sqe` lives until pushed into the queue and ring capacity is checked.
+                    unsafe {
+                        sq.push(&sqe).expect("submission queue push failed");
+                    }
+                    queued += 1;
+                }
+            }
+
+            assert!(
+                queued > 0,
+                "io_uring queue depth is zero; cannot make progress"
+            );
+            ring.submit().expect("io_uring submit failed");
+
+            let mut completed = 0usize;
+            while completed < queued {
+                if ring.completion().is_empty() {
+                    ring.submit_and_wait(1)
+                        .expect("io_uring submit_and_wait failed");
+                }
+
+                let mut cq = ring.completion();
+                for cqe in &mut cq {
+                    let request_pos = cqe.user_data() as usize;
+                    let page_idx = direct_indices[request_pos];
+                    let result = cqe.result();
+                    if result < 0 {
+                        let errno = -result;
+                        panic!(
+                            "io_uring read failed for {:?}: {}",
+                            &reqs[page_idx].block_id,
+                            io::Error::from_raw_os_error(errno)
+                        );
+                    }
+
+                    let bytes_read = result as usize;
+                    let aligned_buf = aligned_bufs[request_pos].as_mut_slice();
+                    if bytes_read > aligned_buf.len() {
+                        panic!(
+                            "io_uring read returned too many bytes: got {}, page size {}",
+                            bytes_read,
+                            aligned_buf.len()
+                        );
+                    }
+                    if bytes_read < aligned_buf.len() {
+                        aligned_buf[bytes_read..].fill(0);
+                    }
+                    pages[page_idx].bytes_mut().copy_from_slice(aligned_buf);
+                    completed += 1;
+                }
+            }
+
+            submitted += queued;
+        }
     }
 }
 impl FileSystemInterface for FileManager {
@@ -13113,9 +13240,12 @@ impl FileSystemInterface for FileManager {
     }
 
     fn read(&self, block_id: &BlockId, page: &mut Page) {
-        let offset = block_offset(block_id.block_num);
-        let of = self.get_open_file(&block_id.filename);
-        *page = Page::from_bytes(of.read_page_at(offset));
+        let reqs = [BatchReadReq {
+            block_id: block_id.clone(),
+        }];
+        let mut pages = [Page::new()];
+        self.read_batch(&reqs, &mut pages);
+        *page = std::mem::take(&mut pages[0]);
     }
 
     fn write(&self, block_id: &BlockId, page: &Page) {
@@ -13130,9 +13260,12 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
-        let offset = block_offset(block_id.block_num);
-        let of = self.get_open_file(&block_id.filename);
-        buf.copy_from_slice(&of.read_page_at(offset));
+        let reqs = [BatchReadReq {
+            block_id: block_id.clone(),
+        }];
+        let mut pages = [Page::new()];
+        self.read_batch(&reqs, &mut pages);
+        buf.copy_from_slice(pages[0].bytes());
     }
 
     fn write_raw(&self, block_id: &BlockId, buf: &[u8]) {
@@ -13144,6 +13277,52 @@ impl FileSystemInterface for FileManager {
         let offset = block_offset(block_id.block_num);
         let of = self.get_open_file(&block_id.filename);
         of.write_page_at(offset, buf);
+    }
+
+    fn read_batch(&self, reqs: &[BatchReadReq], pages: &mut [Page]) {
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch read request/page length mismatch"
+        );
+
+        #[cfg(all(target_os = "linux", feature = "direct-io"))]
+        {
+            let mut direct_indices: Vec<usize> = Vec::new();
+            let mut direct_files: Vec<Arc<OpenFile>> = Vec::new();
+            let mut direct_offsets: Vec<u64> = Vec::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                let of = self.get_open_file(&req.block_id.filename);
+                match of.mode {
+                    IoMode::Buffered => {
+                        let offset = block_offset(req.block_id.block_num);
+                        pages[idx] = Page::from_bytes(of.read_page_at(offset));
+                    }
+                    IoMode::Direct => {
+                        direct_indices.push(idx);
+                        direct_files.push(of);
+                        direct_offsets.push(block_offset(req.block_id.block_num));
+                    }
+                }
+            }
+
+            if !direct_indices.is_empty() {
+                self.submit_direct_reads_uring(
+                    reqs,
+                    &direct_indices,
+                    &direct_files,
+                    &direct_offsets,
+                    pages,
+                );
+            }
+            return;
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+        for (req, page) in reqs.iter().zip(pages.iter_mut()) {
+            self.read_page_sync(&req.block_id, page);
+        }
     }
 
     /// Append a new empty block to the file.
@@ -13456,7 +13635,11 @@ mod file_manager_tests {
 
         let full_path = file_manager.db_directory.join(filename);
         let full_path_str = full_path.to_string_lossy().to_string();
-        assert!(file_manager.open_files.read().unwrap().contains_key(&full_path_str));
+        assert!(file_manager
+            .open_files
+            .read()
+            .unwrap()
+            .contains_key(&full_path_str));
     }
 
     #[test]
