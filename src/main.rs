@@ -8534,15 +8534,46 @@ impl Layout {
     }
 
     /// Encode a slice of non-null values into a dense heap payload.
-    /// Format: [null_bitmap (ceil(n/8) bytes)] [field data in schema order]
-    /// Strings are encoded as: 4-byte LE length + UTF-8 bytes.
+    /// Convenience wrapper around [`Self::encode_payload_with_nulls`].
     pub fn encode_payload(&self, values: &[Constant]) -> Vec<u8> {
         let opts: Vec<Option<Constant>> = values.iter().map(|v| Some(v.clone())).collect();
         self.encode_payload_with_nulls(&opts)
     }
 
     /// Encode values (possibly NULL) into a dense heap payload.
-    /// Null fields set the corresponding bitmap bit and contribute zero payload bytes.
+    ///
+    /// # On-disk tuple format
+    ///
+    /// A complete heap tuple stored in the record space is:
+    /// ```text
+    /// [HeapTupleHeader (24 B)][payload]
+    /// ```
+    ///
+    /// `HeapTupleHeader` (24 bytes, all little-endian):
+    /// ```text
+    /// bytes  0.. 3  payload_len (u32) — byte count of payload, NOT including UPDATE_SLACK
+    /// bytes  4..11  xmin (u64)        — creating transaction id
+    /// bytes 12..19  xmax (u64)        — deleting/updating transaction id
+    /// bytes 20..21  flags (u16)
+    /// bytes 22..23  nullmap_ptr (u16) — offset of null bitmap within payload (always 0)
+    /// ```
+    ///
+    /// `payload` produced by this function:
+    /// ```text
+    /// [null_bitmap: ceil(n/8) bytes][field data in schema order]
+    /// ```
+    ///
+    /// Null bitmap: bit `i` is 1 if field `i` is NULL.
+    ///
+    /// Per-field encoding (NULL fields contribute 0 bytes):
+    /// - `INT`:    4 bytes, little-endian `i32`
+    /// - `STRING`: 4-byte LE `u32` length prefix + actual UTF-8 bytes (no padding)
+    ///
+    /// Example — schema `[id: INT, name: VARCHAR(100), age: INT]`, values `[42, "alice", 30]`:
+    /// ```text
+    /// 1 B nullmap(0x00) | 4 B(42) | 4 B(5) + 5 B("alice") | 4 B(30)  →  18 bytes
+    /// ```
+    /// Compare to the old fixed-slot layout which always reserved `4 + 4 + (4+100) + 4 = 116 bytes`.
     pub fn encode_payload_with_nulls(&self, values: &[Option<Constant>]) -> Vec<u8> {
         let n = self.schema.fields.len();
         let bitmap_bytes = n.div_ceil(8);
