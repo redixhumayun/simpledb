@@ -290,12 +290,15 @@ fn sequential_read_qd(
     total_ops: usize,
     qd: usize,
     iterations: usize,
+    emit_metrics: bool,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
     let file = format!("seqread_qd{}_{}", qd, working_set);
     precreate_blocks_direct(&db, &file, working_set);
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
 
-    benchmark(
+    let result = benchmark(
         &format!(
             "Sequential Read QD={} (K={}, {} ops)",
             qd, working_set, total_ops
@@ -318,7 +321,15 @@ fn sequential_read_qd(
                 done += n;
             }
         },
-    )
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
 }
 
 fn random_read_qd(
@@ -326,13 +337,16 @@ fn random_read_qd(
     total_ops: usize,
     qd: usize,
     iterations: usize,
+    emit_metrics: bool,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
     let file = format!("randread_qd{}_{}", qd, working_set);
     precreate_blocks_direct(&db, &file, working_set);
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
     let mut rng = FastRng::new();
 
-    benchmark(
+    let result = benchmark(
         &format!(
             "Random Read QD={} (K={}, {} ops)",
             qd, working_set, total_ops
@@ -358,7 +372,15 @@ fn random_read_qd(
                 done += n;
             }
         },
-    )
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
 }
 
 fn multistream_scan_qd(
@@ -366,6 +388,7 @@ fn multistream_scan_qd(
     working_set: usize,
     qd: usize,
     iterations: usize,
+    emit_metrics: bool,
 ) -> BenchResult {
     let (db, _test_dir) = setup_io_test();
     let blocks_per_stream = (working_set / num_streams).max(1);
@@ -375,8 +398,10 @@ fn multistream_scan_qd(
     for name in &file_names {
         precreate_blocks_direct(&db, name, blocks_per_stream);
     }
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
 
-    benchmark(
+    let result = benchmark(
         &format!(
             "Multi-stream Scan QD={} ({}x{}blk)",
             qd, num_streams, blocks_per_stream
@@ -401,7 +426,15 @@ fn multistream_scan_qd(
                 }
             }
         },
-    )
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
 }
 
 // ============================================================================
@@ -1151,18 +1184,21 @@ fn main() {
                 io_cfg.phase1_ops,
                 qd,
                 iterations,
+                false,
             ));
             results.push(random_read_qd(
                 io_cfg.working_set_blocks,
                 io_cfg.phase1_ops,
                 qd,
                 iterations,
+                false,
             ));
             results.push(multistream_scan_qd(
                 4,
                 io_cfg.working_set_blocks,
                 qd,
                 iterations,
+                false,
             ));
         }
         // Phase 3 - no filters in JSON mode (use fsync_iterations)
@@ -1354,6 +1390,7 @@ fn main() {
                 io_cfg.phase1_ops,
                 qd,
                 iterations,
+                true,
             ));
         }
         let rand_token = format!("rand_read_qd[{}]", qd);
@@ -1363,6 +1400,7 @@ fn main() {
                 io_cfg.phase1_ops,
                 qd,
                 iterations,
+                true,
             ));
         }
         let stream_token = format!("multistream_scan_qd[{}]", qd);
@@ -1372,6 +1410,7 @@ fn main() {
                 io_cfg.working_set_blocks,
                 qd,
                 iterations,
+                true,
             ));
         }
     }

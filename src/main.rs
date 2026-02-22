@@ -13309,8 +13309,10 @@ impl IoBatchCounters {
     }
 
     fn reset(&self) {
-        self.submitted.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.completed.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.submitted
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.completed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -13551,7 +13553,9 @@ impl FileSystemInterface for FileManager {
             pages.len(),
             "batch read request/page length mismatch"
         );
-        let stats_enabled = self.io_stats_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let stats_enabled = self
+            .io_stats_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
         if stats_enabled {
             self.io_batch_counters.record_submitted(reqs.len());
         }

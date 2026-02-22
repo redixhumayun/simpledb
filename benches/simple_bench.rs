@@ -3,6 +3,7 @@
 use std::env;
 use std::error::Error;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use simpledb::{SimpleDB, TableScan};
@@ -198,9 +199,15 @@ fn run_full_table_scan_macro(
     table_name: &str,
     iterations: usize,
     prefetch_window: usize,
+    emit_metrics: bool,
 ) -> benchmark_framework::BenchResult {
     let query = format!("SELECT * FROM {}", table_name);
-    benchmark(
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
+    db.buffer_manager().enable_stats();
+    db.buffer_manager().reset_stats();
+
+    let result = benchmark(
         &format!("MACRO SELECT * (prefetch={})", prefetch_window),
         iterations,
         1,
@@ -218,7 +225,24 @@ fn run_full_table_scan_macro(
             drop(scan);
             txn.commit().unwrap();
         },
-    )
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+        if let Some(stats) = db.buffer_manager().stats() {
+            let attempted = stats.prefetch_attempted.load(Ordering::Relaxed);
+            let installed = stats.prefetch_installed.load(Ordering::Relaxed);
+            let discarded = stats.prefetch_discarded.load(Ordering::Relaxed);
+            println!(
+                "Prefetch counters [{}]: attempted={} installed={} discarded={}",
+                result.operation, attempted, installed, discarded
+            );
+        }
+    }
+    result
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -289,6 +313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &macro_table_name,
             iterations,
             0,
+            !json_output,
         ));
     }
     if should_run("macro_full_scan_prefetch", effective_filter) {
@@ -297,6 +322,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &macro_table_name,
             iterations,
             prefetch_window_blocks,
+            !json_output,
         ));
     }
 
