@@ -35,7 +35,8 @@ fn precreate_blocks(db: &SimpleDB, file: &str, count: usize) {
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        db.file_manager.write(&BlockId::new(file.clone(), block_num), &page);
+        db.file_manager
+            .write(&BlockId::new(file.clone(), block_num), &page);
     }
 }
 

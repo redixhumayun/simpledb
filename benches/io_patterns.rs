@@ -14,7 +14,7 @@ use simpledb::{
     },
     direct_io_fallback_count,
     test_utils::generate_random_number,
-    BlockId, LogManager, Page, SimpleDB, TestDir,
+    BatchReadReq, BlockId, LogManager, Page, SimpleDB, TestDir,
 };
 
 type BenchFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
@@ -121,7 +121,8 @@ fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        db.file_manager.write(&BlockId::new(file.to_string(), block_num), &page);
+        db.file_manager
+            .write(&BlockId::new(file.to_string(), block_num), &page);
     }
 }
 
@@ -279,6 +280,125 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), block_idx);
                 db.file_manager.write(&block_id, &page);
+            }
+        },
+    )
+}
+
+fn sequential_read_qd(
+    working_set: usize,
+    total_ops: usize,
+    qd: usize,
+    iterations: usize,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("seqread_qd{}_{}", qd, working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+
+    benchmark(
+        &format!(
+            "Sequential Read QD={} (K={}, {} ops)",
+            qd, working_set, total_ops
+        ),
+        iterations,
+        2,
+        || {
+            let mut done = 0usize;
+            while done < total_ops {
+                let n = (total_ops - done).min(qd.max(1));
+                let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                let mut pages: Vec<Page> = Vec::with_capacity(n);
+                for j in 0..n {
+                    reqs.push(BatchReadReq {
+                        block_id: BlockId::new(file.clone(), (done + j) % working_set),
+                    });
+                    pages.push(Page::new());
+                }
+                db.file_manager.read_batch(&reqs, &mut pages);
+                done += n;
+            }
+        },
+    )
+}
+
+fn random_read_qd(
+    working_set: usize,
+    total_ops: usize,
+    qd: usize,
+    iterations: usize,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("randread_qd{}_{}", qd, working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+    let mut rng = FastRng::new();
+
+    benchmark(
+        &format!(
+            "Random Read QD={} (K={}, {} ops)",
+            qd, working_set, total_ops
+        ),
+        iterations,
+        2,
+        || {
+            let random_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
+            let mut done = 0usize;
+            while done < total_ops {
+                let n = (total_ops - done).min(qd.max(1));
+                let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                let mut pages: Vec<Page> = Vec::with_capacity(n);
+                for j in 0..n {
+                    reqs.push(BatchReadReq {
+                        block_id: BlockId::new(file.clone(), random_indices[done + j]),
+                    });
+                    pages.push(Page::new());
+                }
+                db.file_manager.read_batch(&reqs, &mut pages);
+                done += n;
+            }
+        },
+    )
+}
+
+fn multistream_scan_qd(
+    num_streams: usize,
+    working_set: usize,
+    qd: usize,
+    iterations: usize,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let blocks_per_stream = (working_set / num_streams).max(1);
+    let file_names: Vec<String> = (0..num_streams)
+        .map(|s| format!("multi_stream_qd{}_{}_{}", qd, num_streams, s))
+        .collect();
+    for name in &file_names {
+        precreate_blocks_direct(&db, name, blocks_per_stream);
+    }
+
+    benchmark(
+        &format!(
+            "Multi-stream Scan QD={} ({}x{}blk)",
+            qd, num_streams, blocks_per_stream
+        ),
+        iterations,
+        1,
+        || {
+            for file in &file_names {
+                let mut done = 0usize;
+                while done < blocks_per_stream {
+                    let n = (blocks_per_stream - done).min(qd.max(1));
+                    let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                    let mut pages: Vec<Page> = Vec::with_capacity(n);
+                    for j in 0..n {
+                        reqs.push(BatchReadReq {
+                            block_id: BlockId::new(file.clone(), done + j),
+                        });
+                        pages.push(Page::new());
+                    }
+                    db.file_manager.read_batch(&reqs, &mut pages);
+                    done += n;
+                }
             }
         },
     )
@@ -615,7 +735,8 @@ fn onepass_seq_scan(working_set: usize, iterations: usize) -> BenchResult {
         || {
             let mut page = Page::new();
             for i in 0..working_set {
-                db.file_manager.read(&BlockId::new(file.clone(), i), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file.clone(), i), &mut page);
             }
         },
     )
@@ -643,7 +764,8 @@ fn low_locality_rand_read(working_set: usize, iterations: usize) -> BenchResult 
             }
             let mut page = Page::new();
             for &idx in &indices {
-                db.file_manager.read(&BlockId::new(file.clone(), idx), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file.clone(), idx), &mut page);
             }
         },
     )
@@ -704,7 +826,8 @@ fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult 
         || {
             let mut page = Page::new();
             for i in 0..working_set {
-                db.file_manager.read(&BlockId::new(file_name.clone(), i), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file_name.clone(), i), &mut page);
             }
         },
         || {
@@ -736,7 +859,8 @@ fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchR
             }
             let mut page = Page::new();
             for &idx in &indices {
-                db.file_manager.read(&BlockId::new(file_name.clone(), idx), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file_name.clone(), idx), &mut page);
             }
         },
         || {
@@ -751,7 +875,11 @@ fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchR
 /// each iteration. Forces real NVMe reads on every iteration, making FM-level
 /// lock contention visible even under buffered I/O.
 #[cfg(target_os = "linux")]
-fn multi_stream_scan_evict(num_streams: usize, working_set: usize, iterations: usize) -> BenchResult {
+fn multi_stream_scan_evict(
+    num_streams: usize,
+    working_set: usize,
+    iterations: usize,
+) -> BenchResult {
     let (db, test_dir) = setup_io_test();
     let blocks_per_stream = (working_set / num_streams).max(1);
 
@@ -765,7 +893,10 @@ fn multi_stream_scan_evict(num_streams: usize, working_set: usize, iterations: u
     }
 
     benchmark_with_teardown(
-        &format!("Multi-stream Scan+Evict {}x{}blk", num_streams, blocks_per_stream),
+        &format!(
+            "Multi-stream Scan+Evict {}x{}blk",
+            num_streams, blocks_per_stream
+        ),
         iterations,
         1,
         || {
@@ -877,6 +1008,7 @@ struct IoBenchConfig {
     mixed_ops: usize,
     durability_ops: usize,
     concurrent_ops: usize,
+    prefetch_window_blocks: usize,
 }
 
 /// Parse io_patterns-specific flags from argv (second pass after parse_bench_args).
@@ -891,6 +1023,7 @@ fn parse_io_args() -> IoBenchConfig {
     let mut mixed_ops = 500usize;
     let mut durability_ops = 1000usize;
     let mut concurrent_ops = 100usize;
+    let mut prefetch_window_blocks = 16usize;
     let mut phase1_ops_explicit = false;
     let mut mixed_ops_explicit = false;
     let mut durability_ops_explicit = false;
@@ -926,8 +1059,15 @@ fn parse_io_args() -> IoBenchConfig {
                 concurrent_ops = val.parse().unwrap_or(concurrent_ops);
                 concurrent_ops_explicit = true;
             }
+        } else if arg == "--prefetch-window" {
+            if let Some(val) = iter.next() {
+                prefetch_window_blocks = val.parse().unwrap_or(prefetch_window_blocks);
+            }
         } else if arg == "--json" {
             // Handled by parse_bench_args (first pass).
+        } else if arg == "--bench" {
+            // Consumed by cargo bench harness; ignore optional value.
+            let _ = iter.next();
         } else if arg == "--filter" {
             // Handled by parse_bench_args (first pass).
             let _ = iter.next();
@@ -977,6 +1117,7 @@ fn parse_io_args() -> IoBenchConfig {
         mixed_ops,
         durability_ops,
         concurrent_ops,
+        prefetch_window_blocks,
     }
 }
 
@@ -1004,7 +1145,26 @@ fn main() {
             random_read(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
             random_write(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
         ];
-
+        for qd in [1usize, 4, 16, 32] {
+            results.push(sequential_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+            ));
+            results.push(random_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+            ));
+            results.push(multistream_scan_qd(
+                4,
+                io_cfg.working_set_blocks,
+                qd,
+                iterations,
+            ));
+        }
         // Phase 3 - no filters in JSON mode (use fsync_iterations)
         results.push(wal_append_no_fsync(fsync_iterations));
         results.push(wal_append_immediate_fsync(fsync_iterations));
@@ -1080,7 +1240,11 @@ fn main() {
             iterations,
         ));
         #[cfg(target_os = "linux")]
-        results.push(multi_stream_scan_evict(4, io_cfg.working_set_blocks, iterations));
+        results.push(multi_stream_scan_evict(
+            4,
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
 
         // Phase 6 - random write durability (use fsync_iterations, working_set_blocks ops)
         results.push(random_write_durability(
@@ -1135,6 +1299,7 @@ fn main() {
     println!("Mixed ops:           {}", io_cfg.mixed_ops);
     println!("Durability ops:      {}", io_cfg.durability_ops);
     println!("Concurrent ops:      {}", io_cfg.concurrent_ops);
+    println!("Prefetch window:     {}", io_cfg.prefetch_window_blocks);
     println!(
         "Direct I/O:          {}",
         if cfg!(feature = "direct-io") {
@@ -1180,6 +1345,35 @@ fn main() {
             io_cfg.phase1_ops,
             iterations,
         ));
+    }
+    for qd in [1usize, 4, 16, 32] {
+        let seq_token = format!("seq_read_qd[{}]", qd);
+        if should_run(&seq_token, filter_ref) {
+            phase1_results.push(sequential_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+            ));
+        }
+        let rand_token = format!("rand_read_qd[{}]", qd);
+        if should_run(&rand_token, filter_ref) {
+            phase1_results.push(random_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+            ));
+        }
+        let stream_token = format!("multistream_scan_qd[{}]", qd);
+        if should_run(&stream_token, filter_ref) {
+            phase1_results.push(multistream_scan_qd(
+                4,
+                io_cfg.working_set_blocks,
+                qd,
+                iterations,
+            ));
+        }
     }
 
     render_latency_section(

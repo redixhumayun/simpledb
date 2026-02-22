@@ -283,6 +283,9 @@ impl BufferFrame {
 pub struct BufferStats {
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
+    pub prefetch_attempted: AtomicUsize,
+    pub prefetch_installed: AtomicUsize,
+    pub prefetch_discarded: AtomicUsize,
 }
 
 impl Default for BufferStats {
@@ -296,6 +299,9 @@ impl BufferStats {
         Self {
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            prefetch_attempted: AtomicUsize::new(0),
+            prefetch_installed: AtomicUsize::new(0),
+            prefetch_discarded: AtomicUsize::new(0),
         }
     }
 
@@ -309,6 +315,12 @@ impl BufferStats {
     pub fn reset(&self) {
         self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
         self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.prefetch_attempted
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.prefetch_installed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.prefetch_discarded
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -522,6 +534,11 @@ impl BufferManager {
         if reqs.is_empty() {
             return 0;
         }
+        if let Some(stats) = self.stats.get() {
+            stats
+                .prefetch_attempted
+                .fetch_add(reqs.len(), Ordering::Relaxed);
+        }
 
         let mut pages: Vec<Page> = (0..reqs.len()).map(|_| Page::new()).collect();
         self.file_manager.read_batch(&reqs, &mut pages);
@@ -555,11 +572,17 @@ impl BufferManager {
                     .unwrap()
                     .insert(reservation.block_id, Arc::downgrade(&frame));
                 installed += 1;
+                if let Some(stats) = self.stats.get() {
+                    stats.prefetch_installed.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 // LRU/SIEVE remove victims from list during eviction. Reinsert free
                 // frames into replacement state even if this prefetch becomes redundant.
                 self.policy
                     .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
+                if let Some(stats) = self.stats.get() {
+                    stats.prefetch_discarded.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             let became_unpinned = {
