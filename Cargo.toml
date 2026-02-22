@@ -39,9 +39,10 @@ page-1m = []
 
 # Enable direct I/O (O_DIRECT) for data files. WAL always uses buffered I/O.
 # Linux-only in this phase. Default builds remain fully buffered.
-direct-io = []
+direct-io = ["dep:io-uring"]
 
 [dependencies]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+io-uring = { version = "0.7", optional = true }
