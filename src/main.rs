@@ -18,7 +18,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
         Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
@@ -121,9 +121,10 @@ impl SimpleDB {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis();
+            .as_nanos();
         let thread_id = std::thread::current().id();
-        let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
+        let suffix = crate::test_utils::generate_random_number();
+        let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}_{suffix}"));
         let db = Self::new(&test_dir, num_buffers, true, lock_timeout_ms);
         (db, test_dir)
     }
@@ -7849,7 +7850,19 @@ pub struct TableScan {
 }
 
 impl TableScan {
-    const PREFETCH_WINDOW_BLOCKS: usize = 16;
+    fn default_prefetch_window_cell() -> &'static AtomicUsize {
+        static TABLE_SCAN_DEFAULT_PREFETCH_WINDOW_BLOCKS: AtomicUsize = AtomicUsize::new(16);
+        &TABLE_SCAN_DEFAULT_PREFETCH_WINDOW_BLOCKS
+    }
+
+    pub fn default_prefetch_window_blocks() -> usize {
+        Self::default_prefetch_window_cell().load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_default_prefetch_window_blocks(window_blocks: usize) {
+        Self::default_prefetch_window_cell()
+            .store(window_blocks, std::sync::atomic::Ordering::Relaxed);
+    }
 
     pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
@@ -7861,7 +7874,7 @@ impl TableScan {
             record_page: None,
             current_slot: None,
             table_name: table_name.to_string(),
-            prefetch_window: Self::PREFETCH_WINDOW_BLOCKS,
+            prefetch_window: Self::default_prefetch_window_blocks(),
             next_prefetch_block: 1,
         };
 
@@ -12475,9 +12488,7 @@ mod buffer_manager_tests {
         thread,
     };
 
-    use crate::{
-        page::test_helpers, BlockId, BufferManager, Layout, Lsn, Page, Schema, SimpleDB,
-    };
+    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Page, Schema, SimpleDB};
 
     const BUFFER_FIELD: &str = "val";
 
@@ -12505,7 +12516,12 @@ mod buffer_manager_tests {
         buffer_manager.unpin(buffer);
     }
 
-    fn write_row_direct(file_manager: &crate::SharedFS, layout: &Layout, block_id: &BlockId, value: i32) {
+    fn write_row_direct(
+        file_manager: &crate::SharedFS,
+        layout: &Layout,
+        block_id: &BlockId,
+        value: i32,
+    ) {
         let mut page = Page::new();
         test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
             .expect("initialize heap page");
@@ -12712,7 +12728,7 @@ mod buffer_manager_tests {
                           barrier: Arc<Barrier>| {
             thread::spawn(move || {
                 barrier.wait();
-                let _installed = bm.prefetch(&file, 0, 8);
+                let installed = bm.prefetch(&file, 0, 8);
                 barrier.wait();
 
                 for idx in 0..8 {
@@ -12726,6 +12742,7 @@ mod buffer_manager_tests {
                     bm.unpin(buffer);
                     assert_eq!(value, idx as i32, "worker {} saw wrong value", worker_id);
                 }
+                installed
             })
         };
 
@@ -12748,8 +12765,13 @@ mod buffer_manager_tests {
 
         barrier.wait();
         barrier.wait();
-        t1.join().expect("worker 1 panicked");
-        t2.join().expect("worker 2 panicked");
+        let installed_1 = t1.join().expect("worker 1 panicked");
+        let installed_2 = t2.join().expect("worker 2 panicked");
+
+        assert!(
+            installed_1 + installed_2 <= 8,
+            "duplicate-install race should not install same block twice"
+        );
 
         buffer_manager.assert_buffer_count_invariant();
         assert_eq!(
@@ -12757,6 +12779,42 @@ mod buffer_manager_tests {
             pool_size,
             "all buffers must be unpinned after concurrent prefetch test"
         );
+    }
+
+    #[test]
+    fn test_prefetch_best_effort_when_no_victim_available() {
+        let pool_size = 3usize;
+        let (db, _test_dir) = SimpleDB::new_for_test(pool_size, 5000);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = buffer_layout();
+        let file = "prefetch_no_victim.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..6)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, &layout, &block, i);
+                block
+            })
+            .collect();
+
+        let mut pinned = Vec::new();
+        for block in blocks.iter().take(pool_size) {
+            pinned.push(buffer_manager.pin(block).expect("pin to exhaust pool"));
+        }
+        assert_eq!(buffer_manager.available(), 0, "pool should be fully pinned");
+
+        let installed = buffer_manager.prefetch(&file, pool_size, 3);
+        assert_eq!(
+            installed, 0,
+            "prefetch should be best-effort and non-blocking"
+        );
+
+        for frame in pinned {
+            buffer_manager.unpin(frame);
+        }
+        buffer_manager.assert_buffer_count_invariant();
+        assert_eq!(buffer_manager.available(), pool_size);
     }
 }
 
@@ -12976,6 +13034,12 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn append(&self, filename: String) -> BlockId;
     fn sync(&self, filename: &str);
     fn sync_directory(&self);
+    fn enable_io_stats(&self) {}
+    fn disable_io_stats(&self) {}
+    fn io_batch_counters(&self) -> (usize, usize) {
+        (0, 0)
+    }
+    fn reset_io_batch_counters(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -13220,6 +13284,36 @@ impl std::fmt::Debug for IoUringEngine {
 // End I/O mode abstraction
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default)]
+struct IoBatchCounters {
+    submitted: AtomicUsize,
+    completed: AtomicUsize,
+}
+
+impl IoBatchCounters {
+    fn record_submitted(&self, n: usize) {
+        self.submitted
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_completed(&self, n: usize) {
+        self.completed
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (usize, usize) {
+        (
+            self.submitted.load(std::sync::atomic::Ordering::Relaxed),
+            self.completed.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn reset(&self) {
+        self.submitted.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.completed.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The file manager struct that manages the files in the database
 #[derive(Debug)]
 struct FileManager {
@@ -13227,6 +13321,8 @@ struct FileManager {
     /// Read-locked for lookup (common path); write-locked only on first open of a file.
     open_files: RwLock<HashMap<String, Arc<OpenFile>>>,
     directory_fd: File,
+    io_stats_enabled: AtomicBool,
+    io_batch_counters: IoBatchCounters,
     #[cfg(all(target_os = "linux", feature = "direct-io"))]
     io_uring: IoUringEngine,
 }
@@ -13260,6 +13356,8 @@ impl FileManager {
             db_directory: db_path,
             open_files: RwLock::new(HashMap::new()),
             directory_fd,
+            io_stats_enabled: AtomicBool::new(false),
+            io_batch_counters: IoBatchCounters::default(),
             #[cfg(all(target_os = "linux", feature = "direct-io"))]
             io_uring: IoUringEngine {
                 ring: Mutex::new(io_uring),
@@ -13453,6 +13551,10 @@ impl FileSystemInterface for FileManager {
             pages.len(),
             "batch read request/page length mismatch"
         );
+        let stats_enabled = self.io_stats_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        if stats_enabled {
+            self.io_batch_counters.record_submitted(reqs.len());
+        }
 
         #[cfg(all(target_os = "linux", feature = "direct-io"))]
         {
@@ -13484,12 +13586,19 @@ impl FileSystemInterface for FileManager {
                     pages,
                 );
             }
+            if stats_enabled {
+                self.io_batch_counters.record_completed(reqs.len());
+            }
             return;
         }
 
         #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
         for (req, page) in reqs.iter().zip(pages.iter_mut()) {
             self.read_page_sync(&req.block_id, page);
+        }
+        #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+        if stats_enabled {
+            self.io_batch_counters.record_completed(reqs.len());
         }
     }
 
@@ -13517,6 +13626,24 @@ impl FileSystemInterface for FileManager {
 
     fn sync_directory(&self) {
         self.directory_fd.sync_all().unwrap();
+    }
+
+    fn enable_io_stats(&self) {
+        self.io_stats_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn disable_io_stats(&self) {
+        self.io_stats_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn io_batch_counters(&self) -> (usize, usize) {
+        self.io_batch_counters.get()
+    }
+
+    fn reset_io_batch_counters(&self) {
+        self.io_batch_counters.reset();
     }
 }
 

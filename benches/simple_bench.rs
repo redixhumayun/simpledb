@@ -1,10 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
-use simpledb::SimpleDB;
+use simpledb::{SimpleDB, TableScan};
 
 use simpledb::benchmark_framework;
 
@@ -139,8 +140,90 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
     })
 }
 
+fn parse_macro_args() -> (usize, usize) {
+    let args: Vec<String> = env::args().collect();
+    let mut working_set_blocks = 256usize;
+    let mut prefetch_window_blocks = 16usize;
+    let mut i = 1usize;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--macro-working-set-blocks" => {
+                if i + 1 < args.len() {
+                    working_set_blocks = args[i + 1].parse().unwrap_or(working_set_blocks);
+                    i += 1;
+                }
+            }
+            "--prefetch-window" => {
+                if i + 1 < args.len() {
+                    prefetch_window_blocks = args[i + 1].parse().unwrap_or(prefetch_window_blocks);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    (working_set_blocks, prefetch_window_blocks)
+}
+
+fn setup_macro_scan_table(
+    db: &SimpleDB,
+    working_set_blocks: usize,
+) -> Result<String, Box<dyn Error>> {
+    let table_name = format!("macro_scan_{}", working_set_blocks);
+    let create_sql = format!("CREATE TABLE {}(id int, v int)", table_name);
+    let txn = db.new_tx();
+    db.planner.execute_update(create_sql, Arc::clone(&txn))?;
+    txn.commit()?;
+
+    let table_file = format!("{}.tbl", table_name);
+    let mut next_id = 0usize;
+    let txn = db.new_tx();
+    while db.file_manager.length(table_file.clone()) < working_set_blocks {
+        let insert_sql = format!(
+            "INSERT INTO {}(id, v) VALUES ({}, {})",
+            table_name, next_id, next_id
+        );
+        db.planner.execute_update(insert_sql, Arc::clone(&txn))?;
+        next_id += 1;
+    }
+    txn.commit()?;
+    Ok(table_name)
+}
+
+fn run_full_table_scan_macro(
+    db: &SimpleDB,
+    table_name: &str,
+    iterations: usize,
+    prefetch_window: usize,
+) -> benchmark_framework::BenchResult {
+    let query = format!("SELECT * FROM {}", table_name);
+    benchmark(
+        &format!("MACRO SELECT * (prefetch={})", prefetch_window),
+        iterations,
+        1,
+        || {
+            TableScan::set_default_prefetch_window_blocks(prefetch_window);
+            let txn = db.new_tx();
+            let plan = db
+                .planner
+                .create_query_plan(query.clone(), Arc::clone(&txn))
+                .unwrap();
+            let mut scan = plan.open();
+            while let Some(row) = scan.next() {
+                row.unwrap();
+            }
+            drop(scan);
+            txn.commit().unwrap();
+        },
+    )
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
+    let (macro_working_set_blocks, prefetch_window_blocks) = parse_macro_args();
     let filter_ref = filter.as_deref();
 
     if !json_output {
@@ -169,8 +252,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Populate with initial data
     populate_table(&db, 100)?;
+    let macro_table_name = setup_macro_scan_table(&db, macro_working_set_blocks)?;
     if !json_output {
         println!("Populated table with 100 records");
+        println!(
+            "Prepared macro scan table with {} blocks",
+            macro_working_set_blocks
+        );
         println!();
         print_header();
     }
@@ -194,6 +282,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if should_run("DELETE", effective_filter) {
         results.push(run_delete_benchmarks(&db, iterations));
+    }
+    if should_run("macro_full_scan_none", effective_filter) {
+        results.push(run_full_table_scan_macro(
+            &db,
+            &macro_table_name,
+            iterations,
+            0,
+        ));
+    }
+    if should_run("macro_full_scan_prefetch", effective_filter) {
+        results.push(run_full_table_scan_macro(
+            &db,
+            &macro_table_name,
+            iterations,
+            prefetch_window_blocks,
+        ));
     }
 
     let filtered_results = results;
