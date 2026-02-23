@@ -5,6 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use simpledb::{SimpleDB, TableScan};
 
@@ -16,6 +17,25 @@ fn cleanup_bench_data() {
     let bench_path = Path::new("./bench-data");
     if bench_path.exists() {
         std::fs::remove_dir_all(bench_path).ok();
+    }
+}
+
+fn log_phase_start(label: &str, enabled: bool) -> Option<Instant> {
+    if enabled {
+        println!("[phase] start: {}", label);
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+fn log_phase_end(label: &str, start: Option<Instant>, enabled: bool) {
+    if enabled {
+        if let Some(t0) = start {
+            println!("[phase] end: {} (elapsed: {:?})", label, t0.elapsed());
+        } else {
+            println!("[phase] end: {}", label);
+        }
     }
 }
 
@@ -141,9 +161,9 @@ fn run_delete_benchmarks(db: &SimpleDB, iterations: usize) -> benchmark_framewor
     })
 }
 
-fn parse_macro_args() -> (usize, usize) {
+fn parse_macro_args(buffer_pool_blocks: usize) -> (usize, usize) {
     let args: Vec<String> = env::args().collect();
-    let mut working_set_blocks = 256usize;
+    let mut working_set_blocks = buffer_pool_blocks.saturating_mul(2).max(1);
     let mut prefetch_window_blocks = 16usize;
     let mut i = 1usize;
 
@@ -182,6 +202,8 @@ fn setup_macro_scan_table(
     let table_file = format!("{}.tbl", table_name);
     let mut next_id = 0usize;
     let txn = db.new_tx();
+    let mut last_blocks = db.file_manager.length(table_file.clone());
+    let mut last_reported_block_group = 0usize;
     while db.file_manager.length(table_file.clone()) < working_set_blocks {
         let insert_sql = format!(
             "INSERT INTO {}(id, v) VALUES ({}, {})",
@@ -189,8 +211,31 @@ fn setup_macro_scan_table(
         );
         db.planner.execute_update(insert_sql, Arc::clone(&txn))?;
         next_id += 1;
+
+        let blocks = db.file_manager.length(table_file.clone());
+        if blocks != last_blocks {
+            last_blocks = blocks;
+            let block_group = blocks / 64;
+            if block_group > last_reported_block_group {
+                last_reported_block_group = block_group;
+                println!(
+                    "[setup_macro_scan_table] blocks={} inserts_so_far={}",
+                    blocks, next_id
+                );
+            }
+        }
     }
+    println!(
+        "[setup_macro_scan_table] pre-commit blocks={} total_inserts={}",
+        db.file_manager.length(table_file.clone()),
+        next_id
+    );
+    let commit_start = Instant::now();
     txn.commit()?;
+    println!(
+        "[setup_macro_scan_table] commit_done elapsed={:?}",
+        commit_start.elapsed()
+    );
     Ok(table_name)
 }
 
@@ -198,6 +243,8 @@ fn run_full_table_scan_macro(
     db: &SimpleDB,
     table_name: &str,
     iterations: usize,
+    buffer_pool_blocks: usize,
+    working_set_blocks: usize,
     prefetch_window: usize,
     emit_metrics: bool,
 ) -> benchmark_framework::BenchResult {
@@ -207,8 +254,13 @@ fn run_full_table_scan_macro(
     db.buffer_manager().enable_stats();
     db.buffer_manager().reset_stats();
 
+    let op_label = format!(
+        "MACRO SELECT * (pool={}, ws={}, prefetch={})",
+        buffer_pool_blocks, working_set_blocks, prefetch_window
+    );
+    let phase_start = log_phase_start(&op_label, emit_metrics);
     let result = benchmark(
-        &format!("MACRO SELECT * (prefetch={})", prefetch_window),
+        &op_label,
         iterations,
         1,
         || {
@@ -226,6 +278,7 @@ fn run_full_table_scan_macro(
             txn.commit().unwrap();
         },
     );
+    log_phase_end(&op_label, phase_start, emit_metrics);
     if emit_metrics {
         let (submitted, completed) = db.file_manager.io_batch_counters();
         println!(
@@ -246,8 +299,8 @@ fn run_full_table_scan_macro(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (iterations, _num_buffers, json_output, filter) = parse_bench_args();
-    let (macro_working_set_blocks, prefetch_window_blocks) = parse_macro_args();
+    let (iterations, num_buffers, json_output, filter) = parse_bench_args();
+    let (macro_working_set_blocks, prefetch_window_blocks) = parse_macro_args(num_buffers);
     let filter_ref = filter.as_deref();
 
     if !json_output {
@@ -266,23 +319,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     cleanup_bench_data();
 
     // Initialize database with clean=true for fresh benchmark runs
-    let db = SimpleDB::new("./bench-data", 64, true, 100);
+    let db = SimpleDB::new("./bench-data", num_buffers, true, 100);
 
     // Setup test table
+    let phase = log_phase_start("setup_test_table", !json_output);
     setup_test_table(&db)?;
+    log_phase_end("setup_test_table", phase, !json_output);
     if !json_output {
         println!("Created benchmark table with schema: id (int), name (varchar(20)), age (int)");
     }
 
     // Populate with initial data
+    let phase = log_phase_start("populate_table", !json_output);
     populate_table(&db, 100)?;
+    log_phase_end("populate_table", phase, !json_output);
+    let phase = log_phase_start("setup_macro_scan_table", !json_output);
     let macro_table_name = setup_macro_scan_table(&db, macro_working_set_blocks)?;
+    log_phase_end("setup_macro_scan_table", phase, !json_output);
     if !json_output {
         println!("Populated table with 100 records");
+        println!("Buffer pool blocks: {}", num_buffers);
         println!(
             "Prepared macro scan table with {} blocks",
             macro_working_set_blocks
         );
+        println!("Macro prefetch window: {}", prefetch_window_blocks);
         println!();
         print_header();
     }
@@ -312,6 +373,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             &db,
             &macro_table_name,
             iterations,
+            num_buffers,
+            macro_working_set_blocks,
             0,
             !json_output,
         ));
@@ -321,6 +384,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             &db,
             &macro_table_name,
             iterations,
+            num_buffers,
+            macro_working_set_blocks,
             prefetch_window_blocks,
             !json_output,
         ));

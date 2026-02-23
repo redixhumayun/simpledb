@@ -13,6 +13,15 @@ Add a minimal async/batched I/O path and targeted benchmarks that measure perfor
 
 Primary question: does direct I/O become more competitive when we overlap I/O and raise outstanding requests?
 
+## Current decision (implementation policy)
+
+For this repository's current target (single Linux host, non-production validation):
+
+1. Use the `io-uring` Rust crate (`tokio-rs/io-uring`) for integration.
+2. In `--features direct-io` builds, `io_uring` is the first-choice and required backend for data-file reads.
+3. If `io_uring` initialization fails in a `direct-io` build, fail fast with a clear startup error.
+4. Do not add a runtime backend matrix (`sync` vs `io_uring`) during this phase; keep experiment axes focused on `buffered` vs `direct`.
+
 ## Concurrency Model Matrix
 
 Queue-depth outcomes depend on both file-manager serialization and API shape.
@@ -64,10 +73,9 @@ Two components, both required for this layer to be useful:
 `FileManager`. Caller submits a list of (block_id, buffer) pairs; FM issues all of
 them to io_uring and blocks until all completions are harvested. QD = batch size.
 
-Options for the FM backend:
-1. Linux-first `io_uring`.
-2. Portable fallback: worker-pool + blocking `pread`/`pwrite` (simpler, still achieves
-   QD=N via thread concurrency, but conflates threading with async I/O).
+Backend choice for this project phase:
+1. Linux-first `io_uring` via the `io-uring` crate.
+2. No worker-pool fallback in `direct-io` mode for this phase (keeps benchmark matrix simple).
 
 **2b — Prefetch hints at the scan operator layer**: the buffer manager does not detect
 access patterns — that responsibility belongs to the layer that has the knowledge.
@@ -87,6 +95,71 @@ but no async/await and no changes to the iterator protocol.
 Heuristic detection inside the BM is explicitly rejected: it is reactive (misses the
 first window), wrong for concurrent scans on the same file, and encodes access-pattern
 knowledge in the wrong layer.
+
+#### BM prefetch algorithm (concurrency-safe)
+
+High-level flow for `buffer_manager.prefetch(file, start_block, count)`:
+
+1. Build candidate block list.
+   Skip blocks already resident (check under per-block latch + resident shard).
+
+2. Reserve frames for candidates (best-effort).
+   For each candidate, call victim selection and reserve one frame by transitioning
+   pin count from 0 → 1. This prevents eviction/reuse while I/O is in flight.
+
+3. Issue FM batch read.
+   Call `file_manager.read_batch(...)` for reserved candidates and collect page data.
+
+4. Install prefetched pages with a final resident recheck.
+   For each candidate block, reacquire the per-block latch and recheck resident state:
+   - If block is now resident, discard this prefetched copy.
+   - If still absent, copy data into reserved frame, set `block_id`, update replacement
+     policy, and insert resident mapping.
+
+5. Release reservations.
+   Reserved frames are unpinned (1 → 0) whether install succeeds or is discarded, so
+   `num_available` accounting returns to baseline after prefetch completion.
+
+Why recheck in step 4:
+- While prefetch I/O is in flight, another thread may call `pin()` for the same block
+  and install it in a different frame. Recheck prevents duplicate/conflicting installs.
+
+#### Phase 2 execution order (concrete)
+
+1. Add `read_batch_raw`/batched FM interface with `io_uring` implementation.
+2. Route existing single-page reads through the same backend (batch size = 1) in `direct-io` mode.
+3. Add BM prefetch API (`prefetch(file, start_block, count)`) and wire scan operators to call it.
+4. Add `io_patterns` qd benchmarks (`seq_read_qd`, `rand_read_qd`, `multistream_scan_qd`).
+5. Add first macro benchmark (`SELECT * FROM t`) with minimal axes only.
+
+#### Next implementation tasks
+
+1. Make prefetch window configurable.
+   Replace hardcoded `TableScan` window with config/benchmark arg; initial macro runs
+   should use `none` and one tuned candidate window (`16`).
+
+2. Add queue-depth micro-benchmarks in `benches/io_patterns.rs`.
+   Implement `seq_read_qd{1,4,16,32}`, `rand_read_qd{1,4,16,32}`, and
+   `multistream_scan_qd{1,4,16,32}`; drive these through `read_batch` rather than thread fanout.
+
+3. Add first macro benchmark slice for Layer 2 validation.
+   Full table scan (`SELECT * FROM t`) with axes:
+   - buffered vs direct
+   - prefetch window `none/16`
+   - fixed I/O-bound working set (single value, e.g. `2x` buffer pool)
+
+4. Add minimal instrumentation for observability.
+   - FM: batch submitted/completed counters
+   - BM: prefetch attempted/installed/discarded counters
+   - print counters in benchmark output
+
+5. Tighten tests.
+   - test partial prefetch when no free victim (best-effort semantics)
+   - test duplicate-install race handling (resident recheck path)
+
+6. Run full verification matrix from `AGENTS.md`.
+   - required build/test feature combinations
+   - benchmark runs for decision signal
 
 The minimum useful increment is Layers 1+2 together. Layer 1 alone changes nothing
 observable at the storage level.
@@ -121,9 +194,9 @@ Micro-benchmarks cannot validate Layer 2 — they bypass the buffer manager and 
 operator, which are the layers that prefetch hints flow through. Full-stack benchmarks
 are required to measure the actual end-to-end effect of prefetching.
 
-All macro-benchmarks must size the working set relative to the buffer pool to force
-real I/O. Suggested parameter: 1x, 2x, 4x buffer pool size (analogous to
-`hot/pressure/thrash` regimes).
+Initial Layer 2 macro runs should use a single fixed I/O-bound working set
+(e.g., `2x` buffer pool) to keep the matrix small. Add multi-regime (`1x/2x/4x`)
+only if first-pass results are ambiguous.
 
 Benchmarks:
 
@@ -144,8 +217,8 @@ Benchmarks:
 
 Comparison axes for all macro-benchmarks:
 - Buffered vs direct I/O
-- Prefetch window size (none, 4, 16, 32 pages)
-- Working set size (1x, 2x, 4x buffer pool)
+- Prefetch window size (initially `none` vs `16`; expand later if needed)
+- Working set size (initially fixed at one I/O-bound value; expand later if needed)
 
 Output metrics:
 - Total query time
@@ -173,7 +246,7 @@ Run with:
 ## Implementation phases
 
 1. Phase 1: migrate FM to `read_at`/`write_at`, restructure mutex scope.
-2. Phase 2: add io_uring backend at FM layer + buffer manager prefetch window; add queue-depth benchmarks.
+2. Phase 2: add `io_uring` backend at FM layer + buffer manager prefetch window; add queue-depth benchmarks.
 3. Phase 3: evaluate scan-operator pipeline integration (async/await, overlapping CPU and I/O).
 
 ## Prerequisite: switch from seek+read to pread/pwrite
