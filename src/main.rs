@@ -49,6 +49,18 @@ type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 //  Shared filesystem trait object used across the database components
 type SharedFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalMode {
+    #[default]
+    Durable,
+    UnsafeNoWal,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuntimeOptions {
+    pub wal_mode: WalMode,
+}
+
 /// The database struct
 pub struct SimpleDB {
     db_directory: PathBuf,
@@ -69,10 +81,27 @@ impl SimpleDB {
         clean: bool,
         lock_timeout_ms: u64,
     ) -> Self {
+        Self::new_with_options(
+            path,
+            num_buffers,
+            clean,
+            lock_timeout_ms,
+            RuntimeOptions::default(),
+        )
+    }
+
+    pub fn new_with_options<P: AsRef<Path>>(
+        path: P,
+        num_buffers: usize,
+        clean: bool,
+        lock_timeout_ms: u64,
+        runtime_options: RuntimeOptions,
+    ) -> Self {
         let file_manager: SharedFS = Arc::new(FileManager::new(&path, clean).unwrap());
-        let log_manager = Arc::new(Mutex::new(LogManager::new(
+        let log_manager = Arc::new(Mutex::new(LogManager::new_with_mode(
             Arc::clone(&file_manager),
             Self::LOG_FILE,
+            runtime_options.wal_mode,
         )));
         let buffer_manager = Arc::new(BufferManager::new(
             Arc::clone(&file_manager),
@@ -139,6 +168,14 @@ impl SimpleDB {
 
     pub fn db_directory(&self) -> &Path {
         &self.db_directory
+    }
+
+    pub fn set_wal_mode(&self, mode: WalMode) {
+        self.log_manager.lock().unwrap().set_wal_mode(mode);
+    }
+
+    pub fn wal_mode(&self) -> WalMode {
+        self.log_manager.lock().unwrap().wal_mode()
     }
 
     pub fn metadata_manager(&self) -> Arc<MetadataManager> {
@@ -13042,6 +13079,7 @@ mod buffer_manager_tests {
 pub struct LogManager {
     file_manager: SharedFS,
     log_file: String,
+    wal_mode: WalMode,
     log_page: WalPage,
     current_block: BlockId,
     latest_lsn: usize,
@@ -13050,6 +13088,10 @@ pub struct LogManager {
 
 impl LogManager {
     pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
+        Self::new_with_mode(file_manager, log_file, WalMode::Durable)
+    }
+
+    pub fn new_with_mode(file_manager: SharedFS, log_file: &str, wal_mode: WalMode) -> Self {
         let mut log_page = WalPage::new();
         let log_size = file_manager.length(log_file.to_string());
         let current_block = if log_size == 0 {
@@ -13065,14 +13107,27 @@ impl LogManager {
         Self {
             file_manager,
             log_file: log_file.to_string(),
+            wal_mode,
             log_page,
             current_block,
             latest_lsn: 0,
             last_saved_lsn: 0,
         }
     }
+
+    pub fn set_wal_mode(&mut self, wal_mode: WalMode) {
+        self.wal_mode = wal_mode;
+    }
+
+    pub fn wal_mode(&self) -> WalMode {
+        self.wal_mode
+    }
+
     /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
     pub fn flush_lsn(&mut self, lsn: Lsn) {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return;
+        }
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -13082,6 +13137,9 @@ impl LogManager {
     /// Write the bytes from log_page to disk for the current_block
     /// Update the last_saved_lsn before returning
     fn flush_to_disk(&mut self) {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return;
+        }
         self.file_manager
             .write_raw(&self.current_block, self.log_page.bytes());
         self.file_manager.sync(&self.log_file);
@@ -13092,6 +13150,9 @@ impl LogManager {
     /// Write the log_record to the log page
     /// First, check if there is enough space
     pub fn append(&mut self, log_record: Vec<u8>) -> SimpleDBResult<Lsn> {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return Ok(self.latest_lsn);
+        }
         let mut boundary = self.log_page.boundary();
         let bytes_needed = log_record.len() + WalPage::HEADER_BYTES;
         let page_capacity = self.log_page.capacity();
