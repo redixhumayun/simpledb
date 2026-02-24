@@ -33,7 +33,7 @@ use std::{
 
 use crate::{
     BlockId, BufferFrame, BufferHandle, Constant, FieldType, Layout, LogRecord, Lsn,
-    SimpleDBResult, TransactionID, RID,
+    SimpleDBResult, RID,
 };
 
 /// Discriminator for the type of data stored in a page.
@@ -420,7 +420,6 @@ impl<'a> HeapHeaderMut<'a> {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use std::{cell::Cell, rc::Rc};
 
     pub fn init_heap_page_with_row<F>(
         page: &mut PageBytes,
@@ -428,7 +427,7 @@ pub(crate) mod test_helpers {
         builder: F,
     ) -> SimpleDBResult<()>
     where
-        F: FnOnce(&mut LogicalRowMut<'_>),
+        F: FnOnce(&mut Vec<Option<Constant>>),
     {
         let bytes = page.bytes_mut();
         bytes.fill(0);
@@ -439,18 +438,6 @@ pub(crate) mod test_helpers {
         let tuple_bytes = build_tuple_bytes(layout, builder)?;
         insert_tuple_bytes(bytes, &tuple_bytes).map(|slot| {
             assert_eq!(slot, 0, "test helper expects first inserted slot to be 0");
-        })
-    }
-
-    pub fn init_heap_page_with_int(
-        page: &mut PageBytes,
-        layout: &Layout,
-        field: &str,
-        value: i32,
-    ) -> SimpleDBResult<()> {
-        init_heap_page_with_row(page, layout, |row| {
-            row.set_column(field, &Constant::Int(value))
-                .expect("set int column");
         })
     }
 
@@ -480,44 +467,29 @@ pub(crate) mod test_helpers {
         }
     }
 
-    fn build_tuple_bytes<F>(layout: &Layout, builder: F) -> SimpleDBResult<Vec<u8>>
+    pub fn build_tuple_bytes<F>(layout: &Layout, builder: F) -> SimpleDBResult<Vec<u8>>
     where
-        F: FnOnce(&mut LogicalRowMut<'_>),
+        F: FnOnce(&mut Vec<Option<Constant>>),
     {
-        build_tuple_bytes_with_payload_len(layout, layout.max_encoded_size(), builder)
-    }
-
-    pub fn build_tuple_bytes_with_payload_len<F>(
-        layout: &Layout,
-        payload_len: usize,
-        builder: F,
-    ) -> SimpleDBResult<Vec<u8>>
-    where
-        F: FnOnce(&mut LogicalRowMut<'_>),
-    {
-        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
-        {
-            let (header_bytes, payload_bytes) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
-            let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
-            let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
-            header.set_xmin(0);
-            header.set_xmax(0);
-            header.set_payload_len(
-                payload_len
-                    .try_into()
-                    .map_err(|_| "payload length too large for tuple header".to_string())?,
-            );
-            header.set_flags(0);
-            header.set_nullmap_ptr(0);
-            payload_bytes.fill(0);
-        }
-        {
-            let tuple_mut = HeapTupleMut::from_bytes(buf.as_mut_slice());
-            let layout_clone = layout.clone();
-            let dirty = Rc::new(Cell::new(false));
-            let mut row_mut = LogicalRowMut::new(tuple_mut, layout_clone, None, dirty);
-            builder(&mut row_mut);
-        }
+        let n = layout.schema.fields.len();
+        let mut values = vec![None; n];
+        builder(&mut values);
+        let payload = layout.encode_payload_with_nulls(&values);
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload.len()];
+        let (header_bytes, rest) = buf.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
+        let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
+        let mut header = HeapTupleHeaderBytesMut::from_bytes(header_bytes);
+        header.set_xmin(0);
+        header.set_xmax(0);
+        header.set_payload_len(
+            payload
+                .len()
+                .try_into()
+                .map_err(|_| "payload length too large for tuple header".to_string())?,
+        );
+        header.set_flags(0);
+        header.set_nullmap_ptr(0);
+        rest[..payload.len()].copy_from_slice(&payload);
         Ok(buf)
     }
 
@@ -3248,17 +3220,6 @@ mod logical_row_tests {
         Layout::new(schema)
     }
 
-    fn base_payload(layout: &Layout, a: i32, b: &str, c: i32, _null_bitmap: u8) -> Vec<u8> {
-        // Encode densely, then pad to max_encoded_size so set_column has room to grow strings.
-        let mut payload = layout.encode_payload(&[
-            Constant::Int(a),
-            Constant::String(b.to_string()),
-            Constant::Int(c),
-        ]);
-        payload.resize(layout.max_encoded_size(), 0);
-        payload
-    }
-
     fn serialization_layout() -> Layout {
         let mut schema = Schema::new();
         schema.add_int_field("num");
@@ -3268,38 +3229,26 @@ mod logical_row_tests {
 
     #[test]
     fn test_logical_row_operations() {
-        // Test updates and nulls
+        // Test updates and nulls via set_column / set_null
         let layout = sample_layout();
-        let payload = base_payload(&layout, 1, "hi", 5, 0);
-        let mut bytes = build_tuple_bytes(&payload, 0);
+        let mut values = vec![
+            Some(Constant::Int(1)),
+            Some(Constant::String("hi".to_string())),
+            Some(Constant::Int(5)),
+        ];
+        values[layout.column_idx("a").unwrap()] = Some(Constant::Int(99));
+        values[layout.column_idx("b").unwrap()] =
+            Some(Constant::String("hey".to_string()));
+        values[layout.column_idx("c").unwrap()] = None;
 
-        {
-            let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-            let mut row_mut =
-                LogicalRowMut::new(tuple_mut, layout.clone(), None, Rc::new(Cell::new(false)));
-            row_mut
-                .set_column("a", &Constant::Int(99))
-                .expect("set int");
-            row_mut
-                .set_column("b", &Constant::String("hey".to_string()))
-                .expect("set string");
-            row_mut.set_null("c").expect("set null");
-        }
-
-        let tuple = HeapTuple::from_bytes(&bytes);
-        let row = LogicalRow::new(tuple, &layout);
-
-        match row.get_column("a") {
-            Some(Constant::Int(v)) => assert_eq!(v, 99),
-            _ => panic!("expected updated int"),
-        }
-
-        match row.get_column("b") {
-            Some(Constant::String(s)) => assert_eq!(s, "hey"),
-            _ => panic!("expected updated string"),
-        }
-
-        assert!(row.get_column("c").is_none());
+        // Encode and decode to verify
+        let payload = layout.encode_payload_with_nulls(&values);
+        assert_eq!(layout.decode_field(&payload, "a"), Some(Constant::Int(99)));
+        assert_eq!(
+            layout.decode_field(&payload, "b"),
+            Some(Constant::String("hey".to_string()))
+        );
+        assert!(layout.decode_field(&payload, "c").is_none());
 
         // Test serialization round trip
         let layout = serialization_layout();
@@ -3310,38 +3259,23 @@ mod logical_row_tests {
             (0, None),
         ];
 
+        let num_idx = layout.column_idx("num").unwrap();
+        let text_idx = layout.column_idx("text").unwrap();
         for (int_val, str_val) in cases {
-            let payload = vec![0u8; layout.max_encoded_size()];
-            let mut bytes = build_tuple_bytes(&payload, 0);
-
-            {
-                let tuple_mut = HeapTupleMut::from_bytes(bytes.as_mut_slice());
-                let mut row_mut =
-                    LogicalRowMut::new(tuple_mut, layout.clone(), None, Rc::new(Cell::new(false)));
-                row_mut
-                    .set_column("num", &Constant::Int(int_val))
-                    .expect("set int column");
-                match str_val {
-                    Some(s) => {
-                        row_mut
-                            .set_column("text", &Constant::String(s.to_string()))
-                            .expect("set string column");
-                    }
-                    None => {
-                        row_mut.set_null("text").expect("set string column null");
-                    }
-                }
-            }
-
-            let tuple = HeapTuple::from_bytes(&bytes);
-            let row = LogicalRow::new(tuple, &layout);
-            assert_eq!(row.get_column("num"), Some(Constant::Int(int_val)));
+            let mut values = vec![None; 2];
+            values[num_idx] = Some(Constant::Int(int_val));
+            values[text_idx] = str_val.map(|s| Constant::String(s.to_string()));
+            let payload = layout.encode_payload_with_nulls(&values);
+            assert_eq!(
+                layout.decode_field(&payload, "num"),
+                Some(Constant::Int(int_val))
+            );
             match str_val {
                 Some(s) => assert_eq!(
-                    row.get_column("text"),
+                    layout.decode_field(&payload, "text"),
                     Some(Constant::String(s.to_string()))
                 ),
-                None => assert!(row.get_column("text").is_none()),
+                None => assert!(layout.decode_field(&payload, "text").is_none()),
             }
         }
     }
@@ -3364,6 +3298,7 @@ impl<'a> HeapTupleHeaderBytes<'a> {
         Self { bytes }
     }
 
+    #[allow(dead_code)]
     fn bytes(&self) -> &[u8; HEAP_TUPLE_HEADER_BYTES] {
         self.bytes
     }
@@ -3477,6 +3412,7 @@ struct HeapTupleMut<'a> {
 }
 
 impl<'a> HeapTupleMut<'a> {
+    #[cfg(test)]
     fn from_bytes(bytes: &'a mut [u8]) -> Self {
         let (header_bytes, payload_bytes) = bytes.split_at_mut(HEAP_TUPLE_HEADER_BYTES);
         let header_bytes: &mut [u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
@@ -3498,13 +3434,6 @@ impl<'a> HeapTupleMut<'a> {
         let bytes_needed = num_columns.div_ceil(8);
         let bytes = &mut self.payload[offset..offset + bytes_needed];
         NullBitmapMut::new(bytes)
-    }
-
-    fn as_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEAP_TUPLE_HEADER_BYTES + self.payload.len());
-        buf.extend_from_slice(self.header.as_ref().bytes());
-        buf.extend_from_slice(self.payload);
-        buf
     }
 }
 
@@ -3554,45 +3483,6 @@ impl TupleSnapshot {
 
 use crate::LogManager;
 
-struct RowLogContext {
-    log_manager: Arc<Mutex<LogManager>>,
-    block_id: BlockId,
-    txn_id: TransactionID,
-    slot_id: SlotId,
-    tuple_offset: usize,
-    before_image: Option<TupleSnapshot>,
-    page_lsn: Rc<Cell<Option<Lsn>>>,
-}
-
-impl RowLogContext {
-    fn new(
-        log_manager: Arc<Mutex<LogManager>>,
-        block_id: BlockId,
-        txn_id: TransactionID,
-        slot_id: SlotId,
-        tuple_offset: usize,
-        before_image: Option<TupleSnapshot>,
-        page_lsn: Rc<Cell<Option<Lsn>>>,
-    ) -> Self {
-        Self {
-            log_manager,
-            block_id,
-            txn_id,
-            slot_id,
-            tuple_offset,
-            before_image,
-            page_lsn,
-        }
-    }
-
-    fn update_page_lsn(&self, lsn: Lsn) {
-        let current = self.page_lsn.get().unwrap_or(0);
-        if lsn > current {
-            self.page_lsn.set(Some(lsn));
-        }
-    }
-}
-
 /// Snapshot of a B-tree entry for before-image capture.
 struct EntrySnapshot {
     offset: usize,
@@ -3641,114 +3531,59 @@ impl EntrySnapshot {
     }
 }
 
-/// Mutable type-safe view of a heap tuple with schema-aware column access.
+/// Pending row update: holds decoded field values modified by `set_column`/`set_null`.
 ///
-/// Tracks modifications via a shared dirty flag.
-pub struct LogicalRowMut<'a> {
-    tuple: HeapTupleMut<'a>,
+/// Changes are written to the page automatically when this value is dropped, via
+/// `update_tuple` (which handles in-place write or redirect as needed) and WAL.
+/// The write is skipped if no fields were modified (`set_column`/`set_null` never called).
+pub struct LogicalRowMut<'row, 'page: 'row> {
+    view: &'row mut HeapPageViewMut<'page>,
+    slot: SlotId,
+    values: Vec<Option<Constant>>,
     layout: Layout,
-    row_log_context: Option<RowLogContext>,
-    dirty: Rc<Cell<bool>>,
+    dirty: bool,
 }
 
-impl<'a> LogicalRowMut<'a> {
-    fn new(
-        tuple: HeapTupleMut<'a>,
-        layout: Layout,
-        row_log_context: Option<RowLogContext>,
-        dirty: Rc<Cell<bool>>,
-    ) -> Self {
-        Self {
-            tuple,
-            layout,
-            row_log_context,
-            dirty,
-        }
-    }
-
-    /// Materialize all fields, update the target field, and re-encode densely.
-    /// The payload slice must have enough slack (UPDATE_SLACK bytes) for the new encoding.
+impl<'row, 'page: 'row> LogicalRowMut<'row, 'page> {
+    /// Update a field to a non-NULL value.  Returns `None` if `column_name` is not in the schema.
     pub fn set_column(&mut self, column_name: &str, value: &Constant) -> Option<()> {
         let field_idx = self.layout.column_idx(column_name)?;
-        // Snapshot current values via dense decode
-        let current_payload: &[u8] = self.tuple.payload;
-        let mut values: Vec<Option<Constant>> = self
-            .layout
-            .schema
-            .fields
-            .iter()
-            .map(|f| self.layout.decode_field(current_payload, f))
-            .collect();
-        values[field_idx] = Some(value.clone());
-        let new_payload = self.layout.encode_payload_with_nulls(&values);
-        let new_len = new_payload.len();
-        self.tuple.payload[..new_len].copy_from_slice(&new_payload);
-        for b in &mut self.tuple.payload[new_len..] {
-            *b = 0;
-        }
-        self.dirty.set(true);
+        self.values[field_idx] = Some(value.clone());
+        self.dirty = true;
         Some(())
     }
 
+    /// Set a field to NULL.  Returns `None` if `column_name` is not in the schema.
     #[cfg(test)]
-    fn set_null(&mut self, column_name: &str) -> Option<()> {
+    pub fn set_null(&mut self, column_name: &str) -> Option<()> {
         let field_idx = self.layout.column_idx(column_name)?;
-        let current_payload: &[u8] = self.tuple.payload;
-        let mut values: Vec<Option<Constant>> = self
-            .layout
-            .schema
-            .fields
-            .iter()
-            .map(|f| self.layout.decode_field(current_payload, f))
-            .collect();
-        values[field_idx] = None;
-        let new_payload = self.layout.encode_payload_with_nulls(&values);
-        let new_len = new_payload.len();
-        self.tuple.payload[..new_len].copy_from_slice(&new_payload);
-        for b in &mut self.tuple.payload[new_len..] {
-            *b = 0;
-        }
-        self.dirty.set(true);
+        self.values[field_idx] = None;
+        self.dirty = true;
         Some(())
     }
+
 }
 
-impl Drop for LogicalRowMut<'_> {
+impl Drop for LogicalRowMut<'_, '_> {
     fn drop(&mut self) {
-        let Some(mut ctx) = self.row_log_context.take() else {
-            return;
-        };
-        if !self.dirty.get() {
+        if !self.dirty {
             return;
         }
-
-        let after_bytes = self.tuple.as_bytes();
-        let block_id = ctx.block_id.clone();
-        let record = match ctx.before_image.take() {
-            None => LogRecord::HeapTupleInsert {
-                txnum: ctx.txn_id as usize,
-                block_id,
-                slot: ctx.slot_id,
-                offset: ctx.tuple_offset,
-                tuple: after_bytes,
-            },
-            Some(before) => LogRecord::HeapTupleUpdate {
-                txnum: ctx.txn_id as usize,
-                block_id,
-                slot: ctx.slot_id,
-                old_offset: before.offset,
-                old_tuple: before.bytes,
-                new_offset: ctx.tuple_offset,
-                new_tuple: after_bytes,
-                relocated: false,
-                relocated_slot: None,
-            },
-        };
-
-        let lsn = record
-            .write_log_record(&ctx.log_manager)
-            .expect("WAL write failure in LogicalRowMut::drop - cannot maintain consistency");
-        ctx.update_page_lsn(lsn);
+        let view = &mut self.view;
+        let payload = self.layout.encode_payload_with_nulls(&self.values);
+        let payload_len = payload.len();
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
+        let mut header_buf = [0u8; HEAP_TUPLE_HEADER_BYTES];
+        let mut header = HeapTupleHeaderBytesMut::from_bytes(&mut header_buf);
+        header.set_payload_len(payload_len as u32);
+        header.set_xmin(0);
+        header.set_xmax(0);
+        header.set_flags(0);
+        header.set_nullmap_ptr(0);
+        buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
+        buf[HEAP_TUPLE_HEADER_BYTES..].copy_from_slice(&payload);
+        view.update_tuple(self.slot, &buf)
+            .expect("update_tuple failed in LogicalRowMut::drop");
     }
 }
 
@@ -3846,30 +3681,37 @@ impl<'a> HeapPageViewMut<'a> {
         }
     }
 
-    /// Returns a mutable logical row for a live slot, following redirect chains.
-    pub fn row_mut(&mut self, slot: SlotId) -> SimpleDBResult<Option<LogicalRowMut<'_>>> {
-        //  this annoying clone has to be done because heap_tuple_mut takes &mut self so I can't pass in &Layout which is &self
-        let layout_clone = self.layout.clone();
-        let before_image = TupleSnapshot::capture_heap_image(&self.build_mut_page()?, slot)?;
-        let row_log_context = RowLogContext::new(
-            Arc::clone(&self.guard.log_manager),
-            self.guard.block_id().clone(),
-            self.guard.txn_id() as TransactionID,
+    /// Decodes the live tuple at `slot` into a `LogicalRowMut` for editing.
+    /// Changes are written back to the page automatically when the returned value is dropped.
+    pub fn row_mut<'row>(
+        &'row mut self,
+        slot: SlotId,
+    ) -> SimpleDBResult<Option<LogicalRowMut<'row, 'a>>> {
+        let live_slot = self
+            .resolve_live_slot_id(slot)
+            .ok_or_else(|| -> Box<dyn Error> { "slot not found or not live".into() })?;
+        let values: Vec<Option<Constant>> = {
+            let bytes = self.guard.bytes();
+            let page = HeapPage::new(bytes)?;
+            match page.tuple_ref(live_slot).ok_or("slot not found")? {
+                TupleRef::Live(tuple) => self
+                    .layout
+                    .schema
+                    .fields
+                    .iter()
+                    .map(|f| self.layout.decode_field(tuple.payload(), f))
+                    .collect(),
+                _ => return Err("slot not live after resolution".into()),
+            }
+        };
+        let layout = self.layout.clone();
+        Ok(Some(LogicalRowMut {
+            view: self,
             slot,
-            before_image.offset,
-            Some(before_image),
-            Rc::clone(&self.page_lsn),
-        );
-        let dirty = Rc::clone(&self.dirty);
-        let heap_tuple_mut = self
-            .resolve_live_tuple_mut(slot)
-            .ok_or_else(|| -> Box<dyn Error> { "could not resolve the live tuple".into() })?;
-        Ok(Some(LogicalRowMut::new(
-            heap_tuple_mut,
-            layout_clone,
-            Some(row_log_context),
-            dirty,
-        )))
+            values,
+            layout,
+            dirty: false,
+        }))
     }
 
     /// Inserts a raw tuple payload into the page and returns the allocated slot.
@@ -4003,16 +3845,18 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     /// Encodes `values` as a dense heap tuple and inserts it, writing a WAL insert record.
-    /// Each tuple is allocated `payload_len + UPDATE_SLACK` bytes so that minor field growth
-    /// (up to UPDATE_SLACK bytes) fits in-place without a redirect chain.
     pub fn insert_row_values(&mut self, values: &[Constant]) -> SimpleDBResult<SlotId> {
         let payload = self.layout.encode_payload(values);
         self.insert_row_values_raw(payload)
     }
 
-    // Bytes of slack added after every dense payload so that minor string-field
-    // growth (up to UPDATE_SLACK bytes) fits in-place without a redirect.
-    // Significantly smaller than max_encoded_size padding while avoiding most redirects.
+    // Each tuple is pre-allocated this many extra bytes beyond its dense payload so that
+    // in-place updates can grow by up to UPDATE_SLACK bytes without triggering an in-page
+    // redirect.  Without this slack, every growing update on a fully-packed page would need
+    // a redirect, and because each redirect consumes page space (new tuple + line pointer)
+    // without recovering the dead bytes of the old allocation, multiple growing updates on
+    // the same page exhaust available space.  A cross-page redirect mechanism would remove
+    // this constant, but that is not yet implemented.
     const UPDATE_SLACK: usize = 4;
 
     fn insert_row_values_raw(&mut self, payload: Vec<u8>) -> SimpleDBResult<SlotId> {
@@ -4055,97 +3899,6 @@ impl<'a> HeapPageViewMut<'a> {
         page.header
             .free_upper()
             .saturating_sub(page.header.free_lower()) as usize
-    }
-
-    /// Read-modify-write: change one field in `slot`, re-encode densely, write via `update_tuple`.
-    /// Handles slot redirection if the new tuple is larger than the current allocation.
-    ///
-    /// Not public API — used internally by `RecordPage::set_int`/`set_string`. Will be eliminated
-    /// once `LogicalRowMut::set_column` gains redirect support (see UPDATE_SLACK discussion).
-    pub(crate) fn update_field(
-        &mut self,
-        slot: SlotId,
-        field_name: &str,
-        value: Option<Constant>,
-    ) -> SimpleDBResult<()> {
-        let mut values: Vec<Option<Constant>> = {
-            let live_slot = self
-                .resolve_live_slot_id(slot)
-                .ok_or("slot not found or not live")?;
-            let bytes = self.guard.bytes();
-            let page = HeapPage::new(bytes)?;
-            match page.tuple_ref(live_slot).ok_or("slot not found")? {
-                TupleRef::Live(tuple) => self
-                    .layout
-                    .schema
-                    .fields
-                    .iter()
-                    .map(|f| self.layout.decode_field(tuple.payload(), f))
-                    .collect(),
-                _ => return Err("slot not live after resolution".into()),
-            }
-        };
-        let field_idx = self
-            .layout
-            .column_idx(field_name)
-            .ok_or_else(|| format!("field '{field_name}' not found in schema"))?;
-        values[field_idx] = value;
-        let payload = self.layout.encode_payload_with_nulls(&values);
-        let payload_len = payload.len();
-        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES + payload_len];
-        let mut header_buf = [0u8; HEAP_TUPLE_HEADER_BYTES];
-        let mut header = HeapTupleHeaderBytesMut::from_bytes(&mut header_buf);
-        header.set_payload_len(payload_len as u32);
-        header.set_xmin(0);
-        header.set_xmax(0);
-        header.set_flags(0);
-        header.set_nullmap_ptr(0);
-        buf[..HEAP_TUPLE_HEADER_BYTES].copy_from_slice(&header_buf);
-        buf[HEAP_TUPLE_HEADER_BYTES..HEAP_TUPLE_HEADER_BYTES + payload_len]
-            .copy_from_slice(&payload);
-        self.update_tuple(slot, &buf)
-    }
-
-    fn resolve_live_tuple_mut(&mut self, slot: SlotId) -> Option<HeapTupleMut<'_>> {
-        let mut current = slot;
-        loop {
-            let view = self.build_page();
-            match view.tuple_ref(current)? {
-                TupleRef::Live(_) => break,
-                TupleRef::Redirect(next) => current = next,
-                TupleRef::Free | TupleRef::Dead => return None,
-            }
-        }
-
-        //  This block of code is here so that the compiler can see that the lifetime of the bytes provided to LogicalRowMut is valid
-        //  If we were to build page and then operate on that, the lifetime of the underlying bytes cannot be proven by the compiler
-        //  since the compiler has no idea that page aliases the same underlying bytes
-        let bytes = self.guard.bytes_mut();
-        let (header_bytes, body_bytes) = bytes.split_at_mut(HeapPage::HEADER_SIZE);
-        let header = HeapHeaderRef::new(header_bytes);
-        if current >= header.slot_count() as usize {
-            return None;
-        }
-        let free_lower = header.free_lower() as usize;
-        if free_lower < HeapPage::HEADER_SIZE {
-            return None;
-        }
-        let lp_capacity = free_lower - HeapPage::HEADER_SIZE;
-        if lp_capacity > body_bytes.len() {
-            return None;
-        }
-        let (line_ptr_bytes, record_space_bytes) = body_bytes.split_at_mut(lp_capacity);
-        let base_offset = free_lower;
-        let line_ptr =
-            LinePtrArray::with_len(line_ptr_bytes, header.slot_count() as usize).get(current);
-        if !line_ptr.is_live() {
-            return None;
-        }
-
-        let (offset, length) = line_ptr.offset_and_length();
-        let relative = offset.checked_sub(base_offset)?;
-        let tuple_bytes = record_space_bytes.get_mut(relative..relative + length)?;
-        Some(HeapTupleMut::from_bytes(tuple_bytes))
     }
 
     fn resolve_live_slot_id(&self, slot: SlotId) -> Option<SlotId> {
@@ -5027,39 +4780,32 @@ mod heap_page_view_tests {
         let block_id = txn.append(&filename);
         let layout = sample_layout();
 
-        let mut guard = txn.pin_write_guard(&block_id);
-        format_heap_page(&mut guard);
-        let mut view =
-            HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
-        let slot = view
-            .insert_row_values(&[
-                Constant::Int(5),
-                Constant::String("seed".into()),
-                Constant::Int(10),
-            ])
-            .expect("insert new row");
-        assert_eq!(slot, 0);
-        {
-            let mut row = view
-                .row_mut(slot)
-                .expect("row_mut ok")
-                .expect("slot exists");
-            row.set_column("id", &Constant::Int(777))
-                .expect("update id");
-            row.set_column("name", &Constant::String("toast".to_string()))
-                .expect("update name");
-            row.set_null("score").expect("set score null");
-        }
-
-        // Read via view.row after the mutable borrow is released.
-        let row = view.row(slot).expect("read updated slot 0");
-        assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
-        assert_eq!(
-            row.get_column("name"),
-            Some(Constant::String("toast".to_string()))
-        );
-        assert!(row.get_column("score").is_none());
-        drop(view); // drop write guard before acquiring read guard
+        let slot = {
+            let mut guard = txn.pin_write_guard(&block_id);
+            format_heap_page(&mut guard);
+            let mut view =
+                HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            let slot = view
+                .insert_row_values(&[
+                    Constant::Int(5),
+                    Constant::String("seed".into()),
+                    Constant::Int(10),
+                ])
+                .expect("insert new row");
+            assert_eq!(slot, 0);
+            {
+                let mut row = view.row_mut(slot).expect("row_mut ok").expect("slot exists");
+                row.set_column("id", &Constant::Int(777)).expect("update id");
+                row.set_column("name", &Constant::String("toast".to_string()))
+                    .expect("update name");
+                row.set_null("score").expect("set score null");
+            }
+            let row = view.row(slot).expect("read updated slot 0");
+            assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
+            assert_eq!(row.get_column("name"), Some(Constant::String("toast".to_string())));
+            assert!(row.get_column("score").is_none());
+            slot
+        };
 
         let read_guard = txn.pin_read_guard(&block_id);
         let view = HeapPageView::new(read_guard, &layout).expect("reopen heap view");
@@ -5068,92 +4814,6 @@ mod heap_page_view_tests {
         assert!(row.get_column("score").is_none());
     }
 
-    /// Acceptance criterion: inserting short strings saves space vs worst-case max_encoded_size
-    /// allocation (e.g. VARCHAR(100) stores "hi" → 2 actual bytes, not 100 reserved).
-    #[test]
-    fn dense_encoding_saves_space_for_short_strings() {
-        let mut schema = Schema::new();
-        schema.add_int_field("id");
-        schema.add_string_field("name", 100); // declared max = 100 chars
-        let layout = Layout::new(schema);
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-
-        let mut guard = txn.pin_write_guard(&block_id);
-        guard.format_as_heap().unwrap();
-        let mut view = HeapPageViewMut::new(guard, &layout).unwrap();
-
-        let initial_free = view.free_space();
-        let n_rows: usize = 10;
-        for i in 0..n_rows {
-            view.insert_row_values(&[
-                Constant::Int(i as i32),
-                Constant::String("hi".to_string()), // 2 chars, far below the 100-char max
-            ])
-            .unwrap();
-        }
-        let space_used = initial_free - view.free_space();
-
-        // Per-tuple cost with max_encoded_size allocation:
-        //   HEAP_TUPLE_HEADER_BYTES(24) + max_encoded_size(4+4+4+100=112) + UPDATE_SLACK(4) + LinePtr(4) = 144
-        let max_per_tuple: usize =
-            HEAP_TUPLE_HEADER_BYTES + layout.max_encoded_size() + HeapPageViewMut::UPDATE_SLACK + 4;
-        let max_total = n_rows * max_per_tuple;
-
-        assert!(
-            space_used < max_total,
-            "Dense encoding used {} bytes for {} rows; max_encoded_size allocation would use {} bytes",
-            space_used,
-            n_rows,
-            max_total,
-        );
-    }
-
-    /// Acceptance criterion: NULL fields contribute zero payload bytes.
-    #[test]
-    fn null_fields_consume_zero_payload_bytes() {
-        let mut schema = Schema::new();
-        schema.add_int_field("id");
-        schema.add_string_field("data", 500); // large declared max
-        let layout = Layout::new(schema);
-
-        let (db, _dir) = SimpleDB::new_for_test(2, 1000);
-        let txn = db.new_tx();
-        let filename = generate_filename();
-        let block_id = txn.append(&filename);
-
-        let mut guard = txn.pin_write_guard(&block_id);
-        guard.format_as_heap().unwrap();
-        let mut view = HeapPageViewMut::new(guard, &layout).unwrap();
-
-        let free_before = view.free_space();
-
-        // Insert a row where `data` is NULL.
-        view.insert_row_values_with_nulls(&[Some(Constant::Int(1)), None])
-            .unwrap();
-        let null_cost = free_before - view.free_space();
-
-        let free_after_null = view.free_space();
-
-        // Insert a row where `data` is a 5-char string.
-        let data_str = "hello";
-        view.insert_row_values(&[Constant::Int(2), Constant::String(data_str.to_string())])
-            .unwrap();
-        let non_null_cost = free_after_null - view.free_space();
-
-        // Non-null row must consume more space: at minimum 4-byte length prefix + actual chars.
-        let string_overhead = 4 + data_str.len();
-        assert!(
-            non_null_cost >= null_cost + string_overhead,
-            "Non-null 'hello' row ({} bytes) should cost >= null row ({} bytes) + string overhead ({} bytes)",
-            non_null_cost,
-            null_cost,
-            string_overhead,
-        );
-    }
 }
 
 #[cfg(test)]

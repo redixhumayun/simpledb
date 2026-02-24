@@ -89,3 +89,4 @@ Remove dead code, add the acceptance-criteria tests, update documentation.
 - Update `docs/record_management.md` — mark "True Variable-Length Field Implementation (TODO)" section as implemented, add final format spec
 
 **State at end of phase:** PR ready. All tests pass. Acceptance criteria met.
+

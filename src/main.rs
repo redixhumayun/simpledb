@@ -8316,14 +8316,28 @@ impl RecordPage {
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
-        view.update_field(slot, field_name, Some(Constant::Int(value)))
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::Int(value))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
     }
 
     /// Sets a string value in the specified slot and field.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
-        view.update_field(slot, field_name, Some(Constant::String(value.to_string())))
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::String(value.to_string()))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
     }
 
     /// Deletes the record at the specified slot.
@@ -9018,14 +9032,14 @@ mod transaction_tests {
         let mut view = guard
             .into_heap_view_mut(layout)
             .expect("heap page view mut");
-        view.update_field(TXN_SLOT, TXN_INT_FIELD, Some(Constant::Int(int_val)))
+        let mut row = view
+            .row_mut(TXN_SLOT)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(TXN_INT_FIELD, &Constant::Int(int_val))
             .expect("update int field");
-        view.update_field(
-            TXN_SLOT,
-            TXN_STR_FIELD,
-            Some(Constant::String(str_val.to_string())),
-        )
-        .expect("update string field");
+        row.set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
+            .expect("update string field");
     }
 
     fn maybe_snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> Option<TxnRowSnapshot> {
@@ -12054,7 +12068,11 @@ mod recovery_manager_tests {
     ) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        view.update_field(slot, INT_FIELD, Some(Constant::Int(value)))
+        let mut row = view
+            .row_mut(slot)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(INT_FIELD, &Constant::Int(value))
             .expect("update int value");
     }
 
@@ -12067,7 +12085,11 @@ mod recovery_manager_tests {
     ) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        view.update_field(slot, STR_FIELD, Some(Constant::String(value.to_string())))
+        let mut row = view
+            .row_mut(slot)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(STR_FIELD, &Constant::String(value.to_string()))
             .expect("update string value");
     }
 
@@ -12317,17 +12339,15 @@ mod recovery_manager_tests {
         {
             let guard = txn2.pin_write_guard(&block);
             let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
-            let new_bytes = test_helpers::build_tuple_bytes_with_payload_len(
-                &layout,
-                layout.max_encoded_size() + 32,
-                |row| {
-                    row.set_column(INT_FIELD, &Constant::Int(99))
-                        .expect("set int");
-                    row.set_column(STR_FIELD, &Constant::String("relocated".to_string()))
-                        .expect("set string");
-                },
-            )
+            let int_idx = layout.column_idx(INT_FIELD).unwrap();
+            let str_idx = layout.column_idx(STR_FIELD).unwrap();
+            let mut new_bytes = test_helpers::build_tuple_bytes(&layout, |values| {
+                values[int_idx] = Some(Constant::Int(99));
+                values[str_idx] = Some(Constant::String("relocated".to_string()));
+            })
             .expect("build tuple bytes");
+            // Pad to exceed the old slot allocation and force a redirect.
+            new_bytes.resize(new_bytes.len() + layout.max_encoded_size() + 32, 0);
             view.update_tuple(slot, &new_bytes)
                 .expect("update tuple with relocation");
         }
@@ -12550,7 +12570,7 @@ pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
 mod buffer_manager_tests {
     use std::{sync::Arc, thread};
 
-    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Schema, SimpleDB};
+    use crate::{page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Schema, SimpleDB};
 
     const BUFFER_FIELD: &str = "val";
 
@@ -12571,8 +12591,11 @@ mod buffer_manager_tests {
             .expect("pin block for overwrite");
         {
             let mut page = buffer.write_page();
-            test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
-                .expect("initialize heap page");
+            let field_idx = layout.column_idx(BUFFER_FIELD).unwrap();
+            test_helpers::init_heap_page_with_row(&mut page, layout, |values| {
+                values[field_idx] = Some(Constant::Int(value));
+            })
+            .expect("initialize heap page");
         }
         buffer.set_modified(0, Lsn::MAX);
         buffer_manager.unpin(buffer);
@@ -13651,11 +13674,11 @@ mod durability_tests {
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
-        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
-            row.set_column(FIELD_INT, &Constant::Int(42))
-                .expect("set durability int");
-            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
-                .expect("set durability string");
+        let int_idx = layout.column_idx(FIELD_INT).unwrap();
+        let str_idx = layout.column_idx(FIELD_STR).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |values| {
+            values[int_idx] = Some(Constant::Int(42));
+            values[str_idx] = Some(Constant::String("durability".to_string()));
         })
         .expect("initialize heap row");
 
@@ -13691,11 +13714,11 @@ mod durability_tests {
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
-        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
-            row.set_column(FIELD_INT, &Constant::Int(42))
-                .expect("set durability int");
-            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
-                .expect("set durability string");
+        let int_idx = layout.column_idx(FIELD_INT).unwrap();
+        let str_idx = layout.column_idx(FIELD_STR).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |values| {
+            values[int_idx] = Some(Constant::Int(42));
+            values[str_idx] = Some(Constant::String("durability".to_string()));
         })
         .expect("initialize heap row");
 
