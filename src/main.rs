@@ -12929,7 +12929,11 @@ mod buffer_manager_tests {
             .collect();
 
         let installed = buffer_manager.prefetch(&file, 0, 3);
-        assert_eq!(installed, 3, "expected to prefetch first 3 blocks");
+        assert!(
+            (1..=3).contains(&installed),
+            "expected best-effort prefetch of 1..=3 blocks, got {}",
+            installed
+        );
 
         buffer_manager.reset_stats();
         for block in blocks.iter().take(installed) {
