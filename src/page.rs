@@ -2448,8 +2448,7 @@ impl<'a> HeapPageParts<'a> {
 /// and are therefore never visited, preventing double-processing on UPDATE scans.
 #[derive(Clone)]
 pub struct HeapIterator {
-    #[allow(dead_code)] // RAII: keeps the page pinned for the duration of the scan
-    handle: BufferHandle,
+    _handle: BufferHandle, // RAII: keeps the page pinned for the duration of the scan
     frame: Arc<BufferFrame>,
     current_slot: SlotId,
     max_slot: SlotId,
@@ -2463,7 +2462,7 @@ impl HeapIterator {
         max_slot: SlotId,
     ) -> Self {
         Self {
-            handle,
+            _handle: handle,
             frame,
             current_slot: start_slot,
             max_slot,
