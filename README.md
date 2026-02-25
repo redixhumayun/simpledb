@@ -3,6 +3,16 @@ SimpleDB is a Rust port of the Java implementation by Edward Sciore. You can rea
 
 This port is mainly for pedagagical and experimentation reasons. I wanted to understand how query engines worked in more detail and I also wanted a playground to experiment with different ideas.
 
+## Dependency Policy
+
+Core engine paths are intended to remain dependency-free beyond the Rust standard library.
+
+Allowed exceptions:
+- platform bindings that expose OS primitives not available in `std` (for example `libc`)
+- non-engine tooling dependencies (for example benchmarking with `criterion`, or CLI parsing with `clap`)
+
+Third-party crates on the critical execution path (read/write/transaction engine internals) require explicit design rationale.
+
 ## Usage
 
 Run the CLI:
