@@ -13878,7 +13878,6 @@ impl FileSystemInterface for FileManager {
             if stats_enabled {
                 self.io_batch_counters.record_completed(reqs.len());
             }
-            return;
         }
 
         #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
