@@ -27,7 +27,7 @@ name = "simpledb"
 path = "src/main.rs"
 
 [features]
-default = ["replacement_lru", "page-4k"]
+default = ["replacement_lru", "page-4k", "direct-io"]
 replacement_lru = []
 replacement_clock = []
 replacement_sieve = []
@@ -38,7 +38,7 @@ page-8k = []
 page-1m = []
 
 # Enable direct I/O (O_DIRECT) for data files. WAL always uses buffered I/O.
-# Linux-only in this phase. Default builds remain fully buffered.
+# Linux-only in this phase. Enabled by default.
 direct-io = ["dep:io-uring"]
 
 [dependencies]
