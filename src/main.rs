@@ -7027,7 +7027,7 @@ mod metadata_manager_tests {
     fn test_metadata_manager() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
-        let mdm = MetadataManager::new(true, Arc::clone(&tx));
+        let mdm = MetadataManager::new(false, Arc::clone(&tx));
 
         // Part 1: Table Metadata
         let mut schema = Schema::new();
@@ -7127,7 +7127,7 @@ mod metadata_manager_tests {
     fn stat_manager_concurrent_access() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let setup_txn = db.new_tx();
-        let mdm = Arc::new(MetadataManager::new(true, Arc::clone(&setup_txn)));
+        let mdm = Arc::new(MetadataManager::new(false, Arc::clone(&setup_txn)));
 
         let table_name = "stat_concurrent";
         let mut schema = Schema::new();
@@ -8782,12 +8782,15 @@ impl Schema {
     }
 
     fn add_field(&mut self, field_name: &str, field_type: FieldType, length: usize) {
+        debug_assert!(
+            !self.info.contains_key(field_name),
+            "duplicate field '{field_name}' added to schema"
+        );
         if !self.info.contains_key(field_name) {
             self.fields.push(field_name.to_string());
         }
         self.info
             .entry(field_name.to_string())
-            .and_modify(|entry| *entry = FieldInfo { field_type, length })
             .or_insert_with(|| FieldInfo { field_type, length });
     }
 
