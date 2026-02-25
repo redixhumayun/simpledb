@@ -34,7 +34,9 @@ mod page;
 mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
-use crate::page::{NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{
+    NullBitmap, NullBitmapMut, OwnedHeapIterator, PageReadGuard, PageWriteGuard, WalPage,
+};
 mod buffer_manager;
 
 pub type Lsn = usize;
@@ -7858,6 +7860,7 @@ pub struct TableScan {
     layout: Layout,
     file_name: String,
     record_page: Option<RecordPage>,
+    heap_iter: Option<OwnedHeapIterator>,
     current_slot: Option<usize>,
     table_name: String,
 }
@@ -7871,6 +7874,7 @@ impl TableScan {
             layout,
             file_name: file_name.to_string(),
             record_page: None,
+            heap_iter: None,
             current_slot: None,
             table_name: table_name.to_string(),
         };
@@ -7891,21 +7895,36 @@ impl TableScan {
         scan
     }
 
-    /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
+    /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number.
+    /// Captures `max_slot` from the page's current slot count so that redirect-appended
+    /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
     pub fn move_to_block(&mut self, block_num: usize) {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
+        let iter = self
+            .txn
+            .pin_read_guard(&block_id)
+            .into_owned_heap_iter_from(0)
+            .unwrap();
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
+        self.heap_iter = Some(iter);
     }
 
-    /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
+    /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there.
     fn move_to_new_block(&mut self) -> SimpleDBResult<()> {
         let block = self.txn.append(&self.file_name);
-        let record_page = RecordPage::new(Arc::clone(&self.txn), block, self.layout.clone());
+        let record_page =
+            RecordPage::new(Arc::clone(&self.txn), block.clone(), self.layout.clone());
         record_page.format()?;
+        let iter = self
+            .txn
+            .pin_read_guard(&block)
+            .into_owned_heap_iter_from(0)
+            .unwrap();
         self.current_slot = None;
         self.record_page = Some(record_page);
+        self.heap_iter = Some(iter);
         Ok(())
     }
 
@@ -7921,12 +7940,18 @@ impl TableScan {
 
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
+        let iter = self
+            .txn
+            .pin_read_guard(&block_id)
+            .into_owned_heap_iter_from(row_id.slot + 1)
+            .unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
             self.layout.clone(),
         ));
         self.current_slot = Some(row_id.slot);
+        self.heap_iter = Some(iter);
     }
 }
 
@@ -7937,20 +7962,13 @@ impl Iterator for TableScan {
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on TableScan for {}", self.table_name);
         loop {
-            //  Check if there is a record page currently
-            if let Some(record_page) = &self.record_page {
-                match record_page.next_valid_slot(self.current_slot) {
-                    Ok(Some(slot)) => {
-                        self.current_slot = Some(slot);
-                        return Some(Ok(()));
-                    }
-                    Ok(None) => {
-                        // No more slots in this page, continue to next page
-                    }
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
+            if let Some(iter) = &mut self.heap_iter {
+                if let Some(slot) = iter.next() {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
                 }
+                // Page exhausted — drop the iterator (unpins the page)
+                self.heap_iter = None;
             }
 
             if self.at_last_block() {
@@ -8140,6 +8158,52 @@ mod table_scan_tests {
     use crate::{
         test_utils::generate_random_number, Constant, Layout, Scan, Schema, SimpleDB, TableScan,
     };
+
+    /// Regression test: UPDATE scans must not double-process a row when `update_tuple`
+    /// redirects a grown tuple (appends a new Live slot beyond the original `max_slot`).
+    ///
+    /// Before Phase 6, `next_valid_slot` recreated `HeapIterator` from slot 0 on every
+    /// `next()` call, evaluating `slot_count()` each time. After a redirect, the new slot
+    /// (at index >= original `max_slot`) would be visited and the row updated a second time.
+    #[test]
+    fn update_scan_no_double_process_on_redirect() {
+        let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
+        let txn = db.new_tx();
+
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        schema.add_string_field("name", 20);
+        let layout = Layout::new(schema);
+
+        // Insert rows with a short name. Dense payload per row:
+        //   null_bitmap(1) + id(4) + name_len(4) + name_data(1) = 10 bytes
+        // Allocated: 10 + UPDATE_SLACK(4) = 14 bytes. All fit on one 4 K page.
+        let n: usize = 15;
+        let mut ts = TableScan::new(txn, layout, "redirect_test");
+        for i in 0..n {
+            ts.insert_values(&[Constant::Int(i as i32), Constant::String("a".to_string())])
+                .unwrap();
+        }
+
+        // UPDATE: append "xxxxx" (5 chars) to each name.
+        //   New payload: 1+4+4+6 = 15 bytes > 14 bytes allocated → redirect triggered.
+        // Each row must be visited exactly once.
+        ts.move_to_start();
+        let mut updated = 0usize;
+        while ts.next().is_some() {
+            let name = ts.get_string("name").unwrap();
+            ts.set_string("name", name + "xxxxx").unwrap();
+            updated += 1;
+        }
+        assert_eq!(updated, n, "each row must be updated exactly once");
+
+        // Verify every row has exactly one append ("axxxxx"), not two ("axxxxxxxxxx").
+        ts.move_to_start();
+        while ts.next().is_some() {
+            let name = ts.get_string("name").unwrap();
+            assert_eq!(name, "axxxxx", "row double-processed: got {:?}", name);
+        }
+    }
 
     #[test]
     fn table_scan_test() {
@@ -8371,7 +8435,7 @@ impl RecordPage {
     /// Finds the next valid slot after the given slot.
     /// If `after` is None, returns the first valid slot.
     /// Returns None if no more valid slots exist.
-    pub fn next_valid_slot(&self, after: Option<usize>) -> Result<Option<usize>, Box<dyn Error>> {
+    fn next_valid_slot(&self, after: Option<usize>) -> Result<Option<usize>, Box<dyn Error>> {
         let view = self
             .txn
             .pin_read_guard(&self.block_id)
@@ -12570,7 +12634,9 @@ pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
 mod buffer_manager_tests {
     use std::{sync::Arc, thread};
 
-    use crate::{page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Schema, SimpleDB};
+    use crate::{
+        page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Schema, SimpleDB,
+    };
 
     const BUFFER_FIELD: &str = "val";
 

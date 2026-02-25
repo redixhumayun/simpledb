@@ -90,3 +90,21 @@ Remove dead code, add the acceptance-criteria tests, update documentation.
 
 **State at end of phase:** PR ready. All tests pass. Acceptance criteria met.
 
+---
+
+## Phase 6 — Fix scan double-processing of redirected tuples [x]
+
+**Problem:** `update_tuple` redirects a grown tuple by appending a new live slot at the end of the page's slot array. A forward scan (`execute_modify`) walking slots sequentially will encounter that new slot later in the same pass and apply the update expression a second time to the same logical row. Wrong results for expressions like `SET name = name || 'x'`; wrong update count for all growing updates.
+
+**Root cause:** `RecordPage::next_valid_slot` recreates `HeapIterator` from slot 0 on every `scan.next()` call. The iterator is not persistent — `current_slot` is not maintained between calls, causing O(n²) scan and re-evaluation of `page.slot_count()` each time (which now includes redirect-appended slots).
+
+**Fix:** Give `TableScan` a persistent `HeapIterator` per page. `HeapIterator` is restructured to:
+- Hold a `BufferHandle` (keeps the page pinned in the buffer pool for the duration of the page scan)
+- Hold `current_slot` and `max_slot` (captured once at block-entry time from the page's slot count)
+- On each `next()` call: acquire `frame.read_page()` directly (bypassing `pin_read_guard` overhead — no repeated slock, pin, or buffer lookup), read the line pointer at `current_slot`, release the read guard, advance
+
+`max_slot` is captured when `TableScan` moves to a new block. Redirect-appended slots always land at indices >= `max_slot` and are never visited. `RecordPage::next_valid_slot` is deleted.
+
+**Why not hold `PageReadGuard` in `HeapIterator`:** The write path (`set_string` etc.) acquires a write lock on the same page between `next()` calls. Holding the read guard across iterations would deadlock.
+
+**Why not `HeapIterator<'a>` with borrowed bytes:** `PageReadGuard<'a>` has `'a` tied to the borrow of `Arc<Transaction>`. `TableScan` owns `Arc<Transaction>`, so storing a guard that borrows from it would be self-referential. Propagating `'a` to `TableScan<'a>` would require `TableScan` to borrow rather than own `Transaction` — a broader architectural change.

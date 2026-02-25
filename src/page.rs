@@ -2464,6 +2464,63 @@ impl<'a> Iterator for HeapIterator<'a> {
     }
 }
 
+/// Persistent iterator over live slots in a heap page.
+///
+/// Unlike [`HeapIterator`], this type holds an owned [`BufferHandle`] that keeps the page
+/// pinned for the duration of the scan. The page read lock is acquired transiently on each
+/// [`Iterator::next`] call rather than held continuously, so write operations on the same
+/// page can proceed between iterations without deadlocking.
+///
+/// `max_slot` is captured once at construction time. Slots appended by
+/// [`HeapPageViewMut::update_tuple`] (redirect targets) always have indices >= `max_slot`
+/// and are therefore never visited, preventing double-processing on UPDATE scans.
+#[derive(Clone)]
+pub struct OwnedHeapIterator {
+    #[allow(dead_code)] // RAII: keeps the page pinned for the duration of the scan
+    handle: BufferHandle,
+    frame: Arc<BufferFrame>,
+    current_slot: SlotId,
+    max_slot: SlotId,
+}
+
+impl OwnedHeapIterator {
+    pub fn new(
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+        start_slot: SlotId,
+        max_slot: SlotId,
+    ) -> Self {
+        Self {
+            handle,
+            frame,
+            current_slot: start_slot,
+            max_slot,
+        }
+    }
+}
+
+impl Iterator for OwnedHeapIterator {
+    type Item = SlotId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current_slot < self.max_slot {
+            let slot = self.current_slot;
+            self.current_slot += 1;
+            let state = {
+                let guard = self.frame.read_page();
+                HeapPage::new(guard.bytes())
+                    .ok()
+                    .and_then(|p| p.line_ptr(slot))
+                    .map(|lp| lp.state())
+            };
+            if state == Some(LineState::Live) {
+                return Some(slot);
+            }
+        }
+        None
+    }
+}
+
 /// Iterator over entries in a B-tree leaf page.
 pub struct BTreeLeafIterator<'a> {
     page: BTreeLeafPage<'a>,
@@ -2674,6 +2731,29 @@ impl<'a> PageReadGuard<'a> {
         layout: &'a Layout,
     ) -> SimpleDBResult<BTreeInternalPageView<'a>> {
         BTreeInternalPageView::new(self, layout)
+    }
+
+    /// Converts into an [`OwnedHeapIterator`] that scans live slots starting from `start_slot`.
+    ///
+    /// The page stays pinned via the guard's [`BufferHandle`] (transferred into the iterator).
+    /// The read lock is released here; [`OwnedHeapIterator::next`] re-acquires it transiently
+    /// per slot so write operations can proceed between iterations without deadlocking.
+    pub fn into_owned_heap_iter_from(
+        self,
+        start_slot: SlotId,
+    ) -> SimpleDBResult<OwnedHeapIterator> {
+        let PageReadGuard {
+            handle,
+            frame,
+            page,
+        } = self;
+        let max_slot = HeapPage::new(page.bytes())?.slot_count();
+        let iter_frame = Arc::clone(&frame);
+        drop(frame);
+        drop(page);
+        Ok(OwnedHeapIterator::new(
+            handle, iter_frame, start_slot, max_slot,
+        ))
     }
 }
 
@@ -3237,8 +3317,7 @@ mod logical_row_tests {
             Some(Constant::Int(5)),
         ];
         values[layout.column_idx("a").unwrap()] = Some(Constant::Int(99));
-        values[layout.column_idx("b").unwrap()] =
-            Some(Constant::String("hey".to_string()));
+        values[layout.column_idx("b").unwrap()] = Some(Constant::String("hey".to_string()));
         values[layout.column_idx("c").unwrap()] = None;
 
         // Encode and decode to verify
@@ -3561,7 +3640,6 @@ impl<'row, 'page: 'row> LogicalRowMut<'row, 'page> {
         self.dirty = true;
         Some(())
     }
-
 }
 
 impl Drop for LogicalRowMut<'_, '_> {
@@ -4783,8 +4861,8 @@ mod heap_page_view_tests {
         let slot = {
             let mut guard = txn.pin_write_guard(&block_id);
             format_heap_page(&mut guard);
-            let mut view =
-                HeapPageViewMut::new(guard, &layout).expect("heap page mutable view initialization");
+            let mut view = HeapPageViewMut::new(guard, &layout)
+                .expect("heap page mutable view initialization");
             let slot = view
                 .insert_row_values(&[
                     Constant::Int(5),
@@ -4794,15 +4872,22 @@ mod heap_page_view_tests {
                 .expect("insert new row");
             assert_eq!(slot, 0);
             {
-                let mut row = view.row_mut(slot).expect("row_mut ok").expect("slot exists");
-                row.set_column("id", &Constant::Int(777)).expect("update id");
+                let mut row = view
+                    .row_mut(slot)
+                    .expect("row_mut ok")
+                    .expect("slot exists");
+                row.set_column("id", &Constant::Int(777))
+                    .expect("update id");
                 row.set_column("name", &Constant::String("toast".to_string()))
                     .expect("update name");
                 row.set_null("score").expect("set score null");
             }
             let row = view.row(slot).expect("read updated slot 0");
             assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
-            assert_eq!(row.get_column("name"), Some(Constant::String("toast".to_string())));
+            assert_eq!(
+                row.get_column("name"),
+                Some(Constant::String("toast".to_string()))
+            );
             assert!(row.get_column("score").is_none());
             slot
         };
@@ -4813,7 +4898,6 @@ mod heap_page_view_tests {
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
         assert!(row.get_column("score").is_none());
     }
-
 }
 
 #[cfg(test)]
