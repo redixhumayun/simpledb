@@ -2482,8 +2482,8 @@ impl HeapIterator {
             page,
         } = guard;
         let max_slot = HeapPage::new(page.bytes())?.slot_count();
-        let iter_frame = Arc::clone(&frame);
-        Ok(Self::new(handle, iter_frame, start_slot, max_slot))
+        drop(page);
+        Ok(Self::new(handle, frame, start_slot, max_slot))
     }
 }
 
