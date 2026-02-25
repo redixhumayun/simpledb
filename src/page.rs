@@ -3424,7 +3424,7 @@ impl<'a> HeapTuple<'a> {
         self.payload
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
         let offset = self.nullmap_ptr() as usize;
         let bytes_needed = num_columns.div_ceil(8);
@@ -3432,7 +3432,7 @@ impl<'a> HeapTuple<'a> {
         NullBitmap::new(bytes)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn payload_slice(&self, offset: usize, len: usize) -> &'a [u8] {
         &self.payload()[offset..offset + len]
     }
