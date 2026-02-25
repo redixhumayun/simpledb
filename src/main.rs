@@ -8573,10 +8573,22 @@ impl Layout {
     }
 
     /// Encode a slice of non-null values into a dense heap payload.
-    /// Convenience wrapper around [`Self::encode_payload_with_nulls`].
+    /// Encodes non-null values into a dense heap payload.
+    /// All bits in the null bitmap are zero (no NULLs).
     pub fn encode_payload(&self, values: &[Constant]) -> Vec<u8> {
-        let opts: Vec<Option<Constant>> = values.iter().map(|v| Some(v.clone())).collect();
-        self.encode_payload_with_nulls(&opts)
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let mut buf = vec![0u8; bitmap_bytes]; // all-zero bitmap = no NULLs
+        for value in values {
+            match value {
+                Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+                Constant::String(s) => {
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        buf
     }
 
     /// Encode values (possibly NULL) into a dense heap payload.
