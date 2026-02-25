@@ -2482,7 +2482,6 @@ impl HeapIterator {
             page,
         } = guard;
         let max_slot = HeapPage::new(page.bytes())?.slot_count();
-        drop(page);
         Ok(Self::new(handle, frame, start_slot, max_slot))
     }
 }
