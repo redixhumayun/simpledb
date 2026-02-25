@@ -35,7 +35,7 @@ mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
 use crate::page::{
-    NullBitmap, NullBitmapMut, OwnedHeapIterator, PageReadGuard, PageWriteGuard, WalPage,
+    HeapIterator, NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage,
 };
 mod buffer_manager;
 
@@ -721,6 +721,7 @@ pub struct ChunkScan {
     last_block_num: usize,
     current_block_num: usize,
     current_record_page: Option<usize>,
+    heap_iter: Option<HeapIterator>,
     current_slot: Option<usize>,
     buffer_list: Vec<RecordPage>,
 }
@@ -791,6 +792,7 @@ impl ChunkScan {
             last_block_num: actual_last_block,
             current_block_num: first_block_num,
             current_record_page: None,
+            heap_iter: None,
             current_slot: None,
             buffer_list,
         };
@@ -807,7 +809,10 @@ impl ChunkScan {
             "Moving chunk scan to block {} which is offset {}",
             block_num, offset
         );
+        let block_id = self.buffer_list[offset].block_id.clone();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
         self.current_record_page = Some(offset);
+        self.heap_iter = Some(iter);
         self.current_slot = None;
     }
 }
@@ -874,31 +879,22 @@ impl Iterator for ChunkScan {
             return None;
         }
         loop {
-            if let Some(record_page_idx) = &self.current_record_page {
-                let record_page = &self.buffer_list[*record_page_idx];
-                match record_page.next_valid_slot(self.current_slot) {
-                    Ok(Some(slot)) => {
-                        self.current_slot = Some(slot);
-                        return Some(Ok(()));
-                    }
-                    Ok(None) => {
-                        // No more slots in this page, continue to next page
-                    }
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
+            if let Some(iter) = &mut self.heap_iter {
+                if let Some(slot) = iter.next() {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
                 }
-
-                //  There are no more slots in the current record page. Check if there are more record pages
-                if *record_page_idx < self.buffer_list.len() - 1 {
-                    self.current_record_page = Some(*record_page_idx + 1);
-                    self.current_slot = None;
-                    continue;
-                }
+                // Page exhausted
+                self.heap_iter = None;
             }
 
-            //  There are no more record pages left
-            return None;
+            // Advance to next page in the chunk, if any
+            let idx = self.current_record_page?;
+            if idx + 1 < self.buffer_list.len() {
+                self.move_to_block(self.first_block_num + idx + 1);
+            } else {
+                return None;
+            }
         }
     }
 }
@@ -7860,7 +7856,7 @@ pub struct TableScan {
     layout: Layout,
     file_name: String,
     record_page: Option<RecordPage>,
-    heap_iter: Option<OwnedHeapIterator>,
+    heap_iter: Option<HeapIterator>,
     current_slot: Option<usize>,
     table_name: String,
 }
@@ -7900,11 +7896,7 @@ impl TableScan {
     /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
     pub fn move_to_block(&mut self, block_num: usize) {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
-        let iter = self
-            .txn
-            .pin_read_guard(&block_id)
-            .into_owned_heap_iter_from(0)
-            .unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
@@ -7917,11 +7909,7 @@ impl TableScan {
         let record_page =
             RecordPage::new(Arc::clone(&self.txn), block.clone(), self.layout.clone());
         record_page.format()?;
-        let iter = self
-            .txn
-            .pin_read_guard(&block)
-            .into_owned_heap_iter_from(0)
-            .unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block), 0).unwrap();
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
@@ -7940,11 +7928,8 @@ impl TableScan {
 
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
-        let iter = self
-            .txn
-            .pin_read_guard(&block_id)
-            .into_owned_heap_iter_from(row_id.slot + 1)
-            .unwrap();
+        let iter =
+            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), row_id.slot + 1).unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
@@ -8432,23 +8417,6 @@ impl RecordPage {
         Ok(())
     }
 
-    /// Finds the next valid slot after the given slot.
-    /// If `after` is None, returns the first valid slot.
-    /// Returns None if no more valid slots exist.
-    fn next_valid_slot(&self, after: Option<usize>) -> Result<Option<usize>, Box<dyn Error>> {
-        let view = self
-            .txn
-            .pin_read_guard(&self.block_id)
-            .into_heap_view(&self.layout)?;
-
-        let start_slot = after.map(|s| s + 1).unwrap_or(0);
-        let mut iter = view.live_slot_iter();
-        let next = iter
-            .find(|(slot, _)| *slot >= start_slot)
-            .map(|(slot, _)| slot);
-        Ok(next)
-    }
-
     /// Returns a Vec of all live (non-deleted) slot IDs on this page.
     #[cfg(test)]
     pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
@@ -8457,7 +8425,7 @@ impl RecordPage {
             .pin_read_guard(&self.block_id)
             .into_heap_view(&self.layout)?;
 
-        let live: Vec<usize> = view.live_slot_iter().map(|(slot, _)| slot).collect();
+        let live: Vec<usize> = view.live_slot_iter().collect();
 
         Ok(live)
     }

@@ -2436,46 +2436,18 @@ impl<'a> HeapPageParts<'a> {
     }
 }
 
-/// Iterator over tuples in a heap page, optionally filtering by LineState.
-pub struct HeapIterator<'a> {
-    page: HeapPage<'a>,
-    current_slot: SlotId,
-    match_state: Option<LineState>,
-}
-
-impl<'a> Iterator for HeapIterator<'a> {
-    type Item = (SlotId, TupleRef<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let total_slots = self.page.slot_count();
-        while self.current_slot < total_slots {
-            let slot = self.current_slot;
-            self.current_slot += 1;
-            if let Some(tuple_ref) = self.page.tuple_ref(slot) {
-                if self
-                    .match_state
-                    .is_none_or(|ms| ms == tuple_ref.line_state())
-                {
-                    return Some((slot, tuple_ref));
-                }
-            }
-        }
-        None
-    }
-}
-
-/// Persistent iterator over live slots in a heap page.
+/// Iterator over live slots in a heap page.
 ///
-/// Unlike [`HeapIterator`], this type holds an owned [`BufferHandle`] that keeps the page
-/// pinned for the duration of the scan. The page read lock is acquired transiently on each
-/// [`Iterator::next`] call rather than held continuously, so write operations on the same
-/// page can proceed between iterations without deadlocking.
+/// Holds an owned [`BufferHandle`] that keeps the page pinned for the duration of the scan.
+/// The page read lock is acquired transiently on each [`Iterator::next`] call rather than
+/// held continuously, so write operations on the same page can proceed between iterations
+/// without deadlocking.
 ///
 /// `max_slot` is captured once at construction time. Slots appended by
 /// [`HeapPageViewMut::update_tuple`] (redirect targets) always have indices >= `max_slot`
 /// and are therefore never visited, preventing double-processing on UPDATE scans.
 #[derive(Clone)]
-pub struct OwnedHeapIterator {
+pub struct HeapIterator {
     #[allow(dead_code)] // RAII: keeps the page pinned for the duration of the scan
     handle: BufferHandle,
     frame: Arc<BufferFrame>,
@@ -2483,7 +2455,7 @@ pub struct OwnedHeapIterator {
     max_slot: SlotId,
 }
 
-impl OwnedHeapIterator {
+impl HeapIterator {
     pub fn new(
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
@@ -2497,9 +2469,26 @@ impl OwnedHeapIterator {
             max_slot,
         }
     }
+
+    /// Constructs a [`HeapIterator`] from a [`PageReadGuard`], scanning live slots starting
+    /// from `start_slot`.
+    ///
+    /// The guard's [`BufferHandle`] is transferred into the iterator (keeping the page pinned).
+    /// The read lock is released when the guard's fields drop; [`HeapIterator::next`]
+    /// re-acquires it transiently per slot so write operations between iterations don't deadlock.
+    pub fn from_guard(guard: PageReadGuard<'_>, start_slot: SlotId) -> SimpleDBResult<Self> {
+        let PageReadGuard {
+            handle,
+            frame,
+            page,
+        } = guard;
+        let max_slot = HeapPage::new(page.bytes())?.slot_count();
+        let iter_frame = Arc::clone(&frame);
+        Ok(Self::new(handle, iter_frame, start_slot, max_slot))
+    }
 }
 
-impl Iterator for OwnedHeapIterator {
+impl Iterator for HeapIterator {
     type Item = SlotId;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2731,29 +2720,6 @@ impl<'a> PageReadGuard<'a> {
         layout: &'a Layout,
     ) -> SimpleDBResult<BTreeInternalPageView<'a>> {
         BTreeInternalPageView::new(self, layout)
-    }
-
-    /// Converts into an [`OwnedHeapIterator`] that scans live slots starting from `start_slot`.
-    ///
-    /// The page stays pinned via the guard's [`BufferHandle`] (transferred into the iterator).
-    /// The read lock is released here; [`OwnedHeapIterator::next`] re-acquires it transiently
-    /// per slot so write operations can proceed between iterations without deadlocking.
-    pub fn into_owned_heap_iter_from(
-        self,
-        start_slot: SlotId,
-    ) -> SimpleDBResult<OwnedHeapIterator> {
-        let PageReadGuard {
-            handle,
-            frame,
-            page,
-        } = self;
-        let max_slot = HeapPage::new(page.bytes())?.slot_count();
-        let iter_frame = Arc::clone(&frame);
-        drop(frame);
-        drop(page);
-        Ok(OwnedHeapIterator::new(
-            handle, iter_frame, start_slot, max_slot,
-        ))
     }
 }
 
@@ -3126,17 +3092,6 @@ pub enum TupleRef<'a> {
     Free,
     /// Dead tuple marked for garbage collection
     Dead,
-}
-
-impl TupleRef<'_> {
-    pub fn line_state(&self) -> LineState {
-        match self {
-            TupleRef::Live(_) => LineState::Live,
-            TupleRef::Redirect(_) => LineState::Redirect,
-            TupleRef::Free => LineState::Free,
-            TupleRef::Dead => LineState::Dead,
-        }
-    }
 }
 
 pub(crate) struct NullBitmap<'a> {
@@ -3707,12 +3662,13 @@ impl<'a> HeapPageView<'a> {
             .saturating_sub(page.header.free_lower()) as usize
     }
 
-    pub fn live_slot_iter(&self) -> HeapIterator<'_> {
-        HeapIterator {
-            page: self.build_page(),
-            current_slot: 0,
-            match_state: Some(LineState::Live),
-        }
+    pub fn live_slot_iter(&self) -> impl Iterator<Item = SlotId> + '_ {
+        let page = self.build_page();
+        let total = page.slot_count();
+        (0..total).filter(move |&slot| {
+            page.line_ptr(slot)
+                .is_some_and(|lp| lp.state() == LineState::Live)
+        })
     }
 }
 
