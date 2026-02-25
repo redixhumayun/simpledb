@@ -3728,13 +3728,7 @@ impl<'a> HeapPageViewMut<'a> {
             let bytes = self.guard.bytes();
             let page = HeapPage::new(bytes)?;
             match page.tuple_ref(live_slot).ok_or("slot not found")? {
-                TupleRef::Live(tuple) => self
-                    .layout
-                    .schema
-                    .fields
-                    .iter()
-                    .map(|f| self.layout.decode_field(tuple.payload(), f))
-                    .collect(),
+                TupleRef::Live(tuple) => self.layout.decode_all_fields(tuple.payload()),
                 _ => return Err("slot not live after resolution".into()),
             }
         };

@@ -8679,6 +8679,39 @@ impl Layout {
             }
         }
     }
+
+    /// Decodes all fields from `payload` in a single O(N) left-to-right pass.
+    /// More efficient than calling `decode_field` N times (which would be O(N²)).
+    pub fn decode_all_fields(&self, payload: &[u8]) -> Vec<Option<Constant>> {
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let bitmap = NullBitmap::new(&payload[..bitmap_bytes]);
+        let mut offset = bitmap_bytes;
+        let mut result = Vec::with_capacity(n);
+        for (i, fname) in self.schema.fields.iter().enumerate() {
+            if bitmap.is_null(i) {
+                result.push(None);
+                continue;
+            }
+            let info = &self.schema.info[fname];
+            match info.field_type {
+                FieldType::Int => {
+                    let v = i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
+                    result.push(Some(Constant::Int(v)));
+                    offset += 4;
+                }
+                FieldType::String => {
+                    let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    let s =
+                        String::from_utf8(payload[offset + 4..offset + 4 + len].to_vec()).unwrap();
+                    result.push(Some(Constant::String(s)));
+                    offset += 4 + len;
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
