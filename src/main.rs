@@ -34,9 +34,7 @@ mod page;
 mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
-use crate::page::{
-    HeapIterator, HeapTuple, NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage,
-};
+use crate::page::{HeapIterator, HeapTuple, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage};
 mod buffer_manager;
 
 pub type Lsn = usize;
