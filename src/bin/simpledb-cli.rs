@@ -1,17 +1,29 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+use clap::Parser;
 use simpledb::{BTreeIndex, Constant, FieldType, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+#[derive(Parser)]
+#[command(name = "simpledb", about = "SimpleDB interactive CLI")]
+struct Args {
+    #[arg(long, default_value = "./simpledb-data")]
+    db_dir: String,
+    #[arg(long, default_value_t = 8)]
+    num_buffers: usize,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+
     println!("SimpleDB CLI v0.1.0");
     println!("Type 'help' for commands, 'quit' to exit");
     println!();
 
     // Initialize database
-    let db = SimpleDB::new("./simpledb-data", 8, false, 100);
+    let db = SimpleDB::new(&args.db_dir, args.num_buffers, false, 100);
 
     // Main REPL loop
     loop {

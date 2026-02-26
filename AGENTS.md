@@ -59,16 +59,20 @@ There is a test suite which provides basic coverage to ensure the code still wor
 
 5. **Run benchmarks before committing**
    ```bash
-   cargo run --bin simplebench 50
-   # verify that the operations complete and see results
-   cargo bench --bench buffer_pool --no-default-features --features replacement_lru --features page-4k -- 100 12
+   cargo run --bin simpledb
+   # verify the CLI starts up without errors
+
+   SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool --no-default-features --features replacement_lru --features page-4k
    # verify that the operations complete and see results
 
-   cargo bench --bench buffer_pool --no-default-features --features replacement_clock --features page-4k -- 100 12
+   SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool --no-default-features --features replacement_clock --features page-4k
    # verify that the operations complete and see results
 
-   cargo bench --bench buffer_pool --no-default-features --features replacement_sieve --features page-4k -- 100 12
+   SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool --no-default-features --features replacement_sieve --features page-4k
    # verify that the operations complete and see results
+
+   # Filter to a specific benchmark (Criterion passes filter after --)
+   SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Sequential Scan"
    ```
 
 6. **Run cargo formatting before committing**

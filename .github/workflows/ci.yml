@@ -97,3 +97,10 @@ jobs:
         comment-on-alert: true
         fail-on-alert: false
         alert-comment-cc-users: '@${{ github.actor }}'
+
+    - name: Upload Criterion reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: criterion-reports
+        path: target/criterion/
+        retention-days: 30
