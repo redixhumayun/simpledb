@@ -3523,10 +3523,12 @@ impl UpdatePlanner for IndexUpdatePlanner {
             .fields
             .iter()
             .map(|f| {
-                field_map
-                    .get(f.as_str())
-                    .cloned()
-                    .unwrap_or(Constant::Int(0))
+                field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
+                    match schema.info[f].field_type {
+                        FieldType::Int => Constant::Int(0),
+                        FieldType::String => Constant::String(String::new()),
+                    }
+                })
             })
             .collect();
         let mut scan = plan.open();
@@ -3668,10 +3670,12 @@ impl UpdatePlanner for BasicUpdatePlanner {
             .fields
             .iter()
             .map(|f| {
-                field_map
-                    .get(f.as_str())
-                    .cloned()
-                    .unwrap_or(Constant::Int(0))
+                field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
+                    match schema.info[f].field_type {
+                        FieldType::Int => Constant::Int(0),
+                        FieldType::String => Constant::String(String::new()),
+                    }
+                })
             })
             .collect();
         let mut scan = plan.open();
@@ -7025,6 +7029,10 @@ mod metadata_manager_tests {
     fn test_metadata_manager() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
+        // is_new=false: SimpleDB::new_for_test already initialised all system catalog tables
+        // via MetadataManager::new(true, ...) internally. Passing true here would call
+        // create_table again for the same catalog tables, writing duplicate field catalog
+        // rows and corrupting get_layout results.
         let mdm = MetadataManager::new(false, Arc::clone(&tx));
 
         // Part 1: Table Metadata
@@ -7125,6 +7133,7 @@ mod metadata_manager_tests {
     fn stat_manager_concurrent_access() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let setup_txn = db.new_tx();
+        // is_new=false: system catalog tables already exist from SimpleDB::new_for_test.
         let mdm = Arc::new(MetadataManager::new(false, Arc::clone(&setup_txn)));
 
         let table_name = "stat_concurrent";
