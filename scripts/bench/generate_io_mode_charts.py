@@ -55,7 +55,7 @@ BENCHMARKS: List[BenchSpec] = [
     BenchSpec("Low-locality Rand Read", "Low-locality Rand Read ("),
     BenchSpec("One-pass Seq Scan+Evict", "One-pass Seq Scan+Evict ("),
     BenchSpec("Low-locality Rand Read+Evict", "Low-locality Rand Read+Evict ("),
-    BenchSpec("Multi-stream Scan", "Multi-stream Scan"),
+    BenchSpec("Multi-stream Scan", "Multi-stream Scan ("),
 ]
 
 
