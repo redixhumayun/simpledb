@@ -12780,8 +12780,11 @@ mod buffer_manager_tests {
         value: i32,
     ) {
         let mut page = Page::new();
-        test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
-            .expect("initialize heap page");
+        let field_idx = layout.column_idx(BUFFER_FIELD).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, layout, |values| {
+            values[field_idx] = Some(Constant::Int(value));
+        })
+        .expect("initialize heap page");
         file_manager.write(block_id, &page);
     }
 
