@@ -59,23 +59,23 @@ I'm not sure of the below explanation. It's a conclusion I arrived at while chat
 
 ```bash
 # SQL benchmarks - run all
-cargo bench --bench simple_bench -- 50
+cargo bench --bench simple_bench
 
 # SQL benchmarks - run only INSERT
-cargo bench --bench simple_bench -- 50 --filter "INSERT"
+cargo bench --bench simple_bench -- "INSERT"
 
 # Buffer pool benchmarks - run all
-cargo bench --bench buffer_pool -- 50 12
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool
 
 # Buffer pool benchmarks - run only Random K=10
-cargo bench --bench buffer_pool -- 50 12 --filter "Random (K=10,"
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Random (K=10,"
 # Buffer pool benchmarks - run only the 8-thread pin workload
-cargo bench --bench buffer_pool -- 100 12 --filter pin:t8
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- pin:t8
 ```
 
 ## Replacement Policy Summary
 
-All runs use `cargo bench --bench buffer_pool -- 100 12` (pool=12, block=4 KiB). Raw logs live in `docs/benchmarks/replacement_policies/…`.
+All runs use `SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool` (pool=12, block=4 KiB). Raw logs live in `docs/benchmarks/replacement_policies/…`.
 
 ### macOS (M1 Pro, macOS Sequoia)
 |Benchmark (Phase)|Replacement LRU (4KB pages)|Replacement Clock (4KB pages)|Replacement SIEVE (4KB pages)|
@@ -159,8 +159,8 @@ To refresh the raw benchmark logs and the summary tables above:
 
 1. Run the benchmark collector on each platform (defaults fill in title/env automatically):
    ```bash
-   python3 scripts/bench/run_buffer_pool.py --platform macos --iterations 100 --num-buffers 12
-   python3 scripts/bench/run_buffer_pool.py --platform linux --iterations 100 --num-buffers 12
+   python3 scripts/bench/run_buffer_pool.py --platform macos --num-buffers 12
+   python3 scripts/bench/run_buffer_pool.py --platform linux --num-buffers 12
    ```
    Artifacts land in `docs/benchmarks/replacement_policies/raw/<platform>/`.
 
@@ -189,15 +189,15 @@ Step (2) rewrites:
 Filter using substring matching on benchmark names (Phase 1-4) or case tokens (Phase 5):
 
 ```bash
-# Syntax: -- <iterations> [num_buffers] --filter <pattern>
-cargo bench --bench buffer_pool -- 100 12 --filter "Pin/Unpin"      # Phase 1: Pin/Unpin only
-cargo bench --bench buffer_pool -- 100 12 --filter "Zipfian"        # Phase 2+4: Zipfian tests
-cargo bench --bench buffer_pool -- 100 12 --filter "Random (K=10,"  # Specific K value (not K=100)
-cargo bench --bench simple_bench -- 100 --filter "SELECT"           # Both SELECT benchmarks
+# Syntax: SIMPLEDB_BENCH_BUFFERS=<num_buffers> cargo bench --bench <bench_name> -- <filter>
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Pin/Unpin"      # Phase 1: Pin/Unpin only
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Zipfian"        # Phase 2+4: Zipfian tests
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Random (K=10,"  # Specific K value (not K=100)
+cargo bench --bench simple_bench -- "SELECT"                                   # Both SELECT benchmarks
 
 # Phase 5 case tokens (no quotes needed):
-cargo bench --bench buffer_pool -- 200 12 --filter pin:t4           # Multi-threaded pin, 4 threads
-cargo bench --bench buffer_pool -- 200 12 --filter hotset:t8_k4     # Hot-set contention, 8 threads, K=4
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- pin:t4       # Multi-threaded pin, 4 threads
+SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- hotset:t8_k4 # Hot-set contention, 8 threads, K=4
 ```
 
 **Use case:** Isolate specific workloads for profiling (flamegraphs, perf analysis) without noise from other benchmarks.
@@ -218,21 +218,22 @@ Buffer manager microbenchmarks across 5 phases:
 
 ## JSON Output for CI
 
-Both benchmarks support `--json` flag for machine-readable output:
+Both benchmarks support Criterion bencher output for machine-readable capture:
 
 ```bash
-cargo bench --bench buffer_pool -- 50 12 --json
-# Output: [{"name":"Pin/Unpin (hit)","unit":"ns","value":583},...]
+cargo bench --bench buffer_pool -- --output-format bencher --noplot
+# Output: test <name> ... bench: <ns> ns/iter (+/- <dev>)
 ```
 
-**Important:** Filters are **ignored** in JSON mode. All benchmarks always run and output when `--json` is specified, regardless of filter argument.
+**Important:** If you pass a filter token, only matching benchmarks run.
 
-**Why?** JSON mode is for CI only. CI needs complete historical data across all benchmarks for trend tracking. Filtering would create gaps in the time-series data displayed at the GitHub Pages dashboard.
+**Why?** CI needs stable text output that can be parsed into JSON artifacts for trend tracking.
 
 ```bash
-# These produce identical output (all benchmarks):
-cargo bench --bench buffer_pool -- 50 12 --json
-cargo bench --bench buffer_pool -- 50 12 --json --filter "Random"
+# All benchmarks:
+cargo bench --bench buffer_pool -- --output-format bencher --noplot
+# Filtered run:
+cargo bench --bench buffer_pool -- --output-format bencher --noplot "Random"
 ```
 
 ## Direct I/O Regime Matrix
@@ -242,7 +243,7 @@ generate side-by-side comparison reports.
 
 ```bash
 # Syntax:
-# python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy]
+# python3 scripts/run_regime_matrix.py [output_dir] [--profile capped|heavy]
 #                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
 #                                      [--concurrent-ops N]
 ```
@@ -257,7 +258,7 @@ generate side-by-side comparison reports.
 ### Quick run (capped profile)
 
 ```bash
-python3 scripts/run_regime_matrix.py 10 results/regime_capped_$(date +%Y%m%d)
+python3 scripts/run_regime_matrix.py results/regime_capped_$(date +%Y%m%d)
 ```
 
 `capped` profile working sets (`page-4k`):
@@ -274,7 +275,7 @@ Ops auto-scale with working set when `--regime` is used (and not explicitly over
 ### Heavy run (decision-grade signal)
 
 ```bash
-python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
+python3 scripts/run_regime_matrix.py results/regime_heavy_$(date +%Y%m%d) \
   --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000 --concurrent-ops 1000
 ```
 
@@ -329,7 +330,7 @@ Charts are written to:
 ## Implementation
 
 **Framework:** `src/benchmark_framework.rs`
-- `parse_bench_args()` - CLI arg parsing (iterations, num_buffers, json flag, filter string)
+- `parse_bench_args()` - CLI arg parsing (num_buffers, json flag, filter string)
 - `should_run()` - Substring matching for filtering
 - `benchmark()` - Timing harness with warmup, mean, median, stddev
 

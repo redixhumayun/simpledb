@@ -3,10 +3,9 @@
 Auto-discover and run all cargo benchmarks, combining JSON results.
 
 Usage:
-    python3 run_all_benchmarks.py [iterations] [num_buffers] [output_file]
+    python3 run_all_benchmarks.py [num_buffers] [output_file]
 
 Arguments:
-    iterations   - Ignored (Criterion controls iteration count)
     num_buffers  - Buffer pool size for benchmarks (default: 12)
     output_file  - Output JSON file path (default: all_benchmarks.json)
 
@@ -132,10 +131,12 @@ def discover_benchmarks():
 
 def main():
     """Main entry point."""
-    # Parse arguments (iterations is ignored — Criterion controls count)
-    _iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 50
-    num_buffers = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-    output_file = sys.argv[3] if len(sys.argv) > 3 else "all_benchmarks.json"
+    if len(sys.argv) > 1 and sys.argv[1] in {"-h", "--help"}:
+        print(__doc__.strip())
+        sys.exit(0)
+
+    num_buffers = int(sys.argv[1]) if len(sys.argv) > 1 else 12
+    output_file = sys.argv[2] if len(sys.argv) > 2 else "all_benchmarks.json"
 
     print(f"Running all benchmarks (num_buffers={num_buffers})...", file=sys.stderr)
 

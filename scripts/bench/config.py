@@ -6,8 +6,9 @@ consistency between Rust benchmarks and Python analysis/rendering tools.
 IMPORTANT: Keep these constants in sync with benches/buffer_pool.rs
 """
 
+import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # Repository paths
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,10 +68,11 @@ TOTAL_OPS: Dict[str, int] = {
 # Buffer pool sizes
 PIN_HOTSET_POOL_SIZE: int = 4096
 DEFAULT_NUM_BUFFERS: int = 12
-DEFAULT_ITERATIONS: int = 100
 
 # Hotset configuration
 HOTSET_K: int = 4  # Hot set size for hotset contention benchmarks
+
+_PHASE_PREFIX_RE = re.compile(r"^Phase\d+/[^/]+/(.+)$")
 
 
 def compute_ops_per_thread(total_ops: int, threads: int) -> int:
@@ -119,3 +121,25 @@ def zipfian_benchmark_name(threads: int) -> str:
     if threads == 1:
         return f"Zipfian (80/20, {total_ops} ops)"
     return f"Zipfian MT x{threads} (80/20, {total_ops} ops)"
+
+
+def strip_phase_prefix(name: str) -> str:
+    """Normalize Criterion group-prefixed names back to legacy bench names."""
+    match = _PHASE_PREFIX_RE.match(name)
+    if match:
+        return match.group(1)
+    return name
+
+
+def lookup_benchmark_value(result_map: Dict[str, float], bench_name: str) -> Optional[float]:
+    """Lookup exact bench name; fallback to phase-prefix-normalized keys."""
+    value = result_map.get(bench_name)
+    if value is not None:
+        return value
+
+    matches = [v for key, v in result_map.items() if strip_phase_prefix(key) == bench_name]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(f"Ambiguous benchmark key for '{bench_name}'")
+    return None

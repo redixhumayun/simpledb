@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -28,10 +29,21 @@ HEAVY_PROFILE_BLOCKS = {
     "thrash": 8_388_608,
 }
 
+CAPPED_PROFILE_BLOCKS = {
+    # 64 MiB / 512 MiB / 2 GiB with 4KiB pages
+    "hot": 16_384,
+    "pressure": 131_072,
+    "thrash": 524_288,
+}
+
+BENCHER_RE = re.compile(
+    r"^test (.+?) \.\.\. bench:\s+([\d,]+) ns/iter \(\+/-\s+([\d,]+)\)$"
+)
+BENCH_ONLY_RE = re.compile(r"^bench:\s+([\d,]+) ns/iter")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("iterations", nargs="?", type=int, default=50)
     parser.add_argument("output_dir", nargs="?", default="regime_matrix_results")
     parser.add_argument(
         "--profile",
@@ -47,6 +59,17 @@ def parse_args():
     parser.add_argument("--mixed-ops", type=int, default=None)
     parser.add_argument("--durability-ops", type=int, default=None)
     parser.add_argument("--concurrent-ops", type=int, default=None)
+    parser.add_argument(
+        "--working-set-blocks",
+        type=int,
+        default=None,
+        help="Override working set blocks for all regimes (useful for local smoke runs)",
+    )
+    parser.add_argument(
+        "--bench-filter",
+        default=None,
+        help="Optional Criterion substring filter (e.g., 'Sequential Read')",
+    )
     return parser.parse_args()
 
 
@@ -124,49 +147,53 @@ def format_ns(ns):
         return f"{ns / 1_000_000_000:.2f}s"
 
 
-def run_bench_cell(regime, iterations, features_extra, label, args):
+def parse_bencher_output(stdout):
+    """Parse Criterion --output-format bencher output."""
+    results = []
+    for line in stdout.splitlines():
+        m = BENCHER_RE.match(line.strip())
+        if m:
+            name = m.group(1).strip()
+            value = float(m.group(2).replace(",", ""))
+            results.append({"name": name, "unit": "ns", "value": value})
+    if not results:
+        for line in stdout.splitlines():
+            if BENCH_ONLY_RE.match(line.strip()):
+                raise RuntimeError(
+                    "Criterion output omitted benchmark names. "
+                    "This happens with --quick; rerun without --quick."
+                )
+        raise RuntimeError("No benchmark results found in bencher output")
+    return results
+
+
+def run_bench_cell(regime, features_extra, label, args):
     """Run io_patterns bench for one (regime, mode) cell."""
-    bench_args = [str(iterations), "12", "--json"]
-    if args.profile == "heavy":
-        bench_args.extend(
-            ["--working-set-blocks", str(HEAVY_PROFILE_BLOCKS[regime])]
-        )
+    if args.working_set_blocks is not None:
+        working_set = args.working_set_blocks
+    elif args.profile == "heavy":
+        working_set = HEAVY_PROFILE_BLOCKS[regime]
     else:
-        # capped uses regime-derived working sets.
-        bench_args.extend(["--regime", regime])
+        working_set = CAPPED_PROFILE_BLOCKS[regime]
 
-    # Preserve io_patterns regime auto-scaling by only passing op flags when
-    # explicitly set (or intentionally fixed by the heavy profile).
-    phase1_ops = args.phase1_ops
-    mixed_ops = args.mixed_ops
-    durability_ops = args.durability_ops
-    concurrent_ops = args.concurrent_ops
-    if args.profile == "heavy":
-        phase1_ops = phase1_ops if phase1_ops is not None else 20_000
-        mixed_ops = mixed_ops if mixed_ops is not None else 10_000
-        durability_ops = durability_ops if durability_ops is not None else 5_000
-        concurrent_ops = concurrent_ops if concurrent_ops is not None else 1_000
+    criterion_args = ["--output-format", "bencher", "--noplot"]
+    if args.bench_filter:
+        criterion_args.append(args.bench_filter)
 
-    if phase1_ops is not None:
-        bench_args.extend(["--phase1-ops", str(phase1_ops)])
-    if mixed_ops is not None:
-        bench_args.extend(["--mixed-ops", str(mixed_ops)])
-    if durability_ops is not None:
-        bench_args.extend(["--durability-ops", str(durability_ops)])
-    if concurrent_ops is not None:
-        bench_args.extend(["--concurrent-ops", str(concurrent_ops)])
-
-    cmd = (
-        ["cargo", "bench", "--bench", "io_patterns"]
-        + BASE_FEATURES
-        + features_extra
-        + ["--"]
-        + bench_args
-    )
+    cmd = ["cargo", "bench", "--bench", "io_patterns"] + BASE_FEATURES + features_extra + ["--"] + criterion_args
     cmd_str = shlex.join(cmd)
     print(f"  [{label}] running: {cmd_str}", file=sys.stderr)
+    bench_env = os.environ.copy()
+    bench_env.setdefault("CARGO_TERM_COLOR", "never")
+    bench_env["SIMPLEDB_BENCH_WORKING_SET"] = str(working_set)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=bench_env,
+        )
     except subprocess.CalledProcessError as e:
         print(f"\nERROR: bench failed for {label} / {regime}", file=sys.stderr)
         print(f"Command: {' '.join(cmd)}", file=sys.stderr)
@@ -174,15 +201,7 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
             print(e.stderr, file=sys.stderr)
         raise RuntimeError(f"bench failed: {label}/{regime}") from e
 
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("[") and line.endswith("]"):
-            try:
-                return json.loads(line), cmd_str
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"Bad JSON from {label}/{regime}: {exc}") from exc
-
-    raise RuntimeError(f"No JSON output from {label}/{regime}")
+    return parse_bencher_output(result.stdout), cmd_str
 
 
 def run_compare(base_file, pr_file, out_file, label=None):
@@ -197,32 +216,18 @@ def run_compare(base_file, pr_file, out_file, label=None):
     return (out_file.read_text() if out_file.exists() else ""), cmd_str
 
 
-def build_run_metadata(args, iterations, output_dir, filesystem):
+def build_run_metadata(args, output_dir, filesystem):
     """Build run metadata shared by manifest + compare markdown headers."""
-    if args.profile == "heavy":
-        phase1_ops = args.phase1_ops if args.phase1_ops is not None else 20_000
-        mixed_ops = args.mixed_ops if args.mixed_ops is not None else 10_000
-        durability_ops = args.durability_ops if args.durability_ops is not None else 5_000
-        concurrent_ops = args.concurrent_ops if args.concurrent_ops is not None else 1_000
-    else:
-        phase1_ops = "auto" if args.phase1_ops is None else args.phase1_ops
-        mixed_ops = "auto" if args.mixed_ops is None else args.mixed_ops
-        durability_ops = "auto" if args.durability_ops is None else args.durability_ops
-        concurrent_ops = "auto" if args.concurrent_ops is None else args.concurrent_ops
-
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "script_invocation": shlex.join([sys.executable, *sys.argv]),
         "cwd": os.getcwd(),
-        "iterations": iterations,
         "profile": args.profile,
+        "working_set_override": args.working_set_blocks,
+        "working_set_blocks": HEAVY_PROFILE_BLOCKS if args.profile == "heavy" else CAPPED_PROFILE_BLOCKS,
+        "bench_filter": args.bench_filter,
         "regimes": REGIMES,
-        "ops": {
-            "phase1": phase1_ops,
-            "mixed": mixed_ops,
-            "durability": durability_ops,
-            "concurrent": concurrent_ops,
-        },
+        "ops": "criterion-managed (legacy op flags retained for compatibility, ignored)",
         "filesystem_device": filesystem,
         "cgroup": detect_cgroup_context(),
         "output_dir": str(output_dir),
@@ -237,14 +242,18 @@ def render_compare_metadata_md(metadata, regime):
     ops = metadata["ops"]
     cgroup = metadata.get("cgroup", {})
     cmd_set = metadata.get("commands", {}).get(regime, {})
+    regime_ws = metadata.get("working_set_blocks", {}).get(regime)
+    ws_override = metadata.get("working_set_override")
+    ws_render = ws_override if ws_override is not None else regime_ws
     lines = [
         "### Run Metadata",
         "",
         f"- Generated (UTC): `{metadata['generated_at_utc']}`",
         f"- Regime: `{regime}`",
-        f"- Iterations: `{metadata['iterations']}`",
         f"- Profile: `{metadata['profile']}`",
-        f"- Ops: `phase1={ops['phase1']}, mixed={ops['mixed']}, durability={ops['durability']}, concurrent={ops['concurrent']}`",
+        f"- Working set blocks: `{ws_render}`",
+        f"- Criterion filter: `{metadata.get('bench_filter')}`",
+        f"- Ops: `{ops}`",
         f"- Filesystem/device: `{metadata['filesystem_device']}`",
         f"- Output dir: `{metadata['output_dir']}`",
         f"- Script invocation: `{metadata.get('script_invocation', '')}`",
@@ -305,36 +314,27 @@ def summarise_regime(regime, buffered, direct):
 
 def main():
     args = parse_args()
-    iterations = args.iterations
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     filesystem = detect_filesystem()
-    print(f"Regime matrix: {iterations} iterations, output → {output_dir}", file=sys.stderr)
+    print(f"Regime matrix output → {output_dir}", file=sys.stderr)
     print(f"Profile: {args.profile}", file=sys.stderr)
     print(f"Regimes: {REGIMES}", file=sys.stderr)
-    if args.profile == "heavy":
-        print(f"Heavy working-set blocks: {HEAVY_PROFILE_BLOCKS}", file=sys.stderr)
-    if args.profile == "heavy":
-        phase1_info = args.phase1_ops if args.phase1_ops is not None else 20_000
-        mixed_info = args.mixed_ops if args.mixed_ops is not None else 10_000
-        durability_info = args.durability_ops if args.durability_ops is not None else 5_000
-        concurrent_info = args.concurrent_ops if args.concurrent_ops is not None else 1_000
-        print(
-            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}, concurrent={concurrent_info} (heavy explicit)",
-            file=sys.stderr,
-        )
-    else:
-        phase1_info = "auto" if args.phase1_ops is None else str(args.phase1_ops)
-        mixed_info = "auto" if args.mixed_ops is None else str(args.mixed_ops)
-        durability_info = "auto" if args.durability_ops is None else str(args.durability_ops)
-        concurrent_info = "auto" if args.concurrent_ops is None else str(args.concurrent_ops)
-        print(
-            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}, concurrent={concurrent_info}",
-            file=sys.stderr,
-        )
+    profile_blocks = HEAVY_PROFILE_BLOCKS if args.profile == "heavy" else CAPPED_PROFILE_BLOCKS
+    print(f"{args.profile} working-set blocks: {profile_blocks}", file=sys.stderr)
+    if args.working_set_blocks is not None:
+        print(f"Working-set override: {args.working_set_blocks}", file=sys.stderr)
+    if args.bench_filter:
+        print(f"Criterion filter: {args.bench_filter}", file=sys.stderr)
+    if any(v is not None for v in [args.phase1_ops, args.mixed_ops, args.durability_ops, args.concurrent_ops]):
+        print("Note: op flags are ignored with Criterion io_patterns benches", file=sys.stderr)
+    print(
+        "Ops: criterion-managed (legacy op flags retained for compatibility, ignored)",
+        file=sys.stderr,
+    )
     print(f"Filesystem/device: {filesystem}", file=sys.stderr)
-    metadata = build_run_metadata(args, iterations, output_dir, filesystem)
+    metadata = build_run_metadata(args, output_dir, filesystem)
     (output_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2))
 
     all_buffered = {}
@@ -345,13 +345,13 @@ def main():
 
         # Buffered
         buffered_file = output_dir / f"buffered_{regime}.json"
-        buffered, buffered_cmd = run_bench_cell(regime, iterations, [], "buffered", args)
+        buffered, buffered_cmd = run_bench_cell(regime, [], "buffered", args)
         buffered_file.write_text(json.dumps(buffered, indent=2))
         print(f"  Saved: {buffered_file}", file=sys.stderr)
 
         # Direct-io
         direct_file = output_dir / f"direct_{regime}.json"
-        direct, direct_cmd = run_bench_cell(regime, iterations, DIRECT_EXTRA, "direct-io", args)
+        direct, direct_cmd = run_bench_cell(regime, DIRECT_EXTRA, "direct-io", args)
         direct_file.write_text(json.dumps(direct, indent=2))
         print(f"  Saved: {direct_file}", file=sys.stderr)
 

@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-from config import REPO_ROOT
+from config import REPO_ROOT, strip_phase_prefix
 
 REGIMES = ["hot", "pressure", "thrash"]
 
@@ -80,6 +80,8 @@ def load_result_map(path: Path) -> Dict[str, float]:
 
 def find_bench_name(result_map: Dict[str, float], prefix: str) -> Optional[str]:
     matches = [name for name in result_map if name.startswith(prefix)]
+    if not matches:
+        matches = [name for name in result_map if strip_phase_prefix(name).startswith(prefix)]
     if not matches:
         return None
     if len(matches) > 1:
@@ -158,7 +160,11 @@ def main() -> None:
 
         out_path = output_dir / f"io_mode_{regime}.png"
         make_regime_bar_chart(regime, rows, out_path)
-        print(f"Wrote {out_path.relative_to(REPO_ROOT)}")
+        try:
+            rendered_path = out_path.relative_to(REPO_ROOT)
+        except ValueError:
+            rendered_path = out_path
+        print(f"Wrote {rendered_path}")
 
 if __name__ == "__main__":
     main()
