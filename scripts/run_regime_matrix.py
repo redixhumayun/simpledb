@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--phase1-ops", type=int, default=None)
     parser.add_argument("--mixed-ops", type=int, default=None)
     parser.add_argument("--durability-ops", type=int, default=None)
+    parser.add_argument("--concurrent-ops", type=int, default=None)
     return parser.parse_args()
 
 
@@ -139,10 +140,12 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
     phase1_ops = args.phase1_ops
     mixed_ops = args.mixed_ops
     durability_ops = args.durability_ops
+    concurrent_ops = args.concurrent_ops
     if args.profile == "heavy":
         phase1_ops = phase1_ops if phase1_ops is not None else 20_000
         mixed_ops = mixed_ops if mixed_ops is not None else 10_000
         durability_ops = durability_ops if durability_ops is not None else 5_000
+        concurrent_ops = concurrent_ops if concurrent_ops is not None else 1_000
 
     if phase1_ops is not None:
         bench_args.extend(["--phase1-ops", str(phase1_ops)])
@@ -150,6 +153,8 @@ def run_bench_cell(regime, iterations, features_extra, label, args):
         bench_args.extend(["--mixed-ops", str(mixed_ops)])
     if durability_ops is not None:
         bench_args.extend(["--durability-ops", str(durability_ops)])
+    if concurrent_ops is not None:
+        bench_args.extend(["--concurrent-ops", str(concurrent_ops)])
 
     cmd = (
         ["cargo", "bench", "--bench", "io_patterns"]
@@ -198,10 +203,12 @@ def build_run_metadata(args, iterations, output_dir, filesystem):
         phase1_ops = args.phase1_ops if args.phase1_ops is not None else 20_000
         mixed_ops = args.mixed_ops if args.mixed_ops is not None else 10_000
         durability_ops = args.durability_ops if args.durability_ops is not None else 5_000
+        concurrent_ops = args.concurrent_ops if args.concurrent_ops is not None else 1_000
     else:
         phase1_ops = "auto" if args.phase1_ops is None else args.phase1_ops
         mixed_ops = "auto" if args.mixed_ops is None else args.mixed_ops
         durability_ops = "auto" if args.durability_ops is None else args.durability_ops
+        concurrent_ops = "auto" if args.concurrent_ops is None else args.concurrent_ops
 
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -214,6 +221,7 @@ def build_run_metadata(args, iterations, output_dir, filesystem):
             "phase1": phase1_ops,
             "mixed": mixed_ops,
             "durability": durability_ops,
+            "concurrent": concurrent_ops,
         },
         "filesystem_device": filesystem,
         "cgroup": detect_cgroup_context(),
@@ -236,7 +244,7 @@ def render_compare_metadata_md(metadata, regime):
         f"- Regime: `{regime}`",
         f"- Iterations: `{metadata['iterations']}`",
         f"- Profile: `{metadata['profile']}`",
-        f"- Ops: `phase1={ops['phase1']}, mixed={ops['mixed']}, durability={ops['durability']}`",
+        f"- Ops: `phase1={ops['phase1']}, mixed={ops['mixed']}, durability={ops['durability']}, concurrent={ops['concurrent']}`",
         f"- Filesystem/device: `{metadata['filesystem_device']}`",
         f"- Output dir: `{metadata['output_dir']}`",
         f"- Script invocation: `{metadata.get('script_invocation', '')}`",
@@ -311,16 +319,18 @@ def main():
         phase1_info = args.phase1_ops if args.phase1_ops is not None else 20_000
         mixed_info = args.mixed_ops if args.mixed_ops is not None else 10_000
         durability_info = args.durability_ops if args.durability_ops is not None else 5_000
+        concurrent_info = args.concurrent_ops if args.concurrent_ops is not None else 1_000
         print(
-            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info} (heavy explicit)",
+            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}, concurrent={concurrent_info} (heavy explicit)",
             file=sys.stderr,
         )
     else:
         phase1_info = "auto" if args.phase1_ops is None else str(args.phase1_ops)
         mixed_info = "auto" if args.mixed_ops is None else str(args.mixed_ops)
         durability_info = "auto" if args.durability_ops is None else str(args.durability_ops)
+        concurrent_info = "auto" if args.concurrent_ops is None else str(args.concurrent_ops)
         print(
-            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}",
+            f"Ops: phase1={phase1_info}, mixed={mixed_info}, durability={durability_info}, concurrent={concurrent_info}",
             file=sys.stderr,
         )
     print(f"Filesystem/device: {filesystem}", file=sys.stderr)

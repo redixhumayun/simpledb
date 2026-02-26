@@ -1,5 +1,11 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+use io_uring::{opcode, types, IoUring};
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::{
     any::Any,
     cell::{Cell, RefCell},
@@ -9,11 +15,11 @@ use std::{
     fmt::Display,
     fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{self, Read, Seek, Write},
+    io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -41,7 +47,19 @@ pub type Lsn = usize;
 type SimpleDBResult<T> = Result<T, Box<dyn Error>>;
 
 //  Shared filesystem trait object used across the database components
-type SharedFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+type SharedFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalMode {
+    #[default]
+    Durable,
+    UnsafeNoWal,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuntimeOptions {
+    pub wal_mode: WalMode,
+}
 
 /// The database struct
 pub struct SimpleDB {
@@ -63,12 +81,27 @@ impl SimpleDB {
         clean: bool,
         lock_timeout_ms: u64,
     ) -> Self {
-        let file_manager: SharedFS = Arc::new(Mutex::new(Box::new(
-            FileManager::new(&path, clean).unwrap(),
-        )));
-        let log_manager = Arc::new(Mutex::new(LogManager::new(
+        Self::new_with_options(
+            path,
+            num_buffers,
+            clean,
+            lock_timeout_ms,
+            RuntimeOptions::default(),
+        )
+    }
+
+    pub fn new_with_options<P: AsRef<Path>>(
+        path: P,
+        num_buffers: usize,
+        clean: bool,
+        lock_timeout_ms: u64,
+        runtime_options: RuntimeOptions,
+    ) -> Self {
+        let file_manager: SharedFS = Arc::new(FileManager::new(&path, clean).unwrap());
+        let log_manager = Arc::new(Mutex::new(LogManager::new_with_mode(
             Arc::clone(&file_manager),
             Self::LOG_FILE,
+            runtime_options.wal_mode,
         )));
         let buffer_manager = Arc::new(BufferManager::new(
             Arc::clone(&file_manager),
@@ -117,9 +150,10 @@ impl SimpleDB {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis();
+            .as_nanos();
         let thread_id = std::thread::current().id();
-        let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}"));
+        let suffix = crate::test_utils::generate_random_number();
+        let test_dir = TestDir::new(format!("/tmp/test_db_{timestamp}_{thread_id:?}_{suffix}"));
         let db = Self::new(&test_dir, num_buffers, true, lock_timeout_ms);
         (db, test_dir)
     }
@@ -134,6 +168,14 @@ impl SimpleDB {
 
     pub fn db_directory(&self) -> &Path {
         &self.db_directory
+    }
+
+    pub fn set_wal_mode(&self, mode: WalMode) {
+        self.log_manager.lock().unwrap().set_wal_mode(mode);
+    }
+
+    pub fn wal_mode(&self) -> WalMode {
+        self.log_manager.lock().unwrap().wal_mode()
     }
 
     pub fn metadata_manager(&self) -> Arc<MetadataManager> {
@@ -7866,9 +7908,25 @@ pub struct TableScan {
     heap_iter: Option<HeapIterator>,
     current_slot: Option<usize>,
     table_name: String,
+    prefetch_window: usize,
+    next_prefetch_block: usize,
 }
 
 impl TableScan {
+    fn default_prefetch_window_cell() -> &'static AtomicUsize {
+        static TABLE_SCAN_DEFAULT_PREFETCH_WINDOW_BLOCKS: AtomicUsize = AtomicUsize::new(16);
+        &TABLE_SCAN_DEFAULT_PREFETCH_WINDOW_BLOCKS
+    }
+
+    pub fn default_prefetch_window_blocks() -> usize {
+        Self::default_prefetch_window_cell().load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_default_prefetch_window_blocks(window_blocks: usize) {
+        Self::default_prefetch_window_cell()
+            .store(window_blocks, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
         debug!("Creating table scan for {}", table_name);
         let file_name = format!("{table_name}.tbl");
@@ -7880,6 +7938,8 @@ impl TableScan {
             heap_iter: None,
             current_slot: None,
             table_name: table_name.to_string(),
+            prefetch_window: Self::default_prefetch_window_blocks(),
+            next_prefetch_block: 1,
         };
 
         if scan.txn.size(&file_name) == 0 {
@@ -7898,6 +7958,31 @@ impl TableScan {
         scan
     }
 
+    fn maybe_prefetch_from(&mut self, current_block: usize) {
+        if self.prefetch_window == 0 {
+            return;
+        }
+        if self.next_prefetch_block > current_block {
+            return;
+        }
+        let file_size = self.txn.size(&self.file_name);
+        let start = current_block.saturating_add(1);
+        if start >= file_size {
+            return;
+        }
+
+        let available = file_size - start;
+        let count = available.min(self.prefetch_window);
+        if count == 0 {
+            return;
+        }
+
+        self.txn
+            .buffer_manager()
+            .prefetch(&self.file_name, start, count);
+        self.next_prefetch_block = start.saturating_add(count);
+    }
+
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number.
     /// Captures `max_slot` from the page's current slot count so that redirect-appended
     /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
@@ -7908,6 +7993,7 @@ impl TableScan {
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
+        self.maybe_prefetch_from(block_num);
     }
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there.
@@ -7930,6 +8016,7 @@ impl TableScan {
 
     /// Moves the [`RecordPage`] to the start of the file
     pub fn move_to_start(&mut self) {
+        self.next_prefetch_block = 1;
         self.move_to_block(0);
     }
 
@@ -8037,7 +8124,7 @@ impl Scan for TableScan {
     }
 
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
-        self.move_to_block(0);
+        self.move_to_start();
         Ok(())
     }
 }
@@ -9056,24 +9143,20 @@ impl Transaction {
 
     /// Get the size of this file in blocks
     fn size(&self, file_name: &str) -> usize {
-        self.file_manager
-            .lock()
-            .unwrap()
-            .length(file_name.to_string())
+        self.file_manager.length(file_name.to_string())
     }
 
     /// Append a block to the file
     fn append(&self, file_name: &str) -> BlockId {
-        let mut file_manager = self.file_manager.lock().unwrap();
-        let block_id = file_manager.append(file_name.to_string());
+        let block_id = self.file_manager.append(file_name.to_string());
         let page = Page::new();
-        file_manager.write(&block_id, &page);
+        self.file_manager.write(&block_id, &page);
         block_id
     }
 
     /// Get the block size
     pub fn block_size(&self) -> usize {
-        self.file_manager.lock().unwrap().block_size()
+        self.file_manager.block_size()
     }
 }
 #[cfg(test)]
@@ -12617,8 +12700,7 @@ mod buffer_list_tests {
     #[test]
     fn test_buffer_list_functionality() {
         let dir = TestDir::new("buffer_list_tests");
-        let file_manager: super::SharedFS =
-            Arc::new(Mutex::new(Box::new(FileManager::new(&dir, true).unwrap())));
+        let file_manager: super::SharedFS = Arc::new(FileManager::new(&dir, true).unwrap());
         let log_manager = Arc::new(Mutex::new(LogManager::new(
             Arc::clone(&file_manager),
             "buffer_list_tests_log_file",
@@ -12634,11 +12716,7 @@ mod buffer_list_tests {
         // TODO: rework this test to go through RecordPage/PageView once higher layers migrate
         {
             let page = Page::new();
-            buffer_manager
-                .file_manager()
-                .lock()
-                .unwrap()
-                .write(&block_id, &page);
+            buffer_manager.file_manager().write(&block_id, &page);
         }
         assert!(buffer_list.get_buffer(&block_id).is_none());
 
@@ -12657,10 +12735,13 @@ pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
 
 #[cfg(test)]
 mod buffer_manager_tests {
-    use std::{sync::Arc, thread};
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use crate::{
-        page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Schema, SimpleDB,
+        page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Page, Schema, SimpleDB,
     };
 
     const BUFFER_FIELD: &str = "val";
@@ -12692,6 +12773,21 @@ mod buffer_manager_tests {
         buffer_manager.unpin(buffer);
     }
 
+    fn write_row_direct(
+        file_manager: &crate::SharedFS,
+        layout: &Layout,
+        block_id: &BlockId,
+        value: i32,
+    ) {
+        let mut page = Page::new();
+        let field_idx = layout.column_idx(BUFFER_FIELD).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, layout, |values| {
+            values[field_idx] = Some(Constant::Int(value));
+        })
+        .expect("initialize heap page");
+        file_manager.write(block_id, &page);
+    }
+
     #[test]
     fn test_buffer_replacement() {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
@@ -12702,7 +12798,7 @@ mod buffer_manager_tests {
 
         let mut block_ids = Vec::new();
         for _ in 0..4 {
-            let block = file_manager.lock().unwrap().append(file.clone());
+            let block = file_manager.append(file.clone());
             block_ids.push(block);
         }
 
@@ -12749,10 +12845,7 @@ mod buffer_manager_tests {
 
         let blocks: Vec<BlockId> = (0..num_blocks)
             .map(|i| {
-                let block = file_manager
-                    .lock()
-                    .unwrap()
-                    .append("stressfile".to_string());
+                let block = file_manager.append("stressfile".to_string());
                 write_row(&buffer_manager, layout.as_ref(), &block, i as i32);
                 block
             })
@@ -12818,12 +12911,182 @@ mod buffer_manager_tests {
             );
         }
     }
+
+    #[test]
+    fn test_prefetch_turns_following_pins_into_hits() {
+        let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
+        db.buffer_manager.enable_stats();
+        db.buffer_manager.reset_stats();
+
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = buffer_layout();
+        let file = "prefetch_single.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..8)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, &layout, &block, i);
+                block
+            })
+            .collect();
+
+        let installed = buffer_manager.prefetch(&file, 0, 3);
+        assert!(
+            (1..=3).contains(&installed),
+            "expected best-effort prefetch of 1..=3 blocks, got {}",
+            installed
+        );
+
+        buffer_manager.reset_stats();
+        for block in blocks.iter().take(installed) {
+            let buffer = buffer_manager.pin(block).expect("pin prefetched block");
+            let value = {
+                let page = buffer.read_page();
+                test_helpers::read_single_int_field(&page, &layout, BUFFER_FIELD)
+                    .expect("read prefetched row")
+            };
+            buffer_manager.unpin(buffer);
+            assert_eq!(value, block.block_num as i32);
+        }
+
+        let (hits, misses) = buffer_manager
+            .get_stats()
+            .expect("buffer stats should be enabled");
+        assert!(
+            hits >= installed,
+            "expected >= {} hits after prefetch, got {}",
+            installed,
+            hits
+        );
+        assert_eq!(
+            misses, 0,
+            "prefetched blocks should not miss immediately after prefetch"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_prefetch_same_range_preserves_invariants() {
+        let pool_size = 8usize;
+        let (db, _test_dir) = SimpleDB::new_for_test(pool_size, 5000);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = Arc::new(buffer_layout());
+        let file = "prefetch_concurrent.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..16)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, layout.as_ref(), &block, i);
+                block
+            })
+            .collect();
+        let blocks = Arc::new(blocks);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let run_worker = |worker_id: usize,
+                          bm: Arc<BufferManager>,
+                          blocks: Arc<Vec<BlockId>>,
+                          layout: Arc<Layout>,
+                          file: String,
+                          barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                barrier.wait();
+                let installed = bm.prefetch(&file, 0, 8);
+                barrier.wait();
+
+                for idx in 0..8 {
+                    let block = &blocks[idx];
+                    let buffer = bm.pin(block).expect("pin block after concurrent prefetch");
+                    let value = {
+                        let page = buffer.read_page();
+                        test_helpers::read_single_int_field(&page, layout.as_ref(), BUFFER_FIELD)
+                            .expect("read concurrent prefetched row")
+                    };
+                    bm.unpin(buffer);
+                    assert_eq!(value, idx as i32, "worker {} saw wrong value", worker_id);
+                }
+                installed
+            })
+        };
+
+        let t1 = run_worker(
+            1,
+            Arc::clone(&buffer_manager),
+            Arc::clone(&blocks),
+            Arc::clone(&layout),
+            file.clone(),
+            Arc::clone(&barrier),
+        );
+        let t2 = run_worker(
+            2,
+            Arc::clone(&buffer_manager),
+            Arc::clone(&blocks),
+            Arc::clone(&layout),
+            file,
+            Arc::clone(&barrier),
+        );
+
+        barrier.wait();
+        barrier.wait();
+        let installed_1 = t1.join().expect("worker 1 panicked");
+        let installed_2 = t2.join().expect("worker 2 panicked");
+
+        assert!(
+            installed_1 + installed_2 <= 8,
+            "duplicate-install race should not install same block twice"
+        );
+
+        buffer_manager.assert_buffer_count_invariant();
+        assert_eq!(
+            buffer_manager.available(),
+            pool_size,
+            "all buffers must be unpinned after concurrent prefetch test"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_best_effort_when_no_victim_available() {
+        let pool_size = 3usize;
+        let (db, _test_dir) = SimpleDB::new_for_test(pool_size, 5000);
+        let buffer_manager = Arc::clone(&db.buffer_manager);
+        let file_manager = Arc::clone(&db.file_manager);
+        let layout = buffer_layout();
+        let file = "prefetch_no_victim.tbl".to_string();
+
+        let blocks: Vec<BlockId> = (0..6)
+            .map(|i| {
+                let block = file_manager.append(file.clone());
+                write_row_direct(&file_manager, &layout, &block, i);
+                block
+            })
+            .collect();
+
+        let mut pinned = Vec::new();
+        for block in blocks.iter().take(pool_size) {
+            pinned.push(buffer_manager.pin(block).expect("pin to exhaust pool"));
+        }
+        assert_eq!(buffer_manager.available(), 0, "pool should be fully pinned");
+
+        let installed = buffer_manager.prefetch(&file, pool_size, 3);
+        assert_eq!(
+            installed, 0,
+            "prefetch should be best-effort and non-blocking"
+        );
+
+        for frame in pinned {
+            buffer_manager.unpin(frame);
+        }
+        buffer_manager.assert_buffer_count_invariant();
+        assert_eq!(buffer_manager.available(), pool_size);
+    }
 }
 
 #[derive(Debug)]
 pub struct LogManager {
     file_manager: SharedFS,
     log_file: String,
+    wal_mode: WalMode,
     log_page: WalPage,
     current_block: BlockId,
     latest_lsn: usize,
@@ -12832,8 +13095,12 @@ pub struct LogManager {
 
 impl LogManager {
     pub fn new(file_manager: SharedFS, log_file: &str) -> Self {
+        Self::new_with_mode(file_manager, log_file, WalMode::Durable)
+    }
+
+    pub fn new_with_mode(file_manager: SharedFS, log_file: &str, wal_mode: WalMode) -> Self {
         let mut log_page = WalPage::new();
-        let log_size = file_manager.lock().unwrap().length(log_file.to_string());
+        let log_size = file_manager.length(log_file.to_string());
         let current_block = if log_size == 0 {
             LogManager::append_new_block(&file_manager, log_file, &mut log_page)
         } else {
@@ -12841,23 +13108,33 @@ impl LogManager {
                 filename: log_file.to_string(),
                 block_num: log_size - 1,
             };
-            file_manager
-                .lock()
-                .unwrap()
-                .read_raw(&block, log_page.bytes_mut());
+            file_manager.read_raw(&block, log_page.bytes_mut());
             block
         };
         Self {
             file_manager,
             log_file: log_file.to_string(),
+            wal_mode,
             log_page,
             current_block,
             latest_lsn: 0,
             last_saved_lsn: 0,
         }
     }
+
+    pub fn set_wal_mode(&mut self, wal_mode: WalMode) {
+        self.wal_mode = wal_mode;
+    }
+
+    pub fn wal_mode(&self) -> WalMode {
+        self.wal_mode
+    }
+
     /// Determine if this Lsn has been flushed to disk, and flush it if it hasn't
     pub fn flush_lsn(&mut self, lsn: Lsn) {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return;
+        }
         if self.last_saved_lsn >= lsn {
             return;
         }
@@ -12867,20 +13144,22 @@ impl LogManager {
     /// Write the bytes from log_page to disk for the current_block
     /// Update the last_saved_lsn before returning
     fn flush_to_disk(&mut self) {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return;
+        }
         self.file_manager
-            .lock()
-            .unwrap()
             .write_raw(&self.current_block, self.log_page.bytes());
-
-        self.file_manager.lock().unwrap().sync(&self.log_file);
-        self.file_manager.lock().unwrap().sync_directory();
-
+        self.file_manager.sync(&self.log_file);
+        self.file_manager.sync_directory();
         self.last_saved_lsn = self.latest_lsn;
     }
 
     /// Write the log_record to the log page
     /// First, check if there is enough space
     pub fn append(&mut self, log_record: Vec<u8>) -> SimpleDBResult<Lsn> {
+        if self.wal_mode == WalMode::UnsafeNoWal {
+            return Ok(self.latest_lsn);
+        }
         let mut boundary = self.log_page.boundary();
         let bytes_needed = log_record.len() + WalPage::HEADER_BYTES;
         let page_capacity = self.log_page.capacity();
@@ -12916,12 +13195,9 @@ impl LogManager {
         log_file: &str,
         log_page: &mut WalPage,
     ) -> BlockId {
-        let block_id = file_manager.lock().unwrap().append(log_file.to_string());
+        let block_id = file_manager.append(log_file.to_string());
         log_page.reset();
-        file_manager
-            .lock()
-            .unwrap()
-            .write_raw(&block_id, log_page.bytes());
+        file_manager.write_raw(&block_id, log_page.bytes());
         block_id
     }
 
@@ -12947,10 +13223,7 @@ pub struct LogIterator {
 impl LogIterator {
     pub fn new(file_manager: SharedFS, current_block: BlockId, latest_lsn: Lsn) -> Self {
         let mut page = WalPage::new();
-        file_manager
-            .lock()
-            .unwrap()
-            .read_raw(&current_block, page.bytes_mut());
+        file_manager.read_raw(&current_block, page.bytes_mut());
         let boundary = page.boundary();
 
         Self {
@@ -12965,8 +13238,6 @@ impl LogIterator {
 
     pub fn move_to_block(&mut self) {
         self.file_manager
-            .lock()
-            .unwrap()
             .read_raw(&self.current_block, self.page.bytes_mut());
         self.boundary = self.page.boundary();
         self.current_pos = self.boundary;
@@ -13025,17 +13296,38 @@ impl BlockId {
 /// Page backed by the new layout; alias to the RawPage bytes type.
 pub type Page = crate::page::PageBytes;
 
+#[derive(Debug, Clone)]
+pub struct BatchReadReq {
+    pub block_id: BlockId,
+}
+
 /// Trait defining the file system interface for database operations
-pub trait FileSystemInterface: std::fmt::Debug {
+pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
-    fn length(&mut self, filename: String) -> usize;
-    fn read(&mut self, block_id: &BlockId, page: &mut Page);
-    fn write(&mut self, block_id: &BlockId, page: &Page);
-    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]);
-    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]);
-    fn append(&mut self, filename: String) -> BlockId;
-    fn sync(&mut self, filename: &str);
-    fn sync_directory(&mut self);
+    fn length(&self, filename: String) -> usize;
+    fn read(&self, block_id: &BlockId, page: &mut Page);
+    fn write(&self, block_id: &BlockId, page: &Page);
+    fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]);
+    fn write_raw(&self, block_id: &BlockId, buf: &[u8]);
+    fn read_batch(&self, reqs: &[BatchReadReq], pages: &mut [Page]) {
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch read request/page length mismatch"
+        );
+        for (req, page) in reqs.iter().zip(pages.iter_mut()) {
+            self.read(&req.block_id, page);
+        }
+    }
+    fn append(&self, filename: String) -> BlockId;
+    fn sync(&self, filename: &str);
+    fn sync_directory(&self);
+    fn enable_io_stats(&self) {}
+    fn disable_io_stats(&self) {}
+    fn io_batch_counters(&self) -> (usize, usize) {
+        (0, 0)
+    }
+    fn reset_io_batch_counters(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -13062,8 +13354,9 @@ enum IoMode {
 struct OpenFile {
     file: File,
     mode: IoMode,
-    #[cfg(target_os = "linux")]
-    scratch: Option<AlignedBuf>,
+    /// Serialises the length-query → write-at sequence for append operations.
+    /// Only `append` holds this lock; all other methods bypass it.
+    append_mu: Mutex<()>,
 }
 
 impl OpenFile {
@@ -13071,22 +13364,17 @@ impl OpenFile {
         Self {
             file,
             mode,
-            #[cfg(target_os = "linux")]
-            scratch: if mode == IoMode::Direct {
-                Some(AlignedBuf::new_zeroed())
-            } else {
-                None
-            },
+            append_mu: Mutex::new(()),
         }
     }
 
-    /// Read exactly one page from the file at the current seek position.
-    /// Uses an aligned intermediate buffer when the mode is `Direct`.
-    fn read_page(&mut self) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
+    /// Read exactly one page from the file at `offset`.
+    /// Uses the thread-local aligned buffer when the mode is `Direct`.
+    fn read_page_at(&self, offset: u64) -> [u8; crate::page::PAGE_SIZE_BYTES as usize] {
         match self.mode {
             IoMode::Buffered => {
                 let mut buf = [0u8; crate::page::PAGE_SIZE_BYTES as usize];
-                match self.file.read_exact(&mut buf) {
+                match self.file.read_exact_at(&mut buf, offset) {
                     Ok(_) => (),
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => buf.fill(0),
                     Err(e) => panic!("Failed to read from file: {e}"),
@@ -13096,19 +13384,17 @@ impl OpenFile {
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let file = &mut self.file;
-                    let buf = self
-                        .scratch
-                        .as_mut()
-                        .expect("direct mode requires aligned scratch buffer");
-                    match file.read_exact(buf.as_mut_slice()) {
-                        Ok(_) => (),
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            buf.as_mut_slice().fill(0)
+                    DIRECT_IO_SCRATCH.with(|cell| {
+                        let mut buf = cell.borrow_mut();
+                        match self.file.read_exact_at(buf.as_mut_slice(), offset) {
+                            Ok(_) => (),
+                            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                                buf.as_mut_slice().fill(0)
+                            }
+                            Err(e) => panic!("Failed to read from file (direct I/O): {e}"),
                         }
-                        Err(e) => panic!("Failed to read from file (direct I/O): {e}"),
-                    }
-                    buf.as_slice().try_into().unwrap()
+                        buf.as_slice().try_into().unwrap()
+                    })
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("Direct I/O is only supported on Linux")
@@ -13116,24 +13402,22 @@ impl OpenFile {
         }
     }
 
-    /// Write exactly one page to the file at the current seek position.
-    /// Uses an aligned intermediate buffer when the mode is `Direct`.
-    fn write_page(&mut self, data: &[u8]) {
+    /// Write exactly one page to the file at `offset`.
+    /// Uses the thread-local aligned buffer when the mode is `Direct`.
+    fn write_page_at(&self, offset: u64, data: &[u8]) {
         debug_assert_eq!(data.len(), crate::page::PAGE_SIZE_BYTES as usize);
         match self.mode {
             IoMode::Buffered => {
-                self.file.write_all(data).unwrap();
+                self.file.write_all_at(data, offset).unwrap();
             }
             IoMode::Direct => {
                 #[cfg(target_os = "linux")]
                 {
-                    let file = &mut self.file;
-                    let buf = self
-                        .scratch
-                        .as_mut()
-                        .expect("direct mode requires aligned scratch buffer");
-                    buf.as_mut_slice().copy_from_slice(data);
-                    file.write_all(buf.as_slice()).unwrap();
+                    DIRECT_IO_SCRATCH.with(|cell| {
+                        let mut buf = cell.borrow_mut();
+                        buf.as_mut_slice().copy_from_slice(data);
+                        self.file.write_all_at(buf.as_slice(), offset).unwrap();
+                    });
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("Direct I/O is only supported on Linux")
@@ -13170,8 +13454,8 @@ fn desired_mode_for_class(class: FileClass) -> IoMode {
     }
 }
 
-/// Global counter incremented each time a direct-I/O open falls back to buffered.
-/// Readable via `direct_io_fallback_count()`.
+/// Legacy counter for direct-I/O fallback events.
+/// In the current hard-default direct-I/O policy this should remain zero.
 static DIRECT_IO_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Return the number of direct-I/O fallbacks that have occurred in this process.
@@ -13179,40 +13463,25 @@ pub fn direct_io_fallback_count() -> usize {
     DIRECT_IO_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Open a file with the appropriate I/O mode for its class.
+/// Open a file with the configured I/O mode for its class.
 ///
-/// Falls back to buffered mode if `O_DIRECT` open fails with an
-/// unsupported-flag error (`EINVAL` / `EOPNOTSUPP`).  Other errors are
-/// propagated.  The returned `OpenFile.mode` always reflects the mode that
-/// actually succeeded.
-fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
+/// In `direct-io` builds, data files are opened with `O_DIRECT` and open
+/// failures are returned to the caller (no buffered fallback).
+fn open_with_mode(path: &Path, class: FileClass) -> io::Result<OpenFile> {
     let desired = desired_mode_for_class(class);
 
     #[cfg(all(target_os = "linux", feature = "direct-io"))]
     if desired == IoMode::Direct {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let result = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .custom_flags(libc::O_DIRECT)
-            .open(path);
-
-        match result {
-            Ok(file) => return Ok(OpenFile::new(file, IoMode::Direct)),
-            Err(ref e) if is_direct_io_unsupported(e) => {
-                DIRECT_IO_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                eprintln!(
-                    "[direct-io:fallback] file={} requested=direct effective=buffered reason=\"{}\"",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    e
-                );
-                // fall through to buffered open below
-            }
-            Err(e) => return Err(e),
-        }
+            .open(path)?;
+        return Ok(OpenFile::new(file, IoMode::Direct));
     }
     #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
     let _ = desired;
@@ -13224,16 +13493,6 @@ fn open_with_fallback(path: &Path, class: FileClass) -> io::Result<OpenFile> {
         .truncate(false)
         .open(path)?;
     Ok(OpenFile::new(file, IoMode::Buffered))
-}
-
-/// Returns `true` for open-time errors that indicate direct I/O is unsupported
-/// by the filesystem or device.  Do **not** use for read/write errors.
-#[cfg(all(target_os = "linux", feature = "direct-io"))]
-fn is_direct_io_unsupported(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-    )
 }
 
 /// Page-aligned heap allocation for direct I/O.
@@ -13285,16 +13544,77 @@ impl Drop for AlignedBuf {
 #[cfg(target_os = "linux")]
 unsafe impl Send for AlignedBuf {}
 
+// Per-thread aligned buffer for direct I/O.  Reused across calls to avoid
+// a page-aligned allocation on every read/write.  Only initialised on threads
+// that actually perform direct I/O.
+#[cfg(target_os = "linux")]
+thread_local! {
+    static DIRECT_IO_SCRATCH: RefCell<AlignedBuf> =
+        RefCell::new(AlignedBuf::new_zeroed());
+}
+
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+const IO_URING_QUEUE_DEPTH: u32 = 256;
+
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+struct IoUringEngine {
+    ring: Mutex<IoUring>,
+}
+
+#[cfg(all(target_os = "linux", feature = "direct-io"))]
+impl std::fmt::Debug for IoUringEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringEngine").finish_non_exhaustive()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // End I/O mode abstraction
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct IoBatchCounters {
+    submitted: AtomicUsize,
+    completed: AtomicUsize,
+}
+
+impl IoBatchCounters {
+    fn record_submitted(&self, n: usize) {
+        self.submitted
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_completed(&self, n: usize) {
+        self.completed
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (usize, usize) {
+        (
+            self.submitted.load(std::sync::atomic::Ordering::Relaxed),
+            self.completed.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn reset(&self) {
+        self.submitted
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.completed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The file manager struct that manages the files in the database
 #[derive(Debug)]
 struct FileManager {
     db_directory: PathBuf,
-    open_files: HashMap<String, OpenFile>,
+    /// Read-locked for lookup (common path); write-locked only on first open of a file.
+    open_files: RwLock<HashMap<String, Arc<OpenFile>>>,
     directory_fd: File,
+    io_stats_enabled: AtomicBool,
+    io_batch_counters: IoBatchCounters,
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    io_uring: IoUringEngine,
 }
 
 impl FileManager {
@@ -13315,23 +13635,153 @@ impl FileManager {
         }
 
         let directory_fd = File::open(&db_path)?;
+        #[cfg(all(target_os = "linux", feature = "direct-io"))]
+        let io_uring = IoUring::new(IO_URING_QUEUE_DEPTH).map_err(|e| {
+            io::Error::other(format!(
+                "direct-io build requires io_uring initialization: {e}"
+            ))
+        })?;
 
         Ok(Self {
             db_directory: db_path,
-            open_files: HashMap::new(),
+            open_files: RwLock::new(HashMap::new()),
             directory_fd,
+            io_stats_enabled: AtomicBool::new(false),
+            io_batch_counters: IoBatchCounters::default(),
+            #[cfg(all(target_os = "linux", feature = "direct-io"))]
+            io_uring: IoUringEngine {
+                ring: Mutex::new(io_uring),
+            },
         })
     }
 
-    /// Access an `OpenFile` for the given filename, opening it on first access.
-    fn with_open_file<R>(&mut self, filename: &str, f: impl FnOnce(&mut OpenFile) -> R) -> R {
+    /// Return a handle to the `OpenFile` for `filename`, opening it on first access.
+    /// Common path (file already open): takes a shared read lock, no blocking between readers.
+    /// Slow path (first access): upgrades to write lock to insert the new entry.
+    fn get_open_file(&self, filename: &str) -> Arc<OpenFile> {
         let full_path = self.db_directory.join(filename);
-        let key = full_path.to_string_lossy().to_string();
-        let of = self.open_files.entry(key).or_insert_with(|| {
+        let key = full_path.to_string_lossy().into_owned();
+
+        // Fast path: file already open — shared read lock, multiple threads proceed concurrently.
+        {
+            let map = self.open_files.read().unwrap();
+            if let Some(of) = map.get(&key) {
+                return Arc::clone(of);
+            }
+        }
+
+        // Slow path: first access — write lock to insert.
+        let mut map = self.open_files.write().unwrap();
+        // Re-check after acquiring write lock (another thread may have inserted between the two locks).
+        Arc::clone(map.entry(key).or_insert_with(|| {
             let class = classify_file(filename);
-            open_with_fallback(&full_path, class).expect("Failed to open file")
-        });
-        f(of)
+            Arc::new(open_with_mode(&full_path, class).expect("Failed to open file"))
+        }))
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+    fn read_page_sync(&self, block_id: &BlockId, page: &mut Page) {
+        let offset = block_offset(block_id.block_num);
+        let of = self.get_open_file(&block_id.filename);
+        *page = Page::from_bytes(of.read_page_at(offset));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    fn submit_direct_reads_uring(
+        &self,
+        reqs: &[BatchReadReq],
+        direct_indices: &[usize],
+        direct_files: &[Arc<OpenFile>],
+        offsets: &[u64],
+        pages: &mut [Page],
+    ) {
+        assert_eq!(direct_indices.len(), direct_files.len());
+        assert_eq!(direct_indices.len(), offsets.len());
+
+        let mut aligned_bufs: Vec<AlignedBuf> = Vec::with_capacity(direct_indices.len());
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(direct_indices.len());
+        let mut fds: Vec<i32> = Vec::with_capacity(direct_indices.len());
+
+        for pos in 0..direct_indices.len() {
+            aligned_bufs.push(AlignedBuf::new_zeroed());
+            let bytes = aligned_bufs[pos].as_mut_slice();
+            iovecs.push(libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            });
+            fds.push(direct_files[pos].file.as_raw_fd());
+        }
+
+        let mut ring = self.io_uring.ring.lock().unwrap();
+        let mut submitted = 0usize;
+        while submitted < direct_indices.len() {
+            let mut queued = 0usize;
+            {
+                let mut sq = ring.submission();
+                while submitted + queued < direct_indices.len() && !sq.is_full() {
+                    let request_pos = submitted + queued;
+                    let sqe = opcode::Readv::new(
+                        types::Fd(fds[request_pos]),
+                        &iovecs[request_pos] as *const libc::iovec,
+                        1,
+                    )
+                    .offset(offsets[request_pos])
+                    .build()
+                    .user_data(request_pos as u64);
+                    // SAFETY: `sqe` lives until pushed into the queue and ring capacity is checked.
+                    unsafe {
+                        sq.push(&sqe).expect("submission queue push failed");
+                    }
+                    queued += 1;
+                }
+            }
+
+            assert!(
+                queued > 0,
+                "io_uring queue depth is zero; cannot make progress"
+            );
+            ring.submit().expect("io_uring submit failed");
+
+            let mut completed = 0usize;
+            while completed < queued {
+                if ring.completion().is_empty() {
+                    ring.submit_and_wait(1)
+                        .expect("io_uring submit_and_wait failed");
+                }
+
+                let mut cq = ring.completion();
+                for cqe in &mut cq {
+                    let request_pos = cqe.user_data() as usize;
+                    let page_idx = direct_indices[request_pos];
+                    let result = cqe.result();
+                    if result < 0 {
+                        let errno = -result;
+                        panic!(
+                            "io_uring read failed for {:?}: {}",
+                            &reqs[page_idx].block_id,
+                            io::Error::from_raw_os_error(errno)
+                        );
+                    }
+
+                    let bytes_read = result as usize;
+                    let aligned_buf = aligned_bufs[request_pos].as_mut_slice();
+                    if bytes_read > aligned_buf.len() {
+                        panic!(
+                            "io_uring read returned too many bytes: got {}, page size {}",
+                            bytes_read,
+                            aligned_buf.len()
+                        );
+                    }
+                    if bytes_read < aligned_buf.len() {
+                        aligned_buf[bytes_read..].fill(0);
+                    }
+                    pages[page_idx].bytes_mut().copy_from_slice(aligned_buf);
+                    completed += 1;
+                }
+            }
+
+            submitted += queued;
+        }
     }
 }
 impl FileSystemInterface for FileManager {
@@ -13339,81 +13789,152 @@ impl FileSystemInterface for FileManager {
         crate::page::PAGE_SIZE_BYTES as usize
     }
 
-    fn length(&mut self, filename: String) -> usize {
-        self.with_open_file(&filename, |of| {
-            let metadata = of.file.metadata().unwrap();
-            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
-        })
+    fn length(&self, filename: String) -> usize {
+        let of = self.get_open_file(&filename);
+        let metadata = of.file.metadata().unwrap();
+        (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
     }
 
-    fn read(&mut self, block_id: &BlockId, page: &mut Page) {
+    fn read(&self, block_id: &BlockId, page: &mut Page) {
+        let reqs = [BatchReadReq {
+            block_id: block_id.clone(),
+        }];
+        let mut pages = [Page::new()];
+        self.read_batch(&reqs, &mut pages);
+        *page = std::mem::take(&mut pages[0]);
+    }
+
+    fn write(&self, block_id: &BlockId, page: &Page) {
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            *page = Page::from_bytes(of.read_page());
-        });
+        let of = self.get_open_file(&block_id.filename);
+        of.write_page_at(offset, page.bytes());
     }
 
-    fn write(&mut self, block_id: &BlockId, page: &Page) {
-        let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            of.write_page(page.bytes());
-        });
-    }
-
-    fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
+    fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]) {
         assert_eq!(
             buf.len(),
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
-        let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            buf.copy_from_slice(&of.read_page());
-        });
+        let reqs = [BatchReadReq {
+            block_id: block_id.clone(),
+        }];
+        let mut pages = [Page::new()];
+        self.read_batch(&reqs, &mut pages);
+        buf.copy_from_slice(pages[0].bytes());
     }
 
-    fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
+    fn write_raw(&self, block_id: &BlockId, buf: &[u8]) {
         assert_eq!(
             buf.len(),
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
         let offset = block_offset(block_id.block_num);
-        self.with_open_file(&block_id.filename, |of| {
-            of.file.seek(io::SeekFrom::Start(offset)).unwrap();
-            of.write_page(buf);
-        });
+        let of = self.get_open_file(&block_id.filename);
+        of.write_page_at(offset, buf);
     }
 
-    /// Append a new empty block to the file
-    fn append(&mut self, filename: String) -> BlockId {
-        let new_blk_num = self.length(filename.clone());
-        let block_id = BlockId::new(filename.clone(), new_blk_num);
+    fn read_batch(&self, reqs: &[BatchReadReq], pages: &mut [Page]) {
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch read request/page length mismatch"
+        );
+        let stats_enabled = self
+            .io_stats_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if stats_enabled {
+            self.io_batch_counters.record_submitted(reqs.len());
+        }
+
+        #[cfg(all(target_os = "linux", feature = "direct-io"))]
+        {
+            let mut direct_indices: Vec<usize> = Vec::new();
+            let mut direct_files: Vec<Arc<OpenFile>> = Vec::new();
+            let mut direct_offsets: Vec<u64> = Vec::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                let of = self.get_open_file(&req.block_id.filename);
+                match of.mode {
+                    IoMode::Buffered => {
+                        let offset = block_offset(req.block_id.block_num);
+                        pages[idx] = Page::from_bytes(of.read_page_at(offset));
+                    }
+                    IoMode::Direct => {
+                        direct_indices.push(idx);
+                        direct_files.push(of);
+                        direct_offsets.push(block_offset(req.block_id.block_num));
+                    }
+                }
+            }
+
+            if !direct_indices.is_empty() {
+                self.submit_direct_reads_uring(
+                    reqs,
+                    &direct_indices,
+                    &direct_files,
+                    &direct_offsets,
+                    pages,
+                );
+            }
+            if stats_enabled {
+                self.io_batch_counters.record_completed(reqs.len());
+            }
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+        for (req, page) in reqs.iter().zip(pages.iter_mut()) {
+            self.read_page_sync(&req.block_id, page);
+        }
+        #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+        if stats_enabled {
+            self.io_batch_counters.record_completed(reqs.len());
+        }
+    }
+
+    /// Append a new empty block to the file.
+    /// Holds `append_mu` across the length-query → write-at sequence to prevent
+    /// two concurrent appenders writing to the same offset.
+    fn append(&self, filename: String) -> BlockId {
+        let of = self.get_open_file(&filename);
+        let _guard = of.append_mu.lock().unwrap();
+        let new_blk_num = {
+            let metadata = of.file.metadata().unwrap();
+            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        };
+        let block_id = BlockId::new(filename, new_blk_num);
         let zeros = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
-        self.with_open_file(&filename, |of| {
-            of.file
-                .seek(io::SeekFrom::Start(
-                    (new_blk_num * crate::page::PAGE_SIZE_BYTES as usize) as u64,
-                ))
-                .unwrap();
-            of.write_page(&zeros);
-        });
+        let offset = block_offset(new_blk_num);
+        of.write_page_at(offset, &zeros);
         block_id
     }
 
-    /// Sync the file with the disk to ensure durability
-    fn sync(&mut self, filename: &str) {
-        self.with_open_file(filename, |of| {
-            of.file.sync_all().unwrap();
-        });
+    fn sync(&self, filename: &str) {
+        let of = self.get_open_file(filename);
+        of.file.sync_all().unwrap();
     }
 
-    /// Sync the directory with the disk to ensure durability
-    fn sync_directory(&mut self) {
+    fn sync_directory(&self) {
         self.directory_fd.sync_all().unwrap();
+    }
+
+    fn enable_io_stats(&self) {
+        self.io_stats_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn disable_io_stats(&self) {
+        self.io_stats_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn io_batch_counters(&self) -> (usize, usize) {
+        self.io_batch_counters.get()
+    }
+
+    fn reset_io_batch_counters(&self) {
+        self.io_batch_counters.reset();
     }
 }
 
@@ -13450,18 +13971,25 @@ mod mock_file_manager {
     }
 
     #[derive(Debug)]
-    pub struct MockFileManager {
+    struct MockInner {
         files: HashMap<String, MockFile>,
         directory_synced: bool,
         crashed: bool,
     }
 
+    #[derive(Debug)]
+    pub struct MockFileManager {
+        inner: std::sync::Mutex<MockInner>,
+    }
+
     impl MockFileManager {
         pub fn new() -> Self {
             Self {
-                files: HashMap::new(),
-                directory_synced: false,
-                crashed: false,
+                inner: std::sync::Mutex::new(MockInner {
+                    files: HashMap::new(),
+                    directory_synced: false,
+                    crashed: false,
+                }),
             }
         }
 
@@ -13471,40 +13999,39 @@ mod mock_file_manager {
 
         /// Simulate a system crash - discards all unsynced data
         /// Files with unsynced directory entries disappear entirely
-        pub fn simulate_crash(&mut self) {
-            if !self.directory_synced {
-                self.files.clear();
+        pub fn simulate_crash(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.directory_synced {
+                inner.files.clear();
             } else {
-                for (_filename, file) in self.files.iter_mut() {
+                for (_filename, file) in inner.files.iter_mut() {
                     file.blocks.retain(|block| block.synced);
-                    file.file_synced = false; // Reset sync state after crash
+                    file.file_synced = false;
                 }
             }
-
-            self.crashed = true;
+            inner.crashed = true;
         }
 
-        pub fn restore_from_crash(&mut self) {
-            self.crashed = false;
+        pub fn restore_from_crash(&self) {
+            self.inner.lock().unwrap().crashed = false;
         }
 
-        fn ensure_file_exists(&mut self, filename: &str) {
-            if !self.files.contains_key(filename) {
-                self.files.insert(
+        fn ensure_file_exists(inner: &mut MockInner, filename: &str) {
+            if !inner.files.contains_key(filename) {
+                inner.files.insert(
                     filename.to_string(),
                     MockFile {
                         blocks: Vec::new(),
                         file_synced: false,
                     },
                 );
-                self.directory_synced = false;
+                inner.directory_synced = false;
             }
         }
 
-        fn ensure_block_exists(&mut self, filename: &str, block_num: usize) {
-            self.ensure_file_exists(filename);
-            let file = self.files.get_mut(filename).unwrap();
-
+        fn ensure_block_exists(inner: &mut MockInner, filename: &str, block_num: usize) {
+            Self::ensure_file_exists(inner, filename);
+            let file = inner.files.get_mut(filename).unwrap();
             while file.blocks.len() <= block_num {
                 file.blocks.push(MockBlock {
                     data: Self::fresh_page_bytes(),
@@ -13519,24 +14046,28 @@ mod mock_file_manager {
             crate::page::PAGE_SIZE_BYTES as usize
         }
 
-        fn length(&mut self, filename: String) -> usize {
-            self.files
+        fn length(&self, filename: String) -> usize {
+            self.inner
+                .lock()
+                .unwrap()
+                .files
                 .get(&filename)
                 .map_or(0, |file| file.blocks.len())
         }
 
-        fn read(&mut self, block_id: &BlockId, page: &mut Page) {
-            if self.crashed {
+        fn read(&self, block_id: &BlockId, page: &mut Page) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot read from crashed file system");
             }
 
-            if !self.files.contains_key(&block_id.filename) {
+            if !inner.files.contains_key(&block_id.filename) {
                 *page = Page::new();
                 return;
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get(&block_id.filename).unwrap();
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
@@ -13548,24 +14079,26 @@ mod mock_file_manager {
             }
         }
 
-        fn write(&mut self, block_id: &BlockId, page: &Page) {
-            if self.crashed {
+        fn write(&self, block_id: &BlockId, page: &Page) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot write to crashed file system");
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get_mut(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get_mut(&block_id.filename).unwrap();
             let mut buf = vec![0u8; crate::page::PAGE_SIZE_BYTES as usize];
             buf.copy_from_slice(page.bytes());
 
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf,
-                synced: false, // Write only goes to buffer, not synced
+                synced: false,
             };
         }
 
-        fn read_raw(&mut self, block_id: &BlockId, buf: &mut [u8]) {
-            if self.crashed {
+        fn read_raw(&self, block_id: &BlockId, buf: &mut [u8]) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot read from crashed file system");
             }
             assert_eq!(
@@ -13574,13 +14107,13 @@ mod mock_file_manager {
                 "raw read buffer must be PAGE_SIZE_BYTES"
             );
 
-            if !self.files.contains_key(&block_id.filename) {
+            if !inner.files.contains_key(&block_id.filename) {
                 buf.copy_from_slice(&Self::fresh_page_bytes());
                 return;
             }
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get(&block_id.filename).unwrap();
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get(&block_id.filename).unwrap();
 
             if block_id.block_num < file.blocks.len() {
                 let block = &file.blocks[block_id.block_num];
@@ -13590,8 +14123,9 @@ mod mock_file_manager {
             }
         }
 
-        fn write_raw(&mut self, block_id: &BlockId, buf: &[u8]) {
-            if self.crashed {
+        fn write_raw(&self, block_id: &BlockId, buf: &[u8]) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot write to crashed file system");
             }
             assert_eq!(
@@ -13600,24 +14134,23 @@ mod mock_file_manager {
                 "raw write buffer must be PAGE_SIZE_BYTES"
             );
 
-            self.ensure_block_exists(&block_id.filename, block_id.block_num);
-            let file = self.files.get_mut(&block_id.filename).unwrap();
-
+            Self::ensure_block_exists(&mut inner, &block_id.filename, block_id.block_num);
+            let file = inner.files.get_mut(&block_id.filename).unwrap();
             file.blocks[block_id.block_num] = MockBlock {
                 data: buf.to_vec(),
                 synced: false,
             };
         }
 
-        fn append(&mut self, filename: String) -> BlockId {
-            if self.crashed {
+        fn append(&self, filename: String) -> BlockId {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot append to crashed file system");
             }
 
-            self.ensure_file_exists(&filename);
-            let file = self.files.get_mut(&filename).unwrap();
+            Self::ensure_file_exists(&mut inner, &filename);
+            let file = inner.files.get_mut(&filename).unwrap();
             let block_num = file.blocks.len();
-
             file.blocks.push(MockBlock {
                 data: Self::fresh_page_bytes(),
                 synced: false,
@@ -13626,12 +14159,13 @@ mod mock_file_manager {
             BlockId::new(filename, block_num)
         }
 
-        fn sync(&mut self, filename: &str) {
-            if self.crashed {
+        fn sync(&self, filename: &str) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot sync crashed file system");
             }
 
-            if let Some(file) = self.files.get_mut(filename) {
+            if let Some(file) = inner.files.get_mut(filename) {
                 for block in file.blocks.iter_mut() {
                     block.synced = true;
                 }
@@ -13639,11 +14173,12 @@ mod mock_file_manager {
             }
         }
 
-        fn sync_directory(&mut self) {
-            if self.crashed {
+        fn sync_directory(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.crashed {
                 panic!("Cannot sync crashed file manager");
             }
-            self.directory_synced = true;
+            inner.directory_synced = true;
         }
     }
 }
@@ -13678,19 +14213,24 @@ mod file_manager_tests {
 
     #[test]
     fn test_file_creation() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
 
         let filename = "test_file";
-        file_manager.with_open_file(filename, |_| ());
+        // Trigger file creation via append (opens the file)
+        file_manager.append(filename.to_string());
 
         let full_path = file_manager.db_directory.join(filename);
         let full_path_str = full_path.to_string_lossy().to_string();
-        assert!(file_manager.open_files.contains_key(&full_path_str));
+        assert!(file_manager
+            .open_files
+            .read()
+            .unwrap()
+            .contains_key(&full_path_str));
     }
 
     #[test]
     fn test_append_and_length() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
 
         let filename = "testfile".to_string();
         assert_eq!(file_manager.length(filename.clone()), 0);
@@ -13713,7 +14253,7 @@ mod file_manager_tests {
     #[cfg(all(feature = "direct-io", target_os = "linux"))]
     #[test]
     fn test_direct_io_mode_round_trip_write_then_read() {
-        let (_temp_dir, mut file_manager) = setup();
+        let (_temp_dir, file_manager) = setup();
         let filename = "direct_io_round_trip".to_string();
         let block_id = file_manager.append(filename);
 
@@ -13761,7 +14301,7 @@ mod durability_tests {
 
     #[test]
     fn test_mock_filesystem_demonstrates_durability_flaw() {
-        let mut mock_fs = MockFileManager::new();
+        let mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
@@ -13801,7 +14341,7 @@ mod durability_tests {
 
     #[test]
     fn test_mock_filesystem_with_sync_preserves_data() {
-        let mut mock_fs = MockFileManager::new();
+        let mock_fs = MockFileManager::new();
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();

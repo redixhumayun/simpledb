@@ -12,7 +12,12 @@ This documentation provides information about the SimpleDB project and also prov
 
 ## Architecture Overview
 
-There are no dependencies apart from the Rust standard library and that is by design.
+Core engine paths should remain dependency-free beyond the Rust standard library.
+Allowed exceptions:
+- platform bindings that expose OS primitives not available in `std` (for example `libc`)
+- non-engine tooling dependencies (for example benchmark harnesses like `criterion` and CLI parsing like `clap`)
+
+Do not introduce third-party crates on the critical read/write/transaction execution path without explicit design discussion and rationale.
 
 The code is designed to construct and answer typical SQL queries. The code will construct a query tree that will use the pull-based iterator pattern in a way that is probably typical in most SQL systems. However, the code leans towards readability rather than performance.
 

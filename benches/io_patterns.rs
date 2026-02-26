@@ -14,10 +14,10 @@ use simpledb::{
     },
     direct_io_fallback_count,
     test_utils::generate_random_number,
-    BlockId, LogManager, Page, SimpleDB, TestDir,
+    BatchReadReq, BlockId, LogManager, Page, SimpleDB, TestDir,
 };
 
-type BenchFS = Arc<Mutex<Box<dyn FileSystemInterface + Send + 'static>>>;
+type BenchFS = Arc<dyn FileSystemInterface + Send + Sync + 'static>;
 
 type Lsn = usize;
 
@@ -102,7 +102,6 @@ impl DataSyncPolicy {
         match self {
             DataSyncPolicy::None => (),
             DataSyncPolicy::Immediate => {
-                let mut fm = fm.lock().unwrap();
                 fm.sync(file);
                 fm.sync_directory();
             }
@@ -119,12 +118,11 @@ fn setup_io_test() -> (SimpleDB, TestDir) {
 }
 
 fn precreate_blocks_direct(db: &SimpleDB, file: &str, count: usize) {
-    let mut file_manager = db.file_manager.lock().unwrap();
-
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
-        file_manager.write(&BlockId::new(file.to_string(), block_num), &page);
+        db.file_manager
+            .write(&BlockId::new(file.to_string(), block_num), &page);
     }
 }
 
@@ -201,11 +199,10 @@ fn sequential_read(working_set: usize, total_ops: usize, iterations: usize) -> B
         iterations,
         2,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..total_ops {
                 let block_id = BlockId::new(file.clone(), i % working_set);
-                fm.read(&block_id, &mut page);
+                db.file_manager.read(&block_id, &mut page);
             }
         },
     )
@@ -223,12 +220,11 @@ fn sequential_write(working_set: usize, total_ops: usize, iterations: usize) -> 
         iterations,
         2,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..total_ops {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), i % working_set);
-                fm.write(&block_id, &page);
+                db.file_manager.write(&block_id, &page);
             }
         },
     )
@@ -252,11 +248,10 @@ fn random_read(working_set: usize, total_ops: usize, iterations: usize) -> Bench
             let random_indices: Vec<usize> = (0..total_ops)
                 .map(|_| rng.next_range(working_set))
                 .collect();
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &block_idx in &random_indices {
                 let block_id = BlockId::new(file.clone(), block_idx);
-                fm.read(&block_id, &mut page);
+                db.file_manager.read(&block_id, &mut page);
             }
         },
     )
@@ -280,15 +275,166 @@ fn random_write(working_set: usize, total_ops: usize, iterations: usize) -> Benc
             let random_indices: Vec<usize> = (0..total_ops)
                 .map(|_| rng.next_range(working_set))
                 .collect();
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for (i, &block_idx) in random_indices.iter().enumerate() {
                 write_i32_at(page.bytes_mut(), 60, i as i32);
                 let block_id = BlockId::new(file.clone(), block_idx);
-                fm.write(&block_id, &page);
+                db.file_manager.write(&block_id, &page);
             }
         },
     )
+}
+
+fn sequential_read_qd(
+    working_set: usize,
+    total_ops: usize,
+    qd: usize,
+    iterations: usize,
+    emit_metrics: bool,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("seqread_qd{}_{}", qd, working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
+
+    let result = benchmark(
+        &format!(
+            "Sequential Read QD={} (K={}, {} ops)",
+            qd, working_set, total_ops
+        ),
+        iterations,
+        2,
+        || {
+            let mut done = 0usize;
+            while done < total_ops {
+                let n = (total_ops - done).min(qd.max(1));
+                let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                let mut pages: Vec<Page> = Vec::with_capacity(n);
+                for j in 0..n {
+                    reqs.push(BatchReadReq {
+                        block_id: BlockId::new(file.clone(), (done + j) % working_set),
+                    });
+                    pages.push(Page::new());
+                }
+                db.file_manager.read_batch(&reqs, &mut pages);
+                done += n;
+            }
+        },
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
+}
+
+fn random_read_qd(
+    working_set: usize,
+    total_ops: usize,
+    qd: usize,
+    iterations: usize,
+    emit_metrics: bool,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let file = format!("randread_qd{}_{}", qd, working_set);
+    precreate_blocks_direct(&db, &file, working_set);
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
+    let mut rng = FastRng::new();
+
+    let result = benchmark(
+        &format!(
+            "Random Read QD={} (K={}, {} ops)",
+            qd, working_set, total_ops
+        ),
+        iterations,
+        2,
+        || {
+            let random_indices: Vec<usize> = (0..total_ops)
+                .map(|_| rng.next_range(working_set))
+                .collect();
+            let mut done = 0usize;
+            while done < total_ops {
+                let n = (total_ops - done).min(qd.max(1));
+                let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                let mut pages: Vec<Page> = Vec::with_capacity(n);
+                for j in 0..n {
+                    reqs.push(BatchReadReq {
+                        block_id: BlockId::new(file.clone(), random_indices[done + j]),
+                    });
+                    pages.push(Page::new());
+                }
+                db.file_manager.read_batch(&reqs, &mut pages);
+                done += n;
+            }
+        },
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
+}
+
+fn multistream_scan_qd(
+    num_streams: usize,
+    working_set: usize,
+    qd: usize,
+    iterations: usize,
+    emit_metrics: bool,
+) -> BenchResult {
+    let (db, _test_dir) = setup_io_test();
+    let blocks_per_stream = (working_set / num_streams).max(1);
+    let file_names: Vec<String> = (0..num_streams)
+        .map(|s| format!("multi_stream_qd{}_{}_{}", qd, num_streams, s))
+        .collect();
+    for name in &file_names {
+        precreate_blocks_direct(&db, name, blocks_per_stream);
+    }
+    db.file_manager.enable_io_stats();
+    db.file_manager.reset_io_batch_counters();
+
+    let result = benchmark(
+        &format!(
+            "Multi-stream Scan QD={} ({}x{}blk)",
+            qd, num_streams, blocks_per_stream
+        ),
+        iterations,
+        1,
+        || {
+            for file in &file_names {
+                let mut done = 0usize;
+                while done < blocks_per_stream {
+                    let n = (blocks_per_stream - done).min(qd.max(1));
+                    let mut reqs: Vec<BatchReadReq> = Vec::with_capacity(n);
+                    let mut pages: Vec<Page> = Vec::with_capacity(n);
+                    for j in 0..n {
+                        reqs.push(BatchReadReq {
+                            block_id: BlockId::new(file.clone(), done + j),
+                        });
+                        pages.push(Page::new());
+                    }
+                    db.file_manager.read_batch(&reqs, &mut pages);
+                    done += n;
+                }
+            }
+        },
+    );
+    if emit_metrics {
+        let (submitted, completed) = db.file_manager.io_batch_counters();
+        println!(
+            "I/O batch counters [{}]: submitted={} completed={}",
+            result.operation, submitted, completed
+        );
+    }
+    result
 }
 
 // ============================================================================
@@ -403,10 +549,10 @@ fn mixed_workload(
                 let block_id = BlockId::new(file.clone(), block_indices[i]);
 
                 if is_read {
-                    db.file_manager.lock().unwrap().read(&block_id, &mut page);
+                    db.file_manager.read(&block_id, &mut page);
                 } else {
                     write_i32_at(page.bytes_mut(), 60, i as i32);
-                    db.file_manager.lock().unwrap().write(&block_id, &page);
+                    db.file_manager.write(&block_id, &page);
                     let record = make_wal_record(100);
                     let lsn = log.lock().unwrap().append(record).unwrap();
                     policy.record(lsn, &log);
@@ -462,10 +608,10 @@ fn concurrent_io_shared(
 
                             // 70% read / 30% write
                             if (i % 10) < 7 {
-                                fm.lock().unwrap().read(&block_id, &mut page);
+                                fm.read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &page);
+                                fm.write(&block_id, &page);
                                 let record = make_wal_record(100);
                                 let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
@@ -526,10 +672,10 @@ fn concurrent_io_sharded(
 
                             // 70% read / 30% write
                             if (i % 10) < 7 {
-                                fm.lock().unwrap().read(&block_id, &mut page);
+                                fm.read(&block_id, &mut page);
                             } else {
                                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                                fm.lock().unwrap().write(&block_id, &page);
+                                fm.write(&block_id, &page);
                                 let record = make_wal_record(100);
                                 let lsn = log.lock().unwrap().append(record).unwrap();
                                 policy.record(lsn, &log);
@@ -589,9 +735,7 @@ fn random_write_durability(
                 let block_id = BlockId::new(file.clone(), block_num);
 
                 write_i32_at(page.bytes_mut(), 60, i as i32);
-                {
-                    fm.lock().unwrap().write(&block_id, &page);
-                }
+                fm.write(&block_id, &page);
 
                 let record = make_wal_record(100);
                 let lsn = log.lock().unwrap().append(record).unwrap();
@@ -622,10 +766,10 @@ fn onepass_seq_scan(working_set: usize, iterations: usize) -> BenchResult {
         iterations,
         1,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..working_set {
-                fm.read(&BlockId::new(file.clone(), i), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file.clone(), i), &mut page);
             }
         },
     )
@@ -651,10 +795,10 @@ fn low_locality_rand_read(working_set: usize, iterations: usize) -> BenchResult 
                 let j = rng.next_range(i + 1);
                 indices.swap(i, j);
             }
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &idx in &indices {
-                fm.read(&BlockId::new(file.clone(), idx), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file.clone(), idx), &mut page);
             }
         },
     )
@@ -683,9 +827,7 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
                     thread::spawn(move || {
                         let mut page = Page::new();
                         for i in 0..blocks_per_stream {
-                            fm.lock()
-                                .unwrap()
-                                .read(&BlockId::new(file.clone(), i), &mut page);
+                            fm.read(&BlockId::new(file.clone(), i), &mut page);
                         }
                     })
                 })
@@ -700,7 +842,7 @@ fn multi_stream_scan(num_streams: usize, working_set: usize, iterations: usize) 
 // ============================================================================
 // Phase 8: Cache-Evict Variants (Linux only; posix_fadvise DONTNEED between iters)
 // ============================================================================
-// Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+// Filter tokens: onepass_seq_evict, lo_loc_rand_evict, multi_stream_evict
 
 /// One-pass sequential scan with cache eviction between iterations.
 #[cfg(target_os = "linux")]
@@ -715,10 +857,10 @@ fn onepass_seq_scan_evict(working_set: usize, iterations: usize) -> BenchResult 
         iterations,
         1,
         || {
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for i in 0..working_set {
-                fm.read(&BlockId::new(file_name.clone(), i), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file_name.clone(), i), &mut page);
             }
         },
         || {
@@ -748,15 +890,70 @@ fn low_locality_rand_read_evict(working_set: usize, iterations: usize) -> BenchR
                 let j = rng.next_range(i + 1);
                 indices.swap(i, j);
             }
-            let mut fm = db.file_manager.lock().unwrap();
             let mut page = Page::new();
             for &idx in &indices {
-                fm.read(&BlockId::new(file_name.clone(), idx), &mut page);
+                db.file_manager
+                    .read(&BlockId::new(file_name.clone(), idx), &mut page);
             }
         },
         || {
             #[cfg(target_os = "linux")]
             posix_fadvise_dontneed(&file_path);
+        },
+    )
+}
+
+/// Multi-stream sequential scan with cache eviction between iterations.
+/// Each stream scans its own file; all files are evicted from page cache after
+/// each iteration. Forces real NVMe reads on every iteration, making FM-level
+/// lock contention visible even under buffered I/O.
+#[cfg(target_os = "linux")]
+fn multi_stream_scan_evict(
+    num_streams: usize,
+    working_set: usize,
+    iterations: usize,
+) -> BenchResult {
+    let (db, test_dir) = setup_io_test();
+    let blocks_per_stream = (working_set / num_streams).max(1);
+
+    let file_names: Vec<String> = (0..num_streams)
+        .map(|s| format!("multi_stream_evict_{}_{}", num_streams, s))
+        .collect();
+    let file_paths: Vec<PathBuf> = file_names.iter().map(|f| test_dir.path.join(f)).collect();
+
+    for name in &file_names {
+        precreate_blocks_direct(&db, name, blocks_per_stream);
+    }
+
+    benchmark_with_teardown(
+        &format!(
+            "Multi-stream Scan+Evict {}x{}blk",
+            num_streams, blocks_per_stream
+        ),
+        iterations,
+        1,
+        || {
+            let handles: Vec<_> = file_names
+                .iter()
+                .map(|name| {
+                    let name = name.clone();
+                    let fm = Arc::clone(&db.file_manager);
+                    thread::spawn(move || {
+                        let mut page = Page::new();
+                        for i in 0..blocks_per_stream {
+                            fm.read(&BlockId::new(name.clone(), i), &mut page);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        },
+        || {
+            for path in &file_paths {
+                posix_fadvise_dontneed(path);
+            }
         },
     )
 }
@@ -843,6 +1040,8 @@ struct IoBenchConfig {
     phase1_ops: usize,
     mixed_ops: usize,
     durability_ops: usize,
+    concurrent_ops: usize,
+    prefetch_window_blocks: usize,
 }
 
 /// Parse io_patterns-specific flags from argv (second pass after parse_bench_args).
@@ -856,9 +1055,12 @@ fn parse_io_args() -> IoBenchConfig {
     let mut phase1_ops = 1000usize;
     let mut mixed_ops = 500usize;
     let mut durability_ops = 1000usize;
+    let mut concurrent_ops = 100usize;
+    let mut prefetch_window_blocks = 16usize;
     let mut phase1_ops_explicit = false;
     let mut mixed_ops_explicit = false;
     let mut durability_ops_explicit = false;
+    let mut concurrent_ops_explicit = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -885,8 +1087,20 @@ fn parse_io_args() -> IoBenchConfig {
                 durability_ops = val.parse().unwrap_or(durability_ops);
                 durability_ops_explicit = true;
             }
+        } else if arg == "--concurrent-ops" {
+            if let Some(val) = iter.next() {
+                concurrent_ops = val.parse().unwrap_or(concurrent_ops);
+                concurrent_ops_explicit = true;
+            }
+        } else if arg == "--prefetch-window" {
+            if let Some(val) = iter.next() {
+                prefetch_window_blocks = val.parse().unwrap_or(prefetch_window_blocks);
+            }
         } else if arg == "--json" {
             // Handled by parse_bench_args (first pass).
+        } else if arg == "--bench" {
+            // Consumed by cargo bench harness; ignore optional value.
+            let _ = iter.next();
         } else if arg == "--filter" {
             // Handled by parse_bench_args (first pass).
             let _ = iter.next();
@@ -925,6 +1139,9 @@ fn parse_io_args() -> IoBenchConfig {
     if regime_was_set && !durability_ops_explicit {
         durability_ops = working_set_blocks;
     }
+    if regime_was_set && !concurrent_ops_explicit {
+        concurrent_ops = working_set_blocks;
+    }
 
     IoBenchConfig {
         working_set_blocks,
@@ -932,6 +1149,8 @@ fn parse_io_args() -> IoBenchConfig {
         phase1_ops,
         mixed_ops,
         durability_ops,
+        concurrent_ops,
+        prefetch_window_blocks,
     }
 }
 
@@ -959,7 +1178,29 @@ fn main() {
             random_read(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
             random_write(io_cfg.working_set_blocks, io_cfg.phase1_ops, iterations),
         ];
-
+        for qd in [1usize, 4, 16, 32] {
+            results.push(sequential_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+                false,
+            ));
+            results.push(random_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+                false,
+            ));
+            results.push(multistream_scan_qd(
+                4,
+                io_cfg.working_set_blocks,
+                qd,
+                iterations,
+                false,
+            ));
+        }
         // Phase 3 - no filters in JSON mode (use fsync_iterations)
         results.push(wal_append_no_fsync(fsync_iterations));
         results.push(wal_append_immediate_fsync(fsync_iterations));
@@ -1000,14 +1241,14 @@ fn main() {
             ] {
                 results.push(concurrent_io_shared(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
                 ));
                 results.push(concurrent_io_sharded(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy,
                     fsync_iterations,
@@ -1031,6 +1272,12 @@ fn main() {
         ));
         #[cfg(target_os = "linux")]
         results.push(low_locality_rand_read_evict(
+            io_cfg.working_set_blocks,
+            iterations,
+        ));
+        #[cfg(target_os = "linux")]
+        results.push(multi_stream_scan_evict(
+            4,
             io_cfg.working_set_blocks,
             iterations,
         ));
@@ -1087,6 +1334,8 @@ fn main() {
     println!("Phase 1 ops:         {}", io_cfg.phase1_ops);
     println!("Mixed ops:           {}", io_cfg.mixed_ops);
     println!("Durability ops:      {}", io_cfg.durability_ops);
+    println!("Concurrent ops:      {}", io_cfg.concurrent_ops);
+    println!("Prefetch window:     {}", io_cfg.prefetch_window_blocks);
     println!(
         "Direct I/O:          {}",
         if cfg!(feature = "direct-io") {
@@ -1132,6 +1381,38 @@ fn main() {
             io_cfg.phase1_ops,
             iterations,
         ));
+    }
+    for qd in [1usize, 4, 16, 32] {
+        let seq_token = format!("seq_read_qd[{}]", qd);
+        if should_run(&seq_token, filter_ref) {
+            phase1_results.push(sequential_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+                true,
+            ));
+        }
+        let rand_token = format!("rand_read_qd[{}]", qd);
+        if should_run(&rand_token, filter_ref) {
+            phase1_results.push(random_read_qd(
+                io_cfg.working_set_blocks,
+                io_cfg.phase1_ops,
+                qd,
+                iterations,
+                true,
+            ));
+        }
+        let stream_token = format!("multistream_scan_qd[{}]", qd);
+        if should_run(&stream_token, filter_ref) {
+            phase1_results.push(multistream_scan_qd(
+                4,
+                io_cfg.working_set_blocks,
+                qd,
+                iterations,
+                true,
+            ));
+        }
     }
 
     render_latency_section(
@@ -1277,7 +1558,7 @@ fn main() {
             if should_run(&shared_token, filter_ref) {
                 concurrent_results.push(concurrent_io_shared(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
@@ -1288,7 +1569,7 @@ fn main() {
             if should_run(&sharded_token, filter_ref) {
                 concurrent_results.push(concurrent_io_sharded(
                     threads,
-                    100,
+                    io_cfg.concurrent_ops,
                     io_cfg.working_set_blocks,
                     policy.clone(),
                     fsync_iterations,
@@ -1299,7 +1580,10 @@ fn main() {
 
     if !concurrent_results.is_empty() {
         render_latency_section(
-            "Phase 5: Concurrent I/O Stress Test (100 ops/thread)",
+            &format!(
+                "Phase 5: Concurrent I/O Stress Test ({} ops/thread)",
+                io_cfg.concurrent_ops
+            ),
             &concurrent_results,
         );
 
@@ -1319,7 +1603,7 @@ fn main() {
                 1
             };
 
-            let total_ops = threads * 100;
+            let total_ops = threads * io_cfg.concurrent_ops;
             let ops_per_sec = total_ops as f64 / result.mean.as_secs_f64();
             throughput_rows.push(ThroughputRow {
                 label: result.operation.clone(),
@@ -1414,7 +1698,7 @@ fn main() {
     }
 
     // Phase 8: Cache-Evict Variants (Linux only — posix_fadvise DONTNEED unavailable elsewhere)
-    // Filter tokens: onepass_seq_evict, lo_loc_rand_evict
+    // Filter tokens: onepass_seq_evict, lo_loc_rand_evict, multi_stream_evict
     #[cfg(target_os = "linux")]
     {
         let mut evict_results = Vec::new();
@@ -1427,6 +1711,13 @@ fn main() {
         }
         if should_run("lo_loc_rand_evict", filter_ref) {
             evict_results.push(low_locality_rand_read_evict(
+                io_cfg.working_set_blocks,
+                iterations,
+            ));
+        }
+        if should_run("multi_stream_evict", filter_ref) {
+            evict_results.push(multi_stream_scan_evict(
+                4,
                 io_cfg.working_set_blocks,
                 iterations,
             ));

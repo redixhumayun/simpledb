@@ -9,7 +9,14 @@ All benchmarks reference the following machines.
 ### Linux runner (Intel Xeon E3‑1275 v5, Samsung NVMe RAID1, Ubuntu 6.8.0‑90)
 
 - **CPU / Memory**: Intel Xeon E3‑1275 v5 @ 3.60GHz (4C/8T), 62 GB
-- **Storage**: 2× Samsung NVMe 512 GB (RAID1, md2)
+- **Storage**: Samsung NVMe RAID1 (md2, software mirror) — **asymmetric pair**:
+  - nvme0: Samsung 980 PRO 512 GB (MZVL2512HCJQ-00B00, PCIe 4.0 ×4, fw GXA7801Q)
+  - nvme1: Samsung SM951 512 GB (MZVPV512HDGL-00000, PCIe 3.0 ×4, fw BXW7300Q)
+  - Flush latency is bounded by the SM951 (slower mirror). The SM951 has no power-loss
+    protection and must physically drain DRAM→NAND on every FLUSH CACHE command. Concurrent
+    O_DIRECT writes from other threads deepen the SM951's NVMe submission queue ahead of
+    FLUSH, increasing observed per-fsync latency by ~25–43% at 2–8 concurrent writers vs.
+    single-threaded flush.
 - **fio (direct I/O)**
   - Sequential write, 1 MiB: **1.17 GiB/s · 1.20 k IOPS**
   - Sequential read, 1 MiB: **2.70 GiB/s · 2.76 k IOPS**
@@ -237,6 +244,7 @@ generate side-by-side comparison reports.
 # Syntax:
 # python3 scripts/run_regime_matrix.py [iterations] [output_dir] [--profile capped|heavy]
 #                                      [--phase1-ops N] [--mixed-ops N] [--durability-ops N]
+#                                      [--concurrent-ops N]
 ```
 
 ### Profile intent
@@ -261,12 +269,13 @@ Ops auto-scale with working set when `--regime` is used (and not explicitly over
 - `phase1-ops` = `working_set_blocks` (one unique touch per block per iteration)
 - `mixed-ops` = `working_set_blocks / 2`
 - `durability-ops` = `working_set_blocks`
+- `concurrent-ops` = `working_set_blocks` (ops per thread for Phase 5)
 
 ### Heavy run (decision-grade signal)
 
 ```bash
 python3 scripts/run_regime_matrix.py 10 results/regime_heavy_$(date +%Y%m%d) \
-  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000
+  --profile heavy --phase1-ops 20000 --mixed-ops 10000 --durability-ops 5000 --concurrent-ops 1000
 ```
 
 `heavy` profile working sets (`page-4k`):
