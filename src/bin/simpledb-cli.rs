@@ -180,7 +180,10 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
     txn.commit()?;
 
     let mut result = format!("Table: {}\n", table_name);
-    result.push_str(&format!("Slot Size: {} bytes\n", layout.slot_size));
+    result.push_str(&format!(
+        "Max Encoded Size: {} bytes\n",
+        layout.max_encoded_size()
+    ));
     result.push_str(&format!(
         "Statistics: {} blocks, {} records\n",
         stat_info.num_blocks, stat_info.num_records
@@ -210,8 +213,9 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
             let distinct = index_info.distinct_values(&field_name);
 
             // Calculate BTree search cost for comparison
-            let records_per_block = if layout.slot_size > 0 {
-                block_size / layout.slot_size
+            let max_size = layout.max_encoded_size();
+            let records_per_block = if max_size > 0 {
+                block_size / max_size
             } else {
                 1
             };

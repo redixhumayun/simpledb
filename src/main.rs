@@ -34,7 +34,7 @@ mod page;
 mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
-use crate::page::{PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{HeapIterator, HeapTuple, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage};
 mod buffer_manager;
 
 pub type Lsn = usize;
@@ -172,10 +172,13 @@ impl MultiBufferProductPlan {
         let mut table_scan = temp_table.open();
         while let Some(result) = source_scan.next() {
             result?;
-            table_scan.insert()?;
-            for field in plan.schema().fields {
-                table_scan.set_value(&field, source_scan.get_value(&field)?)?;
-            }
+            let values: Vec<Constant> = plan
+                .schema()
+                .fields
+                .iter()
+                .map(|f| source_scan.get_value(f))
+                .collect::<Result<Vec<_>, _>>()?;
+            table_scan.insert_values(&values)?;
         }
         Ok(temp_table)
     }
@@ -203,7 +206,7 @@ impl Plan for MultiBufferProductPlan {
         //  to pass ownership to MaterializePlan right now of self.rhs
         let num_blocks = {
             let layout = Layout::new(self.rhs.schema());
-            let records_per_block = self.txn.block_size() / layout.slot_size;
+            let records_per_block = self.txn.block_size() / layout.max_encoded_size();
             self.rhs.records_output() / records_per_block
         };
         let num_chunks = num_blocks / available_buffs;
@@ -516,7 +519,7 @@ where
         unimplemented!()
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -565,16 +568,16 @@ mod multi_buffer_product_scan_tests {
     ) -> Result<(), Box<dyn Error>> {
         // Insert employee records
         for i in 0..emp_size {
-            emp_scan.insert()?;
-            emp_scan.set_int("emp_id", i as i32)?;
-            emp_scan.set_string("name", format!("emp{i}"))?;
+            emp_scan
+                .insert_values(&[Constant::Int(i as i32), Constant::String(format!("emp{i}"))])?;
         }
 
         // Insert department records
         for i in 0..dept_size {
-            dept_scan.insert()?;
-            dept_scan.set_int("dept_id", i as i32)?;
-            dept_scan.set_string("dept_name", format!("dept{i}"))?;
+            dept_scan.insert_values(&[
+                Constant::Int(i as i32),
+                Constant::String(format!("dept{i}")),
+            ])?;
         }
 
         Ok(())
@@ -716,6 +719,7 @@ pub struct ChunkScan {
     last_block_num: usize,
     current_block_num: usize,
     current_record_page: Option<usize>,
+    heap_iter: Option<HeapIterator>,
     current_slot: Option<usize>,
     buffer_list: Vec<RecordPage>,
 }
@@ -786,6 +790,7 @@ impl ChunkScan {
             last_block_num: actual_last_block,
             current_block_num: first_block_num,
             current_record_page: None,
+            heap_iter: None,
             current_slot: None,
             buffer_list,
         };
@@ -802,7 +807,10 @@ impl ChunkScan {
             "Moving chunk scan to block {} which is offset {}",
             block_num, offset
         );
+        let block_id = self.buffer_list[offset].block_id.clone();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
         self.current_record_page = Some(offset);
+        self.heap_iter = Some(iter);
         self.current_slot = None;
     }
 }
@@ -869,31 +877,22 @@ impl Iterator for ChunkScan {
             return None;
         }
         loop {
-            if let Some(record_page_idx) = &self.current_record_page {
-                let record_page = &self.buffer_list[*record_page_idx];
-                match record_page.next_valid_slot(self.current_slot) {
-                    Ok(Some(slot)) => {
-                        self.current_slot = Some(slot);
-                        return Some(Ok(()));
-                    }
-                    Ok(None) => {
-                        // No more slots in this page, continue to next page
-                    }
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
+            if let Some(iter) = &mut self.heap_iter {
+                if let Some(slot) = iter.next() {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
                 }
-
-                //  There are no more slots in the current record page. Check if there are more record pages
-                if *record_page_idx < self.buffer_list.len() - 1 {
-                    self.current_record_page = Some(*record_page_idx + 1);
-                    self.current_slot = None;
-                    continue;
-                }
+                // Page exhausted
+                self.heap_iter = None;
             }
 
-            //  There are no more record pages left
-            return None;
+            // Advance to next page in the chunk, if any
+            let idx = self.current_record_page?;
+            if idx + 1 < self.buffer_list.len() {
+                self.move_to_block(self.first_block_num + idx + 1);
+            } else {
+                return None;
+            }
         }
     }
 }
@@ -911,7 +910,7 @@ impl UpdateScan for ChunkScan {
         unimplemented!()
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -945,9 +944,10 @@ mod chunk_scan_tests {
 
     fn insert_test_records(table_scan: &mut TableScan, count: usize) -> Result<(), Box<dyn Error>> {
         for i in 0..count {
-            table_scan.insert()?;
-            table_scan.set_int("id", i as i32)?;
-            table_scan.set_string("name", format!("name{i}"))?;
+            table_scan.insert_values(&[
+                Constant::Int(i as i32),
+                Constant::String(format!("name{i}")),
+            ])?;
         }
         Ok(())
     }
@@ -1528,7 +1528,7 @@ where
         unimplemented!()
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         unimplemented!()
     }
 
@@ -1550,8 +1550,8 @@ mod merge_join_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable,
-        UpdateScan,
+        Constant, Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan,
+        TempTable, UpdateScan,
     };
 
     #[test]
@@ -1579,9 +1579,8 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 2, 3, 5, 7] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1589,9 +1588,8 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [2, 3, 5, 7, 9] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1652,18 +1650,16 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5, 7, 9] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
         {
             let mut scan = temp_table2.open();
             for i in [2, 4, 6, 8, 10] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1713,9 +1709,8 @@ mod merge_join_scan_tests {
             let mut scan = temp_table1.open();
             // Insert id=5 twice
             for i in [1, 3, 5, 5, 7] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1723,9 +1718,8 @@ mod merge_join_scan_tests {
             let mut scan = temp_table2.open();
             // Insert id=5 three times
             for i in [2, 5, 5, 5, 8] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1812,8 +1806,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in 1..5 {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
+                scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -1861,18 +1854,16 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5, 7] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
         {
             let mut scan = temp_table2.open();
             for i in [5, 8, 10] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("dept", format!("dept{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                    .unwrap();
             }
         }
 
@@ -1927,16 +1918,14 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in 1..4 {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
+                scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
         }
 
         {
             let mut scan = temp_table2.open();
             for i in 1..4 {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
+                scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -2003,11 +1992,13 @@ impl SortPlan {
         Source: Scan,
         Dest: UpdateScan,
     {
-        destination.insert()?;
-        for field in &self.schema.fields {
-            let value = source.get_value(field)?;
-            destination.set_value(field, value)?;
-        }
+        let values: Vec<Constant> = self
+            .schema
+            .fields
+            .iter()
+            .map(|f| source.get_value(f))
+            .collect::<Result<Vec<_>, _>>()?;
+        destination.insert_values(&values)?;
         Ok(())
     }
 
@@ -2708,7 +2699,7 @@ impl UpdateScan for SortScan {
         todo!()
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         todo!()
     }
 
@@ -2730,7 +2721,7 @@ mod sort_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Layout, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable, UpdateScan,
+        Constant, Layout, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable, UpdateScan,
     };
 
     #[test]
@@ -2753,9 +2744,8 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
@@ -2763,9 +2753,8 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [2, 4, 6] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
-                scan.set_string("name", format!("name{i}")).unwrap();
+                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                    .unwrap();
             }
         }
 
@@ -2814,8 +2803,7 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table.open();
             for i in [1, 2, 3, 4, 5] {
-                scan.insert().unwrap();
-                scan.set_int("id", i).unwrap();
+                scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -2916,12 +2904,14 @@ impl Plan for MaterializePlan {
             if result.is_err() {
                 panic!("Error while materializing the plan");
             }
-            temp_table_scan.insert().unwrap();
-            for field in self.source_plan.schema().fields {
-                temp_table_scan
-                    .set_value(&field, source_scan.get_value(&field).unwrap())
-                    .unwrap();
-            }
+            let values: Vec<Constant> = self
+                .source_plan
+                .schema()
+                .fields
+                .iter()
+                .map(|f| source_scan.get_value(f).unwrap())
+                .collect();
+            temp_table_scan.insert_values(&values).unwrap();
         }
         temp_table_scan.before_first().unwrap();
         Box::new(temp_table_scan)
@@ -2929,7 +2919,7 @@ impl Plan for MaterializePlan {
 
     fn blocks_accessed(&self) -> usize {
         let layout = Layout::new(self.source_plan.schema());
-        let rpb = self.txn.block_size() / layout.slot_size;
+        let rpb = self.txn.block_size() / layout.max_encoded_size();
         self.source_plan.records_output() / rpb
     }
 
@@ -3522,14 +3512,32 @@ impl UpdatePlanner for IndexUpdatePlanner {
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
         let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let schema = plan.schema();
+        let field_map: std::collections::HashMap<&str, Constant> = data
+            .fields
+            .iter()
+            .map(String::as_str)
+            .zip(data.values.iter().cloned())
+            .collect();
+        let values: Vec<Constant> = schema
+            .fields
+            .iter()
+            .map(|f| {
+                field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
+                    match schema.info[f].field_type {
+                        FieldType::Int => Constant::Int(0),
+                        FieldType::String => Constant::String(String::new()),
+                    }
+                })
+            })
+            .collect();
         let mut scan = plan.open();
-        scan.insert()?;
-
-        for (field, value) in data.fields.iter().zip(data.values) {
-            scan.set_value(field, value.clone())?;
+        scan.insert_values(&values)?;
+        let rid = scan.get_rid()?;
+        for (field, value) in data.fields.iter().zip(data.values.iter()) {
             if let Some(ii) = indexes.get(field) {
                 let mut index = ii.open();
-                index.insert(&value, &scan.get_rid()?);
+                index.insert(value, &rid);
             }
         }
         Ok(1)
@@ -3651,11 +3659,27 @@ impl UpdatePlanner for BasicUpdatePlanner {
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
         let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let schema = plan.schema();
+        let field_map: std::collections::HashMap<&str, Constant> = data
+            .fields
+            .iter()
+            .map(String::as_str)
+            .zip(data.values)
+            .collect();
+        let values: Vec<Constant> = schema
+            .fields
+            .iter()
+            .map(|f| {
+                field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
+                    match schema.info[f].field_type {
+                        FieldType::Int => Constant::Int(0),
+                        FieldType::String => Constant::String(String::new()),
+                    }
+                })
+            })
+            .collect();
         let mut scan = plan.open();
-        scan.insert()?;
-        for (field, value) in data.fields.iter().zip(data.values) {
-            scan.set_value(field, value)?;
-        }
+        scan.insert_values(&values)?;
         Ok(1)
     }
 
@@ -5014,8 +5038,8 @@ impl UpdateScan for Box<dyn UpdateScan> {
         (**self).set_value(field_name, value)
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        (**self).insert()
+    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+        (**self).insert_values(values)
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5170,7 +5194,7 @@ where
         Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         panic!("Insert not supported in ProductScan");
     }
 
@@ -5193,8 +5217,8 @@ mod product_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Layout, Predicate, ProductScan, ProjectScan, Scan, Schema, SelectScan, SimpleDB, TableScan,
-        Term,
+        Constant, Layout, Predicate, ProductScan, ProjectScan, Scan, Schema, SelectScan, SimpleDB,
+        TableScan, Term,
     };
 
     #[test]
@@ -5215,12 +5239,12 @@ mod product_scan_tests {
             let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
             for i in 0..50 {
-                scan1.insert().unwrap();
-                scan1.set_int("A", i).unwrap();
-                scan1.set_string("B", format!("string{i}")).unwrap();
-                scan2.insert().unwrap();
-                scan2.set_int("C", i).unwrap();
-                scan2.set_string("D", format!("string{i}")).unwrap();
+                scan1
+                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .unwrap();
+                scan2
+                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .unwrap();
             }
         }
 
@@ -5330,8 +5354,8 @@ where
         self.scan.set_value(field_name, value)
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        self.scan.insert()
+    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+        self.scan.insert_values(values)
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
@@ -5383,18 +5407,22 @@ mod project_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert().unwrap();
-                    scan.set_int("A", 10).unwrap();
-                    scan.set_string("B", format!("string{}", 10)).unwrap();
+                    scan.insert_values(&[
+                        Constant::Int(10),
+                        Constant::String(format!("string{}", 10)),
+                    ])
+                    .unwrap();
                     inserted_count += 1;
                     continue;
                 }
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert().unwrap();
-                scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{number}")).unwrap();
+                scan.insert_values(&[
+                    Constant::Int(number.try_into().unwrap()),
+                    Constant::String(format!("string{number}")),
+                ])
+                .unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -5863,7 +5891,7 @@ where
         Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         panic!("Insert not supported in IndexJoinScan");
     }
 
@@ -5925,14 +5953,14 @@ mod index_join_scan_tests {
 
             for i in 0..50 {
                 // Insert into first table
-                scan1.insert().unwrap();
-                scan1.set_int("A", i).unwrap();
-                scan1.set_string("B", format!("string{i}")).unwrap();
+                scan1
+                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .unwrap();
 
                 // Insert into second table with matching values
-                scan2.insert().unwrap();
-                scan2.set_int("C", i).unwrap();
-                scan2.set_string("D", format!("string{i}")).unwrap();
+                scan2
+                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .unwrap();
 
                 // Create index entry
                 let mut index = index_info.open();
@@ -6052,7 +6080,7 @@ where
         unreachable!()
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
         unreachable!()
     }
 
@@ -6103,9 +6131,11 @@ mod index_select_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert().unwrap();
-                    scan.set_int("A", 10).unwrap();
-                    scan.set_string("B", format!("string{}", 10)).unwrap();
+                    scan.insert_values(&[
+                        Constant::Int(10),
+                        Constant::String(format!("string{}", 10)),
+                    ])
+                    .unwrap();
                     dbg!("Inserting the index entry when value is 10");
                     let mut index = index_info.open();
                     index.insert(&Constant::Int(10), &scan.get_rid().unwrap());
@@ -6115,9 +6145,11 @@ mod index_select_scan_tests {
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {} into table", number);
-                scan.insert().unwrap();
-                scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{number}")).unwrap();
+                scan.insert_values(&[
+                    Constant::Int(number.try_into().unwrap()),
+                    Constant::String(format!("string{number}")),
+                ])
+                .unwrap();
                 dbg!("Inserting the index entry");
                 let mut index = index_info.open();
                 index.insert(
@@ -6227,8 +6259,8 @@ where
         self.scan.set_value(field_name, value)
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
-        self.scan.insert()
+    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+        self.scan.insert_values(values)
     }
 
     fn delete(&mut self) -> Result<(), Box<dyn Error>> {
@@ -6271,18 +6303,22 @@ mod select_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert().unwrap();
-                    scan.set_int("A", 10).unwrap();
-                    scan.set_string("B", format!("string{}", 10)).unwrap();
+                    scan.insert_values(&[
+                        Constant::Int(10),
+                        Constant::String(format!("string{}", 10)),
+                    ])
+                    .unwrap();
                     inserted_count += 1;
                     continue;
                 }
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert().unwrap();
-                scan.set_int("A", number.try_into().unwrap()).unwrap();
-                scan.set_string("B", format!("string{number}")).unwrap();
+                scan.insert_values(&[
+                    Constant::Int(number.try_into().unwrap()),
+                    Constant::String(format!("string{number}")),
+                ])
+                .unwrap();
                 inserted_count += 1;
             }
             dbg!("Inserted count {}", inserted_count);
@@ -6984,7 +7020,7 @@ impl MetadataManager {
 mod metadata_manager_tests {
     use super::UpdateScan;
     use crate::{
-        test_utils::generate_random_number, FieldType, MetadataManager, Schema, SimpleDB,
+        test_utils::generate_random_number, Constant, FieldType, MetadataManager, Schema, SimpleDB,
         TableScan, Transaction,
     };
     use std::sync::Arc;
@@ -6993,7 +7029,11 @@ mod metadata_manager_tests {
     fn test_metadata_manager() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let tx = db.new_tx();
-        let mdm = MetadataManager::new(true, Arc::clone(&tx));
+        // is_new=false: SimpleDB::new_for_test already initialised all system catalog tables
+        // via MetadataManager::new(true, ...) internally. Passing true here would call
+        // create_table again for the same catalog tables, writing duplicate field catalog
+        // rows and corrupting get_layout results.
+        let mdm = MetadataManager::new(false, Arc::clone(&tx));
 
         // Part 1: Table Metadata
         let mut schema = Schema::new();
@@ -7004,10 +7044,10 @@ mod metadata_manager_tests {
         mdm.create_table(table_name, schema.clone(), Arc::clone(&tx));
         let layout = mdm.get_layout(table_name, Arc::clone(&tx));
 
-        println!("MyTable has slot size {}", layout.slot_size);
-        // Verify slot size
+        println!("MyTable has slot size {}", layout.max_encoded_size());
+        // Verify max encoded size
         let expected_slot_size = 4 + 4 + (4 + 9); // header + int + (string length prefix + chars)
-        assert_eq!(layout.slot_size, expected_slot_size);
+        assert_eq!(layout.max_encoded_size(), expected_slot_size);
 
         // Verify schema fields
         println!("Its fields are:");
@@ -7034,10 +7074,10 @@ mod metadata_manager_tests {
         {
             let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name);
             for _ in 0..50 {
-                table_scan.insert().unwrap();
                 let n = (generate_random_number() % 50) + 1;
-                table_scan.set_int("A", n as i32).unwrap();
-                table_scan.set_string("B", format!("rec{n}")).unwrap();
+                table_scan
+                    .insert_values(&[Constant::Int(n as i32), Constant::String(format!("rec{n}"))])
+                    .unwrap();
             }
 
             let stat_info = mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&tx));
@@ -7093,7 +7133,8 @@ mod metadata_manager_tests {
     fn stat_manager_concurrent_access() {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let setup_txn = db.new_tx();
-        let mdm = Arc::new(MetadataManager::new(true, Arc::clone(&setup_txn)));
+        // is_new=false: system catalog tables already exist from SimpleDB::new_for_test.
+        let mdm = Arc::new(MetadataManager::new(false, Arc::clone(&setup_txn)));
 
         let table_name = "stat_concurrent";
         let mut schema = Schema::new();
@@ -7104,8 +7145,7 @@ mod metadata_manager_tests {
         {
             let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name);
             for i in 0..20 {
-                table_scan.insert().unwrap();
-                table_scan.set_int("val", i).unwrap();
+                table_scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
         }
         setup_txn.commit().unwrap();
@@ -7190,15 +7230,12 @@ impl IndexManager {
         txn: Arc<Transaction>,
     ) {
         let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME);
-        table_scan.insert().unwrap();
         table_scan
-            .set_string(Self::INDEX_COL_NAME, index_name.to_string())
-            .unwrap();
-        table_scan
-            .set_string(Self::TABLE_COL_NAME, table_name.to_string())
-            .unwrap();
-        table_scan
-            .set_string(Self::TABLE_FIELD_NAME, field_name.to_string())
+            .insert_values(&[
+                Constant::String(index_name.to_string()),
+                Constant::String(table_name.to_string()),
+                Constant::String(field_name.to_string()),
+            ])
             .unwrap();
     }
 
@@ -7306,7 +7343,7 @@ impl IndexInfo {
 
     /// This function returns the number of blocks that would need to be searched for this index on a specific field
     pub fn blocks_accessed(&self) -> usize {
-        let records_per_block = self.txn.block_size() / self.index_layout.slot_size;
+        let records_per_block = self.txn.block_size() / self.index_layout.max_encoded_size();
         let num_blocks = self.stat_info.num_records / records_per_block;
         HashIndex::search_cost(num_blocks)
     }
@@ -7399,15 +7436,12 @@ impl Index for HashIndex {
     fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
         self.before_first(data_val);
         let table_scan = self.table_scan.as_mut().unwrap();
-        table_scan.insert().unwrap();
         table_scan
-            .set_int(IndexInfo::BLOCK_NUM_FIELD, data_rid.block_num as i32)
-            .unwrap();
-        table_scan
-            .set_int(IndexInfo::ID_FIELD, data_rid.slot as i32)
-            .unwrap();
-        table_scan
-            .set_value(IndexInfo::DATA_FIELD, data_val.clone())
+            .insert_values(&[
+                Constant::Int(data_rid.block_num as i32),
+                Constant::Int(data_rid.slot as i32),
+                data_val.clone(),
+            ])
             .unwrap();
     }
 
@@ -7577,12 +7611,11 @@ impl ViewManager {
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
         let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
-        table_scan.insert().unwrap();
         table_scan
-            .set_string(Self::VIEW_NAME_COL, view_name.to_string())
-            .unwrap();
-        table_scan
-            .set_string(Self::VIEW_DEF_COL, view_def.to_string())
+            .insert_values(&[
+                Constant::String(view_name.to_string()),
+                Constant::String(view_def.to_string()),
+            ])
             .unwrap();
     }
 
@@ -7667,12 +7700,11 @@ impl TableManager {
                 self.table_catalog_layout.clone(),
                 Self::TABLE_CAT_TABLE_NAME,
             );
-            table_scan.insert().unwrap();
             table_scan
-                .set_string(Self::TABLE_NAME_COL, table_name.to_string())
-                .unwrap();
-            table_scan
-                .set_int(Self::SLOT_SIZE_COL, layout.slot_size as i32)
+                .insert_values(&[
+                    Constant::String(table_name.to_string()),
+                    Constant::Int(layout.max_encoded_size() as i32),
+                ])
                 .unwrap();
         }
 
@@ -7684,22 +7716,15 @@ impl TableManager {
                 Self::FIELD_CAT_TABLE_NAME,
             );
             for field in &schema.fields {
-                table_scan.insert().unwrap();
-                table_scan
-                    .set_string(Self::TABLE_NAME_COL, table_name.to_string())
-                    .unwrap();
-                table_scan
-                    .set_string(Self::FIELD_NAME_COL, field.to_string())
-                    .unwrap();
                 let field_info = schema.info.get(field).unwrap();
                 table_scan
-                    .set_int(Self::FIELD_TYPE_COL, field_info.field_type as i32)
-                    .unwrap();
-                table_scan
-                    .set_int(Self::FIELD_LENGTH_COL, field_info.length as i32)
-                    .unwrap();
-                table_scan
-                    .set_int(Self::FIELD_OFFSET_COL, layout.offset(field).unwrap() as i32)
+                    .insert_values(&[
+                        Constant::String(table_name.to_string()),
+                        Constant::String(field.to_string()),
+                        Constant::Int(field_info.field_type as i32),
+                        Constant::Int(field_info.length as i32),
+                        Constant::Int(layout.offset(field).unwrap() as i32),
+                    ])
                     .unwrap();
             }
         }
@@ -7791,12 +7816,12 @@ mod table_manager_tests {
         let layout = table_manager.get_layout(table_name, Arc::clone(&tx));
 
         // Verify slot size
-        println!("MyTable has slot size {}", layout.slot_size);
-        // Assert slot size matches expected (calculate expected size based on schema)
+        println!("MyTable has slot size {}", layout.max_encoded_size());
+        // Assert max encoded size matches expected (calculate expected size based on schema)
         let expected_slot_size = 4 + // header
                             4 + // int field
                             (4 + 9); // string field (length prefix + chars)
-        assert_eq!(layout.slot_size, expected_slot_size);
+        assert_eq!(layout.max_encoded_size(), expected_slot_size);
 
         // Verify schema fields
         println!("Its fields are:");
@@ -7838,6 +7863,7 @@ pub struct TableScan {
     layout: Layout,
     file_name: String,
     record_page: Option<RecordPage>,
+    heap_iter: Option<HeapIterator>,
     current_slot: Option<usize>,
     table_name: String,
 }
@@ -7851,6 +7877,7 @@ impl TableScan {
             layout,
             file_name: file_name.to_string(),
             record_page: None,
+            heap_iter: None,
             current_slot: None,
             table_name: table_name.to_string(),
         };
@@ -7871,21 +7898,28 @@ impl TableScan {
         scan
     }
 
-    /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number
+    /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number.
+    /// Captures `max_slot` from the page's current slot count so that redirect-appended
+    /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
     pub fn move_to_block(&mut self, block_num: usize) {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
+        self.heap_iter = Some(iter);
     }
 
-    /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there
+    /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there.
     fn move_to_new_block(&mut self) -> SimpleDBResult<()> {
         let block = self.txn.append(&self.file_name);
-        let record_page = RecordPage::new(Arc::clone(&self.txn), block, self.layout.clone());
+        let record_page =
+            RecordPage::new(Arc::clone(&self.txn), block.clone(), self.layout.clone());
         record_page.format()?;
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block), 0).unwrap();
         self.current_slot = None;
         self.record_page = Some(record_page);
+        self.heap_iter = Some(iter);
         Ok(())
     }
 
@@ -7901,12 +7935,15 @@ impl TableScan {
 
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
+        let iter =
+            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), row_id.slot + 1).unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
             self.layout.clone(),
         ));
         self.current_slot = Some(row_id.slot);
+        self.heap_iter = Some(iter);
     }
 }
 
@@ -7917,20 +7954,13 @@ impl Iterator for TableScan {
     fn next(&mut self) -> Option<Self::Item> {
         debug!("Calling next on TableScan for {}", self.table_name);
         loop {
-            //  Check if there is a record page currently
-            if let Some(record_page) = &self.record_page {
-                match record_page.next_valid_slot(self.current_slot) {
-                    Ok(Some(slot)) => {
-                        self.current_slot = Some(slot);
-                        return Some(Ok(()));
-                    }
-                    Ok(None) => {
-                        // No more slots in this page, continue to next page
-                    }
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
+            if let Some(iter) = &mut self.heap_iter {
+                if let Some(slot) = iter.next() {
+                    self.current_slot = Some(slot);
+                    return Some(Ok(()));
                 }
+                // Page exhausted — drop the iterator (unpins the page)
+                self.heap_iter = None;
             }
 
             if self.at_last_block() {
@@ -8018,7 +8048,7 @@ impl UpdateScan for TableScan {
             *self.current_slot.as_ref().unwrap(),
             field_name,
             value,
-        );
+        )?;
         Ok(())
     }
 
@@ -8027,7 +8057,7 @@ impl UpdateScan for TableScan {
             *self.current_slot.as_ref().unwrap(),
             field_name,
             &value,
-        );
+        )?;
         Ok(())
     }
 
@@ -8039,16 +8069,15 @@ impl UpdateScan for TableScan {
         Ok(())
     }
 
-    fn insert(&mut self) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
         let mut iterations = 0;
         loop {
-            //  sanity check in case i runs into an infinite loop
             iterations += 1;
             assert!(
                 iterations <= 10000,
-                "Table scan insert failed for {iterations} iterations"
+                "Table scan insert_values failed for {iterations} iterations"
             );
-            match self.record_page.as_ref().unwrap().insert() {
+            match self.record_page.as_ref().unwrap().insert_values(values) {
                 Ok(slot) => {
                     self.current_slot = Some(slot);
                     break;
@@ -8099,7 +8128,8 @@ pub trait UpdateScan: Scan + Any {
     fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
     fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
     fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
-    fn insert(&mut self) -> Result<(), Box<dyn Error>>;
+    /// Insert a new record with the given values (in schema field order).
+    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>>;
     fn delete(&mut self) -> Result<(), Box<dyn Error>>;
     fn get_rid(&self) -> Result<RID, Box<dyn Error>>;
     fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>>;
@@ -8117,7 +8147,55 @@ pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
 mod table_scan_tests {
     use super::UpdateScan;
 
-    use crate::{test_utils::generate_random_number, Layout, Scan, Schema, SimpleDB, TableScan};
+    use crate::{
+        test_utils::generate_random_number, Constant, Layout, Scan, Schema, SimpleDB, TableScan,
+    };
+
+    /// Regression test: UPDATE scans must not double-process a row when `update_tuple`
+    /// redirects a grown tuple (appends a new Live slot beyond the original `max_slot`).
+    ///
+    /// Before Phase 6, `next_valid_slot` recreated `HeapIterator` from slot 0 on every
+    /// `next()` call, evaluating `slot_count()` each time. After a redirect, the new slot
+    /// (at index >= original `max_slot`) would be visited and the row updated a second time.
+    #[test]
+    fn update_scan_no_double_process_on_redirect() {
+        let (db, _test_dir) = SimpleDB::new_for_test(4, 5000);
+        let txn = db.new_tx();
+
+        let mut schema = Schema::new();
+        schema.add_int_field("id");
+        schema.add_string_field("name", 20);
+        let layout = Layout::new(schema);
+
+        // Insert rows with a short name. Dense payload per row:
+        //   null_bitmap(1) + id(4) + name_len(4) + name_data(1) = 10 bytes
+        // Allocated: 10 + UPDATE_SLACK(4) = 14 bytes. All fit on one 4 K page.
+        let n: usize = 15;
+        let mut ts = TableScan::new(txn, layout, "redirect_test");
+        for i in 0..n {
+            ts.insert_values(&[Constant::Int(i as i32), Constant::String("a".to_string())])
+                .unwrap();
+        }
+
+        // UPDATE: append "xxxxx" (5 chars) to each name.
+        //   New payload: 1+4+4+6 = 15 bytes > 14 bytes allocated → redirect triggered.
+        // Each row must be visited exactly once.
+        ts.move_to_start();
+        let mut updated = 0usize;
+        while ts.next().is_some() {
+            let name = ts.get_string("name").unwrap();
+            ts.set_string("name", name + "xxxxx").unwrap();
+            updated += 1;
+        }
+        assert_eq!(updated, n, "each row must be updated exactly once");
+
+        // Verify every row has exactly one append ("axxxxx"), not two ("axxxxxxxxxx").
+        ts.move_to_start();
+        while ts.next().is_some() {
+            let name = ts.get_string("name").unwrap();
+            assert_eq!(name, "axxxxx", "row double-processed: got {:?}", name);
+        }
+    }
 
     #[test]
     fn table_scan_test() {
@@ -8133,10 +8211,13 @@ mod table_scan_tests {
         let mut inserted_count = 0;
         let mut table_scan = TableScan::new(txn, layout, "table");
         for _ in 0..100 {
-            table_scan.insert().unwrap();
             let number = (generate_random_number() % 100) + 1;
-            table_scan.set_int("A", number as i32).unwrap();
-            table_scan.set_string("B", format!("rec{number}")).unwrap();
+            table_scan
+                .insert_values(&[
+                    Constant::Int(number as i32),
+                    Constant::String(format!("rec{number}")),
+                ])
+                .unwrap();
             dbg!(format!("Inserting number {}", number));
             inserted_count += 1;
         }
@@ -8288,25 +8369,31 @@ impl RecordPage {
     }
 
     /// Sets an integer value in the specified slot and field.
-    /// The offset is calculated using the slot number and field layout.
-    fn set_int(&self, slot: usize, field_name: &str, value: i32) {
+    fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         let guard = self.txn.pin_write_guard(&self.block_id);
-        let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
-        view.row_mut(slot)
-            .unwrap()
-            .unwrap()
-            .set_column(field_name, &Constant::Int(value));
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::Int(value))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
     }
 
     /// Sets a string value in the specified slot and field.
-    /// The offset is calculated using the slot number and field layout.
-    fn set_string(&self, slot: usize, field_name: &str, value: &str) {
+    fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
         let guard = self.txn.pin_write_guard(&self.block_id);
-        let mut view = guard.into_heap_view_mut(&self.layout).unwrap();
-        view.row_mut(slot)
-            .unwrap()
-            .unwrap()
-            .set_column(field_name, &Constant::String(value.to_string()));
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::String(value.to_string()))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
     }
 
     /// Deletes the record at the specified slot.
@@ -8337,23 +8424,6 @@ impl RecordPage {
         Ok(())
     }
 
-    /// Finds the next valid slot after the given slot.
-    /// If `after` is None, returns the first valid slot.
-    /// Returns None if no more valid slots exist.
-    pub fn next_valid_slot(&self, after: Option<usize>) -> Result<Option<usize>, Box<dyn Error>> {
-        let view = self
-            .txn
-            .pin_read_guard(&self.block_id)
-            .into_heap_view(&self.layout)?;
-
-        let start_slot = after.map(|s| s + 1).unwrap_or(0);
-        let mut iter = view.live_slot_iter();
-        let next = iter
-            .find(|(slot, _)| *slot >= start_slot)
-            .map(|(slot, _)| slot);
-        Ok(next)
-    }
-
     /// Returns a Vec of all live (non-deleted) slot IDs on this page.
     #[cfg(test)]
     pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
@@ -8362,38 +8432,19 @@ impl RecordPage {
             .pin_read_guard(&self.block_id)
             .into_heap_view(&self.layout)?;
 
-        let live: Vec<usize> = view.live_slot_iter().map(|(slot, _)| slot).collect();
+        let live: Vec<usize> = view.live_slot_iter().collect();
 
         Ok(live)
     }
 
-    /// Allocates an empty slot for a new record and returns its slot ID.
-    /// Used by TableScan which populates fields separately via set_int/set_string.
-    pub fn insert(&self) -> Result<usize, Box<dyn Error>> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
-        let mut view = guard.into_heap_view_mut(&self.layout)?;
-        let (slot_id, _row_mut) = view.insert_row_mut()?;
-        Ok(slot_id)
-    }
-
-    /// Inserts a new record with the given values and returns its slot ID.
-    /// Values must match the schema field order.
-    #[cfg(test)]
-    pub fn insert_with_values(&self, values: &RowValues) -> Result<usize, Box<dyn Error>> {
+    /// Inserts a new record with the given values (in schema field order) and returns its slot ID.
+    pub fn insert_values(&self, values: &[Constant]) -> Result<usize, Box<dyn Error>> {
         if values.len() != self.layout.schema.fields.len() {
             return Err("value count must match schema field count".into());
         }
-
         let guard = self.txn.pin_write_guard(&self.block_id);
         let mut view = guard.into_heap_view_mut(&self.layout)?;
-        let (slot_id, mut row_mut) = view.insert_row_mut()?;
-
-        for (field_name, value) in self.layout.schema.fields.iter().zip(values) {
-            row_mut
-                .set_column(field_name, value)
-                .ok_or_else(|| format!("failed to set column {} during insert", field_name))?;
-        }
-        Ok(slot_id)
+        view.insert_row_values(values)
     }
 }
 
@@ -8427,7 +8478,7 @@ mod record_page_tests {
         let record_page = RecordPage::new(txn, block_id, layout);
         record_page.format().unwrap();
 
-        //  Create a bunch of records using insert_with_values
+        //  Create a bunch of records using insert_values
         let mut inserted_slots = Vec::new();
         loop {
             let number = (generate_random_number() % 100) + 1;
@@ -8436,7 +8487,7 @@ mod record_page_tests {
                 Constant::String(format!("rec{number}")),
             ];
 
-            match record_page.insert_with_values(&values) {
+            match record_page.insert_values(&values) {
                 Ok(slot) => inserted_slots.push(slot),
                 Err(_) => break, // page full
             }
@@ -8469,60 +8520,218 @@ mod record_page_tests {
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub schema: Schema,
-    offsets: HashMap<String, usize>, //  map the field name to the offset
-    column_index: HashMap<String, usize>, //  map the field name to the column index
-    pub slot_size: usize,
+    column_index: HashMap<String, usize>,
 }
 
 impl Layout {
     const INT_BYTES: usize = 4;
     pub fn new(schema: Schema) -> Self {
-        let mut offsets = HashMap::new();
         let mut column_index = HashMap::new();
-        let mut offset = Self::INT_BYTES;
         for (idx, field) in schema.fields.iter().enumerate() {
-            let field_info = schema.info.get(field).unwrap();
             column_index.insert(field.clone(), idx);
-            offsets.insert(field.clone(), offset);
-            match field_info.field_type {
-                FieldType::Int => offset += field_info.length,
-                FieldType::String => offset += Self::INT_BYTES + field_info.length,
-            }
         }
-
         Self {
             schema,
-            offsets,
             column_index,
-            slot_size: offset,
         }
     }
 
-    /// Get the offset of a field in a record
+    /// Compute the byte offset of a field within the fixed-layout payload region.
+    /// Starts at INT_BYTES (4) to preserve the historical base used by BTree entries.
     fn offset(&self, field: &str) -> Option<usize> {
-        self.offsets.get(field).copied()
+        let mut offset = Self::INT_BYTES;
+        for f in &self.schema.fields {
+            if f == field {
+                return Some(offset);
+            }
+            let info = self.schema.info.get(f)?;
+            match info.field_type {
+                FieldType::Int => offset += info.length,
+                FieldType::String => offset += Self::INT_BYTES + info.length,
+            }
+        }
+        None
     }
 
-    /// Get the offset along with the column index for a field
-    fn offset_with_index(&self, field: &str) -> Option<(usize, usize)> {
-        Some((*self.offsets.get(field)?, *self.column_index.get(field)?))
-    }
-
-    /// Get the number of columns stored in this layout
-    fn num_of_columns(&self) -> usize {
-        self.schema.fields.len()
+    /// Worst-case payload size for a schema, assuming all fields are non-NULL and strings are
+    /// at their declared maximum length.
+    ///
+    /// Used by BTree page capacity checks (`is_full`) and planner `records_per_block` estimates.
+    /// Heap tuples use actual dense sizes — this function is NOT used for heap allocation.
+    pub fn max_encoded_size(&self) -> usize {
+        let mut size = Self::INT_BYTES;
+        for f in &self.schema.fields {
+            let info = self.schema.info.get(f).unwrap();
+            match info.field_type {
+                FieldType::Int => size += info.length,
+                FieldType::String => size += Self::INT_BYTES + info.length,
+            }
+        }
+        size
     }
 
     fn field_info(&self, field: &str) -> Option<&FieldInfo> {
         self.schema.info.get(field)
     }
 
-    fn field_length(&self, field: &str) -> Option<usize> {
-        let info = self.field_info(field)?;
-        match info.field_type {
-            FieldType::Int => Some(info.length),
-            FieldType::String => Some(4 + info.length),
+    /// Returns the column index (schema ordinal) for a field.
+    fn column_idx(&self, field: &str) -> Option<usize> {
+        self.column_index.get(field).copied()
+    }
+
+    /// Encode a slice of non-null values into a dense heap payload.
+    /// Encodes non-null values into a dense heap payload.
+    /// All bits in the null bitmap are zero (no NULLs).
+    pub fn encode_payload(&self, values: &[Constant]) -> Vec<u8> {
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let mut buf = vec![0u8; bitmap_bytes]; // all-zero bitmap = no NULLs
+        for value in values {
+            match value {
+                Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+                Constant::String(s) => {
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
         }
+        buf
+    }
+
+    /// Encode values (possibly NULL) into a dense heap payload.
+    ///
+    /// # On-disk tuple format
+    ///
+    /// A complete heap tuple stored in the record space is:
+    /// ```text
+    /// [HeapTupleHeader (24 B)][payload]
+    /// ```
+    ///
+    /// `HeapTupleHeader` (24 bytes, all little-endian):
+    /// ```text
+    /// bytes  0.. 3  payload_len (u32) — byte count of payload, NOT including UPDATE_SLACK
+    /// bytes  4..11  xmin (u64)        — creating transaction id
+    /// bytes 12..19  xmax (u64)        — deleting/updating transaction id
+    /// bytes 20..21  flags (u16)
+    /// bytes 22..23  nullmap_ptr (u16) — offset of null bitmap within payload (always 0)
+    /// ```
+    ///
+    /// `payload` produced by this function:
+    /// ```text
+    /// [null_bitmap: ceil(n/8) bytes][field data in schema order]
+    /// ```
+    ///
+    /// Null bitmap: bit `i` is 1 if field `i` is NULL.
+    ///
+    /// Per-field encoding (NULL fields contribute 0 bytes):
+    /// - `INT`:    4 bytes, little-endian `i32`
+    /// - `STRING`: 4-byte LE `u32` length prefix + actual UTF-8 bytes (no padding)
+    ///
+    /// Example — schema `[id: INT, name: VARCHAR(100), age: INT]`, values `[42, "alice", 30]`:
+    /// ```text
+    /// 1 B nullmap(0x00) | 4 B(42) | 4 B(5) + 5 B("alice") | 4 B(30)  →  18 bytes
+    /// ```
+    /// Compare to the old fixed-slot layout which always reserved `4 + 4 + (4+100) + 4 = 116 bytes`.
+    pub fn encode_payload_with_nulls(&self, values: &[Option<Constant>]) -> Vec<u8> {
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let mut bitmap_buf = vec![0u8; bitmap_bytes];
+        let mut data: Vec<u8> = Vec::new();
+        {
+            let mut bitmap = NullBitmapMut::new(&mut bitmap_buf);
+            for (i, value) in values.iter().enumerate() {
+                match value {
+                    None => {
+                        bitmap.set_null(i);
+                    }
+                    Some(Constant::Int(v)) => {
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    Some(Constant::String(s)) => {
+                        data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        data.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+        }
+        bitmap_buf.extend(data);
+        bitmap_buf
+    }
+
+    /// Decode a single field from a heap tuple.
+    /// Returns None if the field is NULL (bit set in bitmap) or field not found.
+    pub fn decode_field(&self, tuple: &HeapTuple<'_>, field_name: &str) -> Option<Constant> {
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let field_idx = self.column_index.get(field_name).copied()?;
+        let bitmap = tuple.null_bitmap(n);
+        if bitmap.is_null(field_idx) {
+            return None;
+        }
+        let payload = tuple.payload();
+        // Scan preceding non-null fields to find this field's byte offset
+        let mut offset = tuple.nullmap_ptr() as usize + bitmap_bytes;
+        for i in 0..field_idx {
+            if bitmap.is_null(i) {
+                continue; // null field — no bytes
+            }
+            let fname = &self.schema.fields[i];
+            let info = self.schema.info.get(fname)?;
+            match info.field_type {
+                FieldType::Int => offset += 4,
+                FieldType::String => {
+                    let len =
+                        u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
+                    offset += 4 + len;
+                }
+            }
+        }
+        let field_info = self.schema.info.get(field_name)?;
+        match field_info.field_type {
+            FieldType::Int => Some(Constant::Int(i32::from_le_bytes(
+                payload[offset..offset + 4].try_into().ok()?,
+            ))),
+            FieldType::String => {
+                let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
+                Some(Constant::String(
+                    String::from_utf8(payload[offset + 4..offset + 4 + len].to_vec()).ok()?,
+                ))
+            }
+        }
+    }
+
+    /// Decodes all fields from a heap tuple in a single O(N) left-to-right pass.
+    /// More efficient than calling `decode_field` N times (which would be O(N²)).
+    pub fn decode_all_fields(&self, tuple: &HeapTuple<'_>) -> Vec<Option<Constant>> {
+        let n = self.schema.fields.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let bitmap = tuple.null_bitmap(n);
+        let payload = tuple.payload();
+        let mut offset = tuple.nullmap_ptr() as usize + bitmap_bytes;
+        let mut result = Vec::with_capacity(n);
+        for (i, fname) in self.schema.fields.iter().enumerate() {
+            if bitmap.is_null(i) {
+                result.push(None);
+                continue;
+            }
+            let info = &self.schema.info[fname];
+            match info.field_type {
+                FieldType::Int => {
+                    let v = i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
+                    result.push(Some(Constant::Int(v)));
+                    offset += 4;
+                }
+                FieldType::String => {
+                    let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap())
+                        as usize;
+                    let s =
+                        String::from_utf8(payload[offset + 4..offset + 4 + len].to_vec()).unwrap();
+                    result.push(Some(Constant::String(s)));
+                    offset += 4 + len;
+                }
+            }
+        }
+        result
     }
 }
 
@@ -8545,6 +8754,8 @@ mod layout_tests {
                 assert_eq!(offset, 8);
             }
         }
+        // max_encoded_size: 4 (base) + 4 (INT A) + (4+10) (VARCHAR B) = 22
+        assert_eq!(layout.max_encoded_size(), 22);
     }
 }
 
@@ -8592,10 +8803,15 @@ impl Schema {
     }
 
     fn add_field(&mut self, field_name: &str, field_type: FieldType, length: usize) {
-        self.fields.push(field_name.to_string());
+        debug_assert!(
+            !self.info.contains_key(field_name),
+            "duplicate field '{field_name}' added to schema"
+        );
+        if !self.info.contains_key(field_name) {
+            self.fields.push(field_name.to_string());
+        }
         self.info
             .entry(field_name.to_string())
-            .and_modify(|entry| *entry = FieldInfo { field_type, length })
             .or_insert_with(|| FieldInfo { field_type, length });
     }
 
@@ -8892,27 +9108,27 @@ mod transaction_tests {
         let mut view = guard
             .into_heap_view_mut(layout)
             .expect("heap page view mut");
-        let (slot, mut row_mut) = view.insert_row_mut().expect("allocate txn row");
+        let slot = view
+            .insert_row_values(&[
+                Constant::Int(int_val),
+                Constant::String(str_val.to_string()),
+            ])
+            .expect("allocate txn row");
         assert_eq!(slot, TXN_SLOT);
-        row_mut
-            .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
-            .expect("set txn int");
-        row_mut
-            .set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
-            .expect("set txn string");
     }
 
     fn update_txn_row(guard: PageWriteGuard<'_>, layout: &Layout, int_val: i32, str_val: &str) {
         let mut view = guard
             .into_heap_view_mut(layout)
             .expect("heap page view mut");
-        let mut row_mut = view.row_mut(TXN_SLOT).expect("txn row exists").unwrap();
-        row_mut
-            .set_column(TXN_INT_FIELD, &Constant::Int(int_val))
-            .expect("set txn int");
-        row_mut
-            .set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
-            .expect("set txn string");
+        let mut row = view
+            .row_mut(TXN_SLOT)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(TXN_INT_FIELD, &Constant::Int(int_val))
+            .expect("update int field");
+        row.set_column(TXN_STR_FIELD, &Constant::String(str_val.to_string()))
+            .expect("update string field");
     }
 
     fn maybe_snapshot_txn_row(guard: PageReadGuard<'_>, layout: &Layout) -> Option<TxnRowSnapshot> {
@@ -11925,14 +12141,11 @@ mod recovery_manager_tests {
     ) -> SlotId {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let (slot, mut row_mut) = view.insert_row_mut().expect("insert row");
-        row_mut
-            .set_column(INT_FIELD, &Constant::Int(int_value))
-            .expect("set int value");
-        row_mut
-            .set_column(STR_FIELD, &Constant::String(text_value.to_string()))
-            .expect("set string value");
-        slot
+        view.insert_row_values(&[
+            Constant::Int(int_value),
+            Constant::String(text_value.to_string()),
+        ])
+        .expect("insert row")
     }
 
     fn update_int_at(
@@ -11944,9 +12157,11 @@ mod recovery_manager_tests {
     ) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(slot).expect("row exists").unwrap();
-        row_mut
-            .set_column(INT_FIELD, &Constant::Int(value))
+        let mut row = view
+            .row_mut(slot)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(INT_FIELD, &Constant::Int(value))
             .expect("update int value");
     }
 
@@ -11959,9 +12174,11 @@ mod recovery_manager_tests {
     ) {
         let guard = txn.pin_write_guard(block);
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
-        let mut row_mut = view.row_mut(slot).expect("row exists").unwrap();
-        row_mut
-            .set_column(STR_FIELD, &Constant::String(value.to_string()))
+        let mut row = view
+            .row_mut(slot)
+            .expect("row_mut ok")
+            .expect("slot exists");
+        row.set_column(STR_FIELD, &Constant::String(value.to_string()))
             .expect("update string value");
     }
 
@@ -12211,17 +12428,15 @@ mod recovery_manager_tests {
         {
             let guard = txn2.pin_write_guard(&block);
             let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
-            let new_bytes = test_helpers::build_tuple_bytes_with_payload_len(
-                &layout,
-                layout.slot_size + 32,
-                |row| {
-                    row.set_column(INT_FIELD, &Constant::Int(99))
-                        .expect("set int");
-                    row.set_column(STR_FIELD, &Constant::String("relocated".to_string()))
-                        .expect("set string");
-                },
-            )
+            let int_idx = layout.column_idx(INT_FIELD).unwrap();
+            let str_idx = layout.column_idx(STR_FIELD).unwrap();
+            let mut new_bytes = test_helpers::build_tuple_bytes(&layout, |values| {
+                values[int_idx] = Some(Constant::Int(99));
+                values[str_idx] = Some(Constant::String("relocated".to_string()));
+            })
             .expect("build tuple bytes");
+            // Pad to exceed the old slot allocation and force a redirect.
+            new_bytes.resize(new_bytes.len() + layout.max_encoded_size() + 32, 0);
             view.update_tuple(slot, &new_bytes)
                 .expect("update tuple with relocation");
         }
@@ -12444,7 +12659,9 @@ pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
 mod buffer_manager_tests {
     use std::{sync::Arc, thread};
 
-    use crate::{page::test_helpers, BlockId, BufferManager, Layout, Lsn, Schema, SimpleDB};
+    use crate::{
+        page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Schema, SimpleDB,
+    };
 
     const BUFFER_FIELD: &str = "val";
 
@@ -12465,8 +12682,11 @@ mod buffer_manager_tests {
             .expect("pin block for overwrite");
         {
             let mut page = buffer.write_page();
-            test_helpers::init_heap_page_with_int(&mut page, layout, BUFFER_FIELD, value)
-                .expect("initialize heap page");
+            let field_idx = layout.column_idx(BUFFER_FIELD).unwrap();
+            test_helpers::init_heap_page_with_row(&mut page, layout, |values| {
+                values[field_idx] = Some(Constant::Int(value));
+            })
+            .expect("initialize heap page");
         }
         buffer.set_modified(0, Lsn::MAX);
         buffer_manager.unpin(buffer);
@@ -13545,11 +13765,11 @@ mod durability_tests {
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
-        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
-            row.set_column(FIELD_INT, &Constant::Int(42))
-                .expect("set durability int");
-            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
-                .expect("set durability string");
+        let int_idx = layout.column_idx(FIELD_INT).unwrap();
+        let str_idx = layout.column_idx(FIELD_STR).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |values| {
+            values[int_idx] = Some(Constant::Int(42));
+            values[str_idx] = Some(Constant::String("durability".to_string()));
         })
         .expect("initialize heap row");
 
@@ -13585,11 +13805,11 @@ mod durability_tests {
         let block_id = BlockId::new("test_file".to_string(), 42);
         let mut page = Page::new();
         let layout = durability_layout();
-        test_helpers::init_heap_page_with_row(&mut page, &layout, |row| {
-            row.set_column(FIELD_INT, &Constant::Int(42))
-                .expect("set durability int");
-            row.set_column(FIELD_STR, &Constant::String("durability".to_string()))
-                .expect("set durability string");
+        let int_idx = layout.column_idx(FIELD_INT).unwrap();
+        let str_idx = layout.column_idx(FIELD_STR).unwrap();
+        test_helpers::init_heap_page_with_row(&mut page, &layout, |values| {
+            values[int_idx] = Some(Constant::Int(42));
+            values[str_idx] = Some(Constant::String("durability".to_string()));
         })
         .expect("initialize heap row");
 
