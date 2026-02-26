@@ -318,7 +318,7 @@ fn bench_access_patterns_mt(c: &mut Criterion) {
             Arc::clone(&stop),
         );
 
-        group.throughput(Throughput::Elements((num_threads * total_blocks) as u64));
+        group.throughput(Throughput::Elements(total_blocks as u64));
         group.bench_with_input(
             BenchmarkId::new("Seq Scan MT", format!("x{num_threads}")),
             &num_threads,

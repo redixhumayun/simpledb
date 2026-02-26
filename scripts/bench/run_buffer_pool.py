@@ -193,7 +193,7 @@ def main() -> None:
         log_rel = None
 
         if not args.skip_text:
-            text_cmd = base_cmd + ["--noplot"]
+            text_cmd = base_cmd + ["--", "--noplot"]
             text_result = run_command(text_cmd, extra_env=bench_env)
             log_path = raw_platform_dir / f"{policy_key}.txt"
             write_text_log(log_path, text_result.stdout, text_result.stderr)
