@@ -3275,12 +3275,14 @@ mod logical_row_tests {
 
         // Encode and decode to verify
         let payload = layout.encode_payload_with_nulls(&values);
-        assert_eq!(layout.decode_field(&payload, "a"), Some(Constant::Int(99)));
+        let buf = make_tuple_buf(&payload);
+        let tuple = HeapTuple::from_bytes(&buf);
+        assert_eq!(layout.decode_field(&tuple, "a"), Some(Constant::Int(99)));
         assert_eq!(
-            layout.decode_field(&payload, "b"),
+            layout.decode_field(&tuple, "b"),
             Some(Constant::String("hey".to_string()))
         );
-        assert!(layout.decode_field(&payload, "c").is_none());
+        assert!(layout.decode_field(&tuple, "c").is_none());
 
         // Test serialization round trip
         let layout = serialization_layout();
@@ -3298,18 +3300,28 @@ mod logical_row_tests {
             values[num_idx] = Some(Constant::Int(int_val));
             values[text_idx] = str_val.map(|s| Constant::String(s.to_string()));
             let payload = layout.encode_payload_with_nulls(&values);
+            let buf = make_tuple_buf(&payload);
+            let tuple = HeapTuple::from_bytes(&buf);
             assert_eq!(
-                layout.decode_field(&payload, "num"),
+                layout.decode_field(&tuple, "num"),
                 Some(Constant::Int(int_val))
             );
             match str_val {
                 Some(s) => assert_eq!(
-                    layout.decode_field(&payload, "text"),
+                    layout.decode_field(&tuple, "text"),
                     Some(Constant::String(s.to_string()))
                 ),
-                None => assert!(layout.decode_field(&payload, "text").is_none()),
+                None => assert!(layout.decode_field(&tuple, "text").is_none()),
             }
         }
+    }
+
+    /// Wraps a raw payload in a zeroed heap tuple header so tests can construct
+    /// a `HeapTuple` without going through the page layer.
+    fn make_tuple_buf(payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; HEAP_TUPLE_HEADER_BYTES];
+        buf.extend_from_slice(payload);
+        buf
     }
 }
 
@@ -3401,7 +3413,7 @@ pub struct HeapTuple<'a> {
 }
 
 impl<'a> HeapTuple<'a> {
-    fn from_bytes(buf: &'a [u8]) -> Self {
+    pub(crate) fn from_bytes(buf: &'a [u8]) -> Self {
         let (header_bytes, payload_bytes) = buf.split_at(HEAP_TUPLE_HEADER_BYTES);
         let header_bytes: &[u8; HEAP_TUPLE_HEADER_BYTES] = header_bytes.try_into().unwrap();
         let header = HeapTupleHeaderBytes::from_bytes(header_bytes);
@@ -3411,7 +3423,7 @@ impl<'a> HeapTuple<'a> {
         }
     }
 
-    fn nullmap_ptr(&self) -> u16 {
+    pub(crate) fn nullmap_ptr(&self) -> u16 {
         self.header.nullmap_ptr()
     }
 
@@ -3420,12 +3432,11 @@ impl<'a> HeapTuple<'a> {
         self.header.payload_len()
     }
 
-    fn payload(&self) -> &'a [u8] {
+    pub(crate) fn payload(&self) -> &'a [u8] {
         self.payload
     }
 
-    #[cfg(test)]
-    fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
+    pub(crate) fn null_bitmap(&self, num_columns: usize) -> NullBitmap<'_> {
         let offset = self.nullmap_ptr() as usize;
         let bytes_needed = num_columns.div_ceil(8);
         let bytes = &self.payload()[offset..offset + bytes_needed];
@@ -3481,7 +3492,7 @@ impl<'a> LogicalRow<'a> {
     }
 
     pub fn get_column(&self, column_name: &str) -> Option<Constant> {
-        self.layout.decode_field(self.tuple.payload(), column_name)
+        self.layout.decode_field(&self.tuple, column_name)
     }
 }
 
@@ -3726,7 +3737,7 @@ impl<'a> HeapPageViewMut<'a> {
             let bytes = self.guard.bytes();
             let page = HeapPage::new(bytes)?;
             match page.tuple_ref(live_slot).ok_or("slot not found")? {
-                TupleRef::Live(tuple) => self.layout.decode_all_fields(tuple.payload()),
+                TupleRef::Live(tuple) => self.layout.decode_all_fields(&tuple),
                 _ => return Err("slot not live after resolution".into()),
             }
         };

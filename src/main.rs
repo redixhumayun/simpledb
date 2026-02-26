@@ -35,7 +35,7 @@ mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
 use crate::page::{
-    HeapIterator, NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage,
+    HeapIterator, HeapTuple, NullBitmap, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage,
 };
 mod buffer_manager;
 
@@ -8651,18 +8651,19 @@ impl Layout {
         bitmap_buf
     }
 
-    /// Decode a single field from a dense heap payload.
+    /// Decode a single field from a heap tuple.
     /// Returns None if the field is NULL (bit set in bitmap) or field not found.
-    pub fn decode_field(&self, payload: &[u8], field_name: &str) -> Option<Constant> {
+    pub fn decode_field(&self, tuple: &HeapTuple<'_>, field_name: &str) -> Option<Constant> {
         let n = self.schema.fields.len();
         let bitmap_bytes = n.div_ceil(8);
         let field_idx = self.column_index.get(field_name).copied()?;
-        let bitmap = NullBitmap::new(&payload[..bitmap_bytes]);
+        let bitmap = tuple.null_bitmap(n);
         if bitmap.is_null(field_idx) {
             return None;
         }
+        let payload = tuple.payload();
         // Scan preceding non-null fields to find this field's byte offset
-        let mut offset = bitmap_bytes;
+        let mut offset = tuple.nullmap_ptr() as usize + bitmap_bytes;
         for i in 0..field_idx {
             if bitmap.is_null(i) {
                 continue; // null field — no bytes
@@ -8692,13 +8693,14 @@ impl Layout {
         }
     }
 
-    /// Decodes all fields from `payload` in a single O(N) left-to-right pass.
+    /// Decodes all fields from a heap tuple in a single O(N) left-to-right pass.
     /// More efficient than calling `decode_field` N times (which would be O(N²)).
-    pub fn decode_all_fields(&self, payload: &[u8]) -> Vec<Option<Constant>> {
+    pub fn decode_all_fields(&self, tuple: &HeapTuple<'_>) -> Vec<Option<Constant>> {
         let n = self.schema.fields.len();
         let bitmap_bytes = n.div_ceil(8);
-        let bitmap = NullBitmap::new(&payload[..bitmap_bytes]);
-        let mut offset = bitmap_bytes;
+        let bitmap = tuple.null_bitmap(n);
+        let payload = tuple.payload();
+        let mut offset = tuple.nullmap_ptr() as usize + bitmap_bytes;
         let mut result = Vec::with_capacity(n);
         for (i, fname) in self.schema.fields.iter().enumerate() {
             if bitmap.is_null(i) {
