@@ -327,7 +327,6 @@ fn bench_phase1_qd(c: &mut Criterion) {
                 })
             });
         }
-
     }
 
     group.finish();
@@ -559,7 +558,6 @@ fn bench_concurrent_io(c: &mut Criterion) {
                     })
                 });
             }
-
         }
     }
 
