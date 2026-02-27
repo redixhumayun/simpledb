@@ -79,24 +79,43 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
 
+    - uses: bencherdev/bencher@main
+
     - name: Build (release)
       run: cargo build --release
 
-    - name: Run all benchmarks (auto-discovery)
-      run: python3 scripts/run_all_benchmarks.py 12 all_benchmarks.json
+    - name: Benchmark buffer_pool
+      run: |
+        bencher run \
+          --project simpledb \
+          --token "${{ secrets.BENCHER_API_TOKEN }}" \
+          --branch "${{ github.head_ref || github.ref_name }}" \
+          --testbed self-hosted \
+          --adapter rust_bench \
+          --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+          "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- --output-format bencher --noplot"
 
-    - name: Store benchmark results
-      uses: benchmark-action/github-action-benchmark@v1
-      with:
-        name: SimpleDB Benchmarks
-        tool: 'customSmallerIsBetter'
-        output-file-path: all_benchmarks.json
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        alert-threshold: '105%'
-        comment-on-alert: true
-        fail-on-alert: false
-        alert-comment-cc-users: '@${{ github.actor }}'
+    - name: Benchmark io_patterns
+      run: |
+        bencher run \
+          --project simpledb \
+          --token "${{ secrets.BENCHER_API_TOKEN }}" \
+          --branch "${{ github.head_ref || github.ref_name }}" \
+          --testbed self-hosted \
+          --adapter rust_bench \
+          --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+          "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench io_patterns -- --output-format bencher --noplot"
+
+    - name: Benchmark simple_bench
+      run: |
+        bencher run \
+          --project simpledb \
+          --token "${{ secrets.BENCHER_API_TOKEN }}" \
+          --branch "${{ github.head_ref || github.ref_name }}" \
+          --testbed self-hosted \
+          --adapter rust_bench \
+          --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+          "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench simple_bench -- --output-format bencher --noplot"
 
     - name: Upload Criterion reports
       uses: actions/upload-artifact@v4
