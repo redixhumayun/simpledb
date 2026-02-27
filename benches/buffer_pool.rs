@@ -41,12 +41,26 @@ fn write_i32_at(bytes: &mut [u8], offset: usize, value: i32) {
     bytes[offset..offset + 4].copy_from_slice(&le);
 }
 
+/// Returns (warm_up, measurement) durations. Tighter in CI to keep total run time reasonable.
+fn ci_bench_times() -> (Duration, Duration) {
+    if std::env::var("CI").is_ok() {
+        (Duration::from_secs(1), Duration::from_secs(2))
+    } else {
+        (Duration::from_secs(3), Duration::from_secs(5))
+    }
+}
+
 // ============================================================================
 // Phase 1: Core Latency Benchmarks
 // ============================================================================
 
 fn bench_phase1(c: &mut Criterion) {
     let nb = num_buffers();
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase1/Core Latency");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // Pin/Unpin (buffer pool hit)
     {
@@ -55,7 +69,7 @@ fn bench_phase1(c: &mut Criterion) {
         precreate_blocks(&db, &test_file, 2);
         let buffer_manager = db.buffer_manager();
 
-        c.bench_function("Pin/Unpin (hit)", |b| {
+        group.bench_function("Pin/Unpin (hit)", |b| {
             b.iter(|| {
                 let block_id = BlockId::new(test_file.clone(), 1);
                 let buffer = buffer_manager.pin(&block_id).unwrap();
@@ -73,7 +87,7 @@ fn bench_phase1(c: &mut Criterion) {
         let buffer_manager = db.buffer_manager();
 
         let mut block_idx: usize = 0;
-        c.bench_function("Cold Pin (miss)", |b| {
+        group.bench_function("Cold Pin (miss)", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -107,7 +121,7 @@ fn bench_phase1(c: &mut Criterion) {
         }
 
         let mut block_idx: usize = nb;
-        c.bench_function("Dirty Eviction", |b| {
+        group.bench_function("Dirty Eviction", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -124,6 +138,8 @@ fn bench_phase1(c: &mut Criterion) {
 
         txn.commit().unwrap();
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -133,6 +149,11 @@ fn bench_phase1(c: &mut Criterion) {
 fn bench_access_patterns_st(c: &mut Criterion) {
     let nb = num_buffers();
     let total_blocks = nb * 10;
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase2/Access Patterns ST");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // Sequential Scan
     {
@@ -141,7 +162,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
         precreate_blocks(&db, &test_file, total_blocks);
         let buffer_manager = db.buffer_manager();
 
-        c.bench_function(&format!("Sequential Scan ({total_blocks} blocks)"), |b| {
+        group.bench_function(&format!("Sequential Scan ({total_blocks} blocks)"), |b| {
             b.iter(|| {
                 for i in 0..total_blocks {
                     let block_id = BlockId::new(test_file.clone(), i);
@@ -161,7 +182,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
         precreate_blocks(&db, &test_file, working_set);
         let buffer_manager = db.buffer_manager();
 
-        c.bench_function(&format!("Repeated Access ({total_accesses} ops)"), |b| {
+        group.bench_function(&format!("Repeated Access ({total_accesses} ops)"), |b| {
             b.iter(|| {
                 for i in 0..total_accesses {
                     let block_idx = i % working_set;
@@ -184,7 +205,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
             .collect();
         let buffer_manager = db.buffer_manager();
 
-        c.bench_function(
+        group.bench_function(
             &format!("Random (K={working_set_size}, {total_accesses} ops)"),
             |b| {
                 b.iter(|| {
@@ -218,7 +239,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
             .collect();
         let buffer_manager = db.buffer_manager();
 
-        c.bench_function(&format!("Zipfian (80/20, {total_accesses} ops)"), |b| {
+        group.bench_function(&format!("Zipfian (80/20, {total_accesses} ops)"), |b| {
             b.iter(|| {
                 for &block_idx in &zipfian_indices {
                     let block_id = BlockId::new(test_file.clone(), block_idx);
@@ -228,6 +249,8 @@ fn bench_access_patterns_st(c: &mut Criterion) {
             })
         });
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -285,6 +308,11 @@ fn spawn_mt_seq_scan(
 fn bench_access_patterns_mt(c: &mut Criterion) {
     let nb = num_buffers();
     let total_blocks = nb * 10;
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase2/Access Patterns MT");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     for num_threads in [2usize, 4, 8, 16, 32, 64, 128, 256] {
         let (db, _dir) = setup_buffer_pool(nb);
@@ -305,7 +333,7 @@ fn bench_access_patterns_mt(c: &mut Criterion) {
             Arc::clone(&stop),
         );
 
-        c.bench_function(
+        group.bench_function(
             &format!("Seq Scan MT x{num_threads} ({total_blocks} blocks)"),
             |b| {
                 b.iter_custom(|iters| {
@@ -327,6 +355,8 @@ fn bench_access_patterns_mt(c: &mut Criterion) {
             h.join().unwrap();
         }
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -337,8 +367,11 @@ fn bench_pool_scaling(c: &mut Criterion) {
     let working_set_size = 100usize;
     let total_accesses = 500usize;
     let pool_sizes = [8usize, 16, 32, 64, 128, 256];
+    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase3/Pool Scaling");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
     group.throughput(Throughput::Elements(total_accesses as u64));
 
     for &pool_size in &pool_sizes {
@@ -374,6 +407,11 @@ fn bench_pool_scaling(c: &mut Criterion) {
 
 fn bench_concurrent_pin(c: &mut Criterion) {
     let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase5/Concurrent Pin");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
         let ops_per_thread = PIN_TOTAL_OPS / num_threads;
@@ -409,7 +447,7 @@ fn bench_concurrent_pin(c: &mut Criterion) {
             })
             .collect();
 
-        c.bench_function(
+        group.bench_function(
             &format!("Concurrent ({num_threads} threads, {ops_per_thread} ops)"),
             |b| {
                 b.iter_custom(|iters| {
@@ -431,6 +469,8 @@ fn bench_concurrent_pin(c: &mut Criterion) {
             h.join().unwrap();
         }
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -439,6 +479,11 @@ fn bench_concurrent_pin(c: &mut Criterion) {
 
 fn bench_hotset_contention(c: &mut Criterion) {
     let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase5/Hotset Contention");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
         let ops_per_thread = HOTSET_TOTAL_OPS / num_threads;
@@ -474,7 +519,7 @@ fn bench_hotset_contention(c: &mut Criterion) {
             })
             .collect();
 
-        c.bench_function(
+        group.bench_function(
             &format!(
                 "Concurrent Hotset ({num_threads} threads, K={HOTSET_K}, {ops_per_thread} ops)"
             ),
@@ -498,6 +543,8 @@ fn bench_hotset_contention(c: &mut Criterion) {
             h.join().unwrap();
         }
     }
+
+    group.finish();
 }
 
 criterion_group!(

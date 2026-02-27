@@ -3,6 +3,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use simpledb::SimpleDB;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Returns (warm_up, measurement) durations. Tighter in CI to keep total run time reasonable.
+fn ci_bench_times() -> (Duration, Duration) {
+    if std::env::var("CI").is_ok() {
+        (Duration::from_secs(1), Duration::from_secs(2))
+    } else {
+        (Duration::from_secs(3), Duration::from_secs(5))
+    }
+}
 
 fn setup_db() -> (SimpleDB, simpledb::TestDir) {
     let (db, dir) = SimpleDB::new_for_test(64, 100);
@@ -32,8 +42,13 @@ fn setup_db() -> (SimpleDB, simpledb::TestDir) {
 
 fn bench_insert(c: &mut Criterion) {
     let (db, _dir) = setup_db();
+    let (warm_up, measurement) = ci_bench_times();
 
-    c.bench_function("INSERT single record", |b| {
+    let mut group = c.benchmark_group("DML/Insert");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
+
+    group.bench_function("INSERT single record", |b| {
         b.iter(|| {
             let txn = db.new_tx();
             db.planner
@@ -55,11 +70,17 @@ fn bench_insert(c: &mut Criterion) {
             txn.commit().unwrap();
         })
     });
+
+    group.finish();
 }
 
 fn bench_select(c: &mut Criterion) {
     let (db, _dir) = setup_db();
+    let (warm_up, measurement) = ci_bench_times();
+
     let mut group = c.benchmark_group("SELECT");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     group.bench_function("table scan", |b| {
         b.iter(|| {
@@ -95,8 +116,13 @@ fn bench_select(c: &mut Criterion) {
 
 fn bench_update(c: &mut Criterion) {
     let (db, _dir) = setup_db();
+    let (warm_up, measurement) = ci_bench_times();
 
-    c.bench_function("UPDATE single record", |b| {
+    let mut group = c.benchmark_group("DML/Update");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
+
+    group.bench_function("UPDATE single record", |b| {
         b.iter(|| {
             let txn = db.new_tx();
             db.planner
@@ -117,12 +143,19 @@ fn bench_update(c: &mut Criterion) {
             txn.commit().unwrap();
         })
     });
+
+    group.finish();
 }
 
 fn bench_delete(c: &mut Criterion) {
     let (db, _dir) = setup_db();
+    let (warm_up, measurement) = ci_bench_times();
 
-    c.bench_function("DELETE single record", |b| {
+    let mut group = c.benchmark_group("DML/Delete");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
+
+    group.bench_function("DELETE single record", |b| {
         b.iter(|| {
             let txn = db.new_tx();
             db.planner
@@ -144,6 +177,8 @@ fn bench_delete(c: &mut Criterion) {
             txn.commit().unwrap();
         })
     });
+
+    group.finish();
 }
 
 criterion_group!(

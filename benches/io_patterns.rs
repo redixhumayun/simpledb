@@ -135,6 +135,15 @@ fn working_set_blocks() -> usize {
         .unwrap_or(1000)
 }
 
+/// Returns (warm_up, measurement) durations. Tighter in CI to keep total run time reasonable.
+fn ci_bench_times() -> (Duration, Duration) {
+    if std::env::var("CI").is_ok() {
+        (Duration::from_secs(1), Duration::from_secs(2))
+    } else {
+        (Duration::from_secs(3), Duration::from_secs(5))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn posix_fadvise_dontneed(path: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
@@ -150,6 +159,11 @@ fn posix_fadvise_dontneed(path: &std::path::Path) {
 fn bench_phase1_io(c: &mut Criterion) {
     let ws = working_set_blocks();
     let total_ops = ws.min(1000);
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase1/IO Throughput");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // Sequential Read
     {
@@ -157,7 +171,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         let file = format!("seqread_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        c.bench_function(&format!("Sequential Read ({total_ops} ops)"), |b| {
+        group.bench_function(&format!("Sequential Read ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..total_ops {
@@ -174,7 +188,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         let file = format!("seqwrite_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        c.bench_function(&format!("Sequential Write ({total_ops} ops)"), |b| {
+        group.bench_function(&format!("Sequential Write ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..total_ops {
@@ -193,7 +207,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        c.bench_function(&format!("Random Read ({total_ops} ops)"), |b| {
+        group.bench_function(&format!("Random Read ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let indices: Vec<usize> = (0..total_ops).map(|_| rng.next_range(ws)).collect();
                 let mut page = Page::new();
@@ -212,7 +226,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        c.bench_function(&format!("Random Write ({total_ops} ops)"), |b| {
+        group.bench_function(&format!("Random Write ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let indices: Vec<usize> = (0..total_ops).map(|_| rng.next_range(ws)).collect();
                 let mut page = Page::new();
@@ -224,6 +238,8 @@ fn bench_phase1_io(c: &mut Criterion) {
             })
         });
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -233,8 +249,11 @@ fn bench_phase1_io(c: &mut Criterion) {
 fn bench_phase1_qd(c: &mut Criterion) {
     let ws = working_set_blocks();
     let total_ops = ws.min(1000);
+    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase1/Queue Depth");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
     group.throughput(Throughput::Elements(total_ops as u64));
 
     for qd in [1usize, 4, 16, 32] {
@@ -339,7 +358,11 @@ fn bench_phase1_qd(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_wal(c: &mut Criterion) {
+    let (warm_up, measurement) = ci_bench_times();
+
     let mut group = c.benchmark_group("Phase2/WAL");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // WAL append no fsync (1000 ops)
     {
@@ -419,8 +442,11 @@ fn bench_wal(c: &mut Criterion) {
 fn bench_mixed(c: &mut Criterion) {
     let ws = working_set_blocks();
     let mixed_ops = (ws / 2).clamp(1, 500);
+    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase3/Mixed R/W");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
     group.throughput(Throughput::Elements(mixed_ops as u64));
 
     for read_pct in [70usize, 50, 10] {
@@ -485,8 +511,11 @@ fn bench_mixed(c: &mut Criterion) {
 fn bench_concurrent_io(c: &mut Criterion) {
     let ws = working_set_blocks();
     let concurrent_ops = ws.min(100);
+    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase4/Concurrent IO");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     for num_threads in [2usize, 4, 8, 16] {
         for (policy_template, policy_name) in [
@@ -606,6 +635,11 @@ fn bench_concurrent_io(c: &mut Criterion) {
 fn bench_durability(c: &mut Criterion) {
     let ws = working_set_blocks();
     let durability_ops = ws.min(100);
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase5/Durability");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     for (wal_template, wal_name) in [(
         WALFlushPolicy::Immediate,
@@ -621,7 +655,7 @@ fn bench_durability(c: &mut Criterion) {
             let log = db.log_manager();
             let mut rng = FastRng::new();
 
-            c.bench_function(&format!("{wal_name} {data_name}"), |b| {
+            group.bench_function(&format!("{wal_name} {data_name}"), |b| {
                 b.iter(|| {
                     let indices: Vec<usize> =
                         (0..durability_ops).map(|_| rng.next_range(ws)).collect();
@@ -644,6 +678,8 @@ fn bench_durability(c: &mut Criterion) {
             });
         }
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -652,6 +688,11 @@ fn bench_durability(c: &mut Criterion) {
 
 fn bench_cache_adverse(c: &mut Criterion) {
     let ws = working_set_blocks();
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase7/Cache Adverse");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // One-pass sequential scan
     {
@@ -659,7 +700,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
         let file = format!("onepass_seq_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        c.bench_function(&format!("One-pass Seq Scan ({ws} blocks)"), |b| {
+        group.bench_function(&format!("One-pass Seq Scan ({ws} blocks)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..ws {
@@ -677,7 +718,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        c.bench_function(&format!("Low-locality Rand Read ({ws} blocks)"), |b| {
+        group.bench_function(&format!("Low-locality Rand Read ({ws} blocks)"), |b| {
             b.iter(|| {
                 let mut indices: Vec<usize> = (0..ws).collect();
                 for i in (1..ws).rev() {
@@ -703,7 +744,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
             precreate_blocks(&db, &f, blocks_per_stream);
         }
 
-        c.bench_function(&format!("Multi-stream Scan ({ws} blocks)"), |b| {
+        group.bench_function(&format!("Multi-stream Scan ({ws} blocks)"), |b| {
             b.iter(|| {
                 let handles: Vec<_> = (0..num_streams)
                     .map(|s| {
@@ -723,6 +764,8 @@ fn bench_cache_adverse(c: &mut Criterion) {
             })
         });
     }
+
+    group.finish();
 }
 
 // ============================================================================
@@ -732,6 +775,11 @@ fn bench_cache_adverse(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 fn bench_cache_evict(c: &mut Criterion) {
     let ws = working_set_blocks();
+    let (warm_up, measurement) = ci_bench_times();
+
+    let mut group = c.benchmark_group("Phase8/Cache Evict");
+    group.warm_up_time(warm_up);
+    group.measurement_time(measurement);
 
     // One-pass sequential scan + evict
     {
@@ -740,7 +788,7 @@ fn bench_cache_evict(c: &mut Criterion) {
         let file_path: PathBuf = test_dir.path.join(&file_name);
         precreate_blocks(&db, &file_name, ws);
 
-        c.bench_function(&format!("One-pass Seq Scan+Evict ({ws} blocks)"), |b| {
+        group.bench_function(&format!("One-pass Seq Scan+Evict ({ws} blocks)"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -766,7 +814,7 @@ fn bench_cache_evict(c: &mut Criterion) {
         precreate_blocks(&db, &file_name, ws);
         let mut rng = FastRng::new();
 
-        c.bench_function(
+        group.bench_function(
             &format!("Low-locality Rand Read+Evict ({ws} blocks)"),
             |b| {
                 b.iter_custom(|iters| {
@@ -805,7 +853,7 @@ fn bench_cache_evict(c: &mut Criterion) {
             precreate_blocks(&db, name, blocks_per_stream);
         }
 
-        c.bench_function(&format!("Multi-stream Scan+Evict ({ws} blocks)"), |b| {
+        group.bench_function(&format!("Multi-stream Scan+Evict ({ws} blocks)"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -835,6 +883,8 @@ fn bench_cache_evict(c: &mut Criterion) {
             })
         });
     }
+
+    group.finish();
 }
 
 #[cfg(not(target_os = "linux"))]
