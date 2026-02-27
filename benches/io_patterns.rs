@@ -135,13 +135,26 @@ fn working_set_blocks() -> usize {
         .unwrap_or(1000)
 }
 
-/// Returns (warm_up, measurement) durations. Tighter in CI to keep total run time reasonable.
-fn ci_bench_times() -> (Duration, Duration) {
-    if std::env::var("CI").is_ok() {
-        (Duration::from_secs(1), Duration::from_secs(2))
-    } else {
-        (Duration::from_secs(3), Duration::from_secs(5))
-    }
+/// CI config for fast in-memory / buffered-IO groups: 1s warmup, 5s measurement, 100 samples.
+/// Returns None outside CI, leaving Criterion defaults untouched.
+fn ci_fast() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 100))
+}
+
+/// CI config for thread-contention groups: 2s warmup, 8s measurement, 50 samples.
+fn ci_contention() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(2), Duration::from_secs(8), 50))
+}
+
+/// CI config for fsync/durability groups: 3s warmup, 15s measurement, 20 samples.
+fn ci_fsync() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(3), Duration::from_secs(15), 20))
 }
 
 #[cfg(target_os = "linux")]
@@ -159,11 +172,13 @@ fn posix_fadvise_dontneed(path: &std::path::Path) {
 fn bench_phase1_io(c: &mut Criterion) {
     let ws = working_set_blocks();
     let total_ops = ws.min(1000);
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase1/IO Throughput");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // Sequential Read
     {
@@ -249,11 +264,13 @@ fn bench_phase1_io(c: &mut Criterion) {
 fn bench_phase1_qd(c: &mut Criterion) {
     let ws = working_set_blocks();
     let total_ops = ws.min(1000);
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase1/Queue Depth");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
     group.throughput(Throughput::Elements(total_ops as u64));
 
     for qd in [1usize, 4, 16, 32] {
@@ -358,11 +375,12 @@ fn bench_phase1_qd(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_wal(c: &mut Criterion) {
-    let (warm_up, measurement) = ci_bench_times();
-
     let mut group = c.benchmark_group("Phase2/WAL");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fsync() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // WAL append no fsync (1000 ops)
     {
@@ -442,11 +460,13 @@ fn bench_wal(c: &mut Criterion) {
 fn bench_mixed(c: &mut Criterion) {
     let ws = working_set_blocks();
     let mixed_ops = (ws / 2).clamp(1, 500);
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase3/Mixed R/W");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fsync() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
     group.throughput(Throughput::Elements(mixed_ops as u64));
 
     for read_pct in [70usize, 50, 10] {
@@ -511,11 +531,13 @@ fn bench_mixed(c: &mut Criterion) {
 fn bench_concurrent_io(c: &mut Criterion) {
     let ws = working_set_blocks();
     let concurrent_ops = ws.min(100);
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase4/Concurrent IO");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     for num_threads in [2usize, 4, 8, 16] {
         for (policy_template, policy_name) in [
@@ -635,11 +657,13 @@ fn bench_concurrent_io(c: &mut Criterion) {
 fn bench_durability(c: &mut Criterion) {
     let ws = working_set_blocks();
     let durability_ops = ws.min(100);
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase5/Durability");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fsync() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     for (wal_template, wal_name) in [(
         WALFlushPolicy::Immediate,
@@ -688,11 +712,13 @@ fn bench_durability(c: &mut Criterion) {
 
 fn bench_cache_adverse(c: &mut Criterion) {
     let ws = working_set_blocks();
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase7/Cache Adverse");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // One-pass sequential scan
     {
@@ -775,11 +801,13 @@ fn bench_cache_adverse(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 fn bench_cache_evict(c: &mut Criterion) {
     let ws = working_set_blocks();
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase8/Cache Evict");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fsync() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // One-pass sequential scan + evict
     {

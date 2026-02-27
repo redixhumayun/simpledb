@@ -41,13 +41,19 @@ fn write_i32_at(bytes: &mut [u8], offset: usize, value: i32) {
     bytes[offset..offset + 4].copy_from_slice(&le);
 }
 
-/// Returns (warm_up, measurement) durations. Tighter in CI to keep total run time reasonable.
-fn ci_bench_times() -> (Duration, Duration) {
-    if std::env::var("CI").is_ok() {
-        (Duration::from_secs(1), Duration::from_secs(2))
-    } else {
-        (Duration::from_secs(3), Duration::from_secs(5))
-    }
+/// CI config for fast in-memory groups: 1s warmup, 5s measurement, 100 samples.
+/// Returns None outside CI, leaving Criterion defaults untouched.
+fn ci_fast() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 100))
+}
+
+/// CI config for thread-contention groups: 2s warmup, 8s measurement, 50 samples.
+fn ci_contention() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(2), Duration::from_secs(8), 50))
 }
 
 // ============================================================================
@@ -56,11 +62,13 @@ fn ci_bench_times() -> (Duration, Duration) {
 
 fn bench_phase1(c: &mut Criterion) {
     let nb = num_buffers();
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase1/Core Latency");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // Pin/Unpin (buffer pool hit)
     {
@@ -149,11 +157,13 @@ fn bench_phase1(c: &mut Criterion) {
 fn bench_access_patterns_st(c: &mut Criterion) {
     let nb = num_buffers();
     let total_blocks = nb * 10;
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase2/Access Patterns ST");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     // Sequential Scan
     {
@@ -308,11 +318,13 @@ fn spawn_mt_seq_scan(
 fn bench_access_patterns_mt(c: &mut Criterion) {
     let nb = num_buffers();
     let total_blocks = nb * 10;
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase2/Access Patterns MT");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     for num_threads in [2usize, 4, 8, 16, 32, 64, 128, 256] {
         let (db, _dir) = setup_buffer_pool(nb);
@@ -367,11 +379,13 @@ fn bench_pool_scaling(c: &mut Criterion) {
     let working_set_size = 100usize;
     let total_accesses = 500usize;
     let pool_sizes = [8usize, 16, 32, 64, 128, 256];
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase3/Pool Scaling");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
     group.throughput(Throughput::Elements(total_accesses as u64));
 
     for &pool_size in &pool_sizes {
@@ -407,11 +421,13 @@ fn bench_pool_scaling(c: &mut Criterion) {
 
 fn bench_concurrent_pin(c: &mut Criterion) {
     let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase5/Concurrent Pin");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
         let ops_per_thread = PIN_TOTAL_OPS / num_threads;
@@ -479,11 +495,13 @@ fn bench_concurrent_pin(c: &mut Criterion) {
 
 fn bench_hotset_contention(c: &mut Criterion) {
     let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
-    let (warm_up, measurement) = ci_bench_times();
 
     let mut group = c.benchmark_group("Phase5/Hotset Contention");
-    group.warm_up_time(warm_up);
-    group.measurement_time(measurement);
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
 
     for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
         let ops_per_thread = HOTSET_TOTAL_OPS / num_threads;
