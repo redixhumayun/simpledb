@@ -273,7 +273,7 @@ fn bench_phase1_qd(c: &mut Criterion) {
     }
     group.throughput(Throughput::Elements(total_ops as u64));
 
-    for qd in [1usize, 4, 16, 32] {
+    for qd in [1usize, 16, 32] {
         // Sequential Read QD
         {
             let (db, _dir) = setup_io_test();
@@ -328,43 +328,6 @@ fn bench_phase1_qd(c: &mut Criterion) {
             });
         }
 
-        // Multi-stream Scan QD
-        {
-            let num_streams = 4usize;
-            let (db, _dir) = setup_io_test();
-            let blocks_per_stream = (ws / num_streams).max(1);
-            let file_names: Vec<String> = (0..num_streams)
-                .map(|s| format!("multi_stream_qd{qd}_{num_streams}_{s}"))
-                .collect();
-            for name in &file_names {
-                precreate_blocks(&db, name, blocks_per_stream);
-            }
-
-            group.bench_with_input(
-                BenchmarkId::new("Multi-stream Scan QD", qd),
-                &qd,
-                |b, &qd| {
-                    b.iter(|| {
-                        for file in &file_names {
-                            let mut done = 0usize;
-                            while done < blocks_per_stream {
-                                let n = (blocks_per_stream - done).min(qd.max(1));
-                                let mut reqs = Vec::with_capacity(n);
-                                let mut pages = Vec::with_capacity(n);
-                                for j in 0..n {
-                                    reqs.push(BatchReadReq {
-                                        block_id: BlockId::new(file.clone(), done + j),
-                                    });
-                                    pages.push(Page::new());
-                                }
-                                db.file_manager.read_batch(&reqs, &mut pages);
-                                done += n;
-                            }
-                        }
-                    })
-                },
-            );
-        }
     }
 
     group.finish();
@@ -423,7 +386,7 @@ fn bench_wal(c: &mut Criterion) {
     }
 
     // WAL group commit (1000 ops, batch sizes 10/50/100)
-    for batch_size in [10usize, 50, 100] {
+    for batch_size in [10usize] {
         let (db, _dir) = setup_io_test();
         let log = db.log_manager();
         let total_ops = 1000usize;
@@ -469,7 +432,7 @@ fn bench_mixed(c: &mut Criterion) {
     }
     group.throughput(Throughput::Elements(mixed_ops as u64));
 
-    for read_pct in [70usize, 50, 10] {
+    for read_pct in [70usize, 10] {
         for (policy_template, policy_name) in [
             (WALFlushPolicy::None, "no-fsync"),
             (WALFlushPolicy::Immediate, "immediate-fsync"),
@@ -597,53 +560,6 @@ fn bench_concurrent_io(c: &mut Criterion) {
                 });
             }
 
-            // Sharded files
-            {
-                let (db, _dir) = setup_io_test();
-                let target_per_file = (ws / num_threads).max(1);
-                let blocks_per_file = target_per_file.min(concurrent_ops).max(1);
-                for tid in 0..num_threads {
-                    let f = format!("concurrent_shard_{tid}");
-                    precreate_blocks(&db, &f, blocks_per_file);
-                }
-                let log = db.log_manager();
-                let policy_t = policy_template.clone();
-
-                group.throughput(Throughput::Elements((num_threads * concurrent_ops) as u64));
-                group.bench_function(format!("Sharded {num_threads}T {policy_name}"), |b| {
-                    b.iter(|| {
-                        let handles: Vec<_> = (0..num_threads)
-                            .map(|tid| {
-                                let file = format!("concurrent_shard_{tid}");
-                                let log = Arc::clone(&log);
-                                let mut policy = policy_t.clone();
-                                let fm = Arc::clone(&db.file_manager);
-
-                                thread::spawn(move || {
-                                    let mut page = Page::new();
-                                    for i in 0..concurrent_ops {
-                                        let block_num = i % blocks_per_file;
-                                        let block_id = BlockId::new(file.clone(), block_num);
-                                        if (i % 10) < 7 {
-                                            fm.read(&block_id, &mut page);
-                                        } else {
-                                            write_i32_at(page.bytes_mut(), 60, i as i32);
-                                            fm.write(&block_id, &page);
-                                            let record = make_wal_record(100);
-                                            let lsn = log.lock().unwrap().append(record).unwrap();
-                                            policy.record(lsn, &log);
-                                        }
-                                    }
-                                    policy.finish_batch(&log);
-                                })
-                            })
-                            .collect();
-                        for h in handles {
-                            h.join().unwrap();
-                        }
-                    })
-                });
-            }
         }
     }
 

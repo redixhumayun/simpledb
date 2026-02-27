@@ -326,7 +326,7 @@ fn bench_access_patterns_mt(c: &mut Criterion) {
         group.sample_size(ss);
     }
 
-    for num_threads in [2usize, 4, 8, 16, 32, 64, 128, 256] {
+    for num_threads in [2usize, 8, 32, 256] {
         let (db, _dir) = setup_buffer_pool(nb);
         let test_file = Arc::new(format!("seqfile_mt_{num_threads}"));
         precreate_blocks(&db, &test_file, total_blocks);
@@ -503,7 +503,7 @@ fn bench_hotset_contention(c: &mut Criterion) {
         group.sample_size(ss);
     }
 
-    for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+    for num_threads in [1usize, 4, 16, 64, 256] {
         let ops_per_thread = HOTSET_TOTAL_OPS / num_threads;
         let (db, _dir) = setup_buffer_pool(pin_hotset_pool);
         let test_file = "concurrent_hotset".to_string();
