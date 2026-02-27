@@ -49,11 +49,11 @@ fn ci_fast() -> Option<(Duration, Duration, usize)> {
         .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 100))
 }
 
-/// CI config for thread-contention groups: 2s warmup, 8s measurement, 50 samples.
+/// CI config for thread-contention groups: 2s warmup, 8s measurement, 20 samples.
 fn ci_contention() -> Option<(Duration, Duration, usize)> {
     std::env::var("CI")
         .ok()
-        .map(|_| (Duration::from_secs(2), Duration::from_secs(8), 50))
+        .map(|_| (Duration::from_secs(2), Duration::from_secs(8), 20))
 }
 
 // ============================================================================
