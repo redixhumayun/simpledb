@@ -316,27 +316,11 @@ Charts are written to:
 ## CI Integration
 
 **Files:**
-- `.github/workflows/benchmark.yml` - CI workflow
-- Performance tracked at: https://redixhumayun.github.io/simpledb/dev/bench/
+- `.github/workflows/ci.yml` — CI workflow (benchmarks job)
 
 **How it works:**
-1. CI runs benchmarks with `--json` flag on every push
-2. JSON output captured and stored via `github-action-benchmark`
-3. Historical data committed to `gh-pages` branch
-4. Charts rendered at GitHub Pages URL
+1. On push to master: benchmarks run and results are stored with a t-test threshold (95% confidence)
+2. On PRs: results are compared against the master baseline; regressions posted as PR comments
+3. Uses [Bencher](https://bencher.dev) with `rust_bench` adapter parsing `--output-format bencher` output
 
-**View graphs:** Click individual benchmark names in the dashboard to see trends over time.
-
-## Implementation
-
-**Framework:** `src/benchmark_framework.rs`
-- `parse_bench_args()` - CLI arg parsing (num_buffers, json flag, filter string)
-- `should_run()` - Substring matching for filtering
-- `benchmark()` - Timing harness with warmup, mean, median, stddev
-
-**Pattern:** Each benchmark conditionally executes based on filter:
-```rust
-if should_run("benchmark_name", filter_ref) {
-    results.push(run_benchmark(...));
-}
-```
+**View trends:** https://bencher.dev/perf/simpledb

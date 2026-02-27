@@ -46,13 +46,11 @@ cargo bench --bench buffer_pool -- 100 12 --filter pin:t8   # Only the 8-thread 
 
 #### CI Benchmark Tracking
 
-All PRs automatically run **all benchmarks** via auto-discovery:
-- Discovers and runs all cargo benchmarks in `benches/*.rs`
-- Uses standard `cargo bench` for discovery (no manual lists needed!)
-- Results stored historically in the `gh-pages` branch
-- Compared against previous runs with 5% alert threshold
-- Posted as PR comments when significant changes are detected (>5%)
-- **Never block merges** - alerts are informational only
+All pushes to master and PRs automatically run benchmarks via [Bencher](https://bencher.dev):
+- Runs `buffer_pool`, `io_patterns`, and `simple_bench` suites
+- Results tracked historically per branch on the [Bencher dashboard](https://bencher.dev/perf/simpledb)
+- PRs are compared against the master baseline using a t-test (95% confidence)
+- Regression alerts posted as PR comments when performance degrades
 
 **Adding new benchmarks:** Just create a file in `benches/`:
 ```bash
@@ -64,31 +62,7 @@ touch benches/io_benchmark.rs
 name = "io_benchmark"
 harness = false
 
-# Implement with --json flag support
-# CI automatically discovers and runs it!
-```
-
-#### Performance Label
-
-Add the `performance` label to your PR to:
-- Generate a detailed base-vs-PR comparison report
-- Get side-by-side performance metrics for ALL benchmarks in a PR comment
-
-This is useful when:
-- Implementing cache eviction algorithms (LRU, Clock, etc.)
-- Modifying buffer manager code
-- Making changes that could impact memory/disk I/O performance
-
-#### JSON Output
-
-Benchmarks support JSON output for CI integration:
-```bash
-# Run a specific benchmark with JSON
-cargo bench --bench simple_bench -- 50 12 --json
-cargo bench --bench buffer_pool -- 50 12 --json
-
-# Run ALL benchmarks with auto-discovery (used in CI)
-python3 scripts/run_all_benchmarks.py 50 12 output.json
+# Implement using Criterion — CI automatically picks it up
 ```
 
 ### Roadmap
