@@ -1,37 +1,33 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use simpledb::{test_utils::generate_random_number, BlockId, Lsn, Page, SimpleDB, TestDir};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Barrier,
 };
 use std::thread;
-use std::time::Instant;
-
-use simpledb::{
-    benchmark_framework::{
-        benchmark, parse_bench_args, print_header, render_throughput_section, should_run,
-        BenchResult, ThroughputRow,
-    },
-    test_utils::generate_random_number,
-    BlockId, Lsn, Page, SimpleDB, TestDir,
-};
+use std::time::{Duration, Instant};
 
 // Keep in sync with scripts/bench/config.py
 const PIN_HOTSET_POOL_SIZE: usize = 4096;
+const PIN_TOTAL_OPS: usize = 10_000;
+const HOTSET_TOTAL_OPS: usize = 10_000;
+const HOTSET_K: usize = 4;
+
+fn num_buffers() -> usize {
+    std::env::var("SIMPLEDB_BENCH_BUFFERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12)
+}
 
 fn setup_buffer_pool(num_buffers: usize) -> (SimpleDB, TestDir) {
     SimpleDB::new_for_test(num_buffers, 5000)
 }
 
-fn setup_buffer_pool_with_stats(num_buffers: usize) -> (SimpleDB, TestDir) {
-    let (db, test_dir) = SimpleDB::new_for_test(num_buffers, 5000);
-    db.buffer_manager().enable_stats();
-    (db, test_dir)
-}
-
 fn precreate_blocks(db: &SimpleDB, file: &str, count: usize) {
     let file = file.to_string();
-
     for block_num in 0..count {
         let mut page = Page::new();
         write_i32_at(page.bytes_mut(), 60, block_num as i32);
@@ -45,832 +41,244 @@ fn write_i32_at(bytes: &mut [u8], offset: usize, value: i32) {
     bytes[offset..offset + 4].copy_from_slice(&le);
 }
 
-fn partition_work(total: usize, workers: usize) -> Vec<usize> {
-    let base = total / workers;
-    let remainder = total % workers;
-    (0..workers)
-        .map(|tid| base + usize::from(tid < remainder))
-        .collect()
+/// CI config for fast in-memory groups: 1s warmup, 5s measurement, 100 samples.
+/// Returns None outside CI, leaving Criterion defaults untouched.
+fn ci_fast() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 100))
 }
 
-fn throughput_row_from_benchmark(
-    result: BenchResult,
-    total_ops: usize,
-    unit: &str,
-) -> ThroughputRow {
-    let mean_duration = result.mean;
-    let throughput = total_ops as f64 / mean_duration.as_secs_f64();
-    ThroughputRow {
-        label: result.operation,
-        throughput,
-        unit: unit.to_string(),
-        mean_duration,
+/// CI config for thread-contention groups: 2s warmup, 8s measurement, 20 samples.
+fn ci_contention() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(2), Duration::from_secs(8), 20))
+}
+
+// ============================================================================
+// Phase 1: Core Latency Benchmarks
+// ============================================================================
+
+fn bench_phase1(c: &mut Criterion) {
+    let nb = num_buffers();
+
+    let mut group = c.benchmark_group("Phase1/Core Latency");
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
     }
-}
 
-enum AccessPattern {
-    Sequential,
-    SequentialMt {
-        threads: usize,
-    },
-    Repeated {
-        total_ops: usize,
-    },
-    RepeatedMt {
-        threads: usize,
-        total_ops: usize,
-    },
-    Random {
-        working_set: usize,
-        total_ops: usize,
-    },
-    RandomMt {
-        threads: usize,
-        working_set: usize,
-        total_ops: usize,
-    },
-    Zipfian {
-        total_ops: usize,
-    },
-    ZipfianMt {
-        threads: usize,
-        total_ops: usize,
-    },
-}
+    // Pin/Unpin (buffer pool hit)
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "testfile".to_string();
+        precreate_blocks(&db, &test_file, 2);
+        let buffer_manager = db.buffer_manager();
 
-struct AccessCase {
-    filter_token: &'static str,
-    pattern: AccessPattern,
-}
+        group.bench_function("Pin/Unpin (hit)", |b| {
+            b.iter(|| {
+                let block_id = BlockId::new(test_file.clone(), 1);
+                let buffer = buffer_manager.pin(&block_id).unwrap();
+                buffer_manager.unpin(buffer);
+            })
+        });
+    }
 
-impl AccessCase {
-    fn run(&self, num_buffers: usize, iterations: usize) -> BenchResult {
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        match self.pattern {
-            AccessPattern::Sequential => sequential_scan(&db, num_buffers, iterations),
-            AccessPattern::SequentialMt { threads } => sequential_scan_multithreaded(
-                &db,
-                num_buffers,
-                iterations,
-                threads,
-                num_buffers * 10,
-            ),
-            AccessPattern::Repeated { .. } => repeated_access(&db, num_buffers, iterations),
-            AccessPattern::RepeatedMt { threads, total_ops } => {
-                repeated_access_multithreaded(&db, num_buffers, iterations, threads, total_ops)
-            }
-            AccessPattern::Random {
-                working_set,
-                total_ops: _,
-            } => random_access(&db, working_set, iterations),
-            AccessPattern::RandomMt {
-                threads,
-                working_set,
-                total_ops,
-            } => random_access_multithreaded(&db, working_set, iterations, threads, total_ops),
-            AccessPattern::Zipfian { .. } => zipfian_access(&db, num_buffers, iterations),
-            AccessPattern::ZipfianMt { threads, total_ops } => {
-                zipfian_access_multithreaded(&db, num_buffers, iterations, threads, total_ops)
-            }
+    // Cold Pin (cache miss — advance block each iter)
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "coldfile".to_string();
+        // Pre-create enough blocks; Criterion may run many iterations
+        precreate_blocks(&db, &test_file, 1_000_000);
+        let buffer_manager = db.buffer_manager();
+
+        let mut block_idx: usize = 0;
+        group.bench_function("Cold Pin (miss)", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let block_id = BlockId::new(test_file.clone(), block_idx);
+                    let t = Instant::now();
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    total += t.elapsed();
+                    buffer_manager.unpin(buffer);
+                    block_idx += 1;
+                }
+                total
+            })
+        });
+    }
+
+    // Dirty Eviction
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "dirtyfile".to_string();
+        // Pre-create a generous budget; Criterion controls actual iteration count
+        precreate_blocks(&db, &test_file, 100_000 + nb);
+        let buffer_manager = db.buffer_manager();
+
+        // Fill pool with dirty buffers
+        let txn = db.new_tx();
+        for i in 0..nb {
+            let block_id = BlockId::new(test_file.clone(), i);
+            let mut guard = txn.pin_write_guard(&block_id);
+            write_i32_at(guard.bytes_mut(), 60, 999);
+            guard.mark_modified(txn.id(), Lsn::MAX);
         }
+
+        let mut block_idx: usize = nb;
+        group.bench_function("Dirty Eviction", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let block_id = BlockId::new(test_file.clone(), block_idx);
+                    let t = Instant::now();
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    total += t.elapsed();
+                    buffer_manager.unpin(buffer);
+                    block_idx += 1;
+                }
+                total
+            })
+        });
+
+        txn.commit().unwrap();
     }
 
-    fn total_ops(&self, num_buffers: usize) -> usize {
-        match self.pattern {
-            AccessPattern::Sequential | AccessPattern::SequentialMt { .. } => num_buffers * 10,
-            AccessPattern::Repeated { total_ops }
-            | AccessPattern::RepeatedMt { total_ops, .. }
-            | AccessPattern::Random { total_ops, .. }
-            | AccessPattern::RandomMt { total_ops, .. }
-            | AccessPattern::Zipfian { total_ops }
-            | AccessPattern::ZipfianMt { total_ops, .. } => total_ops,
-        }
-    }
+    group.finish();
 }
 
-fn render_latency_section(title: &str, results: &[BenchResult]) {
-    if results.is_empty() {
-        return;
-    }
+// ============================================================================
+// Phase 2: Access Pattern Benchmarks (single-threaded)
+// ============================================================================
 
-    println!("{title}");
-    print_header();
-    for result in results {
-        println!("{result}");
-    }
-    println!();
-}
+fn bench_access_patterns_st(c: &mut Criterion) {
+    let nb = num_buffers();
+    let total_blocks = nb * 10;
 
-struct PinCase {
-    filter_token: &'static str,
-    threads: usize,
-}
-
-impl PinCase {
-    const fn total_ops(&self) -> usize {
-        PIN_TOTAL_OPS
+    let mut group = c.benchmark_group("Phase2/Access Patterns ST");
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
     }
 
-    const fn ops_per_thread(&self) -> usize {
-        PIN_TOTAL_OPS / self.threads
+    // Sequential Scan
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "seqfile".to_string();
+        precreate_blocks(&db, &test_file, total_blocks);
+        let buffer_manager = db.buffer_manager();
+
+        group.bench_function(&format!("Sequential Scan ({total_blocks} blocks)"), |b| {
+            b.iter(|| {
+                for i in 0..total_blocks {
+                    let block_id = BlockId::new(test_file.clone(), i);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+            })
+        });
     }
 
-    fn label(&self) -> String {
-        format!(
-            "{} threads, {} ops/thread",
-            self.threads,
-            self.ops_per_thread()
-        )
-    }
-}
+    // Repeated Access
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "repeatfile".to_string();
+        let working_set = 10.min(nb.saturating_sub(2)).max(1);
+        let total_accesses = 1000usize;
+        precreate_blocks(&db, &test_file, working_set);
+        let buffer_manager = db.buffer_manager();
 
-struct HotsetCase {
-    filter_token: &'static str,
-    threads: usize,
-    hot_set_size: usize,
-}
-
-impl HotsetCase {
-    const fn total_ops(&self) -> usize {
-        HOTSET_TOTAL_OPS
-    }
-
-    const fn ops_per_thread(&self) -> usize {
-        HOTSET_TOTAL_OPS / self.threads
+        group.bench_function(&format!("Repeated Access ({total_accesses} ops)"), |b| {
+            b.iter(|| {
+                for i in 0..total_accesses {
+                    let block_idx = i % working_set;
+                    let block_id = BlockId::new(test_file.clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+            })
+        });
     }
 
-    fn label(&self) -> String {
-        format!(
-            "{} threads, K={}, {} ops/thread",
-            self.threads,
-            self.hot_set_size,
-            self.ops_per_thread()
-        )
+    // Random Access (K=10, K=50, K=100)
+    for working_set_size in [10usize, 50, 100] {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = format!("randomfile_{working_set_size}");
+        let total_accesses = 500usize;
+        precreate_blocks(&db, &test_file, working_set_size);
+        let random_indices: Vec<usize> = (0..total_accesses)
+            .map(|_| generate_random_number() % working_set_size)
+            .collect();
+        let buffer_manager = db.buffer_manager();
+
+        group.bench_function(
+            &format!("Random (K={working_set_size}, {total_accesses} ops)"),
+            |b| {
+                b.iter(|| {
+                    for &block_idx in &random_indices {
+                        let block_id = BlockId::new(test_file.clone(), block_idx);
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+                        buffer_manager.unpin(buffer);
+                    }
+                })
+            },
+        );
     }
-}
 
-// IMPORTANT: Keep these constants in sync with scripts/bench/config.py
-const PIN_TOTAL_OPS: usize = 10_000;
+    // Zipfian Access
+    {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = "zipffile".to_string();
+        let total_blocks_zip = nb * 3;
+        let hot_set_size = ((total_blocks_zip as f64 * 0.2) as usize).max(1);
+        let total_accesses = 500usize;
+        precreate_blocks(&db, &test_file, total_blocks_zip);
+        let zipfian_indices: Vec<usize> = (0..total_accesses)
+            .map(|_| {
+                let rand_val = generate_random_number();
+                if (rand_val % 100) < 80 {
+                    generate_random_number() % hot_set_size
+                } else {
+                    hot_set_size + (generate_random_number() % (total_blocks_zip - hot_set_size))
+                }
+            })
+            .collect();
+        let buffer_manager = db.buffer_manager();
 
-const PIN_CASES: &[PinCase] = &[
-    PinCase {
-        filter_token: "[pin:t1]",
-        threads: 1,
-    },
-    PinCase {
-        filter_token: "[pin:t2]",
-        threads: 2,
-    },
-    PinCase {
-        filter_token: "[pin:t4]",
-        threads: 4,
-    },
-    PinCase {
-        filter_token: "[pin:t8]",
-        threads: 8,
-    },
-    PinCase {
-        filter_token: "[pin:t16]",
-        threads: 16,
-    },
-    PinCase {
-        filter_token: "[pin:t32]",
-        threads: 32,
-    },
-    PinCase {
-        filter_token: "[pin:t64]",
-        threads: 64,
-    },
-    PinCase {
-        filter_token: "[pin:t128]",
-        threads: 128,
-    },
-    PinCase {
-        filter_token: "[pin:t256]",
-        threads: 256,
-    },
-];
-
-// Keep in sync with scripts/bench/config.py
-const HOTSET_TOTAL_OPS: usize = 10_000;
-const HOTSET_K: usize = 4;
-
-const HOTSET_CASES: &[HotsetCase] = &[
-    HotsetCase {
-        filter_token: "[hotset:t1_k4]",
-        threads: 1,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t2_k4]",
-        threads: 2,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t4_k4]",
-        threads: 4,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t8_k4]",
-        threads: 8,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t16_k4]",
-        threads: 16,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t32_k4]",
-        threads: 32,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t64_k4]",
-        threads: 64,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t128_k4]",
-        threads: 128,
-        hot_set_size: HOTSET_K,
-    },
-    HotsetCase {
-        filter_token: "[hotset:t256_k4]",
-        threads: 256,
-        hot_set_size: HOTSET_K,
-    },
-];
-
-const ACCESS_CASES: &[AccessCase] = &[
-    AccessCase {
-        filter_token: "Sequential Scan",
-        pattern: AccessPattern::Sequential,
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x2",
-        pattern: AccessPattern::SequentialMt { threads: 2 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x4",
-        pattern: AccessPattern::SequentialMt { threads: 4 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x8",
-        pattern: AccessPattern::SequentialMt { threads: 8 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x16",
-        pattern: AccessPattern::SequentialMt { threads: 16 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x32",
-        pattern: AccessPattern::SequentialMt { threads: 32 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x64",
-        pattern: AccessPattern::SequentialMt { threads: 64 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x128",
-        pattern: AccessPattern::SequentialMt { threads: 128 },
-    },
-    AccessCase {
-        filter_token: "Seq Scan MT x256",
-        pattern: AccessPattern::SequentialMt { threads: 256 },
-    },
-    AccessCase {
-        filter_token: "Repeated Access (1000 ops)",
-        pattern: AccessPattern::Repeated { total_ops: 1000 },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x2",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 2,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x4",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 4,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x8",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 8,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x16",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 16,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x32",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 32,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x64",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 64,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x128",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 128,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Repeated Access MT x256",
-        pattern: AccessPattern::RepeatedMt {
-            threads: 256,
-            total_ops: 1000,
-        },
-    },
-    AccessCase {
-        filter_token: "Random (K=10,",
-        pattern: AccessPattern::Random {
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random (K=50,",
-        pattern: AccessPattern::Random {
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random (K=100,",
-        pattern: AccessPattern::Random {
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x2 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 2,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x4 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 4,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x8 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 8,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x16 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 16,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x32 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 32,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x64 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 64,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x128 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 128,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x256 (K=10,",
-        pattern: AccessPattern::RandomMt {
-            threads: 256,
-            working_set: 10,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x2 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 2,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x4 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 4,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x8 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 8,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x16 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 16,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x32 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 32,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x64 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 64,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x128 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 128,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x256 (K=50,",
-        pattern: AccessPattern::RandomMt {
-            threads: 256,
-            working_set: 50,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x2 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 2,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x4 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 4,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x8 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 8,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x16 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 16,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x32 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 32,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x64 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 64,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x128 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 128,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Random MT x256 (K=100,",
-        pattern: AccessPattern::RandomMt {
-            threads: 256,
-            working_set: 100,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian (80/20,",
-        pattern: AccessPattern::Zipfian { total_ops: 500 },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x2",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 2,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x4",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 4,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x8",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 8,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x16",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 16,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x32",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 32,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x64",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 64,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x128",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 128,
-            total_ops: 500,
-        },
-    },
-    AccessCase {
-        filter_token: "Zipfian MT x256",
-        pattern: AccessPattern::ZipfianMt {
-            threads: 256,
-            total_ops: 500,
-        },
-    },
-];
-
-fn pin_unpin_overhead(db: &SimpleDB, iterations: usize) -> BenchResult {
-    let test_file = "testfile".to_string();
-    let buffer_manager = db.buffer_manager();
-
-    precreate_blocks(db, &test_file, 2);
-
-    benchmark("Pin/Unpin (hit)", iterations, 5, || {
-        let block_id = BlockId::new(test_file.clone(), 1);
-        let buffer = buffer_manager.pin(&block_id).unwrap();
-        buffer_manager.unpin(buffer);
-    })
-}
-
-fn cold_pin(db: &SimpleDB, iterations: usize) -> BenchResult {
-    let test_file = "coldfile".to_string();
-    let buffer_manager = db.buffer_manager();
-
-    // Pre-create blocks on disk
-    precreate_blocks(db, &test_file, iterations);
-
-    let mut block_idx = 0;
-    benchmark("Cold Pin (miss)", iterations, 0, || {
-        let block_id = BlockId::new(test_file.clone(), block_idx);
-        let buffer = buffer_manager.pin(&block_id).unwrap();
-        buffer_manager.unpin(buffer);
-        block_idx += 1;
-    })
-}
-
-fn dirty_eviction(db: &SimpleDB, iterations: usize, num_buffers: usize) -> BenchResult {
-    let test_file = "dirtyfile".to_string();
-    let buffer_manager = db.buffer_manager();
-
-    // Benchmark closure pins a fresh block each time (starting at `num_buffers`).
-    // Account for both warmup runs and measured iterations so we never read
-    // beyond the blocks we laid out on disk.
-    const WARMUP_ITERS: usize = 2;
-    let total_unique_blocks = num_buffers + WARMUP_ITERS + iterations;
-    precreate_blocks(db, &test_file, total_unique_blocks);
-
-    // Fill buffer pool with dirty buffers using transactions
-    let txn = db.new_tx();
-    for i in 0..num_buffers {
-        let block_id = BlockId::new(test_file.clone(), i);
-        // Pin the block first, then modify it
-        let mut guard = txn.pin_write_guard(&block_id);
-        write_i32_at(guard.bytes_mut(), 60, 999);
-        guard.mark_modified(txn.id(), Lsn::MAX);
+        group.bench_function(&format!("Zipfian (80/20, {total_accesses} ops)"), |b| {
+            b.iter(|| {
+                for &block_idx in &zipfian_indices {
+                    let block_id = BlockId::new(test_file.clone(), block_idx);
+                    let buffer = buffer_manager.pin(&block_id).unwrap();
+                    buffer_manager.unpin(buffer);
+                }
+            })
+        });
     }
-    // Don't commit - keeps buffers dirty and pinned by this transaction
 
-    // Now benchmark: pinning new blocks forces dirty buffer eviction + flush
-    let mut block_idx = num_buffers;
-    let result = benchmark("Dirty Eviction", iterations, WARMUP_ITERS, || {
-        let block_id = BlockId::new(test_file.clone(), block_idx);
-        let buffer = buffer_manager.pin(&block_id).unwrap(); // Forces eviction + flush
-        buffer_manager.unpin(buffer);
-        block_idx += 1;
-    });
-
-    // Clean up: commit transaction to release locks
-    txn.commit().unwrap();
-
-    result
+    group.finish();
 }
 
-// Phase 2: Access Pattern Benchmarks
-fn sequential_scan(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
-    let test_file = "seqfile".to_string();
-    let buffer_manager = db.buffer_manager();
-    let total_blocks = num_buffers * 10; // Working set > pool
+// ============================================================================
+// Phase 2: Access Pattern Benchmarks (multi-threaded)
+// ============================================================================
 
-    // Pre-create blocks
-    precreate_blocks(db, &test_file, total_blocks);
-
-    // Benchmark: complete scan as one workload
-    benchmark(
-        &format!("Sequential Scan ({} blocks)", total_blocks),
-        iterations,
-        2,
-        || {
-            for i in 0..total_blocks {
-                let block_id = BlockId::new(test_file.clone(), i);
-                let buffer = buffer_manager.pin(&block_id).unwrap();
-                buffer_manager.unpin(buffer);
-            }
-        },
-    )
-}
-
-fn repeated_access(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
-    let test_file = "repeatfile".to_string();
-    let buffer_manager = db.buffer_manager();
-    let working_set = 10.min(num_buffers - 2); // Small working set < pool
-    let total_accesses = 1000;
-
-    // Pre-create blocks
-    precreate_blocks(db, &test_file, working_set);
-
-    // Benchmark: repeated access pattern as one workload
-    benchmark(
-        &format!("Repeated Access ({} ops)", total_accesses),
-        iterations,
-        2,
-        || {
-            for i in 0..total_accesses {
-                let block_idx = i % working_set;
-                let block_id = BlockId::new(test_file.clone(), block_idx);
-                let buffer = buffer_manager.pin(&block_id).unwrap();
-                buffer_manager.unpin(buffer);
-            }
-        },
-    )
-}
-
-fn random_access(db: &SimpleDB, working_set_size: usize, iterations: usize) -> BenchResult {
-    let test_file = format!("randomfile_{working_set_size}");
-    let buffer_manager = db.buffer_manager();
-    let total_accesses = 500;
-
-    // Pre-create blocks
-    precreate_blocks(db, &test_file, working_set_size);
-
-    // Pre-generate random sequence (exclude RNG overhead from benchmark)
-    let random_indices: Vec<usize> = (0..total_accesses)
-        .map(|_| generate_random_number() % working_set_size)
-        .collect();
-
-    // Benchmark: random access pattern as one workload
-    benchmark(
-        &format!("Random (K={}, {} ops)", working_set_size, total_accesses),
-        iterations,
-        2,
-        || {
-            for &block_idx in &random_indices {
-                let block_id = BlockId::new(test_file.clone(), block_idx);
-                let buffer = buffer_manager.pin(&block_id).unwrap();
-                buffer_manager.unpin(buffer);
-            }
-        },
-    )
-}
-
-fn zipfian_access(db: &SimpleDB, num_buffers: usize, iterations: usize) -> BenchResult {
-    let test_file = "zipffile".to_string();
-    let buffer_manager = db.buffer_manager();
-    let total_blocks = num_buffers * 3;
-    let hot_set_size = ((total_blocks as f64 * 0.2) as usize).max(1); // 20% hot
-    let total_accesses = 500;
-
-    // Pre-create blocks
-    precreate_blocks(db, &test_file, total_blocks);
-
-    // Pre-generate zipfian sequence (exclude RNG overhead from benchmark)
-    let zipfian_indices: Vec<usize> = (0..total_accesses)
-        .map(|_| {
-            let rand_val = generate_random_number();
-            let is_hot = (rand_val % 100) < 80; // 80% chance
-
-            if is_hot {
-                generate_random_number() % hot_set_size
-            } else {
-                hot_set_size + (generate_random_number() % (total_blocks - hot_set_size))
-            }
-        })
-        .collect();
-
-    // Benchmark: zipfian access pattern as one workload
-    benchmark(
-        &format!("Zipfian (80/20, {} ops)", total_accesses),
-        iterations,
-        2,
-        || {
-            for &block_idx in &zipfian_indices {
-                let block_id = BlockId::new(test_file.clone(), block_idx);
-                let buffer = buffer_manager.pin(&block_id).unwrap();
-                buffer_manager.unpin(buffer);
-            }
-        },
-    )
-}
-
-fn sequential_scan_multithreaded(
+fn spawn_mt_seq_scan(
     db: &SimpleDB,
-    _num_buffers: usize,
-    iterations: usize,
     num_threads: usize,
     total_blocks: usize,
-) -> BenchResult {
-    let test_file = format!("seqfile_mt_{num_threads}");
-
-    precreate_blocks(db, &test_file, total_blocks);
-
+    test_file: Arc<String>,
+    start_barrier: Arc<Barrier>,
+    end_barrier: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+) -> Vec<thread::JoinHandle<()>> {
     let base = total_blocks / num_threads;
     let remainder = total_blocks % num_threads;
-    let ranges = Arc::new(
+    let ranges: Arc<Vec<(usize, usize)>> = Arc::new(
         (0..num_threads)
             .map(|tid| {
                 let start = tid * base + remainder.min(tid);
@@ -878,28 +286,24 @@ fn sequential_scan_multithreaded(
                 let end = start + base + extra;
                 (start, end)
             })
-            .collect::<Vec<_>>(),
+            .collect(),
     );
-    let test_file = Arc::new(test_file);
 
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = ranges
-        .iter()
-        .map(|&(start, end)| {
+    (0..num_threads)
+        .map(|tid| {
             let test_file = Arc::clone(&test_file);
             let buffer_manager = db.buffer_manager();
             let start_barrier = Arc::clone(&start_barrier);
             let end_barrier = Arc::clone(&end_barrier);
             let stop = Arc::clone(&stop);
+            let ranges = Arc::clone(&ranges);
 
             thread::spawn(move || loop {
                 start_barrier.wait();
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                let (start, end) = ranges[tid];
                 for i in start..end {
                     let block_id = BlockId::new(test_file.as_ref().clone(), i);
                     let buffer = buffer_manager.pin(&block_id).unwrap();
@@ -908,816 +312,266 @@ fn sequential_scan_multithreaded(
                 end_barrier.wait();
             })
         })
-        .collect();
-
-    let result = benchmark(
-        &format!("Seq Scan MT x{} ({} blocks)", num_threads, total_blocks),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    result
+        .collect()
 }
 
-fn repeated_access_multithreaded(
-    db: &SimpleDB,
-    num_buffers: usize,
-    iterations: usize,
-    num_threads: usize,
-    total_accesses: usize,
-) -> BenchResult {
-    let test_file = format!("repeatfile_mt_{num_threads}");
-    let working_set = 10.min(num_buffers.saturating_sub(2)).max(1);
+fn bench_access_patterns_mt(c: &mut Criterion) {
+    let nb = num_buffers();
+    let total_blocks = nb * 10;
 
-    precreate_blocks(db, &test_file, working_set);
-
-    let per_thread_ops = partition_work(total_accesses, num_threads);
-    let per_thread_ops = Arc::new(per_thread_ops);
-    let test_file = Arc::new(test_file);
-
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = per_thread_ops
-        .iter()
-        .enumerate()
-        .map(|(thread_id, &ops)| {
-            let test_file = Arc::clone(&test_file);
-            let buffer_manager = db.buffer_manager();
-            let start_barrier = Arc::clone(&start_barrier);
-            let end_barrier = Arc::clone(&end_barrier);
-            let stop = Arc::clone(&stop);
-
-            thread::spawn(move || loop {
-                start_barrier.wait();
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                for i in 0..ops {
-                    let block_idx = (i + thread_id) % working_set;
-                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-                end_barrier.wait();
-            })
-        })
-        .collect();
-
-    let result = benchmark(
-        &format!(
-            "Repeated Access MT x{} ({} ops)",
-            num_threads, total_accesses
-        ),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
+    let mut group = c.benchmark_group("Phase2/Access Patterns MT");
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
     }
 
-    result
-}
+    for num_threads in [2usize, 4, 8, 16, 32, 64, 128, 256] {
+        let (db, _dir) = setup_buffer_pool(nb);
+        let test_file = Arc::new(format!("seqfile_mt_{num_threads}"));
+        precreate_blocks(&db, &test_file, total_blocks);
 
-fn random_access_multithreaded(
-    db: &SimpleDB,
-    working_set_size: usize,
-    iterations: usize,
-    num_threads: usize,
-    total_accesses: usize,
-) -> BenchResult {
-    let test_file = format!("randomfile_mt_{working_set_size}_{num_threads}");
+        let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
 
-    precreate_blocks(db, &test_file, working_set_size);
+        let handles = spawn_mt_seq_scan(
+            &db,
+            num_threads,
+            total_blocks,
+            Arc::clone(&test_file),
+            Arc::clone(&start_barrier),
+            Arc::clone(&end_barrier),
+            Arc::clone(&stop),
+        );
 
-    let per_thread_ops = partition_work(total_accesses, num_threads);
+        group.bench_function(
+            &format!("Seq Scan MT x{num_threads} ({total_blocks} blocks)"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        start_barrier.wait();
+                        end_barrier.wait();
+                        total += t.elapsed();
+                    }
+                    total
+                })
+            },
+        );
 
-    let sequences: Vec<Vec<usize>> = per_thread_ops
-        .iter()
-        .map(|&ops| {
-            (0..ops)
-                .map(|_| generate_random_number() % working_set_size)
-                .collect()
-        })
-        .collect();
-
-    let sequences = Arc::new(sequences);
-    let test_file = Arc::new(test_file);
-
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let sequences = Arc::clone(&sequences);
-            let test_file = Arc::clone(&test_file);
-            let buffer_manager = db.buffer_manager();
-            let start_barrier = Arc::clone(&start_barrier);
-            let end_barrier = Arc::clone(&end_barrier);
-            let stop = Arc::clone(&stop);
-
-            thread::spawn(move || loop {
-                start_barrier.wait();
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                for &block_idx in &sequences[thread_id] {
-                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-                end_barrier.wait();
-            })
-        })
-        .collect();
-
-    let result = benchmark(
-        &format!(
-            "Random MT x{} (K={}, {} ops)",
-            num_threads, working_set_size, total_accesses
-        ),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
+        stop.store(true, Ordering::Release);
+        start_barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
-    result
+    group.finish();
 }
 
-fn zipfian_access_multithreaded(
-    db: &SimpleDB,
-    num_buffers: usize,
-    iterations: usize,
-    num_threads: usize,
-    total_accesses: usize,
-) -> BenchResult {
-    let test_file = format!("zipffile_mt_{num_threads}");
-    let total_blocks = num_buffers * 3;
-    let hot_set_size = ((total_blocks as f64 * 0.2) as usize).max(1);
+// ============================================================================
+// Phase 3: Pool Size Scaling
+// ============================================================================
 
-    precreate_blocks(db, &test_file, total_blocks);
+fn bench_pool_scaling(c: &mut Criterion) {
+    let working_set_size = 100usize;
+    let total_accesses = 500usize;
+    let pool_sizes = [8usize, 16, 32, 64, 128, 256];
 
-    let per_thread_ops = partition_work(total_accesses, num_threads);
+    let mut group = c.benchmark_group("Phase3/Pool Scaling");
+    if let Some((wu, mt, ss)) = ci_fast() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
+    group.throughput(Throughput::Elements(total_accesses as u64));
 
-    let cold_span = total_blocks.saturating_sub(hot_set_size);
+    for &pool_size in &pool_sizes {
+        let (db, _dir) = setup_buffer_pool(pool_size);
+        let test_file = "scaling_test".to_string();
+        precreate_blocks(&db, &test_file, working_set_size);
+        let random_indices: Vec<usize> = (0..total_accesses)
+            .map(|_| generate_random_number() % working_set_size)
+            .collect();
+        let buffer_manager = db.buffer_manager();
 
-    let sequences: Vec<Vec<usize>> = per_thread_ops
-        .iter()
-        .map(|&ops| {
-            (0..ops)
-                .map(|_| {
-                    let rand_val = generate_random_number();
-                    let is_hot = (rand_val % 100) < 80;
-                    if is_hot || cold_span == 0 {
-                        generate_random_number() % hot_set_size
-                    } else {
-                        hot_set_size + (generate_random_number() % cold_span)
+        group.bench_with_input(
+            BenchmarkId::new("Random Access", pool_size),
+            &pool_size,
+            |b, _| {
+                b.iter(|| {
+                    for &block_idx in &random_indices {
+                        let block_id = BlockId::new(test_file.clone(), block_idx);
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+                        buffer_manager.unpin(buffer);
                     }
                 })
-                .collect()
-        })
-        .collect();
-
-    let sequences = Arc::new(sequences);
-    let test_file = Arc::new(test_file);
-
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let sequences = Arc::clone(&sequences);
-            let test_file = Arc::clone(&test_file);
-            let buffer_manager = db.buffer_manager();
-            let start_barrier = Arc::clone(&start_barrier);
-            let end_barrier = Arc::clone(&end_barrier);
-            let stop = Arc::clone(&stop);
-
-            thread::spawn(move || loop {
-                start_barrier.wait();
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                for &block_idx in &sequences[thread_id] {
-                    let block_id = BlockId::new(test_file.as_ref().clone(), block_idx);
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-                end_barrier.wait();
-            })
-        })
-        .collect();
-
-    let result = benchmark(
-        &format!(
-            "Zipfian MT x{} (80/20, {} ops)",
-            num_threads, total_accesses
-        ),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    result
-}
-
-// Phase 3: Pool Size Sensitivity
-fn run_fixed_workload_with_pool_size(
-    num_buffers: usize,
-    working_set_size: usize,
-    iterations: usize,
-) -> f64 {
-    let (db, _test_dir) = setup_buffer_pool(num_buffers);
-    let test_file = "scaling_test".to_string();
-    let buffer_manager = db.buffer_manager();
-    let total_accesses = 500;
-
-    // Pre-create blocks
-    for i in 0..working_set_size {
-        let block_id = BlockId::new(test_file.clone(), i);
-        let mut page = Page::new();
-        write_i32_at(page.bytes_mut(), 60, i as i32);
-        db.file_manager.write(&block_id, &page);
-    }
-
-    // Pre-generate random sequence
-    let random_indices: Vec<usize> = (0..total_accesses)
-        .map(|_| generate_random_number() % working_set_size)
-        .collect();
-
-    // Run workload
-    let result = benchmark("Pool Size Test", iterations, 2, || {
-        for &block_idx in &random_indices {
-            let block_id = BlockId::new(test_file.clone(), block_idx);
-            let buffer = buffer_manager.pin(&block_id).unwrap();
-            buffer_manager.unpin(buffer);
-        }
-    });
-
-    total_accesses as f64 / result.mean.as_secs_f64()
-}
-
-fn pool_size_scaling(iterations: usize) {
-    let pool_sizes = vec![8, 16, 32, 64, 128, 256];
-    let working_set_size = 100; // Fixed workload: 100 blocks
-
-    println!("Phase 3A: Pool Size Sensitivity");
-    println!();
-    println!("Fixed workload: Random access to {working_set_size} blocks");
-    println!("Pool Size (buffers) | Throughput (blocks/sec)");
-    println!("{}", "-".repeat(50));
-
-    for pool_size in pool_sizes {
-        let throughput = run_fixed_workload_with_pool_size(pool_size, working_set_size, iterations);
-        println!("{pool_size:19} | {throughput:>10.0}");
-    }
-}
-
-fn memory_pressure_test(iterations: usize) {
-    println!();
-    println!("Phase 3B: Memory Pressure Test");
-    println!("Memory Pressure Test: Working set = pool_size + K");
-    println!("Pool Size | Working Set | Throughput (blocks/sec)");
-    println!("{}", "-".repeat(60));
-
-    let base_pool_size = 32;
-    let pressure_offsets = vec![0, 1, 5, 10, 20];
-
-    for offset in pressure_offsets {
-        let working_set = base_pool_size + offset;
-        let throughput = run_fixed_workload_with_pool_size(base_pool_size, working_set, iterations);
-        println!("{base_pool_size:9} | {working_set:11} | {throughput:>10.0}");
-    }
-}
-
-// Phase 4: Hit Rate Measurement
-fn run_pattern_with_stats(
-    name: &str,
-    pool_buffers: usize,
-    pattern_arg: usize,
-    iterations: usize,
-    pattern_fn: impl Fn(&SimpleDB, usize, usize) -> BenchResult,
-) {
-    let (db, _test_dir) = setup_buffer_pool_with_stats(pool_buffers);
-
-    // Reset stats before run
-    db.buffer_manager().reset_stats();
-
-    // Run the pattern (ignore timing result, we only care about hit rate here)
-    let _ = pattern_fn(&db, pattern_arg, iterations);
-
-    // Get stats
-    if let Some(stats) = db.buffer_manager().stats() {
-        let hit_rate = stats.hit_rate();
-        let (hits, misses) = stats.get();
-        println!("{name:20} | Hit rate: {hit_rate:>5.1}% (hits: {hits}, misses: {misses})");
-    }
-}
-
-// Phase 5: Concurrent Access
-fn multithreaded_pin(
-    db: &SimpleDB,
-    num_threads: usize,
-    ops_per_thread: usize,
-    iterations: usize,
-) -> BenchResult {
-    let test_file = "concurrent_test".to_string();
-
-    // Pre-create blocks (each thread gets its own range)
-    precreate_blocks(db, &test_file, num_threads * 10);
-
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let test_file = test_file.clone();
-            let buffer_manager = db.buffer_manager();
-            let start_barrier = Arc::clone(&start_barrier);
-            let end_barrier = Arc::clone(&end_barrier);
-            let stop = Arc::clone(&stop);
-
-            thread::spawn(move || loop {
-                start_barrier.wait();
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                for i in 0..ops_per_thread {
-                    // Each thread accesses blocks in its own range to reduce contention
-                    let block_num = (thread_id * 10) + (i % 10);
-                    let block_id = BlockId::new(test_file.clone(), block_num);
-
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-                end_barrier.wait();
-            })
-        })
-        .collect();
-
-    let result = benchmark(
-        &format!(
-            "Concurrent ({} threads, {} ops)",
-            num_threads, ops_per_thread
-        ),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    result
-}
-
-fn multithreaded_hotset_contention(
-    db: &SimpleDB,
-    num_threads: usize,
-    ops_per_thread: usize,
-    hot_set_size: usize,
-    iterations: usize,
-) -> BenchResult {
-    assert!(hot_set_size > 0, "hot set size must be greater than zero");
-
-    let test_file = "concurrent_hotset".to_string();
-
-    // Pre-create a small hot set shared across all threads
-    precreate_blocks(db, &test_file, hot_set_size);
-
-    let start_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let end_barrier = Arc::new(Barrier::new(num_threads + 1));
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
-            let test_file = test_file.clone();
-            let buffer_manager = db.buffer_manager();
-            let start_barrier = Arc::clone(&start_barrier);
-            let end_barrier = Arc::clone(&end_barrier);
-            let stop = Arc::clone(&stop);
-
-            thread::spawn(move || loop {
-                start_barrier.wait();
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                for i in 0..ops_per_thread {
-                    // All threads reuse the same hot set to maximize latch contention
-                    let block_num = i % hot_set_size;
-                    let block_id = BlockId::new(test_file.clone(), block_num);
-
-                    let buffer = buffer_manager.pin(&block_id).unwrap();
-                    buffer_manager.unpin(buffer);
-                }
-                end_barrier.wait();
-            })
-        })
-        .collect();
-
-    let result = benchmark(
-        &format!(
-            "Concurrent Hotset ({} threads, K={}, {} ops)",
-            num_threads, hot_set_size, ops_per_thread
-        ),
-        iterations,
-        2,
-        || {
-            start_barrier.wait();
-            end_barrier.wait();
-        },
-    );
-
-    stop.store(true, Ordering::Release);
-    start_barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    result
-}
-
-fn buffer_starvation(db: &SimpleDB, num_buffers: usize) {
-    let test_file = "starvation_test".to_string();
-
-    // Pre-create blocks
-    precreate_blocks(db, &test_file, num_buffers + 10);
-
-    // Pin entire buffer pool
-    let buffer_manager = db.buffer_manager();
-    let mut pinned_buffers = Vec::new();
-
-    for i in 0..num_buffers {
-        let block_id = BlockId::new(test_file.clone(), i);
-        let buffer = buffer_manager.pin(&block_id).unwrap();
-        pinned_buffers.push(buffer);
-    }
-
-    // Now spawn threads that will need to wait
-    let num_waiting_threads = 4;
-    let start = Instant::now();
-
-    let handles: Vec<_> = (0..num_waiting_threads)
-        .map(|thread_id| {
-            let test_file = test_file.clone();
-            let buffer_manager = buffer_manager.clone();
-
-            thread::spawn(move || {
-                let block_id = BlockId::new(test_file.clone(), num_buffers + thread_id);
-
-                let buffer = buffer_manager.pin(&block_id).unwrap();
-                buffer_manager.unpin(buffer);
-            })
-        })
-        .collect();
-
-    // NOTE: Timing assumption - we sleep 50ms hoping all threads reach pin() and block.
-    // On loaded systems, threads might not be scheduled in time, causing them to start
-    // their pin() calls after we begin unpinning, which would measure thread startup
-    // overhead rather than starvation recovery. If you observe high variance in results
-    // (e.g., 50ms one run, 200ms another), this race condition is likely occurring.
-    // Consider instrumenting BufferManager with a waiting_threads counter for deterministic
-    // measurement (see docs/buffer_pool_thrashing_analysis.md for implementation).
-    thread::sleep(std::time::Duration::from_millis(50));
-
-    // Unpin one buffer at a time with small delay to observe gradual recovery
-    for buffer in pinned_buffers {
-        buffer_manager.unpin(buffer);
-        thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    // Wait for all threads to complete
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    let elapsed = start.elapsed();
-
-    println!("Starved {num_waiting_threads} threads | Pool recovery time: {elapsed:>10.2?}");
-}
-
-fn run_multithreaded_pin_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&PinCase]) {
-    let mut rows = Vec::new();
-
-    if cases.is_empty() {
-        return;
-    }
-
-    for case in cases {
-        let result = multithreaded_pin(db, case.threads, case.ops_per_thread(), iterations);
-        let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
-        row.label = case.label();
-        rows.push(row);
-    }
-
-    render_throughput_section("Multi-threaded Pin/Unpin (lock contention)", &rows);
-}
-
-fn run_hotset_contention_benchmarks(db: &SimpleDB, iterations: usize, cases: &[&HotsetCase]) {
-    let mut rows = Vec::new();
-
-    if cases.is_empty() {
-        return;
-    }
-
-    for case in cases {
-        let result = multithreaded_hotset_contention(
-            db,
-            case.threads,
-            case.ops_per_thread(),
-            case.hot_set_size,
-            iterations,
+            },
         );
-        let mut row = throughput_row_from_benchmark(result, case.total_ops(), "ops/sec");
-        row.label = case.label();
-        rows.push(row);
     }
 
-    render_throughput_section("Hot-set Contention (shared buffers)", &rows);
+    group.finish();
 }
 
-fn run_buffer_starvation_benchmark(db: &SimpleDB, num_buffers: usize) {
-    println!("Buffer Starvation (cond.wait() latency):");
-    println!("{}", "-".repeat(70));
-    buffer_starvation(db, num_buffers);
-    println!();
-}
+// ============================================================================
+// Phase 5: Concurrent Pin/Unpin
+// ============================================================================
 
-fn main() {
-    let (iterations, num_buffers, json_output, filter) = parse_bench_args();
-    let filter_ref = filter.as_deref();
-    let block_size = 4096;
+fn bench_concurrent_pin(c: &mut Criterion) {
     let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
 
-    if json_output {
-        let mut results = Vec::new();
-
-        // Phase 1
-        {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
-            results.push(pin_unpin_overhead(&db, iterations));
-        }
-        {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
-            results.push(cold_pin(&db, iterations));
-        }
-        {
-            let (db, _test_dir) = setup_buffer_pool(num_buffers);
-            results.push(dirty_eviction(&db, iterations, num_buffers));
-        }
-
-        for case in ACCESS_CASES {
-            results.push(case.run(num_buffers, iterations));
-        }
-
-        results.extend(PIN_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
-            multithreaded_pin(&db, case.threads, case.ops_per_thread(), iterations)
-        }));
-
-        results.extend(HOTSET_CASES.iter().map(|case| {
-            let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
-            multithreaded_hotset_contention(
-                &db,
-                case.threads,
-                case.ops_per_thread(),
-                case.hot_set_size,
-                iterations,
-            )
-        }));
-
-        let json_results: Vec<String> = results.iter().map(|r| r.to_json()).collect();
-        println!("[{}]", json_results.join(","));
-        return;
+    let mut group = c.benchmark_group("Phase5/Concurrent Pin");
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
     }
 
-    // Normal mode: run all phases with human-readable output
-    println!("SimpleDB Buffer Pool Benchmark Suite");
-    println!("====================================");
-    println!("Running benchmarks with {iterations} iterations per operation");
-    println!("Pool size: {num_buffers} buffers, Block size: {block_size} bytes");
-    println!(
-        "Environment: {} ({})",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
-    println!();
+    for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+        let ops_per_thread = PIN_TOTAL_OPS / num_threads;
+        let (db, _dir) = setup_buffer_pool(pin_hotset_pool);
+        let test_file = "concurrent_test".to_string();
+        precreate_blocks(&db, &test_file, num_threads * 10);
 
-    // Phase 1
-    let mut phase1_results = Vec::new();
+        let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
 
-    if should_run("Pin/Unpin (hit)", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        phase1_results.push(pin_unpin_overhead(&db, iterations));
-    }
-    if should_run("Cold Pin (miss)", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        phase1_results.push(cold_pin(&db, iterations));
-    }
-    if should_run("Dirty Eviction", filter_ref) {
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        phase1_results.push(dirty_eviction(&db, iterations, num_buffers));
-    }
+        let handles: Vec<_> = (0..num_threads)
+            .map(|thread_id| {
+                let test_file = test_file.clone();
+                let buffer_manager = db.buffer_manager();
+                let start_barrier = Arc::clone(&start_barrier);
+                let end_barrier = Arc::clone(&end_barrier);
+                let stop = Arc::clone(&stop);
 
-    render_latency_section("Phase 1: Core Latency Benchmarks", &phase1_results);
+                thread::spawn(move || loop {
+                    start_barrier.wait();
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    for i in 0..ops_per_thread {
+                        let block_num = (thread_id * 10) + (i % 10);
+                        let block_id = BlockId::new(test_file.clone(), block_num);
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+                        buffer_manager.unpin(buffer);
+                    }
+                    end_barrier.wait();
+                })
+            })
+            .collect();
 
-    // Phase 2
-    let mut phase2_rows = Vec::new();
-
-    for case in ACCESS_CASES {
-        if should_run(case.filter_token, filter_ref) {
-            let result = case.run(num_buffers, iterations);
-            let total_ops = case.total_ops(num_buffers);
-            phase2_rows.push(throughput_row_from_benchmark(
-                result,
-                total_ops,
-                "blocks/sec",
-            ));
-        }
-    }
-
-    if !phase2_rows.is_empty() {
-        render_throughput_section("Phase 2: Access Pattern Benchmarks", &phase2_rows);
-    }
-
-    // Phase 3
-    if should_run("Pool Size", filter_ref) {
-        pool_size_scaling(iterations);
-        println!();
-    }
-
-    if should_run("Memory Pressure", filter_ref) {
-        memory_pressure_test(iterations);
-        println!();
-    }
-
-    // Phase 4
-    let mut phase4_header_printed = false;
-    let mut print_phase4_header = || {
-        if !phase4_header_printed {
-            println!("Phase 4: Hit Rate Measurement");
-            println!("Operation            | Hit Rate & Statistics");
-            println!("{}", "-".repeat(70));
-            phase4_header_printed = true;
-        }
-    };
-
-    if should_run("Sequential Scan", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats(
-            "Sequential Scan",
-            num_buffers,
-            num_buffers,
-            iterations,
-            sequential_scan,
+        group.bench_function(
+            &format!("Concurrent ({num_threads} threads, {ops_per_thread} ops)"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        start_barrier.wait();
+                        end_barrier.wait();
+                        total += t.elapsed();
+                    }
+                    total
+                })
+            },
         );
-    }
 
-    if should_run("Repeated Access", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats(
-            "Repeated Access",
-            num_buffers,
-            num_buffers,
-            iterations,
-            repeated_access,
-        );
-    }
-
-    if should_run("Zipfian", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats(
-            "Zipfian (80/20)",
-            num_buffers,
-            num_buffers,
-            iterations,
-            zipfian_access,
-        );
-    }
-
-    if should_run("Random (K=10)", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats("Random (K=10)", num_buffers, 10, iterations, random_access);
-    }
-
-    if should_run("Random (K=50)", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats("Random (K=50)", num_buffers, 50, iterations, random_access);
-    }
-
-    if should_run("Random (K=100)", filter_ref) {
-        print_phase4_header();
-        run_pattern_with_stats(
-            "Random (K=100)",
-            num_buffers,
-            100,
-            iterations,
-            random_access,
-        );
-    }
-
-    if phase4_header_printed {
-        println!();
-    }
-
-    // Phase 5
-    let mut phase5_has_output = false;
-
-    let pin_cases: Vec<&PinCase> = match filter_ref {
-        None => PIN_CASES.iter().collect(),
-        Some(_) => PIN_CASES
-            .iter()
-            .filter(|case| should_run(case.filter_token, filter_ref))
-            .collect(),
-    };
-    if !pin_cases.is_empty() {
-        if !phase5_has_output {
-            println!("Phase 5: Concurrent Access");
-            println!();
-            phase5_has_output = true;
+        stop.store(true, Ordering::Release);
+        start_barrier.wait();
+        for h in handles {
+            h.join().unwrap();
         }
-        if pin_hotset_pool != num_buffers {
-            println!("Pin pool size override: {pin_hotset_pool} buffers");
-            println!();
-        }
-        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
-        run_multithreaded_pin_benchmarks(&db, iterations, &pin_cases);
     }
 
-    let hotset_cases: Vec<&HotsetCase> = match filter_ref {
-        None => HOTSET_CASES.iter().collect(),
-        Some(_) => HOTSET_CASES
-            .iter()
-            .filter(|case| should_run(case.filter_token, filter_ref))
-            .collect(),
-    };
-    if !hotset_cases.is_empty() {
-        if !phase5_has_output {
-            println!("Phase 5: Concurrent Access");
-            println!();
-            phase5_has_output = true;
-        }
-        if pin_hotset_pool != num_buffers {
-            println!("Hotset pool size override: {pin_hotset_pool} buffers");
-            println!();
-        }
-        let (db, _test_dir) = setup_buffer_pool(pin_hotset_pool);
-        run_hotset_contention_benchmarks(&db, iterations, &hotset_cases);
-    }
-
-    if should_run("Starvation", filter_ref) {
-        if !phase5_has_output {
-            println!("Phase 5: Concurrent Access");
-            println!();
-        }
-        let (db, _test_dir) = setup_buffer_pool(num_buffers);
-        run_buffer_starvation_benchmark(&db, num_buffers);
-    }
-
-    println!("All benchmarks completed!");
+    group.finish();
 }
+
+// ============================================================================
+// Phase 5: Hotset Contention
+// ============================================================================
+
+fn bench_hotset_contention(c: &mut Criterion) {
+    let pin_hotset_pool = PIN_HOTSET_POOL_SIZE;
+
+    let mut group = c.benchmark_group("Phase5/Hotset Contention");
+    if let Some((wu, mt, ss)) = ci_contention() {
+        group.warm_up_time(wu);
+        group.measurement_time(mt);
+        group.sample_size(ss);
+    }
+
+    for num_threads in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+        let ops_per_thread = HOTSET_TOTAL_OPS / num_threads;
+        let (db, _dir) = setup_buffer_pool(pin_hotset_pool);
+        let test_file = "concurrent_hotset".to_string();
+        precreate_blocks(&db, &test_file, HOTSET_K);
+
+        let start_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let end_barrier = Arc::new(Barrier::new(num_threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let test_file = test_file.clone();
+                let buffer_manager = db.buffer_manager();
+                let start_barrier = Arc::clone(&start_barrier);
+                let end_barrier = Arc::clone(&end_barrier);
+                let stop = Arc::clone(&stop);
+
+                thread::spawn(move || loop {
+                    start_barrier.wait();
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    for i in 0..ops_per_thread {
+                        let block_num = i % HOTSET_K;
+                        let block_id = BlockId::new(test_file.clone(), block_num);
+                        let buffer = buffer_manager.pin(&block_id).unwrap();
+                        buffer_manager.unpin(buffer);
+                    }
+                    end_barrier.wait();
+                })
+            })
+            .collect();
+
+        group.bench_function(
+            &format!(
+                "Concurrent Hotset ({num_threads} threads, K={HOTSET_K}, {ops_per_thread} ops)"
+            ),
+            |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        start_barrier.wait();
+                        end_barrier.wait();
+                        total += t.elapsed();
+                    }
+                    total
+                })
+            },
+        );
+
+        stop.store(true, Ordering::Release);
+        start_barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_phase1,
+    bench_access_patterns_st,
+    bench_access_patterns_mt,
+    bench_pool_scaling,
+    bench_concurrent_pin,
+    bench_hotset_contention
+);
+criterion_main!(benches);

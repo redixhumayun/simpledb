@@ -4,14 +4,11 @@
 This helper wraps `cargo bench --bench buffer_pool` so that we can:
 
 1. Execute every replacement policy (master + feature-flagged builds)
-   for a given platform with consistent `iterations`/`num_buffers`.
-2. Capture the JSON payload (via `--json`) for downstream markdown/table
-   generation.
+   for a given platform with consistent `num_buffers`.
+2. Capture results in github-action-benchmark compatible JSON
+   (parsed from Criterion --output-format bencher text output).
 3. Capture the human-readable benchmark log so docs can embed it exactly
    as produced by `cargo bench`.
-4. Extract Phase 4 hit rates from the textual log and store them in
-   metadata so downstream tooling can annotate tables with hit-rate data
-   without reparsing the logs.
 
 The script writes all artifacts under:
 
@@ -26,7 +23,7 @@ Example usage:
         --platform macos \
         --title "macOS (M1 Pro, macOS Sequoia)" \
         --environment "macos (aarch64)" \
-        --iterations 100 --num-buffers 12
+        --num-buffers 12
 
 This script only orchestrates benchmark execution; rendering markdown
 tables/docs is handled by `render_replacement_policy_docs.py`.
@@ -44,7 +41,6 @@ from pathlib import Path
 from typing import Dict, List
 
 from config import (
-    DEFAULT_ITERATIONS,
     DEFAULT_NUM_BUFFERS,
     PAGE_SIZES,
     PIN_HOTSET_POOL_SIZE,
@@ -53,9 +49,8 @@ from config import (
     REPO_ROOT,
 )
 
-HIT_RATE_RE = re.compile(
-    r"^(?P<name>[^|]+?)\s*\|\s*Hit rate:\s*(?P<rate>[\d.]+)%\s*"
-    r"\(hits:\s*(?P<hits>\d+),\s*misses:\s*(?P<misses>\d+)\)"
+BENCHER_RE = re.compile(
+    r"^test (.+?) \.\.\. bench:\s+([\d,]+) ns/iter \(\+/-\s+([\d,]+)\)$"
 )
 
 
@@ -70,7 +65,6 @@ def parse_args() -> argparse.Namespace:
         "--environment",
         help="Short environment string (e.g., 'macos (aarch64)')",
     )
-    parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS, help="Iterations per benchmark")
     parser.add_argument("--num-buffers", type=int, default=DEFAULT_NUM_BUFFERS, help="Buffer pool size")
     parser.add_argument(
         "--policies",
@@ -88,14 +82,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-text",
         action="store_true",
-        help="Skip capturing text logs (only JSON will be stored)",
+        help="Skip capturing human-readable text logs",
     )
     return parser.parse_args()
 
 
-def run_command(cmd: List[str]) -> subprocess.CompletedProcess[str]:
+def run_command(cmd: List[str], extra_env: Dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.setdefault("CARGO_TERM_COLOR", "never")
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         cmd,
         cwd=REPO_ROOT,
@@ -106,37 +102,27 @@ def run_command(cmd: List[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def extract_json(stdout: str) -> List[Dict[str, object]]:
+def parse_bencher_output(stdout: str) -> List[Dict[str, object]]:
+    """Parse Criterion --output-format bencher text output into JSON records."""
+    results = []
     for line in stdout.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            return json.loads(stripped)
-    raise RuntimeError("Failed to locate JSON payload in cargo bench output")
+        m = BENCHER_RE.match(line.strip())
+        if m:
+            name = m.group(1).strip()
+            value = float(m.group(2).replace(",", ""))
+            results.append({"name": name, "unit": "ns", "value": value})
+    if not results:
+        raise RuntimeError("No bench results found in cargo bench output")
+    return results
 
 
-def capture_hit_rates(log_text: str) -> Dict[str, Dict[str, float]]:
-    hits: Dict[str, Dict[str, float]] = {}
-    for line in log_text.splitlines():
-        match = HIT_RATE_RE.match(line)
-        if match:
-            name = match.group("name").strip()
-            hits[name] = {
-                "hit_rate": float(match.group("rate")),
-                "hits": int(match.group("hits")),
-                "misses": int(match.group("misses")),
-            }
-    return hits
-
-
-def write_text_log(path: Path, stdout: str, stderr: str) -> str:
-    # Preserve stdout first, then stderr (cargo prints compilation status to stderr)
+def write_text_log(path: Path, stdout: str, stderr: str) -> None:
     combined = stdout
     if stderr:
         if combined and not combined.endswith("\n"):
             combined += "\n"
         combined += stderr
     path.write_text(combined)
-    return combined
 
 
 def load_existing_metadata(path: Path) -> Dict[str, object]:
@@ -175,7 +161,6 @@ def main() -> None:
             "platform": args.platform,
             "title": args.title,
             "environment": args.environment,
-            "iterations": args.iterations,
             "num_buffers": args.num_buffers,
             "pin_hotset_pool_size": PIN_HOTSET_POOL_SIZE,
             "page_size": args.page_size,
@@ -189,41 +174,36 @@ def main() -> None:
         page_size_display = PAGE_SIZES[args.page_size]
         print(f"Running policy: {policy_key}")
 
-        # Build cargo args with both policy and page size features
         cargo_args = [
             "--no-default-features",
             "--features", policy_key,
             "--features", args.page_size,
         ]
         base_cmd = ["cargo", "bench", "--bench", "buffer_pool"] + cargo_args
+        bench_env = {"SIMPLEDB_BENCH_BUFFERS": str(args.num_buffers)}
 
-        # JSON run
-        json_cmd = base_cmd + ["--", str(args.iterations), str(args.num_buffers), "--json"]
-        json_result = run_command(json_cmd)
-        json_payload = extract_json(json_result.stdout)
+        # JSON run (bencher text → parsed to JSON)
+        json_cmd = base_cmd + ["--", "--output-format", "bencher", "--noplot"]
+        json_result = run_command(json_cmd, extra_env=bench_env)
+        json_payload = parse_bencher_output(json_result.stdout)
 
         json_path = raw_platform_dir / f"{policy_key}.json"
         json_path.write_text(json.dumps(json_payload, indent=2))
 
         log_rel = None
-        hit_rates: Dict[str, Dict[str, float]] = {}
 
         if not args.skip_text:
-            text_cmd = base_cmd + ["--", str(args.iterations), str(args.num_buffers)]
-            text_result = run_command(text_cmd)
+            text_cmd = base_cmd + ["--", "--noplot"]
+            text_result = run_command(text_cmd, extra_env=bench_env)
             log_path = raw_platform_dir / f"{policy_key}.txt"
-            log_output = write_text_log(log_path, text_result.stdout, text_result.stderr)
+            write_text_log(log_path, text_result.stdout, text_result.stderr)
             log_rel = log_path.relative_to(REPO_ROOT).as_posix()
-            hit_rates = capture_hit_rates(log_output)
-        else:
-            log_rel = None
 
         full_display = f"{policy_display} ({page_size_display})"
         metadata["policies"][policy_key] = {
             "display": full_display,
             "json_path": json_path.relative_to(REPO_ROOT).as_posix(),
             "log_path": log_rel,
-            "hit_rates": hit_rates,
         }
 
     metadata_path.write_text(json.dumps(metadata, indent=2))

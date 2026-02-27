@@ -28,6 +28,7 @@ from config import (
     THREAD_COUNTS,
     TOTAL_OPS,
     compute_ops_per_thread,
+    lookup_benchmark_value,
 )
 
 
@@ -209,7 +210,7 @@ def extract_scaling_data(spec: ChartSpec, platform_data: Dict) -> Dict[str, List
                 scaling_data[policy].append(None)
                 continue
 
-            mean_ns = policy_means.get(bench_name)
+            mean_ns = lookup_benchmark_value(policy_means, bench_name)
             throughput = compute_throughput(mean_ns, spec.total_ops)
             if throughput:
                 # Convert to millions

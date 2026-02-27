@@ -8,7 +8,7 @@ Usage:
 Reads two JSON files containing benchmark results and generates a markdown
 comparison table showing performance changes.
 
-Input JSON format (from run_all_benchmarks.sh):
+Input JSON format (from run_all_benchmarks.py, derived from Criterion bencher output):
     [
         {"name": "benchmark_name", "unit": "ns", "value": 12345},
         ...

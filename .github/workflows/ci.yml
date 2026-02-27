@@ -83,7 +83,7 @@ jobs:
       run: cargo build --release
 
     - name: Run all benchmarks (auto-discovery)
-      run: python3 scripts/run_all_benchmarks.py 100 12 all_benchmarks.json
+      run: python3 scripts/run_all_benchmarks.py 12 all_benchmarks.json
 
     - name: Store benchmark results
       uses: benchmark-action/github-action-benchmark@v1
@@ -97,3 +97,10 @@ jobs:
         comment-on-alert: true
         fail-on-alert: false
         alert-comment-cc-users: '@${{ github.actor }}'
+
+    - name: Upload Criterion reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: criterion-reports
+        path: target/criterion/
+        retention-days: 30

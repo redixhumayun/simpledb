@@ -32,7 +32,6 @@ use parser::{
 
 pub use test_utils::TestDir;
 
-pub mod benchmark_framework;
 mod btree;
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 mod intrusive_dll;

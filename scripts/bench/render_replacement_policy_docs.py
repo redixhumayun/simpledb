@@ -35,6 +35,7 @@ from config import (
     random_benchmark_name,
     repeated_benchmark_name,
     sequential_benchmark_name,
+    lookup_benchmark_value,
     zipfian_benchmark_name,
 )
 
@@ -223,7 +224,7 @@ def build_table(platform_data: Dict[str, Dict[str, object]], rows: List[RowSpec]
             if pdata is None:
                 row_values.append(None)
                 continue
-            mean_ns = pdata["means"].get(row.bench_name)
+            mean_ns = lookup_benchmark_value(pdata["means"], row.bench_name)
             if row.kind == "latency":
                 row_values.append(mean_ns)
             else:
@@ -283,7 +284,7 @@ def render_platform_doc(platform: str, metadata: Dict[str, object], platform_dat
     output_path = REPO_ROOT / "docs" / "benchmarks" / "replacement_policies" / f"{platform}_buffer_pool.md"
     lines = [f"# {metadata.get('title', platform.title())}", ""]
     num_buffers = metadata.get("num_buffers", 12)
-    lines.append("Command template: `cargo bench --bench buffer_pool -- <iterations> <num_buffers>`")
+    lines.append("Command template: `SIMPLEDB_BENCH_BUFFERS=<num_buffers> cargo bench --bench buffer_pool -- [FILTER]`")
     pin_hotset_pool = metadata.get("pin_hotset_pool_size")
     if pin_hotset_pool and pin_hotset_pool != num_buffers:
         lines.append(
