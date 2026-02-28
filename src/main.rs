@@ -180,6 +180,10 @@ impl SimpleDB {
     pub fn metadata_manager(&self) -> Arc<MetadataManager> {
         Arc::clone(&self.metadata_manager)
     }
+
+    pub fn lock_table(&self) -> Arc<LockTable> {
+        Arc::clone(&self.lock_table)
+    }
 }
 
 pub struct MultiBufferProductPlan {
@@ -837,27 +841,28 @@ impl ChunkScan {
         };
 
         if has_blocks {
-            scan.move_to_block(first_block_num);
+            scan.move_to_block(first_block_num).unwrap();
         }
         scan
     }
 
-    pub fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) -> SimpleDBResult<()> {
         let offset = block_num - self.first_block_num;
         debug!(
             "Moving chunk scan to block {} which is offset {}",
             block_num, offset
         );
         let block_id = self.buffer_list[offset].block_id.clone();
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id)?, 0).unwrap();
         self.current_record_page = Some(offset);
         self.heap_iter = Some(iter);
         self.current_slot = None;
+        Ok(())
     }
 }
 impl Scan for ChunkScan {
     fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
-        self.move_to_block(self.first_block_num);
+        self.move_to_block(self.first_block_num)?;
         Ok(())
     }
 
@@ -868,15 +873,14 @@ impl Scan for ChunkScan {
                 self.table_name
             )
         })?];
-        Ok(self
-            .current_slot
-            .ok_or_else(|| {
-                format!(
-                    "No current slot set in ChunkScan when calling get_int for {}",
-                    self.table_name
-                )
-            })
-            .map(|slot| record_page.get_int(slot, field_name))?)
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set in ChunkScan when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        record_page.get_int(slot, field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
@@ -886,15 +890,14 @@ impl Scan for ChunkScan {
                 self.table_name
             )
         })?];
-        Ok(self
-            .current_slot
-            .ok_or_else(|| {
-                format!(
-                    "No current slot set in ChunkScan when calling get_string for {}",
-                    self.table_name
-                )
-            })
-            .map(|slot| record_page.get_string(slot, field_name))?)
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set in ChunkScan when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        record_page.get_string(slot, field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -930,7 +933,9 @@ impl Iterator for ChunkScan {
             // Advance to next page in the chunk, if any
             let idx = self.current_record_page?;
             if idx + 1 < self.buffer_list.len() {
-                self.move_to_block(self.first_block_num + idx + 1);
+                if let Err(e) = self.move_to_block(self.first_block_num + idx + 1) {
+                    return Some(Err(e));
+                }
             } else {
                 return None;
             }
@@ -7952,7 +7957,7 @@ impl TableScan {
                 "TableScan for {} is not empty, moving to block 0",
                 table_name
             );
-            scan.move_to_block(0);
+            scan.move_to_block(0).unwrap();
         }
         scan
     }
@@ -7985,14 +7990,15 @@ impl TableScan {
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number.
     /// Captures `max_slot` from the page's current slot count so that redirect-appended
     /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
-    pub fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) -> SimpleDBResult<()> {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id)?, 0).unwrap();
         let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
         self.maybe_prefetch_from(block_num);
+        Ok(())
     }
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there.
@@ -8001,7 +8007,7 @@ impl TableScan {
         let record_page =
             RecordPage::new(Arc::clone(&self.txn), block.clone(), self.layout.clone());
         record_page.format()?;
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block), 0).unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block)?, 0).unwrap();
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
@@ -8016,13 +8022,13 @@ impl TableScan {
     /// Moves the [`RecordPage`] to the start of the file
     pub fn move_to_start(&mut self) {
         self.next_prefetch_block = 1;
-        self.move_to_block(0);
+        self.move_to_block(0).unwrap();
     }
 
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
         let iter =
-            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), row_id.slot + 1).unwrap();
+            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id).unwrap(), row_id.slot + 1).unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
@@ -8061,54 +8067,46 @@ impl Iterator for TableScan {
                 return None;
             }
 
-            self.move_to_block(next_block);
+            self.move_to_block(next_block).unwrap();
         }
     }
 }
 
 impl Scan for TableScan {
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        Ok(self
-            .record_page
-            .as_ref()
-            .ok_or_else(|| {
-                format!(
-                    "No record page set when calling get_int for {}",
-                    self.table_name
-                )
-            })
-            .and_then(|page| {
-                self.current_slot
-                    .ok_or_else(|| {
-                        format!(
-                            "No current slot set when calling get_int for {}",
-                            self.table_name
-                        )
-                    })
-                    .map(|slot| page.get_int(slot, field_name))
-            })?)
+        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No record page set when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        page.get_int(slot, field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        Ok(self
-            .record_page
-            .as_ref()
-            .ok_or_else(|| {
-                format!(
-                    "No record page set when calling get_string for {}",
-                    self.table_name
-                )
-            })
-            .and_then(|page| {
-                self.current_slot
-                    .ok_or_else(|| {
-                        format!(
-                            "No current slot set when calling get_string for {}",
-                            self.table_name
-                        )
-                    })
-                    .map(|slot| page.get_string(slot, field_name))
-            })?)
+        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No record page set when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        page.get_string(slot, field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -8174,7 +8172,7 @@ impl UpdateScan for TableScan {
                     } else {
                         self.move_to_block(
                             self.record_page.as_ref().unwrap().block_id.block_num + 1,
-                        );
+                        )?;
                     }
                     continue;
                 }
@@ -8427,23 +8425,23 @@ impl RecordPage {
 
     /// Retrieves an integer value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
-    fn get_int(&self, slot: usize, field_name: &str) -> i32 {
-        self.txn
-            .pin_read_guard(&self.block_id)
+    fn get_int(&self, slot: usize, field_name: &str) -> SimpleDBResult<i32> {
+        Ok(self.txn
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
             .row(slot)
             .unwrap()
             .get_column(field_name)
             .unwrap()
-            .as_int()
+            .as_int())
     }
 
     /// Retrieves a string value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
-    fn get_string(&self, slot: usize, field_name: &str) -> String {
-        self.txn
-            .pin_read_guard(&self.block_id)
+    fn get_string(&self, slot: usize, field_name: &str) -> SimpleDBResult<String> {
+        Ok(self.txn
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
             .row(slot)
@@ -8451,12 +8449,12 @@ impl RecordPage {
             .get_column(field_name)
             .unwrap()
             .as_str()
-            .to_string()
+            .to_string())
     }
 
     /// Sets an integer value in the specified slot and field.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -8470,7 +8468,7 @@ impl RecordPage {
 
     /// Sets a string value in the specified slot and field.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -8484,7 +8482,7 @@ impl RecordPage {
 
     /// Deletes the record at the specified slot.
     pub fn delete(&self, slot: usize) -> Result<(), Box<dyn Error>> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.delete_slot(slot)?;
         Ok(())
@@ -8502,7 +8500,7 @@ impl RecordPage {
         };
         let append_lsn = record.write_log_record(&self.txn.log_manager())?;
 
-        let mut guard = self.txn.pin_write_guard(&block_id);
+        let mut guard = self.txn.pin_write_guard(&block_id)?;
         guard.mark_modified(txn_id as usize, append_lsn);
 
         // Format (emits HeapPageFormatFresh internally and overwrites with newer LSN)
@@ -8515,7 +8513,7 @@ impl RecordPage {
     pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
         let view = self
             .txn
-            .pin_read_guard(&self.block_id)
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)?;
 
         let live: Vec<usize> = view.live_slot_iter().collect();
@@ -8528,7 +8526,7 @@ impl RecordPage {
         if values.len() != self.layout.schema.fields.len() {
             return Err("value count must match schema field count".into());
         }
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.insert_row_values(values)
     }
@@ -8583,7 +8581,7 @@ mod record_page_tests {
         //  Delete all records with a value less than 25
         let mut deleted_count = 0;
         for slot in &inserted_slots {
-            let a = record_page.get_int(*slot, "A");
+            let a = record_page.get_int(*slot, "A").unwrap();
             if a < 25 {
                 deleted_count += 1;
                 record_page.delete(*slot).ok();
@@ -8593,7 +8591,7 @@ mod record_page_tests {
         //  Check that the correct number of records are left
         let mut remaining_count = 0;
         for slot in record_page.live_slots().unwrap() {
-            let a = record_page.get_int(slot, "A");
+            let a = record_page.get_int(slot, "A").unwrap();
             if a >= 25 {
                 remaining_count += 1;
             }
@@ -8979,7 +8977,7 @@ impl Drop for BufferHandle {
 
 trait TransactionOperations {
     fn txn_id(&self) -> usize;
-    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_>;
+    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>>;
 }
 
 impl TransactionOperations for Arc<Transaction> {
@@ -8987,7 +8985,7 @@ impl TransactionOperations for Arc<Transaction> {
         self.id()
     }
 
-    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_> {
+    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
         Transaction::pin_write_guard(self, block_id)
     }
 }
@@ -9090,19 +9088,19 @@ impl Transaction {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
-    pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> PageReadGuard<'_> {
-        self.concurrency_manager.slock(block_id).unwrap();
+    pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> SimpleDBResult<PageReadGuard<'_>> {
+        self.concurrency_manager.slock(block_id)?;
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
         let raw = Arc::into_raw(frame_clone);
         let page = unsafe { (*raw).read_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        PageReadGuard::new(handle, frame_for_guard, page)
+        Ok(PageReadGuard::new(handle, frame_for_guard, page))
     }
 
-    pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> PageWriteGuard<'_> {
-        self.concurrency_manager.xlock(block_id).unwrap();
+    pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
+        self.concurrency_manager.xlock(block_id)?;
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
@@ -9110,7 +9108,7 @@ impl Transaction {
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
         let log_manager = Arc::clone(&self.log_manager);
-        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
+        Ok(PageWriteGuard::new(handle, frame_for_guard, page, log_manager))
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -9242,7 +9240,7 @@ mod transaction_tests {
         let t1 = test_db.new_tx();
         let block_id = t1.append(&file);
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 1, "one");
         }
         t1.commit().unwrap();
@@ -9251,12 +9249,12 @@ mod transaction_tests {
         //  Set new values in this transaction
         let t2 = test_db.new_tx();
         {
-            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 1);
             assert_eq!(snapshot.str_val, "one");
         }
         {
-            let guard = t2.pin_write_guard(&block_id);
+            let guard = t2.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 2, "two");
         }
         t2.commit().unwrap();
@@ -9264,11 +9262,11 @@ mod transaction_tests {
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
         let t3 = test_db.new_tx();
-        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id).unwrap(), &layout);
         assert_eq!(snapshot.int_val, 2);
         assert_eq!(snapshot.str_val, "two");
         {
-            let guard = t3.pin_write_guard(&block_id);
+            let guard = t3.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 3, "three");
         }
         t3.rollback().unwrap();
@@ -9277,7 +9275,7 @@ mod transaction_tests {
         //  This will be a read only transaction that commits
         let t4 = test_db.new_tx();
         {
-            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 2);
             assert_eq!(snapshot.str_val, "two");
         }
@@ -9298,7 +9296,7 @@ mod transaction_tests {
         // Initialize page so readers always see a formatted heap page.
         {
             let init_txn = test_db.new_tx();
-            let guard = init_txn.pin_write_guard(&block_id);
+            let guard = init_txn.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
             init_txn.commit().unwrap();
         }
@@ -9319,7 +9317,7 @@ mod transaction_tests {
         let layout_reader = Arc::clone(&layout);
         let t1 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
-            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1), layout_reader.as_ref());
+            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
             txn.commit().unwrap();
         });
 
@@ -9328,7 +9326,7 @@ mod transaction_tests {
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
-                let guard = txn.pin_write_guard(&bid2);
+                let guard = txn.pin_write_guard(&bid2).unwrap();
                 update_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
             //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
@@ -9345,7 +9343,7 @@ mod transaction_tests {
             test_db.buffer_manager,
             test_db.lock_table,
         ));
-        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id), layout.as_ref());
+        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id).unwrap(), layout.as_ref());
         assert_eq!(snapshot.int_val, 1);
         assert_eq!(snapshot.str_val, "Hello");
     }
@@ -9369,7 +9367,7 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = init_txn.pin_write_guard(&block_id);
+            let guard = init_txn.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "initial");
         }
         init_txn.commit().unwrap();
@@ -9387,7 +9385,7 @@ mod transaction_tests {
             handles.push(std::thread::spawn(move || {
                 let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
 
-                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid), layout_reader.as_ref());
+                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid).unwrap(), layout_reader.as_ref());
                 let val = snapshot.int_val;
                 assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
 
@@ -9409,7 +9407,7 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = txn.pin_write_guard(&block_id);
+            let guard = txn.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, layout.as_ref(), 42, "final");
         }
         txn.commit().unwrap();
@@ -9426,7 +9424,7 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id), layout.as_ref());
+            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id).unwrap(), layout.as_ref());
             assert_eq!(snapshot.int_val, 42);
             assert_eq!(snapshot.str_val, "final");
         }
@@ -9451,7 +9449,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 100, "initial");
         }
         t1.commit().unwrap();
@@ -9464,7 +9462,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t2.pin_write_guard(&block_id);
+            let guard = t2.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
@@ -9477,7 +9475,7 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id).unwrap(), &layout);
         assert_eq!(snapshot.int_val, 100);
         assert_eq!(snapshot.str_val, "initial");
     }
@@ -9514,7 +9512,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
         }
         t1.commit().unwrap();
@@ -9548,14 +9546,14 @@ mod transaction_tests {
                     // Try to perform the increment
                     match (|| -> Result<(), Box<dyn Error>> {
                         let val = {
-                            let guard = txn.pin_read_guard(&bid);
+                            let guard = txn.pin_read_guard(&bid).unwrap();
                             snapshot_txn_row(guard, layout_clone.as_ref()).int_val
                         };
                         // Short sleep to increase chance of conflicts
                         std::thread::sleep(Duration::from_millis(10));
 
                         {
-                            let guard = txn.pin_write_guard(&bid);
+                            let guard = txn.pin_write_guard(&bid).unwrap();
                             update_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
                         txn.commit()?;
@@ -9628,7 +9626,7 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id), layout.as_ref());
+        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id).unwrap(), layout.as_ref());
         assert_eq!(snapshot.int_val, num_of_txns);
     }
 
@@ -9649,7 +9647,7 @@ mod transaction_tests {
             ));
             let block_id = t1.append(&file);
             {
-                let guard = t1.pin_write_guard(&block_id);
+                let guard = t1.pin_write_guard(&block_id).unwrap();
                 init_txn_row(guard, &layout, 100, "");
             }
             t1.commit().unwrap();
@@ -9667,7 +9665,7 @@ mod transaction_tests {
             ));
             t2.recover().unwrap();
 
-            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 100);
         }
     }
@@ -10220,7 +10218,7 @@ impl RecoveryManager {
                 }
                 _ => {
                     if !finished_txns.contains(&record.get_tx_num())
-                        && record.should_undo_during_recovery(tx, record_lsn)
+                        && record.should_undo_during_recovery(tx, record_lsn)?
                     {
                         record.undo(tx)?;
                     }
@@ -11706,7 +11704,7 @@ impl LogRecord {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
                     return Err("HeapTupleInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleInsert undo: failed to create heap page for block {:?}: {}",
@@ -11734,7 +11732,7 @@ impl LogRecord {
                 else {
                     return Err("HeapTupleUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleUpdate undo: failed to create heap page for block {:?}: {}",
@@ -11757,7 +11755,7 @@ impl LogRecord {
                 else {
                     return Err("HeapTupleDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleDelete undo: failed to create heap page for block {:?}: {}",
@@ -11777,7 +11775,7 @@ impl LogRecord {
                 let LogRecord::BTreeLeafInsert { block_id, slot, .. } = self else {
                     return Err("BTreeLeafInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page =
                     crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
                         format!(
@@ -11802,7 +11800,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeLeafDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 // Check page type - if not IndexLeaf, page was deallocated/unformatted by prior undo
                 let mut page =
                     crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
@@ -11827,7 +11825,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 // Check page type - if not IndexInternal, page was deallocated/unformatted by prior undo
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
                     .map_err(|e| format!("BTreeInternalInsert undo: failed to create internal page for block {:?}: {}", block_id, e))?;
@@ -11850,7 +11848,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
                     .map_err(|e| format!("BTreeInternalDelete undo: failed to create internal page for block {:?}: {}", block_id, e))?;
                 // Undo delete may fail if page structure changed by prior undo operations
@@ -11869,7 +11867,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeLeafHeaderUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let header = guard
                     .bytes_mut()
                     .get_mut(..old_header.len())
@@ -11892,7 +11890,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalHeaderUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let header = guard.bytes_mut().get_mut(..old_header.len())
                     .ok_or_else(|| format!("BTreeInternalHeaderUpdate undo: header slice out of bounds for block {:?}", block_id))?;
                 header.copy_from_slice(old_header);
@@ -11916,7 +11914,7 @@ impl LogRecord {
 
                 // Restore left-page structural metadata (skip if page deallocated/unformatted).
                 if *is_leaf {
-                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut left_guard = txn.pin_write_guard(left_block_id)?;
                     let mut page = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
                             .map_err(|e| format!("BTreePageSplit undo: failed to create leaf page for left block {:?}: {}", left_block_id, e))?;
                     match old_left_high_key {
@@ -11931,7 +11929,7 @@ impl LogRecord {
                             .map_err(|e| format!("BTreePageSplit undo: failed to restore leaf overflow for block {:?}: {}", left_block_id, e))?;
                     left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 } else {
-                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut left_guard = txn.pin_write_guard(left_block_id)?;
                     let mut page = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
                             .map_err(|e| format!("BTreePageSplit undo: failed to create internal page for left block {:?}: {}", left_block_id, e))?;
                     match old_left_high_key {
@@ -11947,7 +11945,7 @@ impl LogRecord {
 
                 // Deallocate right split page by pushing it onto the index free-list.
                 let meta_block = BlockId::new(left_block_id.filename.clone(), 0);
-                let meta_guard = txn.pin_write_guard(&meta_block);
+                let meta_guard = txn.pin_write_guard(&meta_block)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -11958,7 +11956,7 @@ impl LogRecord {
                     })?;
                 let old_head = meta_view.first_free_block();
 
-                let mut right_guard = txn.pin_write_guard(right_block_id);
+                let mut right_guard = txn.pin_write_guard(right_block_id)?;
                 right_guard.format_as_free(old_head, Lsn::MAX);
 
                 meta_view.set_first_free_block(right_block_id.block_num as u32);
@@ -11977,7 +11975,7 @@ impl LogRecord {
                     return Err("BTreeRootUpdate: invalid record structure".into());
                 };
 
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -11994,7 +11992,7 @@ impl LogRecord {
                 if old_root_block != new_root_block {
                     let new_root =
                         BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
-                    let mut new_root_guard = txn.pin_write_guard(&new_root);
+                    let mut new_root_guard = txn.pin_write_guard(&new_root)?;
                     new_root_guard.format_as_free(old_free_head, Lsn::MAX);
                     meta_view.set_first_free_block(*new_root_block);
                 }
@@ -12015,7 +12013,7 @@ impl LogRecord {
                 };
 
                 // Restore meta to point to old head
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12027,7 +12025,7 @@ impl LogRecord {
                 meta_view.set_first_free_block(*old_head);
 
                 // Restore the allocated block as free with its old next pointer
-                let mut block_guard = txn.pin_write_guard(block_id);
+                let mut block_guard = txn.pin_write_guard(block_id)?;
                 block_guard.format_as_free(*old_block_next, Lsn::MAX);
 
                 meta_view.update_crc32();
@@ -12044,7 +12042,7 @@ impl LogRecord {
                 };
 
                 // Restore meta to point to old head (before push)
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12063,7 +12061,7 @@ impl LogRecord {
             }
             LogRecord::HeapPageFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
@@ -12074,7 +12072,7 @@ impl LogRecord {
                 ..
             } => {
                 // Deallocate by pushing to free list
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12086,7 +12084,7 @@ impl LogRecord {
                 let old_free_head = meta_view.first_free_block();
 
                 // Mark page as Free and link to old head
-                let mut block_guard = txn.pin_write_guard(block_id);
+                let mut block_guard = txn.pin_write_guard(block_id)?;
                 block_guard.format_as_free(old_free_head, Lsn::MAX);
 
                 // Update meta to point to this page as new head
@@ -12096,21 +12094,21 @@ impl LogRecord {
             }
             LogRecord::BTreeMetaFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
             }
             LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
             }
             LogRecord::BTreeLeafFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
@@ -12124,16 +12122,16 @@ impl LogRecord {
         &self,
         txn: &dyn TransactionOperations,
         record_lsn: Lsn,
-    ) -> bool {
+    ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
         match self {
             // Multi-page operation: affects left, right, and meta pages
             // Always undo for unfinished txns (can't rely on single-page LSN check)
-            LogRecord::BTreePageSplit { .. } => return true,
+            LogRecord::BTreePageSplit { .. } => return Ok(true),
 
             // Append operations: freshly appended pages may not have reliable header LSN
             // Bypass LSN gate to ensure undo/deallocation happens for unfinished txns
-            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => return true,
+            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => return Ok(true),
 
             // All other operations use standard LSN-based gating
             _ => {}
@@ -12141,11 +12139,11 @@ impl LogRecord {
 
         // Standard LSN-based gating for single-page operations
         let Some(block_id) = self.undo_block_id() else {
-            return true;
+            return Ok(true);
         };
-        let guard = txn.pin_write_guard(block_id);
+        let guard = txn.pin_write_guard(block_id)?;
         let page_lsn = crate::page::page_lsn_from_bytes(guard.bytes());
-        page_lsn >= record_lsn
+        Ok(page_lsn >= record_lsn)
     }
 
     fn undo_block_id(&self) -> Option<&BlockId> {
@@ -12210,7 +12208,7 @@ mod recovery_manager_tests {
     }
 
     fn format_heap(txn: &Arc<Transaction>, block: &BlockId) {
-        let mut guard = txn.pin_write_guard(block);
+        let mut guard = txn.pin_write_guard(block).unwrap();
         guard.format_as_heap().unwrap();
     }
 
@@ -12221,7 +12219,7 @@ mod recovery_manager_tests {
         int_value: i32,
         text_value: &str,
     ) -> SlotId {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.insert_row_values(&[
             Constant::Int(int_value),
@@ -12237,7 +12235,7 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: i32,
     ) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -12254,7 +12252,7 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: &str,
     ) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -12265,13 +12263,13 @@ mod recovery_manager_tests {
     }
 
     fn delete_slot(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.delete_slot(slot).expect("delete slot");
     }
 
     fn read_int_at(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) -> i32 {
-        let guard = txn.pin_read_guard(block);
+        let guard = txn.pin_read_guard(block).unwrap();
         let view = guard.into_heap_view(layout).expect("heap view");
         let row = view.row(slot).expect("row exists");
         match row.get_column(INT_FIELD) {
@@ -12286,7 +12284,7 @@ mod recovery_manager_tests {
         layout: &Layout,
         slot: SlotId,
     ) -> String {
-        let guard = txn.pin_read_guard(block);
+        let guard = txn.pin_read_guard(block).unwrap();
         let view = guard.into_heap_view(layout).expect("heap view");
         let row = view.row(slot).expect("row exists");
         match row.get_column(STR_FIELD) {
@@ -12314,7 +12312,7 @@ mod recovery_manager_tests {
 
         // Verify: page is formatted, insert is rolled back
         let check_txn = db.new_tx();
-        let guard = check_txn.pin_read_guard(&block);
+        let guard = check_txn.pin_read_guard(&block).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(0).is_none(), "slot 0 should not be live");
         assert_eq!(view.live_slot_iter().count(), 0);
@@ -12362,7 +12360,7 @@ mod recovery_manager_tests {
 
         // Verify: page is formatted, all operations are rolled back
         let check_txn = db.new_tx();
-        let guard = check_txn.pin_read_guard(&block);
+        let guard = check_txn.pin_read_guard(&block).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert_eq!(view.live_slot_iter().count(), 0);
     }
@@ -12409,7 +12407,7 @@ mod recovery_manager_tests {
         let txn = db.new_tx();
         txn.recover().unwrap();
 
-        let guard = txn.pin_read_guard(&block_id);
+        let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert_eq!(view.live_slot_iter().count(), 1);
     }
@@ -12436,7 +12434,7 @@ mod recovery_manager_tests {
         let txn = db.new_tx();
         txn.recover().unwrap();
 
-        let guard = txn.pin_read_guard(&block_id);
+        let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(committed_slot).is_some());
         assert!(view.row(uncommitted_slot).is_none());
@@ -12508,7 +12506,7 @@ mod recovery_manager_tests {
 
         let txn2 = db.new_tx();
         {
-            let guard = txn2.pin_write_guard(&block);
+            let guard = txn2.pin_write_guard(&block).unwrap();
             let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
             let int_idx = layout.column_idx(INT_FIELD).unwrap();
             let str_idx = layout.column_idx(STR_FIELD).unwrap();
@@ -12560,7 +12558,7 @@ mod recovery_manager_tests {
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot1), 2);
         assert_eq!(read_string_at(&check_txn, &block_id, &layout, slot1), "two");
 
-        let guard = check_txn.pin_read_guard(&block_id);
+        let guard = check_txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(slot2).is_none());
         assert_eq!(view.live_slot_iter().count(), 2);

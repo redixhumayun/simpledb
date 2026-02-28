@@ -8,6 +8,22 @@ Current design conflates:
 
 Both are currently acquired via transaction pin APIs at page (`BlockId`) granularity. This over-serializes concurrent work on different rows in the same page.
 
+## Immediate Prerequisite: Fallible Pin/Lock Call Path
+
+Before lock-granularity benchmarks can be interpreted correctly, the pin/lock path must stop panicking on lock conflicts/timeouts.
+
+Current behavior:
+1. `pin_read_guard` / `pin_write_guard` call lock APIs and `unwrap()` errors.
+2. Deadlock prevention or timeout paths then panic worker threads instead of returning retryable errors.
+3. Concurrent UPDATE / mixed benchmarks fail as thread panics, so retries/timeouts are not measured meaningfully.
+
+Required first step:
+1. Make pin guard acquisition fallible (`Result<...>`), not panic-based.
+2. Propagate lock acquisition failures through record/scan/update call paths.
+3. Let benchmark/executor call-sites handle rollback + retry explicitly.
+
+This is a prerequisite for evaluating deadlock-prevention policy and lock-granularity performance. Without it, benchmark results are dominated by panic behavior, not concurrency-control behavior.
+
 ## Target Direction
 
 Separate concerns:

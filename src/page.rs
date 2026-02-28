@@ -4766,7 +4766,7 @@ mod heap_page_view_tests {
         let layout = sample_layout();
 
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             format_heap_page(&mut guard);
             let mut view_mut = HeapPageViewMut::new(guard, &layout)
                 .expect("heap page mutable view initialization");
@@ -4789,7 +4789,7 @@ mod heap_page_view_tests {
             assert_eq!(slot1, 1);
         } // drop guard
 
-        let read_guard = txn.pin_read_guard(&block_id);
+        let read_guard = txn.pin_read_guard(&block_id).unwrap();
         let view = HeapPageView::new(read_guard, &layout).expect("heap page view");
 
         let row0 = view.row(0).expect("slot 0 row");
@@ -4818,7 +4818,7 @@ mod heap_page_view_tests {
         let layout = sample_layout();
 
         let slot = {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             format_heap_page(&mut guard);
             let mut view = HeapPageViewMut::new(guard, &layout)
                 .expect("heap page mutable view initialization");
@@ -4851,7 +4851,7 @@ mod heap_page_view_tests {
             slot
         };
 
-        let read_guard = txn.pin_read_guard(&block_id);
+        let read_guard = txn.pin_read_guard(&block_id).unwrap();
         let view = HeapPageView::new(read_guard, &layout).expect("reopen heap view");
         let row = view.row(slot).expect("slot 0 after write guard drop");
         assert_eq!(row.get_column("id"), Some(Constant::Int(777)));
@@ -5371,7 +5371,7 @@ mod btree_page_tests {
         let layout = btree_leaf_layout_int();
 
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
@@ -5620,7 +5620,7 @@ mod btree_page_tests {
         let block_id = txn.append(&filename);
         let layout = btree_leaf_layout_int();
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
@@ -5659,7 +5659,7 @@ mod btree_page_tests {
         let filename = generate_filename();
         let block_id = txn.append(&filename);
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
@@ -5705,7 +5705,7 @@ mod btree_page_tests {
         let filename = generate_filename();
         let block_id = txn.append(&filename);
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             let mut view = BTreeLeafPageViewMut::new(guard, &layout).expect("create leaf view");
 
@@ -5726,6 +5726,7 @@ mod btree_page_tests {
         {
             let view = txn
                 .pin_read_guard(&block_id)
+                .unwrap()
                 .into_btree_leaf_page_view(&layout)
                 .expect("create read view");
 
@@ -5747,7 +5748,7 @@ mod btree_page_tests {
         let block_id = txn.append(&filename);
         let layout = btree_internal_layout_int();
         {
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             guard.format_as_btree_internal(2, Some(0)).unwrap();
             let mut view =
                 BTreeInternalPageViewMut::new(guard, &layout).expect("create internal view");
