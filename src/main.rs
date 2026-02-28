@@ -635,14 +635,14 @@ mod multi_buffer_product_scan_tests {
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp").unwrap();
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept").unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp").unwrap();
         let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
         // Count total combinations (should be 500 * 3000 = 1,500,000)
@@ -666,7 +666,7 @@ mod multi_buffer_product_scan_tests {
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Create empty scans
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp").unwrap();
         let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
         let mut count = 0;
@@ -686,14 +686,14 @@ mod multi_buffer_product_scan_tests {
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp").unwrap();
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept").unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp").unwrap();
         let mut mbp_scan =
             MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
@@ -721,14 +721,14 @@ mod multi_buffer_product_scan_tests {
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp").unwrap();
+        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept").unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp").unwrap();
         let mut mbp_scan =
             MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
@@ -1005,7 +1005,7 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 10)?;
         drop(table_scan);
 
@@ -1044,7 +1044,7 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 100)?;
         drop(table_scan);
 
@@ -1084,7 +1084,7 @@ mod chunk_scan_tests {
 
         // Insert test records; 300 ensures multiple 4KB blocks
         {
-            let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+            let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
             insert_test_records(&mut table_scan, 300)?;
         }
 
@@ -1123,7 +1123,7 @@ mod chunk_scan_tests {
 
         // Create empty table
         {
-            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         }
 
         // Test ChunkScan over empty blocks
@@ -1146,7 +1146,7 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 5)?;
         drop(table_scan);
 
@@ -3138,7 +3138,7 @@ impl TempTable {
     }
 
     pub fn open(&self) -> TableScan {
-        TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name)
+        TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name).unwrap()
     }
 }
 
@@ -4924,7 +4924,7 @@ impl Plan for TablePlan {
             Arc::clone(&self.txn),
             self.layout.clone(),
             &self.table_name,
-        ))
+        ).unwrap())
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -5282,8 +5282,8 @@ mod product_scan_tests {
 
         //  open scanners for both schemas and insert them
         {
-            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1").unwrap();
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2").unwrap();
             for i in 0..50 {
                 scan1
                     .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
@@ -5296,8 +5296,8 @@ mod product_scan_tests {
 
         //  create a product scan for both tables and retrieve B and D where A = C
         {
-            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1").unwrap();
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2").unwrap();
             let product_scan = ProductScan::new(scan1, scan2);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -5449,7 +5449,7 @@ mod project_scan_tests {
         let mut inserted_count = 0;
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T").unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -5477,7 +5477,7 @@ mod project_scan_tests {
         //  selection and projection block
         {
             let mut projected_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T").unwrap();
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -5993,9 +5993,9 @@ mod index_join_scan_tests {
         let mut inserted_count = 0;
         {
             // First table
-            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1").unwrap();
             // Second table with index
-            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2").unwrap();
 
             for i in 0..50 {
                 // Insert into first table
@@ -6020,8 +6020,8 @@ mod index_join_scan_tests {
         // Test the index join
         {
             let mut join_count = 0;
-            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1").unwrap();
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2").unwrap();
             let index = index_info.open();
 
             let mut index_join_scan = IndexJoinScan::new(scan1, index, scan2, "A".to_string());
@@ -6173,7 +6173,7 @@ mod index_select_scan_tests {
         );
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T").unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -6210,7 +6210,7 @@ mod index_select_scan_tests {
         //  read block via index
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T").unwrap();
             let value = Constant::Int(10);
             let index = index_info.open();
             let mut index_select_scan = IndexSelectScan::new(scan, index, value);
@@ -6345,7 +6345,7 @@ mod select_scan_tests {
         let mut inserted_count = 0;
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T").unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -6373,7 +6373,7 @@ mod select_scan_tests {
         //  selection block
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T").unwrap();
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -7118,7 +7118,7 @@ mod metadata_manager_tests {
 
         // Part 2: Statistics Metadata
         {
-            let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name);
+            let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name).unwrap();
             for _ in 0..50 {
                 let n = (generate_random_number() % 50) + 1;
                 table_scan
@@ -7189,7 +7189,7 @@ mod metadata_manager_tests {
 
         let layout = mdm.get_layout(table_name, Arc::clone(&setup_txn));
         {
-            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name);
+            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name).unwrap();
             for i in 0..20 {
                 table_scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
@@ -7275,7 +7275,7 @@ impl IndexManager {
         field_name: &str,
         txn: Arc<Transaction>,
     ) {
-        let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME);
+        let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME).unwrap();
         table_scan
             .insert_values(&[
                 Constant::String(index_name.to_string()),
@@ -7295,7 +7295,7 @@ impl IndexManager {
             Arc::clone(&txn),
             self.layout.clone(),
             Self::INDEX_CAT_TBL_NAME,
-        );
+        ).unwrap();
         while table_scan.next().is_some() {
             if table_scan.get_string(Self::TABLE_COL_NAME).unwrap() == table_name {
                 let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
@@ -7453,7 +7453,7 @@ impl Index for HashIndex {
         let hash = hasher.finish() as usize;
         let bucket = hash % Self::NUM_BUCKETS;
         let table_name = format!("{}_{}", self.index_name, bucket);
-        let table_scan = TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name);
+        let table_scan = TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name).unwrap();
         self.table_scan = Some(table_scan);
     }
 
@@ -7580,7 +7580,7 @@ impl StatManager {
             Arc::clone(&txn),
             table_catalog_layout,
             TableManager::TABLE_CAT_TABLE_NAME,
-        );
+        ).unwrap();
         while table_scan.next().is_some() {
             let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
@@ -7598,7 +7598,7 @@ impl StatManager {
         txn: Arc<Transaction>,
     ) -> StatInfo {
         debug!("calculating table stats for {}", table_name);
-        let mut table_scan = TableScan::new(txn, layout, table_name);
+        let mut table_scan = TableScan::new(txn, layout, table_name).unwrap();
         let mut num_rec = 0;
         let mut num_blocks = 0;
         while table_scan.next().is_some() {
@@ -7656,7 +7656,7 @@ impl ViewManager {
         let layout = self
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
-        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME).unwrap();
         table_scan
             .insert_values(&[
                 Constant::String(view_name.to_string()),
@@ -7670,7 +7670,7 @@ impl ViewManager {
         let layout = self
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
-        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME).unwrap();
         while let Some(_) = table_scan.next() {
             if view_name == table_scan.get_string(Self::VIEW_NAME_COL).unwrap() {
                 return Some(table_scan.get_string(Self::VIEW_DEF_COL).unwrap());
@@ -7745,7 +7745,7 @@ impl TableManager {
                 Arc::clone(&tx),
                 self.table_catalog_layout.clone(),
                 Self::TABLE_CAT_TABLE_NAME,
-            );
+            ).unwrap();
             table_scan
                 .insert_values(&[
                     Constant::String(table_name.to_string()),
@@ -7760,7 +7760,7 @@ impl TableManager {
                 tx,
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            );
+            ).unwrap();
             for field in &schema.fields {
                 let field_info = schema.info.get(field).unwrap();
                 table_scan
@@ -7784,7 +7784,7 @@ impl TableManager {
         //         Arc::clone(&tx),
         //         self.table_catalog_layout.clone(),
         //         Self::TABLE_CAT_TABLE_NAME,
-        //     );
+        //     ).unwrap();
         //     let mut slot_size = None;
         //     while let Some(_) = table_scan.next() {
         //         if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
@@ -7800,7 +7800,7 @@ impl TableManager {
                 Arc::clone(&tx),
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            );
+            ).unwrap();
             let mut schema = Schema::new();
             while let Some(result) = table_scan.next() {
                 result.expect("failed to advance table scan in get_layout");
@@ -7824,7 +7824,7 @@ impl TableManager {
             tx,
             self.table_catalog_layout.clone(),
             Self::TABLE_CAT_TABLE_NAME,
-        );
+        ).unwrap();
         let mut tables = Vec::new();
         while let Some(result) = table_scan.next() {
             result?;
@@ -7931,7 +7931,7 @@ impl TableScan {
             .store(window_blocks, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
+    pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> SimpleDBResult<Self> {
         debug!("Creating table scan for {}", table_name);
         let file_name = format!("{table_name}.tbl");
         let mut scan = Self {
@@ -7951,15 +7951,15 @@ impl TableScan {
                 "TableScan for {} is empty, allocating new block",
                 table_name
             );
-            scan.move_to_new_block().unwrap();
+            scan.move_to_new_block()?;
         } else {
             debug!(
                 "TableScan for {} is not empty, moving to block 0",
                 table_name
             );
-            scan.move_to_block(0).unwrap();
+            scan.move_to_block(0)?;
         }
-        scan
+        Ok(scan)
     }
 
     fn maybe_prefetch_from(&mut self, current_block: usize) {
@@ -8256,7 +8256,7 @@ mod table_scan_tests {
         //   null_bitmap(1) + id(4) + name_len(4) + name_data(1) = 10 bytes
         // Allocated: 10 + UPDATE_SLACK(4) = 14 bytes. All fit on one 4 K page.
         let n: usize = 15;
-        let mut ts = TableScan::new(txn, layout, "redirect_test");
+        let mut ts = TableScan::new(txn, layout, "redirect_test").unwrap();
         for i in 0..n {
             ts.insert_values(&[Constant::Int(i as i32), Constant::String("a".to_string())])
                 .unwrap();
@@ -8294,7 +8294,7 @@ mod table_scan_tests {
 
         dbg!("Inserting a bunch of records into the table");
         let mut inserted_count = 0;
-        let mut table_scan = TableScan::new(txn, layout, "table");
+        let mut table_scan = TableScan::new(txn, layout, "table").unwrap();
         for _ in 0..100 {
             let number = (generate_random_number() % 100) + 1;
             table_scan
