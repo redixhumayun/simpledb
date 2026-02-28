@@ -8028,7 +8028,8 @@ impl TableScan {
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
         let iter =
-            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id).unwrap(), row_id.slot + 1).unwrap();
+            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id).unwrap(), row_id.slot + 1)
+                .unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
@@ -8426,7 +8427,8 @@ impl RecordPage {
     /// Retrieves an integer value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn get_int(&self, slot: usize, field_name: &str) -> SimpleDBResult<i32> {
-        Ok(self.txn
+        Ok(self
+            .txn
             .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
@@ -8440,7 +8442,8 @@ impl RecordPage {
     /// Retrieves a string value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
     fn get_string(&self, slot: usize, field_name: &str) -> SimpleDBResult<String> {
-        Ok(self.txn
+        Ok(self
+            .txn
             .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
@@ -9088,7 +9091,10 @@ impl Transaction {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
-    pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> SimpleDBResult<PageReadGuard<'_>> {
+    pub fn pin_read_guard(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<PageReadGuard<'_>> {
         self.concurrency_manager.slock(block_id)?;
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
@@ -9099,7 +9105,10 @@ impl Transaction {
         Ok(PageReadGuard::new(handle, frame_for_guard, page))
     }
 
-    pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
+    pub fn pin_write_guard(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<PageWriteGuard<'_>> {
         self.concurrency_manager.xlock(block_id)?;
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
@@ -9108,7 +9117,12 @@ impl Transaction {
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
         let log_manager = Arc::clone(&self.log_manager);
-        Ok(PageWriteGuard::new(handle, frame_for_guard, page, log_manager))
+        Ok(PageWriteGuard::new(
+            handle,
+            frame_for_guard,
+            page,
+            log_manager,
+        ))
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -9317,7 +9331,8 @@ mod transaction_tests {
         let layout_reader = Arc::clone(&layout);
         let t1 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
-            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
+            let _ =
+                maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
             txn.commit().unwrap();
         });
 
@@ -9385,7 +9400,8 @@ mod transaction_tests {
             handles.push(std::thread::spawn(move || {
                 let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
 
-                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid).unwrap(), layout_reader.as_ref());
+                let snapshot =
+                    snapshot_txn_row(txn.pin_read_guard(&bid).unwrap(), layout_reader.as_ref());
                 let val = snapshot.int_val;
                 assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
 
@@ -9424,7 +9440,10 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id).unwrap(), layout.as_ref());
+            let snapshot = snapshot_txn_row(
+                final_txn.pin_read_guard(&block_id).unwrap(),
+                layout.as_ref(),
+            );
             assert_eq!(snapshot.int_val, 42);
             assert_eq!(snapshot.str_val, "final");
         }
@@ -9626,7 +9645,8 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id).unwrap(), layout.as_ref());
+        let snapshot =
+            snapshot_txn_row(t_final.pin_read_guard(&block_id).unwrap(), layout.as_ref());
         assert_eq!(snapshot.int_val, num_of_txns);
     }
 
@@ -12131,7 +12151,9 @@ impl LogRecord {
 
             // Append operations: freshly appended pages may not have reliable header LSN
             // Bypass LSN gate to ensure undo/deallocation happens for unfinished txns
-            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => return Ok(true),
+            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => {
+                return Ok(true)
+            }
 
             // All other operations use standard LSN-based gating
             _ => {}

@@ -118,31 +118,43 @@ fn new_tx(rt: &ConcurrencyRuntime) -> Arc<Transaction> {
 
 fn run_select_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std::error::Error>> {
     let txn = new_tx(rt);
-    let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE);
-    scan.move_to_start();
-    while scan.next().is_some() {
-        if scan.get_int("id")? == id as i32 {
-            let _ = scan.get_int("age")?;
-            break;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE);
+        scan.move_to_start();
+        while scan.next().is_some() {
+            if scan.get_int("id")? == id as i32 {
+                let _ = scan.get_int("age")?;
+                break;
+            }
         }
+        txn.commit()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = txn.rollback();
     }
-    txn.commit()?;
-    Ok(())
+    result
 }
 
 fn run_update_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std::error::Error>> {
     let txn = new_tx(rt);
-    let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE);
-    scan.move_to_start();
-    while scan.next().is_some() {
-        if scan.get_int("id")? == id as i32 {
-            let age = scan.get_int("age")?;
-            scan.set_int("age", age + 1)?;
-            break;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE);
+        scan.move_to_start();
+        while scan.next().is_some() {
+            if scan.get_int("id")? == id as i32 {
+                let age = scan.get_int("age")?;
+                scan.set_int("age", age + 1)?;
+                break;
+            }
         }
+        txn.commit()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = txn.rollback();
     }
-    txn.commit()?;
-    Ok(())
+    result
 }
 
 fn run_with_retry(
@@ -155,9 +167,7 @@ fn run_with_retry(
         attempts += 1;
         match op(rt) {
             Ok(()) => {
-                if attempts > 1 {
-                    stats.retries += (attempts - 1) as u64;
-                }
+                stats.retries = (attempts.saturating_sub(1)) as u64;
                 return stats;
             }
             Err(err) => {
@@ -168,9 +178,9 @@ fn run_with_retry(
                     stats.errors += 1;
                 }
                 if is_timeout && attempts < CONC_MAX_RETRIES {
-                    stats.retries += 1;
                     continue;
                 }
+                stats.retries = (attempts.saturating_sub(1)) as u64;
                 return stats;
             }
         }

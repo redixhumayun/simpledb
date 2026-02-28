@@ -1065,7 +1065,9 @@ mod btree_index_tests {
         }
 
         // Meta state should match committed baseline.
-        let guard = verify_tx.pin_read_guard(&BlockId::new(index_file_name, 0)).unwrap();
+        let guard = verify_tx
+            .pin_read_guard(&BlockId::new(index_file_name, 0))
+            .unwrap();
         let meta = BTreeMetaPageView::new(guard).unwrap();
         assert_eq!(meta.root_block(), committed_root_block);
         assert_eq!(meta.tree_height(), committed_tree_height);
@@ -1123,7 +1125,9 @@ mod btree_index_tests {
         }
 
         // Meta should match committed baseline.
-        let meta_guard = t3.pin_read_guard(&BlockId::new(index_file_name.clone(), 0)).unwrap();
+        let meta_guard = t3
+            .pin_read_guard(&BlockId::new(index_file_name.clone(), 0))
+            .unwrap();
         let meta = BTreeMetaPageView::new(meta_guard).unwrap();
         assert_eq!(meta.root_block(), baseline_root_block);
         assert_eq!(meta.tree_height(), baseline_tree_height);
