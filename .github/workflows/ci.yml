@@ -79,24 +79,45 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-
 
+    - uses: bencherdev/bencher@main
+
     - name: Build (release)
       run: cargo build --release
 
-    - name: Run all benchmarks (auto-discovery)
-      run: python3 scripts/run_all_benchmarks.py 12 all_benchmarks.json
+    - name: Run benchmarks (push to master)
+      if: github.event_name == 'push'
+      run: |
+        for bench in buffer_pool io_patterns simple_bench; do
+          bencher run \
+            --project simpledb \
+            --token "${{ secrets.BENCHER_API_TOKEN }}" \
+            --branch "${{ github.ref_name }}" \
+            --testbed self-hosted \
+            --adapter rust_criterion \
+            --threshold-measure latency \
+            --threshold-test t-test \
+            --threshold-upper-boundary 0.95 \
+            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --noplot"
+        done
 
-    - name: Store benchmark results
-      uses: benchmark-action/github-action-benchmark@v1
-      with:
-        name: SimpleDB Benchmarks
-        tool: 'customSmallerIsBetter'
-        output-file-path: all_benchmarks.json
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        alert-threshold: '105%'
-        comment-on-alert: true
-        fail-on-alert: false
-        alert-comment-cc-users: '@${{ github.actor }}'
+    - name: Run benchmarks (PR)
+      if: github.event_name == 'pull_request'
+      run: |
+        for bench in buffer_pool io_patterns simple_bench; do
+          bencher run \
+            --project simpledb \
+            --token "${{ secrets.BENCHER_API_TOKEN }}" \
+            --branch "${{ github.head_ref }}" \
+            --start-point "${{ github.base_ref }}" \
+            --start-point-hash "${{ github.event.pull_request.base.sha }}" \
+            --start-point-clone-thresholds \
+            --start-point-reset \
+            --testbed self-hosted \
+            --adapter rust_criterion \
+            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --noplot"
+        done
 
     - name: Upload Criterion reports
       uses: actions/upload-artifact@v4
