@@ -93,12 +93,12 @@ jobs:
             --token "${{ secrets.BENCHER_API_TOKEN }}" \
             --branch "${{ github.ref_name }}" \
             --testbed self-hosted \
-            --adapter rust_bench \
+            --adapter rust_criterion \
             --threshold-measure latency \
             --threshold-test t-test \
             --threshold-upper-boundary 0.95 \
             --github-actions "${{ secrets.GITHUB_TOKEN }}" \
-            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --output-format bencher --noplot"
+            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --noplot"
         done
 
     - name: Run benchmarks (PR)
@@ -114,9 +114,9 @@ jobs:
             --start-point-clone-thresholds \
             --start-point-reset \
             --testbed self-hosted \
-            --adapter rust_bench \
+            --adapter rust_criterion \
             --github-actions "${{ secrets.GITHUB_TOKEN }}" \
-            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --output-format bencher --noplot"
+            "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --noplot"
         done
 
     - name: Upload Criterion reports

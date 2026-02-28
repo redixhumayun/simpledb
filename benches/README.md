@@ -109,26 +109,6 @@ Buffer manager microbenchmarks across 5 phases:
 - **Phase 5:** Concurrent access, hotset contention, starvation  
   _Case tokens:_ `pin:t2`, `pin:t4`, `pin:t8`, `pin:t16`, `hotset:t4_k4`, `hotset:t8_k4`, `hotset:t16_k4`
 
-## JSON Output for CI
-
-Both benchmarks support Criterion bencher output for machine-readable capture:
-
-```bash
-cargo bench --bench buffer_pool -- --output-format bencher --noplot
-# Output: test <name> ... bench: <ns> ns/iter (+/- <dev>)
-```
-
-**Important:** If you pass a filter token, only matching benchmarks run.
-
-**Why?** CI needs stable text output that can be parsed into JSON artifacts for trend tracking.
-
-```bash
-# All benchmarks:
-cargo bench --bench buffer_pool -- --output-format bencher --noplot
-# Filtered run:
-cargo bench --bench buffer_pool -- --output-format bencher --noplot "Random"
-```
-
 ## Direct I/O Regime Matrix
 
 Use `scripts/run_regime_matrix.py` to run buffered vs direct-io across three regimes and
@@ -214,6 +194,6 @@ Charts are written to:
 **How it works:**
 1. On push to master: benchmarks run and results are stored with a t-test threshold (95% confidence)
 2. On PRs: results are compared against the master baseline; regressions posted as PR comments
-3. Uses [Bencher](https://bencher.dev) with `rust_bench` adapter parsing `--output-format bencher` output
+3. Uses [Bencher](https://bencher.dev) with `rust_criterion` adapter parsing Criterion's native output
 
 **View trends:** https://bencher.dev/perf/simpledb
