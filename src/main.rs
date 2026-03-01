@@ -18,7 +18,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize},
         Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
@@ -1005,7 +1005,8 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 10)?;
         drop(table_scan);
 
@@ -1044,7 +1045,8 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 100)?;
         drop(table_scan);
 
@@ -1084,7 +1086,8 @@ mod chunk_scan_tests {
 
         // Insert test records; 300 ensures multiple 4KB blocks
         {
-            let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
+            let mut table_scan =
+                TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
             insert_test_records(&mut table_scan, 300)?;
         }
 
@@ -1146,7 +1149,8 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table").unwrap();
         insert_test_records(&mut table_scan, 5)?;
         drop(table_scan);
 
@@ -4920,11 +4924,9 @@ impl TablePlan {
 
 impl Plan for TablePlan {
     fn open(&self) -> Box<dyn UpdateScan> {
-        Box::new(TableScan::new(
-            Arc::clone(&self.txn),
-            self.layout.clone(),
-            &self.table_name,
-        ).unwrap())
+        Box::new(
+            TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name).unwrap(),
+        )
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -7057,6 +7059,14 @@ impl MetadataManager {
         self.stat_manager.get_stat_info(table_name, layout, txn)
     }
 
+    pub fn get_table_id(
+        &self,
+        table_name: &str,
+        txn: Arc<Transaction>,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.table_manager.get_table_id(table_name, txn)
+    }
+
     pub fn get_table_names(&self, txn: &Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
         self.table_manager.get_table_names(Arc::clone(txn))
     }
@@ -7118,7 +7128,8 @@ mod metadata_manager_tests {
 
         // Part 2: Statistics Metadata
         {
-            let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name).unwrap();
+            let mut table_scan =
+                TableScan::new(Arc::clone(&tx), layout.clone(), table_name).unwrap();
             for _ in 0..50 {
                 let n = (generate_random_number() % 50) + 1;
                 table_scan
@@ -7189,7 +7200,8 @@ mod metadata_manager_tests {
 
         let layout = mdm.get_layout(table_name, Arc::clone(&setup_txn));
         {
-            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name).unwrap();
+            let mut table_scan =
+                TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name).unwrap();
             for i in 0..20 {
                 table_scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
@@ -7275,7 +7287,8 @@ impl IndexManager {
         field_name: &str,
         txn: Arc<Transaction>,
     ) {
-        let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME).unwrap();
+        let mut table_scan =
+            TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME).unwrap();
         table_scan
             .insert_values(&[
                 Constant::String(index_name.to_string()),
@@ -7295,7 +7308,8 @@ impl IndexManager {
             Arc::clone(&txn),
             self.layout.clone(),
             Self::INDEX_CAT_TBL_NAME,
-        ).unwrap();
+        )
+        .unwrap();
         while table_scan.next().is_some() {
             if table_scan.get_string(Self::TABLE_COL_NAME).unwrap() == table_name {
                 let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
@@ -7453,7 +7467,8 @@ impl Index for HashIndex {
         let hash = hasher.finish() as usize;
         let bucket = hash % Self::NUM_BUCKETS;
         let table_name = format!("{}_{}", self.index_name, bucket);
-        let table_scan = TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name).unwrap();
+        let table_scan =
+            TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name).unwrap();
         self.table_scan = Some(table_scan);
     }
 
@@ -7580,7 +7595,8 @@ impl StatManager {
             Arc::clone(&txn),
             table_catalog_layout,
             TableManager::TABLE_CAT_TABLE_NAME,
-        ).unwrap();
+        )
+        .unwrap();
         while table_scan.next().is_some() {
             let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
@@ -7683,6 +7699,7 @@ impl ViewManager {
 struct TableManager {
     table_catalog_layout: Layout,
     field_catalog_layout: Layout,
+    next_table_id: AtomicI32,
 }
 
 impl TableManager {
@@ -7693,6 +7710,7 @@ impl TableManager {
     // Table catalog columns
     const TABLE_NAME_COL: &str = "table_name";
     const SLOT_SIZE_COL: &str = "slot_size";
+    const TABLE_ID_COL: &str = "table_id";
 
     // Field catalog columns
     const FIELD_NAME_COL: &str = "field_name";
@@ -7705,6 +7723,7 @@ impl TableManager {
         let mut table_cat_schema = Schema::new();
         table_cat_schema.add_string_field(Self::TABLE_NAME_COL, Self::MAX_NAME_LENGTH);
         table_cat_schema.add_int_field(Self::SLOT_SIZE_COL);
+        table_cat_schema.add_int_field(Self::TABLE_ID_COL);
         let table_cat_layout = Layout::new(table_cat_schema.clone());
 
         //  Create the field catalog layout
@@ -7716,9 +7735,32 @@ impl TableManager {
         field_cat_schema.add_int_field(Self::FIELD_OFFSET_COL);
         let field_cat_layout = Layout::new(field_cat_schema.clone());
 
+        // Seed the next_table_id counter. On a fresh database start from 0; on an existing
+        // database scan the catalog to find the current maximum and resume from there.
+        let next_id = if is_new {
+            0
+        } else {
+            let mut scan = TableScan::new(
+                Arc::clone(&tx),
+                table_cat_layout.clone(),
+                Self::TABLE_CAT_TABLE_NAME,
+            )
+            .unwrap();
+            let mut max_id = -1i32;
+            while let Some(result) = scan.next() {
+                result.expect("failed to scan table catalog for max table_id");
+                let id = scan.get_int(Self::TABLE_ID_COL).unwrap_or(-1);
+                if id > max_id {
+                    max_id = id;
+                }
+            }
+            max_id + 1
+        };
+
         let table_mgr = Self {
             table_catalog_layout: table_cat_layout,
             field_catalog_layout: field_cat_layout,
+            next_table_id: AtomicI32::new(next_id),
         };
 
         if is_new {
@@ -7737,19 +7779,24 @@ impl TableManager {
     /// This method will accept a [`Schema`] for a table that is being created as part of a txn and
     /// create the relevant metadata in the catalog tables
     fn create_table(&self, table_name: &str, schema: &Schema, tx: Arc<Transaction>) {
+        let table_id = self
+            .next_table_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let layout = Layout::new(schema.clone());
 
-        //  insert the record for the table name and slot size
+        //  insert the record for the table name, slot size, and table_id
         {
             let mut table_scan = TableScan::new(
                 Arc::clone(&tx),
                 self.table_catalog_layout.clone(),
                 Self::TABLE_CAT_TABLE_NAME,
-            ).unwrap();
+            )
+            .unwrap();
             table_scan
                 .insert_values(&[
                     Constant::String(table_name.to_string()),
                     Constant::Int(layout.max_encoded_size() as i32),
+                    Constant::Int(table_id),
                 ])
                 .unwrap();
         }
@@ -7760,7 +7807,8 @@ impl TableManager {
                 tx,
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            ).unwrap();
+            )
+            .unwrap();
             for field in &schema.fields {
                 let field_info = schema.info.get(field).unwrap();
                 table_scan
@@ -7800,7 +7848,8 @@ impl TableManager {
                 Arc::clone(&tx),
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            ).unwrap();
+            )
+            .unwrap();
             let mut schema = Schema::new();
             while let Some(result) = table_scan.next() {
                 result.expect("failed to advance table scan in get_layout");
@@ -7818,13 +7867,32 @@ impl TableManager {
         Layout::new(schema)
     }
 
+    /// Return the persistent integer id for a table, or an error if not found
+    fn get_table_id(&self, table_name: &str, tx: Arc<Transaction>) -> Result<u32, Box<dyn Error>> {
+        let mut table_scan = TableScan::new(
+            tx,
+            self.table_catalog_layout.clone(),
+            Self::TABLE_CAT_TABLE_NAME,
+        )?;
+        while let Some(result) = table_scan.next() {
+            result?;
+            let scanned_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
+            if scanned_name == table_name {
+                let id = table_scan.get_int(Self::TABLE_ID_COL)? as u32;
+                return Ok(id);
+            }
+        }
+        Err(format!("table '{}' not found in catalog", table_name).into())
+    }
+
     /// Return a list of all table names in the database
     fn get_table_names(&self, tx: Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
         let mut table_scan = TableScan::new(
             tx,
             self.table_catalog_layout.clone(),
             Self::TABLE_CAT_TABLE_NAME,
-        ).unwrap();
+        )
+        .unwrap();
         let mut tables = Vec::new();
         while let Some(result) = table_scan.next() {
             result?;

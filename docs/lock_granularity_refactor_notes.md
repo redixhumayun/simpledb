@@ -24,6 +24,20 @@ Required first step:
 
 This is a prerequisite for evaluating deadlock-prevention policy and lock-granularity performance. Without it, benchmark results are dominated by panic behavior, not concurrency-control behavior.
 
+## Prerequisite: Stable Table Identifier for Lock Keys
+
+To implement table/row logical locks cleanly, we need a stable `table_id` in metadata.
+
+Required step:
+1. Add `table_id` to `table_catalog`.
+2. Assign/persist it on table creation.
+3. Expose metadata lookup from table name -> `table_id`.
+4. Thread `table_id` into lock-target construction (`Table{table_id}`, `Row{table_id, rid}`).
+
+Decision for this refactor:
+1. No backward-compatibility path for old catalogs.
+2. Dev/test databases can be recreated.
+
 ## Target Direction
 
 Separate concerns:
