@@ -7826,22 +7826,6 @@ impl TableManager {
 
     /// Return the physical [`Layout`] for a specific table defined in the table catalog metadata
     fn get_layout(&self, table_name: &str, tx: Arc<Transaction>) -> Layout {
-        //  Get the slot size of the table
-        // let slot_size = {
-        //     let mut table_scan = TableScan::new(
-        //         Arc::clone(&tx),
-        //         self.table_catalog_layout.clone(),
-        //         Self::TABLE_CAT_TABLE_NAME,
-        //     ).unwrap();
-        //     let mut slot_size = None;
-        //     while let Some(_) = table_scan.next() {
-        //         if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
-        //             slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
-        //         }
-        //     }
-        //     slot_size
-        // };
-
         //  Construct the schema from the table so the layout can be created
         let schema = {
             let mut table_scan = TableScan::new(
