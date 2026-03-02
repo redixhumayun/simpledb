@@ -9357,7 +9357,7 @@ mod transaction_tests {
     use crate::{
         page::{PageReadGuard, PageWriteGuard},
         test_utils::{generate_filename, generate_random_number, TestDir},
-        BlockId, BufferHandle, Constant, Layout, Schema, SimpleDB, Transaction,
+        BlockId, BufferHandle, Constant, Layout, LockError, Schema, SimpleDB, Transaction,
     };
 
     const TXN_INT_FIELD: &str = "txn_int";
@@ -9767,12 +9767,12 @@ mod transaction_tests {
                     })() {
                         Ok(_) => break, // Success, exit loop
                         Err(e) => {
-                            // If lock timeout, retry
-                            if e.to_string().contains("Timeout") {
+                            // If lock error (timeout or wait-die abort), retry
+                            if e.downcast_ref::<LockError>().is_some() {
                                 retry_count += 1;
                                 txn.rollback().unwrap();
                                 tx.send(format!(
-                                    "Transaction {} retrying after timeout",
+                                    "Transaction {} retrying after lock error: {e}",
                                     txn.tx_id
                                 ))
                                 .unwrap();
@@ -9993,6 +9993,26 @@ mod transaction_tests {
 }
 
 #[derive(Debug)]
+pub enum LockError {
+    Timeout,
+    WaitDieAbort,
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Timeout => write!(f, "Lock timeout"),
+            LockError::WaitDieAbort => write!(
+                f,
+                "Transaction aborted by wait-die: younger transaction cannot wait on older holder"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+#[derive(Debug)]
 struct LockState {
     holders: HashMap<TransactionID, LockMode>,
     upgrade_requests: VecDeque<TransactionID>,
@@ -10055,6 +10075,20 @@ impl LockTable {
                 if !other_incompatible && front_is_us {
                     break;
                 }
+                if other_incompatible && !front_is_us {
+                    // Wait-die on upgrade: die if any incompatible other holder is older
+                    let must_die = state.holders.iter().any(|(&id, &h)| {
+                        id != tx_id && !LockMode::compatible(h, target_mode) && id < tx_id
+                    });
+                    if must_die {
+                        guard
+                            .get_mut(&target)
+                            .unwrap()
+                            .upgrade_requests
+                            .retain(|&id| id != tx_id);
+                        return Err(Box::new(LockError::WaitDieAbort));
+                    }
+                }
                 let timeout = deadline.saturating_duration_since(Instant::now());
                 if timeout.is_zero() {
                     guard
@@ -10062,7 +10096,7 @@ impl LockTable {
                         .unwrap()
                         .upgrade_requests
                         .retain(|&id| id != tx_id);
-                    return Err("Timeout while waiting for lock upgrade".into());
+                    return Err(Box::new(LockError::Timeout));
                 }
                 let (g, result) = self.cond_var.wait_timeout(guard, timeout).unwrap();
                 guard = g;
@@ -10072,7 +10106,7 @@ impl LockTable {
                         .unwrap()
                         .upgrade_requests
                         .retain(|&id| id != tx_id);
-                    return Err("Timeout while waiting for lock upgrade".into());
+                    return Err(Box::new(LockError::Timeout));
                 }
             }
             guard.get_mut(&target).unwrap().upgrade_requests.pop_front();
@@ -10096,14 +10130,21 @@ impl LockTable {
             if !blocked {
                 break;
             }
+            // Wait-die: if any incompatible holder is older (lower tx_id), die immediately
+            let must_die = state.holders.iter().any(|(&holder_id, &held)| {
+                holder_id != tx_id && !LockMode::compatible(held, mode) && holder_id < tx_id
+            });
+            if must_die {
+                return Err(Box::new(LockError::WaitDieAbort));
+            }
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
-                return Err("Timeout while waiting for lock".into());
+                return Err(Box::new(LockError::Timeout));
             }
             let (g, result) = self.cond_var.wait_timeout(guard, timeout).unwrap();
             guard = g;
             if result.timed_out() {
-                return Err("Timeout while waiting for lock".into());
+                return Err(Box::new(LockError::Timeout));
             }
         }
         guard.get_mut(&target).unwrap().holders.insert(tx_id, mode);
