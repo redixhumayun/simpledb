@@ -27,6 +27,7 @@
 
 ### BTree
 1. [Support range scans for BTree](https://github.com/redixhumayun/simpledb/issues/11) - Enable efficient range queries
+2. [B-tree concurrency: logical locks and latch crabbing](https://github.com/redixhumayun/simpledb/issues/83) - Add table-S/X logical locks at index entry points and latch crabbing for traversal to give index operations correct 2PL protection
 
 ### Query Engine & CLI
 1. [Add EXPLAIN command for query plan visualization](https://github.com/redixhumayun/simpledb/issues/19) - Show query execution plans for educational insight
