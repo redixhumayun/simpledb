@@ -763,6 +763,33 @@ mod btree_index_tests {
     }
 
     #[test]
+    fn test_before_first_on_height_two_tree() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let mut index = setup_index(&db);
+
+        let mut next_key = 0_i32;
+        let cap = 200_000_i32;
+        while index.tree_height < 2 && next_key < cap {
+            index.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
+            next_key += 1;
+        }
+        assert!(
+            index.tree_height >= 2,
+            "failed to grow index to height >= 2 within cap={cap}, reached height={}",
+            index.tree_height
+        );
+
+        let lookup_key = next_key / 2;
+        index.before_first(&Constant::Int(lookup_key));
+        assert!(index.next(), "expected to find key {lookup_key}");
+        assert_eq!(
+            index.get_data_rid(),
+            RID::new(1, lookup_key as usize),
+            "lookup should land on the matching RID for key {lookup_key}"
+        );
+    }
+
+    #[test]
     fn test_range_iterator_across_siblings() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
@@ -1274,15 +1301,16 @@ impl BTreeInternal {
     /// It will loop until it finds the terminal internal node and then return the block
     /// number of the leaf node that contains the key
     fn search(&mut self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
-        let mut child_block = self.find_child_block(search_key)?;
-        let mut guard = self.txn.pin_read_guard(&self.block_id)?;
-        let mut view = guard.into_btree_internal_page_view(&self.layout)?;
-        while view.btree_level() != 0 {
-            child_block = self.find_child_block(search_key)?;
-            guard = self.txn.pin_read_guard(&child_block)?;
-            view = guard.into_btree_internal_page_view(&self.layout)?;
+        let mut current_block = self.block_id.clone();
+        loop {
+            let guard = self.txn.pin_read_guard(&current_block)?;
+            let view = guard.into_btree_internal_page_view(&self.layout)?;
+            let child_block = self.find_child_block_in(&view, &current_block, search_key)?;
+            if view.btree_level() == 0 {
+                return Ok(child_block.block_num);
+            }
+            current_block = child_block;
         }
-        Ok(child_block.block_num)
     }
 
     /// Create a new root above current root after a split.
@@ -1380,6 +1408,15 @@ impl BTreeInternal {
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
         let guard = self.txn.pin_read_guard(&self.block_id)?;
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
+        self.find_child_block_in(&view, &self.block_id, search_key)
+    }
+
+    fn find_child_block_in(
+        &self,
+        view: &BTreeInternalPageView<'_>,
+        current_block: &BlockId,
+        search_key: &Constant,
+    ) -> Result<BlockId, Box<dyn Error>> {
         let mut left = 0;
         let mut right = view.slot_count();
         while left < right {
@@ -1393,12 +1430,12 @@ impl BTreeInternal {
         }
         if left < view.slot_count() {
             let block_num = view.get_entry(left)?.child_block;
-            Ok(BlockId::new(self.file_name.clone(), block_num))
+            Ok(BlockId::new(current_block.filename.clone(), block_num))
         } else {
             let block_num = view
                 .rightmost_child_block()
                 .ok_or("missing rightmost child")?;
-            Ok(BlockId::new(self.file_name.clone(), block_num))
+            Ok(BlockId::new(current_block.filename.clone(), block_num))
         }
     }
 }
