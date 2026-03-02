@@ -2037,11 +2037,7 @@ impl SortPlan {
         }
     }
 
-    fn copy<Source, Dest>(
-        &self,
-        source: &Source,
-        destination: &mut Dest,
-    ) -> SimpleDBResult<()>
+    fn copy<Source, Dest>(&self, source: &Source, destination: &mut Dest) -> SimpleDBResult<()>
     where
         Source: Scan,
         Dest: UpdateScan,
@@ -10361,12 +10357,7 @@ impl ConcurrencyManager {
         Ok(())
     }
 
-    fn acquire_row(
-        &self,
-        table_id: u32,
-        rid: RID,
-        mode: RowLockMode,
-    ) -> SimpleDBResult<()> {
+    fn acquire_row(&self, table_id: u32, rid: RID, mode: RowLockMode) -> SimpleDBResult<()> {
         let block = rid.block_num as u32;
         let slot = rid.slot as u32;
         self.lock_table.acquire(

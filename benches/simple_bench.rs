@@ -125,7 +125,8 @@ fn new_tx(rt: &ConcurrencyRuntime) -> Arc<Transaction> {
 fn run_select_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std::error::Error>> {
     let txn = new_tx(rt);
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
+        let mut scan =
+            TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
         scan.move_to_start();
         while scan.next().is_some() {
             if scan.get_int("id")? == id as i32 {
@@ -145,7 +146,8 @@ fn run_select_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std
 fn run_update_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std::error::Error>> {
     let txn = new_tx(rt);
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut scan = TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
+        let mut scan =
+            TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
         scan.move_to_start();
         while scan.next().is_some() {
             if scan.get_int("id")? == id as i32 {

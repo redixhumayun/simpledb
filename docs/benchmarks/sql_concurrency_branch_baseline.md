@@ -2,8 +2,8 @@
 
 Branch-local baseline for before/after lock-granularity changes.
 
-- Commit: `22620aa`
-- Captured: `2026-03-01 00:13:36 UTC`
+- Commit: `3a1c0d5`
+- Captured: `2026-03-02 01:13:32 UTC`
 - Benchmark binary: `target/release/deps/simple_bench-c756f2129f3691a9`
 - Flags: `--bench --noplot --sample-size 10 --warm-up-time 0.5 --measurement-time 1`
 
@@ -26,21 +26,21 @@ $BIN --bench --noplot --sample-size 10 --warm-up-time 0.5 --measurement-time 1 \
 
 ### Concurrent SELECT same-page disjoint-id
 
-- time: `[840.04 ms, 849.79 ms, 859.13 ms]`
-- throughput: `[111.74, 112.97, 114.28] elem/s`
+- time: `[834.44 ms, 847.82 ms, 862.97 ms]`
+- throughput: `[111.24, 113.23, 115.05] elem/s`
 - counters observed: `retries=0 timeouts=0 errors=0`
 
 ### Concurrent UPDATE same-page disjoint-id
 
-- time: `[78.361 s, 78.590 s, 78.783 s]`
-- throughput: `[1.2185, 1.2215, 1.2251] elem/s`
-- counters observed per iteration: around `retries=192 timeouts=288 errors=0`
+- time: `[1.7297 s, 1.7517 s, 1.7791 s]`
+- throughput: `[53.960, 54.803, 55.502] elem/s`
+- counters observed: `retries=0 timeouts=0 errors=0`
 
 ### Concurrent mixed 80/20 RW same-page disjoint-id
 
-- pilot counters observed: around `retries=32-33 timeouts=47-48 errors=0` (iters=1)
-- Criterion estimate for this config: about `137.14 s` for 10 samples
-- Full analyzed interval not captured in this snapshot (run intentionally stopped early)
+- time: `[1.0285 s, 1.0379 s, 1.0466 s]`
+- throughput: `[91.722, 92.493, 93.344] elem/s`
+- counters observed: `retries=0 timeouts=0 errors=0`
 
 ## Notes
 
