@@ -10015,6 +10015,9 @@ impl LockTable {
         }
     }
 
+    /// Block until `mode` on `target` is compatible with all current holders, then grant it.
+    /// If the tx already holds a weaker mode, upgrades atomically via the upgrade queue.
+    /// Returns `Err` on timeout; cleans up upgrade_requests before returning.
     fn acquire(
         &self,
         tx_id: TransactionID,
@@ -10038,10 +10041,13 @@ impl LockTable {
             let deadline = Instant::now() + Duration::from_millis(self.timeout);
             loop {
                 let state = guard.get(&target).unwrap();
+                // other_incompatible: another holder blocks the upgraded mode
                 let other_incompatible = state
                     .holders
                     .iter()
                     .any(|(&id, &h)| id != tx_id && !LockMode::compatible(h, target_mode));
+                // front_is_us: serialise concurrent upgraders; only the front of the
+                // queue may proceed to avoid two upgraders deadlocking each other
                 let front_is_us = state
                     .upgrade_requests
                     .front()
@@ -10104,6 +10110,7 @@ impl LockTable {
         Ok(())
     }
 
+    /// Remove `tx_id` from holders and upgrade_requests for `target`, then wake waiters.
     fn release(&self, tx_id: TransactionID, target: &LockTarget) -> SimpleDBResult<()> {
         let mut guard = self.lock_table.lock().unwrap();
         if let Some(state) = guard.get_mut(target) {
@@ -10350,6 +10357,7 @@ impl ConcurrencyManager {
         }
     }
 
+    /// Acquire a table-level lock and track it locally for release at commit/rollback.
     fn acquire_table(&self, table_id: u32, mode: TableLockMode) -> SimpleDBResult<()> {
         self.lock_table
             .acquire(self.tx_id, LockTarget::Table { table_id }, mode.into())?;
@@ -10357,6 +10365,8 @@ impl ConcurrencyManager {
         Ok(())
     }
 
+    /// Acquire a row-level lock and track it locally for release at commit/rollback.
+    /// Callers must acquire the appropriate intent lock on the table first.
     fn acquire_row(&self, table_id: u32, rid: RID, mode: RowLockMode) -> SimpleDBResult<()> {
         let block = rid.block_num as u32;
         let slot = rid.slot as u32;
