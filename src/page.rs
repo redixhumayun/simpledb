@@ -2666,9 +2666,9 @@ impl WalPage {
 /// Holds a buffer handle, frame reference, and read lock on the page data.
 /// Automatically unpins when dropped.
 pub struct PageReadGuard<'a> {
-    handle: BufferHandle,
-    frame: Arc<BufferFrame>,
     page: RwLockReadGuard<'a, PageBytes>,
+    frame: Arc<BufferFrame>,
+    handle: BufferHandle,
 }
 
 impl<'a> PageReadGuard<'a> {
