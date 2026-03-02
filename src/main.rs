@@ -10,7 +10,7 @@ use std::{
     any::Any,
     cell::{Cell, RefCell},
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
@@ -18,7 +18,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize},
         Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant},
@@ -179,6 +179,10 @@ impl SimpleDB {
 
     pub fn metadata_manager(&self) -> Arc<MetadataManager> {
         Arc::clone(&self.metadata_manager)
+    }
+
+    pub fn lock_table(&self) -> Arc<LockTable> {
+        Arc::clone(&self.lock_table)
     }
 }
 
@@ -521,7 +525,7 @@ impl<S1> Scan for MultiBufferProductScan<S1>
 where
     S1: Scan + Clone,
 {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.next_start_block_num = 0;
         self.load_next_set_of_chunks();
         Ok(())
@@ -548,23 +552,23 @@ impl<S1> UpdateScan for MultiBufferProductScan<S1>
 where
     S1: UpdateScan + Clone + 'static,
 {
-    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
@@ -572,7 +576,7 @@ where
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         unimplemented!()
     }
 }
@@ -606,7 +610,7 @@ mod multi_buffer_product_scan_tests {
         emp_size: usize,
         dept_scan: &mut TableScan,
         dept_size: usize,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> SimpleDBResult<()> {
         // Insert employee records
         for i in 0..emp_size {
             emp_scan
@@ -625,20 +629,21 @@ mod multi_buffer_product_scan_tests {
     }
 
     #[test]
-    fn test_multi_buffer_product_basic() -> Result<(), Box<dyn Error>> {
+    fn test_multi_buffer_product_basic() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+        let mut dept_scan =
+            TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept", 2).unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
         let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
         // Count total combinations (should be 500 * 3000 = 1,500,000)
@@ -656,13 +661,13 @@ mod multi_buffer_product_scan_tests {
     }
 
     #[test]
-    fn test_multi_buffer_product_empty_tables() -> Result<(), Box<dyn Error>> {
+    fn test_multi_buffer_product_empty_tables() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Create empty scans
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
         let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
         let mut count = 0;
@@ -676,20 +681,21 @@ mod multi_buffer_product_scan_tests {
     }
 
     #[test]
-    fn test_multi_buffer_product_field_access() -> Result<(), Box<dyn Error>> {
+    fn test_multi_buffer_product_field_access() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+        let mut dept_scan =
+            TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept", 2).unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
         let mut mbp_scan =
             MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
@@ -711,20 +717,21 @@ mod multi_buffer_product_scan_tests {
     }
 
     #[test]
-    fn test_multi_buffer_product_before_first() -> Result<(), Box<dyn Error>> {
+    fn test_multi_buffer_product_before_first() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp");
-        let mut dept_scan = TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept");
+        let mut emp_scan = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+        let mut dept_scan =
+            TableScan::new(Arc::clone(&txn), dept_layout.clone(), "dept", 2).unwrap();
         insert_test_records(&mut emp_scan, 5, &mut dept_scan, 30)?;
         drop(emp_scan);
         drop(dept_scan);
 
         // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp");
+        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
         let mut mbp_scan =
             MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
 
@@ -815,7 +822,8 @@ impl ChunkScan {
         if file_size > 0 && first_block_num < file_size {
             for block_num in first_block_num..=actual_last_block {
                 let block_id = BlockId::new(file_name.to_string(), block_num);
-                let record_page = RecordPage::new(Arc::clone(&txn), block_id, layout.clone());
+                let record_page =
+                    RecordPage::new(Arc::clone(&txn), block_id, layout.clone(), u32::MAX);
                 buffer_list.push(record_page);
             }
         }
@@ -837,27 +845,28 @@ impl ChunkScan {
         };
 
         if has_blocks {
-            scan.move_to_block(first_block_num);
+            scan.move_to_block(first_block_num).unwrap();
         }
         scan
     }
 
-    pub fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) -> SimpleDBResult<()> {
         let offset = block_num - self.first_block_num;
         debug!(
             "Moving chunk scan to block {} which is offset {}",
             block_num, offset
         );
         let block_id = self.buffer_list[offset].block_id.clone();
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id)?, 0).unwrap();
         self.current_record_page = Some(offset);
         self.heap_iter = Some(iter);
         self.current_slot = None;
+        Ok(())
     }
 }
 impl Scan for ChunkScan {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
-        self.move_to_block(self.first_block_num);
+    fn before_first(&mut self) -> SimpleDBResult<()> {
+        self.move_to_block(self.first_block_num)?;
         Ok(())
     }
 
@@ -868,15 +877,14 @@ impl Scan for ChunkScan {
                 self.table_name
             )
         })?];
-        Ok(self
-            .current_slot
-            .ok_or_else(|| {
-                format!(
-                    "No current slot set in ChunkScan when calling get_int for {}",
-                    self.table_name
-                )
-            })
-            .map(|slot| record_page.get_int(slot, field_name))?)
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set in ChunkScan when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        record_page.get_int(slot, field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
@@ -886,15 +894,14 @@ impl Scan for ChunkScan {
                 self.table_name
             )
         })?];
-        Ok(self
-            .current_slot
-            .ok_or_else(|| {
-                format!(
-                    "No current slot set in ChunkScan when calling get_string for {}",
-                    self.table_name
-                )
-            })
-            .map(|slot| record_page.get_string(slot, field_name))?)
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set in ChunkScan when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        record_page.get_string(slot, field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -930,7 +937,9 @@ impl Iterator for ChunkScan {
             // Advance to next page in the chunk, if any
             let idx = self.current_record_page?;
             if idx + 1 < self.buffer_list.len() {
-                self.move_to_block(self.first_block_num + idx + 1);
+                if let Err(e) = self.move_to_block(self.first_block_num + idx + 1) {
+                    return Some(Err(e));
+                }
             } else {
                 return None;
             }
@@ -939,23 +948,23 @@ impl Iterator for ChunkScan {
 }
 
 impl UpdateScan for ChunkScan {
-    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
@@ -963,7 +972,7 @@ impl UpdateScan for ChunkScan {
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         unimplemented!()
     }
 }
@@ -983,7 +992,7 @@ mod chunk_scan_tests {
         layout
     }
 
-    fn insert_test_records(table_scan: &mut TableScan, count: usize) -> Result<(), Box<dyn Error>> {
+    fn insert_test_records(table_scan: &mut TableScan, count: usize) -> SimpleDBResult<()> {
         for i in 0..count {
             table_scan.insert_values(&[
                 Constant::Int(i as i32),
@@ -994,13 +1003,14 @@ mod chunk_scan_tests {
     }
 
     #[test]
-    fn test_chunk_scan_basic() -> Result<(), Box<dyn Error>> {
+    fn test_chunk_scan_basic() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table", 1).unwrap();
         insert_test_records(&mut table_scan, 10)?;
         drop(table_scan);
 
@@ -1039,7 +1049,8 @@ mod chunk_scan_tests {
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert some test records using TableScan
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table", 1).unwrap();
         insert_test_records(&mut table_scan, 100)?;
         drop(table_scan);
 
@@ -1072,14 +1083,15 @@ mod chunk_scan_tests {
     }
 
     #[test]
-    fn test_chunk_scan_partial_blocks() -> Result<(), Box<dyn Error>> {
+    fn test_chunk_scan_partial_blocks() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert test records; 300 ensures multiple 4KB blocks
         {
-            let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+            let mut table_scan =
+                TableScan::new(Arc::clone(&txn), layout.clone(), "test_table", 1).unwrap();
             insert_test_records(&mut table_scan, 300)?;
         }
 
@@ -1111,14 +1123,14 @@ mod chunk_scan_tests {
     }
 
     #[test]
-    fn test_chunk_scan_empty_blocks() -> Result<(), Box<dyn Error>> {
+    fn test_chunk_scan_empty_blocks() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Create empty table
         {
-            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table", 1).unwrap();
         }
 
         // Test ChunkScan over empty blocks
@@ -1135,13 +1147,14 @@ mod chunk_scan_tests {
     }
 
     #[test]
-    fn test_chunk_scan_before_first() -> Result<(), Box<dyn Error>> {
+    fn test_chunk_scan_before_first() -> SimpleDBResult<()> {
         let (db, _test_dir) = SimpleDB::new_for_test(8, 5000);
         let txn = db.new_tx();
         let layout = create_test_table(&db, Arc::clone(&txn));
 
         // Insert test records
-        let mut table_scan = TableScan::new(Arc::clone(&txn), layout.clone(), "test_table");
+        let mut table_scan =
+            TableScan::new(Arc::clone(&txn), layout.clone(), "test_table", 1).unwrap();
         insert_test_records(&mut table_scan, 5)?;
         drop(table_scan);
 
@@ -1512,7 +1525,7 @@ impl<S> Scan for MergeJoinScan<S>
 where
     S: Scan,
 {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.scan_1.before_first()?;
         self.scan_2.before_first()?;
         Ok(())
@@ -1557,23 +1570,23 @@ impl<S> UpdateScan for MergeJoinScan<S>
 where
     S: Scan + 'static,
 {
-    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         unimplemented!()
     }
 
@@ -1581,7 +1594,7 @@ where
         unimplemented!()
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         unimplemented!()
     }
 }
@@ -2024,11 +2037,7 @@ impl SortPlan {
         }
     }
 
-    fn copy<Source, Dest>(
-        &self,
-        source: &Source,
-        destination: &mut Dest,
-    ) -> Result<(), Box<dyn Error>>
+    fn copy<Source, Dest>(&self, source: &Source, destination: &mut Dest) -> SimpleDBResult<()>
     where
         Source: Scan,
         Dest: UpdateScan,
@@ -2549,7 +2558,7 @@ impl SortScan {
         }
     }
 
-    pub fn set_current_scan(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn set_current_scan(&mut self) -> SimpleDBResult<()> {
         match self
             .record_comparator
             .compare(&self.s1, self.s2.as_ref().unwrap())
@@ -2575,7 +2584,7 @@ impl SortScan {
         }
     }
 
-    pub fn save_position(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn save_position(&mut self) -> SimpleDBResult<()> {
         let rid_1 = self.s1.get_rid()?;
         let rid_2 = self.s2.as_ref().map(|s| s.get_rid()).transpose()?;
         self.saved_rids[0] = Some(rid_1);
@@ -2583,7 +2592,7 @@ impl SortScan {
         Ok(())
     }
 
-    pub fn restore_position(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn restore_position(&mut self) -> SimpleDBResult<()> {
         let rid_1 = self.saved_rids[0]
             .ok_or_else(|| "Error getting saved RID from first scan".to_string())?;
         self.s1.move_to_row_id(rid_1);
@@ -2677,7 +2686,7 @@ impl Iterator for SortScan {
 }
 
 impl Scan for SortScan {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.current_scan = SortScanState::BeforeFirst;
         self.s1.before_first()?;
         if let Some(s2) = &mut self.s2 {
@@ -2728,23 +2737,23 @@ impl Scan for SortScan {
 }
 
 impl UpdateScan for SortScan {
-    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
         todo!()
     }
 
-    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
         todo!()
     }
 
-    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
         todo!()
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         todo!()
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         todo!()
     }
 
@@ -2752,7 +2761,7 @@ impl UpdateScan for SortScan {
         todo!()
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         todo!()
     }
 }
@@ -3111,13 +3120,14 @@ mod materialize_plan_tests {
     }
 }
 
-pub static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
+pub static TEMP_TABLE_ID_GENERATOR: AtomicUsize = AtomicUsize::new(0x8000_0000);
 
 #[derive(Clone)]
 pub struct TempTable {
     txn: Arc<Transaction>,
     table_name: String,
     layout: Layout,
+    table_id: u32,
 }
 
 impl TempTable {
@@ -3129,11 +3139,18 @@ impl TempTable {
             txn,
             table_name,
             layout,
+            table_id: table_id as u32,
         }
     }
 
     pub fn open(&self) -> TableScan {
-        TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &self.table_name)
+        TableScan::new(
+            Arc::clone(&self.txn),
+            self.layout.clone(),
+            &self.table_name,
+            self.table_id,
+        )
+        .unwrap()
     }
 }
 
@@ -4893,6 +4910,7 @@ struct TablePlan {
     txn: Arc<Transaction>,
     layout: Layout,
     stat_info: StatInfo,
+    table_id: u32,
 }
 
 impl TablePlan {
@@ -4904,22 +4922,30 @@ impl TablePlan {
         let layout = metadata_manager.get_layout(table_name, Arc::clone(&txn));
         let stat_info =
             metadata_manager.get_stat_info(table_name, layout.clone(), Arc::clone(&txn));
+        let table_id = metadata_manager
+            .get_table_id(table_name, Arc::clone(&txn))
+            .unwrap_or(u32::MAX);
         Self {
             table_name: table_name.to_string(),
             txn,
             layout,
             stat_info,
+            table_id,
         }
     }
 }
 
 impl Plan for TablePlan {
     fn open(&self) -> Box<dyn UpdateScan> {
-        Box::new(TableScan::new(
-            Arc::clone(&self.txn),
-            self.layout.clone(),
-            &self.table_name,
-        ))
+        Box::new(
+            TableScan::new(
+                Arc::clone(&self.txn),
+                self.layout.clone(),
+                &self.table_name,
+                self.table_id,
+            )
+            .unwrap(),
+        )
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -5023,7 +5049,7 @@ mod plan_test_single_table {
 }
 
 impl Scan for Box<dyn Scan> {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         (**self).before_first()
     }
 
@@ -5045,7 +5071,7 @@ impl Scan for Box<dyn Scan> {
 }
 
 impl Scan for Box<dyn UpdateScan> {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         (**self).before_first()
     }
 
@@ -5067,23 +5093,23 @@ impl Scan for Box<dyn UpdateScan> {
 }
 
 impl UpdateScan for Box<dyn UpdateScan> {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         (**self).set_int(field_name, value)
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         (**self).set_string(field_name, value)
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         (**self).set_value(field_name, value)
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
         (**self).insert_values(values)
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         (**self).delete()
     }
 
@@ -5091,7 +5117,7 @@ impl UpdateScan for Box<dyn UpdateScan> {
         (**self).get_rid()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
         (**self).move_to_rid(rid)
     }
 }
@@ -5153,7 +5179,7 @@ where
     S1: Scan,
     S2: Scan,
 {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.s1.before_first()?;
         self.s1.next();
         self.s2.before_first()
@@ -5205,7 +5231,7 @@ where
     S1: UpdateScan + 'static,
     S2: UpdateScan + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         if self.s1.has_field(field_name)? {
             return self.s1.set_int(field_name, value);
         }
@@ -5215,7 +5241,7 @@ where
         Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         if self.s1.has_field(field_name)? {
             return self.s1.set_string(field_name, value);
         }
@@ -5225,7 +5251,7 @@ where
         Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         if self.s1.has_field(field_name)? {
             return self.s1.set_value(field_name, value);
         }
@@ -5235,11 +5261,11 @@ where
         Err(format!("Field {field_name} not found in ProductScan").into())
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         panic!("Insert not supported in ProductScan");
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         panic!("Delete not supported in ProductScan");
     }
 
@@ -5247,7 +5273,7 @@ where
         panic!("Get RID not supported in ProductScan");
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         panic!("Move to RID not supported in ProductScan");
     }
 }
@@ -5277,8 +5303,8 @@ mod product_scan_tests {
 
         //  open scanners for both schemas and insert them
         {
-            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1", 1).unwrap();
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
             for i in 0..50 {
                 scan1
                     .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
@@ -5291,8 +5317,8 @@ mod product_scan_tests {
 
         //  create a product scan for both tables and retrieve B and D where A = C
         {
-            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1", 1).unwrap();
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
             let product_scan = ProductScan::new(scan1, scan2);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -5374,7 +5400,7 @@ where
         self.scan.has_field(field_name)
     }
 
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.scan.before_first()
     }
 }
@@ -5383,23 +5409,23 @@ impl<S> UpdateScan for ProjectScan<S>
 where
     S: UpdateScan + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.scan.set_int(field_name, value)
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         self.scan.set_string(field_name, value)
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         self.scan.set_value(field_name, value)
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
         self.scan.insert_values(values)
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         self.scan.delete()
     }
 
@@ -5407,7 +5433,7 @@ where
         self.scan.get_rid()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
         self.scan.move_to_rid(rid)
     }
 }
@@ -5444,7 +5470,7 @@ mod project_scan_tests {
         let mut inserted_count = 0;
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -5472,7 +5498,7 @@ mod project_scan_tests {
         //  selection and projection block
         {
             let mut projected_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T", 1).unwrap();
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -5777,7 +5803,7 @@ where
         }
     }
 
-    pub fn reset_index(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn reset_index(&mut self) -> SimpleDBResult<()> {
         self.index
             .before_first(&self.lhs.get_value(&self.join_field)?);
         Ok(())
@@ -5851,7 +5877,7 @@ where
     S: Scan,
     I: Index,
 {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.state = IndexJoinScanState::Init;
         Ok(())
     }
@@ -5902,7 +5928,7 @@ where
     S: UpdateScan + 'static,
     I: Index + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         if self.lhs.has_field(field_name)? {
             return self.lhs.set_int(field_name, value);
         }
@@ -5912,7 +5938,7 @@ where
         Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         if self.lhs.has_field(field_name)? {
             return self.lhs.set_string(field_name, value);
         }
@@ -5922,7 +5948,7 @@ where
         Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         if self.lhs.has_field(field_name)? {
             return self.lhs.set_value(field_name, value);
         }
@@ -5932,11 +5958,11 @@ where
         Err(format!("Field {field_name} not found in IndexJoinScan").into())
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         panic!("Insert not supported in IndexJoinScan");
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         panic!("Delete not supported in IndexJoinScan");
     }
 
@@ -5944,7 +5970,7 @@ where
         panic!("Get RID not supported in IndexJoinScan");
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         panic!("Move to RID not supported in IndexJoinScan");
     }
 }
@@ -5988,9 +6014,9 @@ mod index_join_scan_tests {
         let mut inserted_count = 0;
         {
             // First table
-            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
+            let mut scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1", 1).unwrap();
             // Second table with index
-            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
 
             for i in 0..50 {
                 // Insert into first table
@@ -6015,8 +6041,8 @@ mod index_join_scan_tests {
         // Test the index join
         {
             let mut join_count = 0;
-            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1");
-            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2");
+            let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1", 1).unwrap();
+            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
             let index = index_info.open();
 
             let mut index_join_scan = IndexJoinScan::new(scan1, index, scan2, "A".to_string());
@@ -6083,7 +6109,7 @@ impl<I> Scan for IndexSelectScan<I>
 where
     I: Index,
 {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.index.before_first(&self.value);
         Ok(())
     }
@@ -6109,23 +6135,23 @@ impl<I> UpdateScan for IndexSelectScan<I>
 where
     I: Index + 'static,
 {
-    fn set_int(&self, _field_name: &str, _value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
         unreachable!()
     }
 
-    fn set_string(&self, _field_name: &str, _value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
         unreachable!()
     }
 
-    fn set_value(&self, _field_name: &str, _value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
         unreachable!()
     }
 
-    fn insert_values(&mut self, _values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
         unreachable!()
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         unreachable!()
     }
 
@@ -6133,7 +6159,7 @@ where
         unreachable!()
     }
 
-    fn move_to_rid(&mut self, _rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
         unreachable!()
     }
 }
@@ -6168,7 +6194,7 @@ mod index_select_scan_tests {
         );
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -6205,7 +6231,7 @@ mod index_select_scan_tests {
         //  read block via index
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
             let value = Constant::Int(10);
             let index = index_info.open();
             let mut index_select_scan = IndexSelectScan::new(scan, index, value);
@@ -6279,7 +6305,7 @@ where
         self.scan.has_field(field_name)
     }
 
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.scan.before_first()
     }
 }
@@ -6288,23 +6314,23 @@ impl<S> UpdateScan for SelectScan<S>
 where
     S: UpdateScan + 'static,
 {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.scan.set_int(field_name, value)
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         self.scan.set_string(field_name, value)
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         self.scan.set_value(field_name, value)
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
         self.scan.insert_values(values)
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         self.scan.delete()
     }
 
@@ -6312,7 +6338,7 @@ where
         self.scan.get_rid()
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
         self.scan.move_to_rid(rid)
     }
 }
@@ -6340,7 +6366,7 @@ mod select_scan_tests {
         let mut inserted_count = 0;
         //  insertion block
         {
-            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T");
+            let mut scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
@@ -6368,7 +6394,7 @@ mod select_scan_tests {
         //  selection block
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout, "T");
+            let scan = TableScan::new(Arc::clone(&txn), layout, "T", 1).unwrap();
             let constant = Constant::Int(10);
             let term = Term::new(
                 crate::Expression::FieldName("A".to_string()),
@@ -7052,6 +7078,14 @@ impl MetadataManager {
         self.stat_manager.get_stat_info(table_name, layout, txn)
     }
 
+    pub fn get_table_id(
+        &self,
+        table_name: &str,
+        txn: Arc<Transaction>,
+    ) -> Result<u32, Box<dyn Error>> {
+        self.table_manager.get_table_id(table_name, txn)
+    }
+
     pub fn get_table_names(&self, txn: &Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
         self.table_manager.get_table_names(Arc::clone(txn))
     }
@@ -7113,7 +7147,9 @@ mod metadata_manager_tests {
 
         // Part 2: Statistics Metadata
         {
-            let mut table_scan = TableScan::new(Arc::clone(&tx), layout.clone(), table_name);
+            let table_id = mdm.get_table_id(table_name, Arc::clone(&tx)).unwrap();
+            let mut table_scan =
+                TableScan::new(Arc::clone(&tx), layout.clone(), table_name, table_id).unwrap();
             for _ in 0..50 {
                 let n = (generate_random_number() % 50) + 1;
                 table_scan
@@ -7184,7 +7220,12 @@ mod metadata_manager_tests {
 
         let layout = mdm.get_layout(table_name, Arc::clone(&setup_txn));
         {
-            let mut table_scan = TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name);
+            let table_id = mdm
+                .get_table_id(table_name, Arc::clone(&setup_txn))
+                .unwrap();
+            let mut table_scan =
+                TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name, table_id)
+                    .unwrap();
             for i in 0..20 {
                 table_scan.insert_values(&[Constant::Int(i)]).unwrap();
             }
@@ -7241,6 +7282,7 @@ impl IndexManager {
     const INDEX_COL_NAME: &str = "index_name";
     const TABLE_COL_NAME: &str = "table_name";
     const TABLE_FIELD_NAME: &str = "field_name";
+    pub const INDEX_CATALOG_ID: u32 = 3;
 
     pub fn new(
         is_new: bool,
@@ -7270,7 +7312,13 @@ impl IndexManager {
         field_name: &str,
         txn: Arc<Transaction>,
     ) {
-        let mut table_scan = TableScan::new(txn, self.layout.clone(), Self::INDEX_CAT_TBL_NAME);
+        let mut table_scan = TableScan::new(
+            txn,
+            self.layout.clone(),
+            Self::INDEX_CAT_TBL_NAME,
+            IndexManager::INDEX_CATALOG_ID,
+        )
+        .unwrap();
         table_scan
             .insert_values(&[
                 Constant::String(index_name.to_string()),
@@ -7290,7 +7338,9 @@ impl IndexManager {
             Arc::clone(&txn),
             self.layout.clone(),
             Self::INDEX_CAT_TBL_NAME,
-        );
+            IndexManager::INDEX_CATALOG_ID,
+        )
+        .unwrap();
         while table_scan.next().is_some() {
             if table_scan.get_string(Self::TABLE_COL_NAME).unwrap() == table_name {
                 let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
@@ -7448,7 +7498,13 @@ impl Index for HashIndex {
         let hash = hasher.finish() as usize;
         let bucket = hash % Self::NUM_BUCKETS;
         let table_name = format!("{}_{}", self.index_name, bucket);
-        let table_scan = TableScan::new(Arc::clone(&self.txn), self.layout.clone(), &table_name);
+        let table_scan = TableScan::new(
+            Arc::clone(&self.txn),
+            self.layout.clone(),
+            &table_name,
+            u32::MAX,
+        )
+        .unwrap();
         self.table_scan = Some(table_scan);
     }
 
@@ -7555,7 +7611,12 @@ impl StatManager {
         }
 
         debug!("going to calculate table stats");
-        let table_stats = self.calculate_table_stats(table_name, layout, Arc::clone(&txn));
+        let table_id = self
+            .table_manager
+            .get_table_id(table_name, Arc::clone(&txn))
+            .unwrap_or(u32::MAX);
+        let table_stats =
+            self.calculate_table_stats(table_name, layout, table_id, Arc::clone(&txn));
         let mut state = self.state.lock().unwrap();
         debug!("table stats {:?}", table_stats);
         state
@@ -7575,11 +7636,15 @@ impl StatManager {
             Arc::clone(&txn),
             table_catalog_layout,
             TableManager::TABLE_CAT_TABLE_NAME,
-        );
+            TableManager::TABLE_CATALOG_ID,
+        )
+        .unwrap();
         while table_scan.next().is_some() {
             let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
+            let table_id = table_scan.get_int(TableManager::TABLE_ID_COL).unwrap_or(-1) as u32;
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
-            let table_stats = self.calculate_table_stats(&table_name, layout, Arc::clone(&txn));
+            let table_stats =
+                self.calculate_table_stats(&table_name, layout, table_id, Arc::clone(&txn));
             state.table_stats.insert(table_name, table_stats);
         }
         state.num_calls = 0;
@@ -7590,10 +7655,11 @@ impl StatManager {
         &self,
         table_name: &str,
         layout: Layout,
+        table_id: u32,
         txn: Arc<Transaction>,
     ) -> StatInfo {
         debug!("calculating table stats for {}", table_name);
-        let mut table_scan = TableScan::new(txn, layout, table_name);
+        let mut table_scan = TableScan::new(txn, layout, table_name, table_id).unwrap();
         let mut num_rec = 0;
         let mut num_blocks = 0;
         while table_scan.next().is_some() {
@@ -7635,6 +7701,7 @@ impl ViewManager {
     const VIEW_MANAGER_TABLE_NAME: &str = "view_catalog";
     const VIEW_NAME_COL: &str = "view_name";
     const VIEW_DEF_COL: &str = "view_col";
+    pub const VIEW_CATALOG_ID: u32 = 2;
 
     pub fn new(is_new: bool, table_manager: Arc<TableManager>, txn: Arc<Transaction>) -> Self {
         if is_new {
@@ -7651,7 +7718,13 @@ impl ViewManager {
         let layout = self
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
-        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        let mut table_scan = TableScan::new(
+            txn,
+            layout,
+            Self::VIEW_MANAGER_TABLE_NAME,
+            ViewManager::VIEW_CATALOG_ID,
+        )
+        .unwrap();
         table_scan
             .insert_values(&[
                 Constant::String(view_name.to_string()),
@@ -7665,7 +7738,13 @@ impl ViewManager {
         let layout = self
             .table_manager
             .get_layout(Self::VIEW_MANAGER_TABLE_NAME, Arc::clone(&txn));
-        let mut table_scan = TableScan::new(txn, layout, Self::VIEW_MANAGER_TABLE_NAME);
+        let mut table_scan = TableScan::new(
+            txn,
+            layout,
+            Self::VIEW_MANAGER_TABLE_NAME,
+            ViewManager::VIEW_CATALOG_ID,
+        )
+        .unwrap();
         while let Some(_) = table_scan.next() {
             if view_name == table_scan.get_string(Self::VIEW_NAME_COL).unwrap() {
                 return Some(table_scan.get_string(Self::VIEW_DEF_COL).unwrap());
@@ -7678,16 +7757,20 @@ impl ViewManager {
 struct TableManager {
     table_catalog_layout: Layout,
     field_catalog_layout: Layout,
+    next_table_id: AtomicI32,
 }
 
 impl TableManager {
     const MAX_NAME_LENGTH: usize = 16; //  the max length for a table name (TODO: Do other databases use variable name lengths for tables?)
     const TABLE_CAT_TABLE_NAME: &str = "table_catalog";
     const FIELD_CAT_TABLE_NAME: &str = "field_catalog";
+    pub const TABLE_CATALOG_ID: u32 = 0;
+    pub const FIELD_CATALOG_ID: u32 = 1;
 
     // Table catalog columns
     const TABLE_NAME_COL: &str = "table_name";
     const SLOT_SIZE_COL: &str = "slot_size";
+    const TABLE_ID_COL: &str = "table_id";
 
     // Field catalog columns
     const FIELD_NAME_COL: &str = "field_name";
@@ -7700,6 +7783,7 @@ impl TableManager {
         let mut table_cat_schema = Schema::new();
         table_cat_schema.add_string_field(Self::TABLE_NAME_COL, Self::MAX_NAME_LENGTH);
         table_cat_schema.add_int_field(Self::SLOT_SIZE_COL);
+        table_cat_schema.add_int_field(Self::TABLE_ID_COL);
         let table_cat_layout = Layout::new(table_cat_schema.clone());
 
         //  Create the field catalog layout
@@ -7711,9 +7795,33 @@ impl TableManager {
         field_cat_schema.add_int_field(Self::FIELD_OFFSET_COL);
         let field_cat_layout = Layout::new(field_cat_schema.clone());
 
+        // Seed the next_table_id counter. On a fresh database start from 0; on an existing
+        // database scan the catalog to find the current maximum and resume from there.
+        let next_id = if is_new {
+            0
+        } else {
+            let mut scan = TableScan::new(
+                Arc::clone(&tx),
+                table_cat_layout.clone(),
+                Self::TABLE_CAT_TABLE_NAME,
+                TableManager::TABLE_CATALOG_ID,
+            )
+            .unwrap();
+            let mut max_id = -1i32;
+            while let Some(result) = scan.next() {
+                result.expect("failed to scan table catalog for max table_id");
+                let id = scan.get_int(Self::TABLE_ID_COL).unwrap_or(-1);
+                if id > max_id {
+                    max_id = id;
+                }
+            }
+            max_id + 1
+        };
+
         let table_mgr = Self {
             table_catalog_layout: table_cat_layout,
             field_catalog_layout: field_cat_layout,
+            next_table_id: AtomicI32::new(next_id),
         };
 
         if is_new {
@@ -7732,19 +7840,25 @@ impl TableManager {
     /// This method will accept a [`Schema`] for a table that is being created as part of a txn and
     /// create the relevant metadata in the catalog tables
     fn create_table(&self, table_name: &str, schema: &Schema, tx: Arc<Transaction>) {
+        let table_id = self
+            .next_table_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let layout = Layout::new(schema.clone());
 
-        //  insert the record for the table name and slot size
+        //  insert the record for the table name, slot size, and table_id
         {
             let mut table_scan = TableScan::new(
                 Arc::clone(&tx),
                 self.table_catalog_layout.clone(),
                 Self::TABLE_CAT_TABLE_NAME,
-            );
+                TableManager::TABLE_CATALOG_ID,
+            )
+            .unwrap();
             table_scan
                 .insert_values(&[
                     Constant::String(table_name.to_string()),
                     Constant::Int(layout.max_encoded_size() as i32),
+                    Constant::Int(table_id),
                 ])
                 .unwrap();
         }
@@ -7755,7 +7869,9 @@ impl TableManager {
                 tx,
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            );
+                TableManager::FIELD_CATALOG_ID,
+            )
+            .unwrap();
             for field in &schema.fields {
                 let field_info = schema.info.get(field).unwrap();
                 table_scan
@@ -7773,29 +7889,15 @@ impl TableManager {
 
     /// Return the physical [`Layout`] for a specific table defined in the table catalog metadata
     fn get_layout(&self, table_name: &str, tx: Arc<Transaction>) -> Layout {
-        //  Get the slot size of the table
-        // let slot_size = {
-        //     let mut table_scan = TableScan::new(
-        //         Arc::clone(&tx),
-        //         self.table_catalog_layout.clone(),
-        //         Self::TABLE_CAT_TABLE_NAME,
-        //     );
-        //     let mut slot_size = None;
-        //     while let Some(_) = table_scan.next() {
-        //         if table_name == table_scan.get_string(Self::TABLE_NAME_COL).unwrap() {
-        //             slot_size = Some(table_scan.get_int(Self::SLOT_SIZE_COL));
-        //         }
-        //     }
-        //     slot_size
-        // };
-
         //  Construct the schema from the table so the layout can be created
         let schema = {
             let mut table_scan = TableScan::new(
                 Arc::clone(&tx),
                 self.field_catalog_layout.clone(),
                 Self::FIELD_CAT_TABLE_NAME,
-            );
+                TableManager::FIELD_CATALOG_ID,
+            )
+            .unwrap();
             let mut schema = Schema::new();
             while let Some(result) = table_scan.next() {
                 result.expect("failed to advance table scan in get_layout");
@@ -7813,13 +7915,34 @@ impl TableManager {
         Layout::new(schema)
     }
 
+    /// Return the persistent integer id for a table, or an error if not found
+    fn get_table_id(&self, table_name: &str, tx: Arc<Transaction>) -> Result<u32, Box<dyn Error>> {
+        let mut table_scan = TableScan::new(
+            tx,
+            self.table_catalog_layout.clone(),
+            Self::TABLE_CAT_TABLE_NAME,
+            TableManager::TABLE_CATALOG_ID,
+        )?;
+        while let Some(result) = table_scan.next() {
+            result?;
+            let scanned_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
+            if scanned_name == table_name {
+                let id = table_scan.get_int(Self::TABLE_ID_COL)? as u32;
+                return Ok(id);
+            }
+        }
+        Err(format!("table '{}' not found in catalog", table_name).into())
+    }
+
     /// Return a list of all table names in the database
     fn get_table_names(&self, tx: Arc<Transaction>) -> Result<Vec<String>, Box<dyn Error>> {
         let mut table_scan = TableScan::new(
             tx,
             self.table_catalog_layout.clone(),
             Self::TABLE_CAT_TABLE_NAME,
-        );
+            TableManager::TABLE_CATALOG_ID,
+        )
+        .unwrap();
         let mut tables = Vec::new();
         while let Some(result) = table_scan.next() {
             result?;
@@ -7909,6 +8032,7 @@ pub struct TableScan {
     table_name: String,
     prefetch_window: usize,
     next_prefetch_block: usize,
+    table_id: u32,
 }
 
 impl TableScan {
@@ -7926,7 +8050,12 @@ impl TableScan {
             .store(window_blocks, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn new(txn: Arc<Transaction>, layout: Layout, table_name: &str) -> Self {
+    pub fn new(
+        txn: Arc<Transaction>,
+        layout: Layout,
+        table_name: &str,
+        table_id: u32,
+    ) -> SimpleDBResult<Self> {
         debug!("Creating table scan for {}", table_name);
         let file_name = format!("{table_name}.tbl");
         let mut scan = Self {
@@ -7939,6 +8068,7 @@ impl TableScan {
             table_name: table_name.to_string(),
             prefetch_window: Self::default_prefetch_window_blocks(),
             next_prefetch_block: 1,
+            table_id,
         };
 
         if scan.txn.size(&file_name) == 0 {
@@ -7946,15 +8076,15 @@ impl TableScan {
                 "TableScan for {} is empty, allocating new block",
                 table_name
             );
-            scan.move_to_new_block().unwrap();
+            scan.move_to_new_block()?;
         } else {
             debug!(
                 "TableScan for {} is not empty, moving to block 0",
                 table_name
             );
-            scan.move_to_block(0);
+            scan.move_to_block(0)?;
         }
-        scan
+        Ok(scan)
     }
 
     fn maybe_prefetch_from(&mut self, current_block: usize) {
@@ -7985,23 +8115,33 @@ impl TableScan {
     /// Moves the [`RecordPage`] on this [`TableScan`] to a specific block number.
     /// Captures `max_slot` from the page's current slot count so that redirect-appended
     /// slots (indices >= `max_slot`) are never visited during UPDATE scans.
-    pub fn move_to_block(&mut self, block_num: usize) {
+    pub fn move_to_block(&mut self, block_num: usize) -> SimpleDBResult<()> {
         let block_id = BlockId::new(self.file_name.clone(), block_num);
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), 0).unwrap();
-        let record_page = RecordPage::new(Arc::clone(&self.txn), block_id, self.layout.clone());
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block_id)?, 0).unwrap();
+        let record_page = RecordPage::new(
+            Arc::clone(&self.txn),
+            block_id,
+            self.layout.clone(),
+            self.table_id,
+        );
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
         self.maybe_prefetch_from(block_num);
+        Ok(())
     }
 
     /// Allocates a new [`BlockId`] to the underlying file and moves the [`RecordPage`] there.
     fn move_to_new_block(&mut self) -> SimpleDBResult<()> {
         let block = self.txn.append(&self.file_name);
-        let record_page =
-            RecordPage::new(Arc::clone(&self.txn), block.clone(), self.layout.clone());
+        let record_page = RecordPage::new(
+            Arc::clone(&self.txn),
+            block.clone(),
+            self.layout.clone(),
+            self.table_id,
+        );
         record_page.format()?;
-        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block), 0).unwrap();
+        let iter = HeapIterator::from_guard(self.txn.pin_read_guard(&block)?, 0).unwrap();
         self.current_slot = None;
         self.record_page = Some(record_page);
         self.heap_iter = Some(iter);
@@ -8016,17 +8156,19 @@ impl TableScan {
     /// Moves the [`RecordPage`] to the start of the file
     pub fn move_to_start(&mut self) {
         self.next_prefetch_block = 1;
-        self.move_to_block(0);
+        self.move_to_block(0).unwrap();
     }
 
     pub fn move_to_row_id(&mut self, row_id: RID) {
         let block_id = BlockId::new(self.file_name.clone(), row_id.block_num);
         let iter =
-            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id), row_id.slot + 1).unwrap();
+            HeapIterator::from_guard(self.txn.pin_read_guard(&block_id).unwrap(), row_id.slot + 1)
+                .unwrap();
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
             self.layout.clone(),
+            self.table_id,
         ));
         self.current_slot = Some(row_id.slot);
         self.heap_iter = Some(iter);
@@ -8061,54 +8203,46 @@ impl Iterator for TableScan {
                 return None;
             }
 
-            self.move_to_block(next_block);
+            self.move_to_block(next_block).unwrap();
         }
     }
 }
 
 impl Scan for TableScan {
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        Ok(self
-            .record_page
-            .as_ref()
-            .ok_or_else(|| {
-                format!(
-                    "No record page set when calling get_int for {}",
-                    self.table_name
-                )
-            })
-            .and_then(|page| {
-                self.current_slot
-                    .ok_or_else(|| {
-                        format!(
-                            "No current slot set when calling get_int for {}",
-                            self.table_name
-                        )
-                    })
-                    .map(|slot| page.get_int(slot, field_name))
-            })?)
+        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No record page set when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set when calling get_int for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        page.get_int(slot, field_name)
     }
 
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        Ok(self
-            .record_page
-            .as_ref()
-            .ok_or_else(|| {
-                format!(
-                    "No record page set when calling get_string for {}",
-                    self.table_name
-                )
-            })
-            .and_then(|page| {
-                self.current_slot
-                    .ok_or_else(|| {
-                        format!(
-                            "No current slot set when calling get_string for {}",
-                            self.table_name
-                        )
-                    })
-                    .map(|slot| page.get_string(slot, field_name))
-            })?)
+        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No record page set when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set when calling get_string for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        page.get_string(slot, field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -8122,14 +8256,14 @@ impl Scan for TableScan {
         Ok(self.layout.schema.fields.contains(&field_name.to_string()))
     }
 
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
         self.move_to_start();
         Ok(())
     }
 }
 
 impl UpdateScan for TableScan {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>> {
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.record_page.as_ref().unwrap().set_int(
             *self.current_slot.as_ref().unwrap(),
             field_name,
@@ -8138,7 +8272,7 @@ impl UpdateScan for TableScan {
         Ok(())
     }
 
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
         self.record_page.as_ref().unwrap().set_string(
             *self.current_slot.as_ref().unwrap(),
             field_name,
@@ -8147,7 +8281,7 @@ impl UpdateScan for TableScan {
         Ok(())
     }
 
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>> {
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => self.set_int(field_name, value.as_int())?,
             FieldType::String => self.set_string(field_name, value.as_str().to_string())?,
@@ -8155,7 +8289,7 @@ impl UpdateScan for TableScan {
         Ok(())
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>> {
+    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
         let mut iterations = 0;
         loop {
             iterations += 1;
@@ -8174,7 +8308,7 @@ impl UpdateScan for TableScan {
                     } else {
                         self.move_to_block(
                             self.record_page.as_ref().unwrap().block_id.block_num + 1,
-                        );
+                        )?;
                     }
                     continue;
                 }
@@ -8183,7 +8317,7 @@ impl UpdateScan for TableScan {
         Ok(())
     }
 
-    fn delete(&mut self) -> Result<(), Box<dyn Error>> {
+    fn delete(&mut self) -> SimpleDBResult<()> {
         self.record_page
             .as_ref()
             .unwrap()
@@ -8198,12 +8332,13 @@ impl UpdateScan for TableScan {
         ))
     }
 
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
+    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
         let block_id = BlockId::new(self.file_name.clone(), rid.block_num);
         self.record_page = Some(RecordPage::new(
             Arc::clone(&self.txn),
             block_id,
             self.layout.clone(),
+            self.table_id,
         ));
         self.current_slot = Some(rid.slot);
         Ok(())
@@ -8211,18 +8346,18 @@ impl UpdateScan for TableScan {
 }
 
 pub trait UpdateScan: Scan + Any {
-    fn set_int(&self, field_name: &str, value: i32) -> Result<(), Box<dyn Error>>;
-    fn set_string(&self, field_name: &str, value: String) -> Result<(), Box<dyn Error>>;
-    fn set_value(&self, field_name: &str, value: Constant) -> Result<(), Box<dyn Error>>;
+    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()>;
+    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()>;
+    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()>;
     /// Insert a new record with the given values (in schema field order).
-    fn insert_values(&mut self, values: &[Constant]) -> Result<(), Box<dyn Error>>;
-    fn delete(&mut self) -> Result<(), Box<dyn Error>>;
+    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()>;
+    fn delete(&mut self) -> SimpleDBResult<()>;
     fn get_rid(&self) -> Result<RID, Box<dyn Error>>;
-    fn move_to_rid(&mut self, rid: RID) -> Result<(), Box<dyn Error>>;
+    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()>;
 }
 
 pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
-    fn before_first(&mut self) -> Result<(), Box<dyn Error>>;
+    fn before_first(&mut self) -> SimpleDBResult<()>;
     fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>>;
     fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
@@ -8257,7 +8392,7 @@ mod table_scan_tests {
         //   null_bitmap(1) + id(4) + name_len(4) + name_data(1) = 10 bytes
         // Allocated: 10 + UPDATE_SLACK(4) = 14 bytes. All fit on one 4 K page.
         let n: usize = 15;
-        let mut ts = TableScan::new(txn, layout, "redirect_test");
+        let mut ts = TableScan::new(txn, layout, "redirect_test", 1).unwrap();
         for i in 0..n {
             ts.insert_values(&[Constant::Int(i as i32), Constant::String("a".to_string())])
                 .unwrap();
@@ -8295,7 +8430,7 @@ mod table_scan_tests {
 
         dbg!("Inserting a bunch of records into the table");
         let mut inserted_count = 0;
-        let mut table_scan = TableScan::new(txn, layout, "table");
+        let mut table_scan = TableScan::new(txn, layout, "table", 1).unwrap();
         for _ in 0..100 {
             let number = (generate_random_number() % 100) + 1;
             table_scan
@@ -8412,38 +8547,46 @@ struct RecordPage {
     txn: Arc<Transaction>,
     block_id: BlockId,
     layout: Layout,
+    table_id: u32,
 }
 
 impl RecordPage {
     /// Creates a new RecordPage with the given transaction, block ID, and layout.
     /// Pins the block in memory.
-    pub fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout) -> Self {
+    pub fn new(txn: Arc<Transaction>, block_id: BlockId, layout: Layout, table_id: u32) -> Self {
         Self {
             txn,
             block_id,
             layout,
+            table_id,
         }
     }
 
     /// Retrieves an integer value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
-    fn get_int(&self, slot: usize, field_name: &str) -> i32 {
+    fn get_int(&self, slot: usize, field_name: &str) -> SimpleDBResult<i32> {
         self.txn
-            .pin_read_guard(&self.block_id)
+            .lock_row_s(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        Ok(self
+            .txn
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
             .row(slot)
             .unwrap()
             .get_column(field_name)
             .unwrap()
-            .as_int()
+            .as_int())
     }
 
     /// Retrieves a string value from the specified slot and field.
     /// The offset is calculated using the slot number and field layout.
-    fn get_string(&self, slot: usize, field_name: &str) -> String {
+    fn get_string(&self, slot: usize, field_name: &str) -> SimpleDBResult<String> {
         self.txn
-            .pin_read_guard(&self.block_id)
+            .lock_row_s(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        Ok(self
+            .txn
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)
             .unwrap()
             .row(slot)
@@ -8451,12 +8594,14 @@ impl RecordPage {
             .get_column(field_name)
             .unwrap()
             .as_str()
-            .to_string()
+            .to_string())
     }
 
     /// Sets an integer value in the specified slot and field.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        self.txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -8470,7 +8615,9 @@ impl RecordPage {
 
     /// Sets a string value in the specified slot and field.
     fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        self.txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -8483,8 +8630,10 @@ impl RecordPage {
     }
 
     /// Deletes the record at the specified slot.
-    pub fn delete(&self, slot: usize) -> Result<(), Box<dyn Error>> {
-        let guard = self.txn.pin_write_guard(&self.block_id);
+    pub fn delete(&self, slot: usize) -> SimpleDBResult<()> {
+        self.txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.delete_slot(slot)?;
         Ok(())
@@ -8502,7 +8651,7 @@ impl RecordPage {
         };
         let append_lsn = record.write_log_record(&self.txn.log_manager())?;
 
-        let mut guard = self.txn.pin_write_guard(&block_id);
+        let mut guard = self.txn.pin_write_guard(&block_id)?;
         guard.mark_modified(txn_id as usize, append_lsn);
 
         // Format (emits HeapPageFormatFresh internally and overwrites with newer LSN)
@@ -8515,7 +8664,7 @@ impl RecordPage {
     pub fn live_slots(&self) -> Result<Vec<usize>, Box<dyn Error>> {
         let view = self
             .txn
-            .pin_read_guard(&self.block_id)
+            .pin_read_guard(&self.block_id)?
             .into_heap_view(&self.layout)?;
 
         let live: Vec<usize> = view.live_slot_iter().collect();
@@ -8528,9 +8677,23 @@ impl RecordPage {
         if values.len() != self.layout.schema.fields.len() {
             return Err("value count must match schema field count".into());
         }
-        let guard = self.txn.pin_write_guard(&self.block_id);
+        // Acquire table-IX before touching the page so concurrent table-S holders are
+        // blocked before we mutate anything.
+        self.txn.lock_table_ix(self.table_id)?;
+        let guard = self.txn.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
-        view.insert_row_values(values)
+        let slot = view.insert_row_values(values)?;
+        // Attempt row-X on the assigned slot while still holding the write guard.
+        // If this fails (e.g. a concurrent reader holds S on a reused RID), undo the
+        // insert immediately so no uncommitted mutation is left on the page.
+        if let Err(e) = self
+            .txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))
+        {
+            view.delete_slot(slot)?;
+            return Err(e);
+        }
+        Ok(slot)
     }
 }
 
@@ -8561,7 +8724,7 @@ mod record_page_tests {
             }
         }
         let block_id = txn.append("test_file");
-        let record_page = RecordPage::new(txn, block_id, layout);
+        let record_page = RecordPage::new(txn, block_id, layout, u32::MAX);
         record_page.format().unwrap();
 
         //  Create a bunch of records using insert_values
@@ -8583,7 +8746,7 @@ mod record_page_tests {
         //  Delete all records with a value less than 25
         let mut deleted_count = 0;
         for slot in &inserted_slots {
-            let a = record_page.get_int(*slot, "A");
+            let a = record_page.get_int(*slot, "A").unwrap();
             if a < 25 {
                 deleted_count += 1;
                 record_page.delete(*slot).ok();
@@ -8593,7 +8756,7 @@ mod record_page_tests {
         //  Check that the correct number of records are left
         let mut remaining_count = 0;
         for slot in record_page.live_slots().unwrap() {
-            let a = record_page.get_int(slot, "A");
+            let a = record_page.get_int(slot, "A").unwrap();
             if a >= 25 {
                 remaining_count += 1;
             }
@@ -8909,7 +9072,7 @@ impl Schema {
         self.add_field(field_name, FieldType::String, length);
     }
 
-    fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> Result<(), Box<dyn Error>> {
+    fn add_from_schema(&mut self, field_name: &str, schema: &Schema) -> SimpleDBResult<()> {
         let (field_type, field_length) = schema
             .info
             .get(field_name)
@@ -8922,7 +9085,7 @@ impl Schema {
         Ok(())
     }
 
-    fn add_all_from_schema(&mut self, schema: &Schema) -> Result<(), Box<dyn Error>> {
+    fn add_all_from_schema(&mut self, schema: &Schema) -> SimpleDBResult<()> {
         for field_name in schema.fields.iter() {
             self.add_from_schema(field_name, schema)?;
         }
@@ -8979,7 +9142,7 @@ impl Drop for BufferHandle {
 
 trait TransactionOperations {
     fn txn_id(&self) -> usize;
-    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_>;
+    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>>;
 }
 
 impl TransactionOperations for Arc<Transaction> {
@@ -8987,7 +9150,7 @@ impl TransactionOperations for Arc<Transaction> {
         self.id()
     }
 
-    fn pin_write_guard(&self, block_id: &BlockId) -> PageWriteGuard<'_> {
+    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
         Transaction::pin_write_guard(self, block_id)
     }
 }
@@ -9060,7 +9223,7 @@ impl Transaction {
     /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
-    pub fn commit(&self) -> Result<(), Box<dyn Error>> {
+    pub fn commit(&self) -> SimpleDBResult<()> {
         self.recovery_manager.commit()?;
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
@@ -9070,7 +9233,7 @@ impl Transaction {
     /// Rollback this transaction
     /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
     /// It will also handle meta operations like unpinning buffers
-    pub fn rollback(self: &Arc<Self>) -> Result<(), Box<dyn Error>> {
+    pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
         self.recovery_manager.rollback(self).unwrap();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
@@ -9078,7 +9241,7 @@ impl Transaction {
     }
 
     /// Recover the database on start-up or after a crash
-    pub fn recover(self: &Arc<Self>) -> Result<(), Box<dyn Error>> {
+    pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
         self.recovery_manager.recover(self).unwrap();
         self.concurrency_manager.release()?;
         self.buffer_list.unpin_all();
@@ -9090,19 +9253,23 @@ impl Transaction {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
-    pub fn pin_read_guard(self: &Arc<Self>, block_id: &BlockId) -> PageReadGuard<'_> {
-        self.concurrency_manager.slock(block_id).unwrap();
+    pub fn pin_read_guard(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<PageReadGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
         let raw = Arc::into_raw(frame_clone);
         let page = unsafe { (*raw).read_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        PageReadGuard::new(handle, frame_for_guard, page)
+        Ok(PageReadGuard::new(handle, frame_for_guard, page))
     }
 
-    pub fn pin_write_guard(self: &Arc<Self>, block_id: &BlockId) -> PageWriteGuard<'_> {
-        self.concurrency_manager.xlock(block_id).unwrap();
+    pub fn pin_write_guard(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<PageWriteGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         let frame_clone = Arc::clone(&frame);
@@ -9110,7 +9277,32 @@ impl Transaction {
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
         let log_manager = Arc::clone(&self.log_manager);
-        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
+        Ok(PageWriteGuard::new(
+            handle,
+            frame_for_guard,
+            page,
+            log_manager,
+        ))
+    }
+
+    pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_row_s(table_id, rid)
+    }
+
+    pub fn lock_row_x(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_row_x(table_id, rid)
+    }
+
+    pub fn lock_table_ix(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_table_ix(table_id)
+    }
+
+    pub fn lock_table_s(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_table_s(table_id)
+    }
+
+    pub fn lock_table_x(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_table_x(table_id)
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -9242,7 +9434,7 @@ mod transaction_tests {
         let t1 = test_db.new_tx();
         let block_id = t1.append(&file);
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 1, "one");
         }
         t1.commit().unwrap();
@@ -9251,12 +9443,12 @@ mod transaction_tests {
         //  Set new values in this transaction
         let t2 = test_db.new_tx();
         {
-            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 1);
             assert_eq!(snapshot.str_val, "one");
         }
         {
-            let guard = t2.pin_write_guard(&block_id);
+            let guard = t2.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 2, "two");
         }
         t2.commit().unwrap();
@@ -9264,11 +9456,11 @@ mod transaction_tests {
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
         let t3 = test_db.new_tx();
-        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id).unwrap(), &layout);
         assert_eq!(snapshot.int_val, 2);
         assert_eq!(snapshot.str_val, "two");
         {
-            let guard = t3.pin_write_guard(&block_id);
+            let guard = t3.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 3, "three");
         }
         t3.rollback().unwrap();
@@ -9277,7 +9469,7 @@ mod transaction_tests {
         //  This will be a read only transaction that commits
         let t4 = test_db.new_tx();
         {
-            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t4.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 2);
             assert_eq!(snapshot.str_val, "two");
         }
@@ -9298,7 +9490,7 @@ mod transaction_tests {
         // Initialize page so readers always see a formatted heap page.
         {
             let init_txn = test_db.new_tx();
-            let guard = init_txn.pin_write_guard(&block_id);
+            let guard = init_txn.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
             init_txn.commit().unwrap();
         }
@@ -9319,7 +9511,8 @@ mod transaction_tests {
         let layout_reader = Arc::clone(&layout);
         let t1 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
-            let _ = maybe_snapshot_txn_row(txn.pin_read_guard(&bid1), layout_reader.as_ref());
+            let _ =
+                maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
             txn.commit().unwrap();
         });
 
@@ -9328,7 +9521,7 @@ mod transaction_tests {
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
             {
-                let guard = txn.pin_write_guard(&bid2);
+                let guard = txn.pin_write_guard(&bid2).unwrap();
                 update_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
             //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
@@ -9345,7 +9538,7 @@ mod transaction_tests {
             test_db.buffer_manager,
             test_db.lock_table,
         ));
-        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id), layout.as_ref());
+        let snapshot = snapshot_txn_row(txn.pin_read_guard(&block_id).unwrap(), layout.as_ref());
         assert_eq!(snapshot.int_val, 1);
         assert_eq!(snapshot.str_val, "Hello");
     }
@@ -9369,7 +9562,7 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = init_txn.pin_write_guard(&block_id);
+            let guard = init_txn.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "initial");
         }
         init_txn.commit().unwrap();
@@ -9387,7 +9580,8 @@ mod transaction_tests {
             handles.push(std::thread::spawn(move || {
                 let txn = Arc::new(Transaction::new(fm, lm, bm, lt));
 
-                let snapshot = snapshot_txn_row(txn.pin_read_guard(&bid), layout_reader.as_ref());
+                let snapshot =
+                    snapshot_txn_row(txn.pin_read_guard(&bid).unwrap(), layout_reader.as_ref());
                 let val = snapshot.int_val;
                 assert!(val == 0 || val == 42, "Read invalid int value: {}", val);
 
@@ -9409,7 +9603,7 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = txn.pin_write_guard(&block_id);
+            let guard = txn.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, layout.as_ref(), 42, "final");
         }
         txn.commit().unwrap();
@@ -9426,7 +9620,10 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let snapshot = snapshot_txn_row(final_txn.pin_read_guard(&block_id), layout.as_ref());
+            let snapshot = snapshot_txn_row(
+                final_txn.pin_read_guard(&block_id).unwrap(),
+                layout.as_ref(),
+            );
             assert_eq!(snapshot.int_val, 42);
             assert_eq!(snapshot.str_val, "final");
         }
@@ -9451,7 +9648,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 100, "initial");
         }
         t1.commit().unwrap();
@@ -9464,7 +9661,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t2.pin_write_guard(&block_id);
+            let guard = t2.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
@@ -9477,7 +9674,7 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id), &layout);
+        let snapshot = snapshot_txn_row(t3.pin_read_guard(&block_id).unwrap(), &layout);
         assert_eq!(snapshot.int_val, 100);
         assert_eq!(snapshot.str_val, "initial");
     }
@@ -9514,7 +9711,7 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id);
+            let guard = t1.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
         }
         t1.commit().unwrap();
@@ -9548,14 +9745,14 @@ mod transaction_tests {
                     // Try to perform the increment
                     match (|| -> Result<(), Box<dyn Error>> {
                         let val = {
-                            let guard = txn.pin_read_guard(&bid);
+                            let guard = txn.pin_read_guard(&bid).unwrap();
                             snapshot_txn_row(guard, layout_clone.as_ref()).int_val
                         };
                         // Short sleep to increase chance of conflicts
                         std::thread::sleep(Duration::from_millis(10));
 
                         {
-                            let guard = txn.pin_write_guard(&bid);
+                            let guard = txn.pin_write_guard(&bid).unwrap();
                             update_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
                         txn.commit()?;
@@ -9628,7 +9825,8 @@ mod transaction_tests {
             Arc::clone(&test_db.buffer_manager),
             Arc::clone(&test_db.lock_table),
         ));
-        let snapshot = snapshot_txn_row(t_final.pin_read_guard(&block_id), layout.as_ref());
+        let snapshot =
+            snapshot_txn_row(t_final.pin_read_guard(&block_id).unwrap(), layout.as_ref());
         assert_eq!(snapshot.int_val, num_of_txns);
     }
 
@@ -9649,7 +9847,7 @@ mod transaction_tests {
             ));
             let block_id = t1.append(&file);
             {
-                let guard = t1.pin_write_guard(&block_id);
+                let guard = t1.pin_write_guard(&block_id).unwrap();
                 init_txn_row(guard, &layout, 100, "");
             }
             t1.commit().unwrap();
@@ -9667,7 +9865,7 @@ mod transaction_tests {
             ));
             t2.recover().unwrap();
 
-            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id), &layout);
+            let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 100);
         }
     }
@@ -9796,15 +9994,14 @@ mod transaction_tests {
 
 #[derive(Debug)]
 struct LockState {
-    readers: HashSet<TransactionID>, //  keep track of which transaction id's have a reader lock here
-    writer: Option<TransactionID>,   //  keep track of the transaction writing to a specific block
-    upgrade_requests: VecDeque<TransactionID>, //  keep track of upgrade requests to prevent writer starvation
+    holders: HashMap<TransactionID, LockMode>,
+    upgrade_requests: VecDeque<TransactionID>,
 }
 
 /// Global struct used by all transactions to keep track of locks
 #[derive(Debug)]
 pub struct LockTable {
-    lock_table: Mutex<HashMap<BlockId, LockState>>,
+    lock_table: Mutex<HashMap<LockTarget, LockState>>,
     cond_var: Condvar,
     timeout: u64,
 }
@@ -9818,146 +10015,106 @@ impl LockTable {
         }
     }
 
-    /// Acquire a shared lock on a [`BlockId`] for a [`Transaction`]
-    fn acquire_shared_lock(
+    /// Block until `mode` on `target` is compatible with all current holders, then grant it.
+    /// If the tx already holds a weaker mode, upgrades atomically via the upgrade queue.
+    /// Returns `Err` on timeout; cleans up upgrade_requests before returning.
+    fn acquire(
         &self,
         tx_id: TransactionID,
-        block_id: &BlockId,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut lock_table_guard = self.lock_table.lock().unwrap();
-        lock_table_guard
-            .entry(block_id.clone())
-            .or_insert(LockState {
-                readers: vec![tx_id].into_iter().collect(),
-                writer: None,
-                upgrade_requests: VecDeque::new(),
-            });
+        target: LockTarget,
+        mode: LockMode,
+    ) -> SimpleDBResult<()> {
+        let mut guard = self.lock_table.lock().unwrap();
+        let state = guard.entry(target.clone()).or_insert(LockState {
+            holders: HashMap::new(),
+            upgrade_requests: VecDeque::new(),
+        });
 
-        //  Do an early return if the txn already has an SLock on this block
-        if lock_table_guard
-            .get(block_id)
-            .unwrap()
-            .readers
-            .contains(&tx_id)
-        {
-            return Ok(());
-        }
-
-        //  Loop until either
-        //  1. There are no more writers or pending writers on this block
-        //  2. The timeout expires
-        let deadline = Instant::now() + Duration::from_millis(self.timeout);
-        loop {
-            let state = lock_table_guard.get_mut(block_id).unwrap();
-            let should_wait = state.writer.is_some() || !state.upgrade_requests.is_empty();
-
-            if !should_wait {
-                break;
+        // If this tx already holds a lock on this target, check if upgrade is needed
+        if let Some(&held) = state.holders.get(&tx_id) {
+            if LockMode::covers(held, mode) {
+                return Ok(());
             }
-
-            lock_table_guard = self.cond_var.wait(lock_table_guard).unwrap();
-
-            if Instant::now() >= deadline {
-                return Err("Timeout while waiting for shared lock".into());
-            }
-        }
-        lock_table_guard
-            .get_mut(block_id)
-            .unwrap()
-            .readers
-            .insert(tx_id);
-        Ok(())
-    }
-
-    /// Acquire an exclusive lock on a [`BlockId`] for a [`Transaction`]
-    fn acquire_write_lock(
-        &self,
-        tx_id: TransactionID,
-        block_id: &BlockId,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut lock_table_guard = self.lock_table.lock().unwrap();
-        lock_table_guard
-            .entry(block_id.clone())
-            .or_insert(LockState {
-                readers: HashSet::from_iter(vec![tx_id]),
-                writer: Some(tx_id),
-                upgrade_requests: VecDeque::new(),
-            });
-
-        //  Do an early return if this txn already has an xlock on the buffer
-        if lock_table_guard.get(block_id).unwrap().writer == Some(tx_id) {
-            return Ok(());
-        }
-
-        //  Maintain the invariant that any transaction that wants an xlock must first have an slock
-        assert!(lock_table_guard
-            .get(block_id)
-            .unwrap()
-            .readers
-            .contains(&tx_id), "Transaction {tx_id} failed to have an slock before attempting to acquire xlock on block id {block_id:?}");
-
-        lock_table_guard
-            .get_mut(block_id)
-            .unwrap()
-            .upgrade_requests
-            .push_back(tx_id);
-        let deadline = Instant::now() + Duration::from_millis(self.timeout);
-        loop {
-            let state = lock_table_guard.get_mut(block_id).unwrap();
-            let should_wait = state.readers.len() > 1
-                || state.writer.is_some()
-                || state
+            // Upgrade required: compute the target mode
+            let target_mode = LockMode::join(held, mode);
+            state.upgrade_requests.push_back(tx_id);
+            let deadline = Instant::now() + Duration::from_millis(self.timeout);
+            loop {
+                let state = guard.get(&target).unwrap();
+                // other_incompatible: another holder blocks the upgraded mode
+                let other_incompatible = state
+                    .holders
+                    .iter()
+                    .any(|(&id, &h)| id != tx_id && !LockMode::compatible(h, target_mode));
+                // front_is_us: serialise concurrent upgraders; only the front of the
+                // queue may proceed to avoid two upgraders deadlocking each other
+                let front_is_us = state
                     .upgrade_requests
                     .front()
-                    .is_some_and(|id| *id != tx_id);
+                    .is_some_and(|&id| id == tx_id);
+                if !other_incompatible && front_is_us {
+                    break;
+                }
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    guard
+                        .get_mut(&target)
+                        .unwrap()
+                        .upgrade_requests
+                        .retain(|&id| id != tx_id);
+                    return Err("Timeout while waiting for lock upgrade".into());
+                }
+                let (g, result) = self.cond_var.wait_timeout(guard, timeout).unwrap();
+                guard = g;
+                if result.timed_out() {
+                    guard
+                        .get_mut(&target)
+                        .unwrap()
+                        .upgrade_requests
+                        .retain(|&id| id != tx_id);
+                    return Err("Timeout while waiting for lock upgrade".into());
+                }
+            }
+            guard.get_mut(&target).unwrap().upgrade_requests.pop_front();
+            guard
+                .get_mut(&target)
+                .unwrap()
+                .holders
+                .insert(tx_id, target_mode);
+            return Ok(());
+        }
 
-            if !should_wait {
+        // New lock request — wait until compatible with all current holders
+        let deadline = Instant::now() + Duration::from_millis(self.timeout);
+        loop {
+            let state = guard.get(&target).unwrap();
+            let blocked = state
+                .holders
+                .iter()
+                .any(|(&id, &held)| id != tx_id && !LockMode::compatible(held, mode))
+                || (mode == LockMode::S && !state.upgrade_requests.is_empty());
+            if !blocked {
                 break;
             }
-
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
-                return Err("Timeout while waiting for write lock".into());
+                return Err("Timeout while waiting for lock".into());
             }
-            let (guard, timeout_reached) = self
-                .cond_var
-                .wait_timeout(lock_table_guard, timeout)
-                .unwrap();
-            lock_table_guard = guard;
-            if timeout_reached.timed_out() {
-                return Err(
-                    "Timeout while waiting for write lock and timeout exceeded after woken up"
-                        .into(),
-                );
+            let (g, result) = self.cond_var.wait_timeout(guard, timeout).unwrap();
+            guard = g;
+            if result.timed_out() {
+                return Err("Timeout while waiting for lock".into());
             }
         }
-        let state = lock_table_guard.get_mut(block_id).unwrap();
-        assert_eq!(state.readers.len(), 1);
-        assert!(state.readers.contains(&tx_id));
-        assert!(state
-            .upgrade_requests
-            .front()
-            .is_some_and(|id| *id == tx_id));
-        state.writer = Some(tx_id);
-        state.readers.remove(&tx_id);
-        state.upgrade_requests.pop_front();
+        guard.get_mut(&target).unwrap().holders.insert(tx_id, mode);
         Ok(())
     }
 
-    /// Release all locks on a specific [`BlockId`] that were acquired by a [`Transaction`]
-    fn release_locks(
-        &self,
-        tx_id: TransactionID,
-        block_id: &BlockId,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut lock_table_guard = self.lock_table.lock().unwrap();
-        if let Some(state) = lock_table_guard.get_mut(block_id) {
-            state.readers.remove(&tx_id);
-            if let Some(writer_tx_id) = state.writer {
-                if writer_tx_id == tx_id {
-                    state.writer = None;
-                }
-            }
+    /// Remove `tx_id` from holders and upgrade_requests for `target`, then wake waiters.
+    fn release(&self, tx_id: TransactionID, target: &LockTarget) -> SimpleDBResult<()> {
+        let mut guard = self.lock_table.lock().unwrap();
+        if let Some(state) = guard.get_mut(target) {
+            state.holders.remove(&tx_id);
             state.upgrade_requests.retain(|&id| id != tx_id);
         }
         self.cond_var.notify_all();
@@ -9969,67 +10126,77 @@ impl LockTable {
 mod lock_table_tests {
     use std::{sync::Arc, time::Duration};
 
-    use crate::{test_utils::generate_filename, BlockId, LockTable};
+    use crate::{LockMode, LockTable, LockTarget};
 
     #[test]
     fn test_basic_shared_lock() {
-        let filename = generate_filename();
         let lock_table = Arc::new(LockTable::new(10_000));
-        let block_id = BlockId::new(filename, 1);
+        let target = LockTarget::Row {
+            table_id: 0,
+            block: 1,
+            slot: 0,
+        };
 
         // Should be able to acquire shared lock
-        lock_table.acquire_shared_lock(1, &block_id).unwrap();
+        lock_table.acquire(1, target.clone(), LockMode::S).unwrap();
 
         // Another transaction should also be able to acquire shared lock
-        lock_table.acquire_shared_lock(2, &block_id).unwrap();
+        lock_table.acquire(2, target.clone(), LockMode::S).unwrap();
 
         // Release locks
-        lock_table.release_locks(1, &block_id).unwrap();
-        lock_table.release_locks(2, &block_id).unwrap();
+        lock_table.release(1, &target).unwrap();
+        lock_table.release(2, &target).unwrap();
     }
 
     #[test]
     fn test_basic_exclusive_lock() {
-        let filename = generate_filename();
         let lock_table = Arc::new(LockTable::new(1)); //  extremely short timeout of 1ms
-        let block_id = BlockId::new(filename, 1);
+        let target = LockTarget::Row {
+            table_id: 0,
+            block: 1,
+            slot: 0,
+        };
 
         // Should be able to acquire exclusive lock
-        lock_table.acquire_write_lock(1, &block_id).unwrap();
+        lock_table.acquire(1, target.clone(), LockMode::X).unwrap();
 
         let lt_1 = Arc::clone(&lock_table);
-        let bid_1 = block_id.clone();
+        let target_1 = target.clone();
 
         //  Another transaction should not be able to acquire any locks
         let _ = std::thread::spawn(move || {
-            lt_1.acquire_shared_lock(2, &bid_1).unwrap_err();
+            lt_1.acquire(2, target_1, LockMode::S).unwrap_err();
         });
 
         // Release lock after a timeout of making sure t2 panics
         std::thread::sleep(Duration::from_millis(5));
-        lock_table.release_locks(1, &block_id).unwrap();
+        lock_table.release(1, &target).unwrap();
     }
 
     #[test]
     fn test_read_write_interleaving() {
         let lock_table = Arc::new(LockTable::new(1000)); //  timeout of 1sec
-        let block_id = BlockId::new(generate_filename(), 1);
+        let target = LockTarget::Row {
+            table_id: 0,
+            block: 1,
+            slot: 0,
+        };
 
         //  reader thread
         let lt_1 = Arc::clone(&lock_table);
-        let bid_1 = block_id.clone();
+        let target_1 = target.clone();
         std::thread::spawn(move || {
             let readers = 10;
             for i in 0..readers {
-                lt_1.acquire_shared_lock(i, &bid_1).unwrap();
+                lt_1.acquire(i, target_1.clone(), LockMode::S).unwrap();
                 std::thread::sleep(Duration::from_millis(super::Transaction::sleep_timeout()));
-                lt_1.release_locks(i, &bid_1).unwrap();
+                lt_1.release(i, &target_1).unwrap();
             }
         });
 
         //  writer thread
         let lt_2 = Arc::clone(&lock_table);
-        let bid_2 = block_id.clone();
+        let target_2 = target.clone();
         std::thread::spawn(move || {
             let count = 10;
             let mut iterations = 0;
@@ -10038,9 +10205,9 @@ mod lock_table_tests {
                     break;
                 }
 
-                lt_2.acquire_shared_lock(12, &bid_2).unwrap();
-                lt_2.acquire_write_lock(12, &bid_2).unwrap();
-                lt_2.release_locks(12, &bid_2).unwrap();
+                lt_2.acquire(12, target_2.clone(), LockMode::S).unwrap();
+                lt_2.acquire(12, target_2.clone(), LockMode::X).unwrap();
+                lt_2.release(12, &target_2).unwrap();
 
                 iterations += 1;
             }
@@ -10050,97 +10217,223 @@ mod lock_table_tests {
     #[test]
     fn test_lock_upgrade() {
         let lock_table = Arc::new(LockTable::new(1000));
-        let block_id = BlockId::new(generate_filename(), 1);
+        let target = LockTarget::Row {
+            table_id: 0,
+            block: 1,
+            slot: 0,
+        };
         let (tx, rx) = std::sync::mpsc::channel::<String>();
 
         //  T1 acquires shared lock
-        lock_table.acquire_shared_lock(1, &block_id).unwrap();
+        lock_table.acquire(1, target.clone(), LockMode::S).unwrap();
 
         //  T2 acquires shared lock
-        lock_table.acquire_shared_lock(2, &block_id).unwrap();
+        lock_table.acquire(2, target.clone(), LockMode::S).unwrap();
 
         //  T1 requests an upgrade
         let lt1 = Arc::clone(&lock_table);
-        let bid1 = block_id.clone();
+        let target1 = target.clone();
         std::thread::spawn(move || {
             tx.send("Acquiring write lock".to_string()).unwrap();
-            lt1.acquire_write_lock(1, &bid1).unwrap();
+            lt1.acquire(1, target1, LockMode::X).unwrap();
             tx.send("Acquired write lock".to_string()).unwrap();
         });
 
         //  Wait for T1 to start acquiring write lock and release T2's lock
         assert!(rx.recv().unwrap() == *"Acquiring write lock");
-        lock_table.release_locks(2, &block_id).unwrap();
+        lock_table.release(2, &target).unwrap();
         assert!(rx.recv().unwrap() == *"Acquired write lock");
     }
 }
 
-#[derive(Debug)]
-enum LockType {
-    Shared,
-    Exclusive,
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+enum LockTarget {
+    Table {
+        table_id: u32,
+    },
+    Row {
+        table_id: u32,
+        block: u32,
+        slot: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    IS,
+    IX,
+    S,
+    X,
+}
+
+impl LockMode {
+    /// Returns true if `requested` is compatible with `held`
+    fn compatible(held: LockMode, requested: LockMode) -> bool {
+        matches!(
+            (held, requested),
+            (LockMode::IS, LockMode::IS)
+                | (LockMode::IS, LockMode::IX)
+                | (LockMode::IS, LockMode::S)
+                | (LockMode::IX, LockMode::IS)
+                | (LockMode::IX, LockMode::IX)
+                | (LockMode::S, LockMode::IS)
+                | (LockMode::S, LockMode::S)
+        )
+    }
+
+    /// Returns true if holding `held` satisfies a request for `requested`
+    /// (i.e. no upgrade is needed).
+    fn covers(held: LockMode, requested: LockMode) -> bool {
+        match held {
+            LockMode::X => true,
+            LockMode::S => matches!(requested, LockMode::S | LockMode::IS),
+            LockMode::IX => matches!(requested, LockMode::IX | LockMode::IS),
+            LockMode::IS => matches!(requested, LockMode::IS),
+        }
+    }
+
+    /// Returns the least mode that satisfies both `a` and `b`.
+    /// Since we have no SIX, S+IX escalates to X.
+    fn join(a: LockMode, b: LockMode) -> LockMode {
+        match (a, b) {
+            (LockMode::X, _) | (_, LockMode::X) => LockMode::X,
+            (LockMode::S, LockMode::IX) | (LockMode::IX, LockMode::S) => LockMode::X,
+            (LockMode::S, _) | (_, LockMode::S) => LockMode::S,
+            (LockMode::IX, _) | (_, LockMode::IX) => LockMode::IX,
+            _ => LockMode::IS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableLockMode {
+    IS,
+    IX,
+    S,
+    X,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowLockMode {
+    S,
+    X,
+}
+
+impl From<TableLockMode> for LockMode {
+    fn from(m: TableLockMode) -> Self {
+        match m {
+            TableLockMode::IS => LockMode::IS,
+            TableLockMode::IX => LockMode::IX,
+            TableLockMode::S => LockMode::S,
+            TableLockMode::X => LockMode::X,
+        }
+    }
+}
+
+impl From<RowLockMode> for LockMode {
+    fn from(m: RowLockMode) -> Self {
+        match m {
+            RowLockMode::S => LockMode::S,
+            RowLockMode::X => LockMode::X,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ConcurrencyManager {
     lock_table: Arc<LockTable>,
-    locks: RefCell<HashMap<BlockId, LockType>>,
+    table_locks: RefCell<HashMap<u32, TableLockMode>>,
+    row_locks: RefCell<HashMap<(u32, u32, u32), RowLockMode>>,
     tx_id: TransactionID,
 }
+
 impl ConcurrencyManager {
     pub fn new(tx_id: TransactionID, lock_table: Arc<LockTable>) -> Self {
         Self {
             lock_table,
-            locks: RefCell::new(HashMap::new()),
+            table_locks: RefCell::new(HashMap::new()),
+            row_locks: RefCell::new(HashMap::new()),
             tx_id,
         }
     }
 
-    /// Acquire a shared lock on a [`BlockId`] for the associated [`Transaction`]
-    fn slock(&self, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
-        let mut locks = self.locks.borrow_mut();
-        if locks.contains_key(block_id) {
-            return Ok(());
-        }
-        self.lock_table.acquire_shared_lock(self.tx_id, block_id)?;
-        locks.insert(block_id.clone(), LockType::Shared);
+    /// Acquire a table-level lock and track it locally for release at commit/rollback.
+    fn acquire_table(&self, table_id: u32, mode: TableLockMode) -> SimpleDBResult<()> {
+        self.lock_table
+            .acquire(self.tx_id, LockTarget::Table { table_id }, mode.into())?;
+        self.table_locks.borrow_mut().insert(table_id, mode);
         Ok(())
     }
 
-    /// Acquire an exclusive lock on a [`BlockId`] for the associated [`Transaction`]
-    /// It will first check to see if there is already a [`LockType`] available on the [`BlockId`]
-    /// If there is none, it will first attempt to acquire a [`LockType::Shared`] and then a [`LockType::Exclusive`]
-    fn xlock(&self, block_id: &BlockId) -> Result<(), Box<dyn Error>> {
-        let mut locks = self.locks.borrow_mut();
-        match locks.get(block_id) {
-            Some(lock) => match lock {
-                LockType::Shared => {
-                    self.lock_table.acquire_write_lock(self.tx_id, block_id)?;
-                    locks.insert(block_id.clone(), LockType::Exclusive).unwrap();
-                }
-                LockType::Exclusive => return Ok(()),
+    /// Acquire a row-level lock and track it locally for release at commit/rollback.
+    /// Callers must acquire the appropriate intent lock on the table first.
+    fn acquire_row(&self, table_id: u32, rid: RID, mode: RowLockMode) -> SimpleDBResult<()> {
+        let block = rid.block_num as u32;
+        let slot = rid.slot as u32;
+        self.lock_table.acquire(
+            self.tx_id,
+            LockTarget::Row {
+                table_id,
+                block,
+                slot,
             },
-            None => {
-                //  drop the value here so no overlapping borrows
-                drop(locks);
-                self.slock(block_id)?;
-                self.lock_table.acquire_write_lock(self.tx_id, block_id)?;
-
-                //  re-acquire the borrow mut here
-                let mut locks = self.locks.borrow_mut();
-                locks.insert(block_id.clone(), LockType::Exclusive);
-            }
-        }
+            mode.into(),
+        )?;
+        self.row_locks
+            .borrow_mut()
+            .insert((table_id, block, slot), mode);
         Ok(())
     }
 
-    /// Release all locks associated with a [`Transaction`]
-    fn release(&self) -> Result<(), Box<dyn Error>> {
-        let mut locks = self.locks.borrow_mut();
-        for block in locks.keys() {
-            self.lock_table.release_locks(self.tx_id, block)?;
+    fn lock_table_is(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.acquire_table(table_id, TableLockMode::IS)
+    }
+
+    fn lock_table_ix(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.acquire_table(table_id, TableLockMode::IX)
+    }
+
+    pub fn lock_table_s(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.acquire_table(table_id, TableLockMode::S)
+    }
+
+    pub fn lock_table_x(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.acquire_table(table_id, TableLockMode::X)
+    }
+
+    pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
+        self.lock_table_is(table_id)?;
+        self.acquire_row(table_id, rid, RowLockMode::S)
+    }
+
+    pub fn lock_row_x(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
+        self.lock_table_ix(table_id)?;
+        self.acquire_row(table_id, rid, RowLockMode::X)
+    }
+
+    fn release(&self) -> SimpleDBResult<()> {
+        let table_ids: Vec<u32> = self.table_locks.borrow().keys().cloned().collect();
+        let row_ids: Vec<(u32, u32, u32)> = self.row_locks.borrow().keys().cloned().collect();
+        for table_id in &table_ids {
+            self.lock_table.release(
+                self.tx_id,
+                &LockTarget::Table {
+                    table_id: *table_id,
+                },
+            )?;
         }
-        locks.clear();
+        for &(table_id, block, slot) in &row_ids {
+            self.lock_table.release(
+                self.tx_id,
+                &LockTarget::Row {
+                    table_id,
+                    block,
+                    slot,
+                },
+            )?;
+        }
+        self.table_locks.borrow_mut().clear();
+        self.row_locks.borrow_mut().clear();
         Ok(())
     }
 }
@@ -10182,7 +10475,7 @@ impl RecoveryManager {
     /// Iterate over the WAL records in reverse order and undo any modifications done for this [`Transaction`]
     /// Flush all data associated with this transaction
     /// Create, write and flush a [`LogRecord::Checkpoint`] record
-    fn rollback(&self, tx: &dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+    fn rollback(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
         //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
         for (_, log) in log_iter {
@@ -10207,7 +10500,7 @@ impl RecoveryManager {
     /// Recover the database from the last [`LogRecord::Checkpoint`]
     /// Find all the incomplete transactions and undo their operations
     /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
-    fn recover(&self, tx: &dyn TransactionOperations) -> Result<(), Box<dyn Error>> {
+    fn recover(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
         //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
         let log_iter = self.log_manager.lock().unwrap().iterator();
         let mut finished_txns: Vec<usize> = Vec::new();
@@ -10220,7 +10513,7 @@ impl RecoveryManager {
                 }
                 _ => {
                     if !finished_txns.contains(&record.get_tx_num())
-                        && record.should_undo_during_recovery(tx, record_lsn)
+                        && record.should_undo_during_recovery(tx, record_lsn)?
                     {
                         record.undo(tx)?;
                     }
@@ -11706,7 +11999,7 @@ impl LogRecord {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
                     return Err("HeapTupleInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleInsert undo: failed to create heap page for block {:?}: {}",
@@ -11734,7 +12027,7 @@ impl LogRecord {
                 else {
                     return Err("HeapTupleUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleUpdate undo: failed to create heap page for block {:?}: {}",
@@ -11757,7 +12050,7 @@ impl LogRecord {
                 else {
                     return Err("HeapTupleDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::HeapPageMut::new(guard.bytes_mut()).map_err(|e| {
                     format!(
                         "HeapTupleDelete undo: failed to create heap page for block {:?}: {}",
@@ -11777,7 +12070,7 @@ impl LogRecord {
                 let LogRecord::BTreeLeafInsert { block_id, slot, .. } = self else {
                     return Err("BTreeLeafInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page =
                     crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
                         format!(
@@ -11802,7 +12095,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeLeafDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 // Check page type - if not IndexLeaf, page was deallocated/unformatted by prior undo
                 let mut page =
                     crate::page::BTreeLeafPageMut::new(guard.bytes_mut()).map_err(|e| {
@@ -11827,7 +12120,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalInsert: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 // Check page type - if not IndexInternal, page was deallocated/unformatted by prior undo
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
                     .map_err(|e| format!("BTreeInternalInsert undo: failed to create internal page for block {:?}: {}", block_id, e))?;
@@ -11850,7 +12143,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalDelete: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let mut page = crate::page::BTreeInternalPageMut::new(guard.bytes_mut())
                     .map_err(|e| format!("BTreeInternalDelete undo: failed to create internal page for block {:?}: {}", block_id, e))?;
                 // Undo delete may fail if page structure changed by prior undo operations
@@ -11869,7 +12162,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeLeafHeaderUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let header = guard
                     .bytes_mut()
                     .get_mut(..old_header.len())
@@ -11892,7 +12185,7 @@ impl LogRecord {
                 else {
                     return Err("BTreeInternalHeaderUpdate: invalid record structure".into());
                 };
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 let header = guard.bytes_mut().get_mut(..old_header.len())
                     .ok_or_else(|| format!("BTreeInternalHeaderUpdate undo: header slice out of bounds for block {:?}", block_id))?;
                 header.copy_from_slice(old_header);
@@ -11916,7 +12209,7 @@ impl LogRecord {
 
                 // Restore left-page structural metadata (skip if page deallocated/unformatted).
                 if *is_leaf {
-                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut left_guard = txn.pin_write_guard(left_block_id)?;
                     let mut page = crate::page::BTreeLeafPageMut::new(left_guard.bytes_mut())
                             .map_err(|e| format!("BTreePageSplit undo: failed to create leaf page for left block {:?}: {}", left_block_id, e))?;
                     match old_left_high_key {
@@ -11931,7 +12224,7 @@ impl LogRecord {
                             .map_err(|e| format!("BTreePageSplit undo: failed to restore leaf overflow for block {:?}: {}", left_block_id, e))?;
                     left_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 } else {
-                    let mut left_guard = txn.pin_write_guard(left_block_id);
+                    let mut left_guard = txn.pin_write_guard(left_block_id)?;
                     let mut page = crate::page::BTreeInternalPageMut::new(left_guard.bytes_mut())
                             .map_err(|e| format!("BTreePageSplit undo: failed to create internal page for left block {:?}: {}", left_block_id, e))?;
                     match old_left_high_key {
@@ -11947,7 +12240,7 @@ impl LogRecord {
 
                 // Deallocate right split page by pushing it onto the index free-list.
                 let meta_block = BlockId::new(left_block_id.filename.clone(), 0);
-                let meta_guard = txn.pin_write_guard(&meta_block);
+                let meta_guard = txn.pin_write_guard(&meta_block)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -11958,7 +12251,7 @@ impl LogRecord {
                     })?;
                 let old_head = meta_view.first_free_block();
 
-                let mut right_guard = txn.pin_write_guard(right_block_id);
+                let mut right_guard = txn.pin_write_guard(right_block_id)?;
                 right_guard.format_as_free(old_head, Lsn::MAX);
 
                 meta_view.set_first_free_block(right_block_id.block_num as u32);
@@ -11977,7 +12270,7 @@ impl LogRecord {
                     return Err("BTreeRootUpdate: invalid record structure".into());
                 };
 
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -11994,7 +12287,7 @@ impl LogRecord {
                 if old_root_block != new_root_block {
                     let new_root =
                         BlockId::new(meta_block_id.filename.clone(), *new_root_block as usize);
-                    let mut new_root_guard = txn.pin_write_guard(&new_root);
+                    let mut new_root_guard = txn.pin_write_guard(&new_root)?;
                     new_root_guard.format_as_free(old_free_head, Lsn::MAX);
                     meta_view.set_first_free_block(*new_root_block);
                 }
@@ -12015,7 +12308,7 @@ impl LogRecord {
                 };
 
                 // Restore meta to point to old head
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12027,7 +12320,7 @@ impl LogRecord {
                 meta_view.set_first_free_block(*old_head);
 
                 // Restore the allocated block as free with its old next pointer
-                let mut block_guard = txn.pin_write_guard(block_id);
+                let mut block_guard = txn.pin_write_guard(block_id)?;
                 block_guard.format_as_free(*old_block_next, Lsn::MAX);
 
                 meta_view.update_crc32();
@@ -12044,7 +12337,7 @@ impl LogRecord {
                 };
 
                 // Restore meta to point to old head (before push)
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12063,7 +12356,7 @@ impl LogRecord {
             }
             LogRecord::HeapPageFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
@@ -12074,7 +12367,7 @@ impl LogRecord {
                 ..
             } => {
                 // Deallocate by pushing to free list
-                let meta_guard = txn.pin_write_guard(meta_block_id);
+                let meta_guard = txn.pin_write_guard(meta_block_id)?;
                 meta_guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 let mut meta_view =
                     crate::page::BTreeMetaPageViewMut::new(meta_guard).map_err(|e| {
@@ -12086,7 +12379,7 @@ impl LogRecord {
                 let old_free_head = meta_view.first_free_block();
 
                 // Mark page as Free and link to old head
-                let mut block_guard = txn.pin_write_guard(block_id);
+                let mut block_guard = txn.pin_write_guard(block_id)?;
                 block_guard.format_as_free(old_free_head, Lsn::MAX);
 
                 // Update meta to point to this page as new head
@@ -12096,21 +12389,21 @@ impl LogRecord {
             }
             LogRecord::BTreeMetaFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
             }
             LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
             }
             LogRecord::BTreeLeafFormatFresh { block_id, .. } => {
                 // Zero page bytes to mark as unformatted
-                let mut guard = txn.pin_write_guard(block_id);
+                let mut guard = txn.pin_write_guard(block_id)?;
                 guard.bytes_mut().fill(0);
                 guard.mark_modified(txn.txn_id(), Lsn::MAX);
                 Ok(())
@@ -12124,16 +12417,18 @@ impl LogRecord {
         &self,
         txn: &dyn TransactionOperations,
         record_lsn: Lsn,
-    ) -> bool {
+    ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
         match self {
             // Multi-page operation: affects left, right, and meta pages
             // Always undo for unfinished txns (can't rely on single-page LSN check)
-            LogRecord::BTreePageSplit { .. } => return true,
+            LogRecord::BTreePageSplit { .. } => return Ok(true),
 
             // Append operations: freshly appended pages may not have reliable header LSN
             // Bypass LSN gate to ensure undo/deallocation happens for unfinished txns
-            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => return true,
+            LogRecord::HeapPageAppend { .. } | LogRecord::BTreePageAppend { .. } => {
+                return Ok(true)
+            }
 
             // All other operations use standard LSN-based gating
             _ => {}
@@ -12141,11 +12436,11 @@ impl LogRecord {
 
         // Standard LSN-based gating for single-page operations
         let Some(block_id) = self.undo_block_id() else {
-            return true;
+            return Ok(true);
         };
-        let guard = txn.pin_write_guard(block_id);
+        let guard = txn.pin_write_guard(block_id)?;
         let page_lsn = crate::page::page_lsn_from_bytes(guard.bytes());
-        page_lsn >= record_lsn
+        Ok(page_lsn >= record_lsn)
     }
 
     fn undo_block_id(&self) -> Option<&BlockId> {
@@ -12210,7 +12505,7 @@ mod recovery_manager_tests {
     }
 
     fn format_heap(txn: &Arc<Transaction>, block: &BlockId) {
-        let mut guard = txn.pin_write_guard(block);
+        let mut guard = txn.pin_write_guard(block).unwrap();
         guard.format_as_heap().unwrap();
     }
 
@@ -12221,7 +12516,7 @@ mod recovery_manager_tests {
         int_value: i32,
         text_value: &str,
     ) -> SlotId {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.insert_row_values(&[
             Constant::Int(int_value),
@@ -12237,7 +12532,7 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: i32,
     ) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -12254,7 +12549,7 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: &str,
     ) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -12265,13 +12560,13 @@ mod recovery_manager_tests {
     }
 
     fn delete_slot(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) {
-        let guard = txn.pin_write_guard(block);
+        let guard = txn.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.delete_slot(slot).expect("delete slot");
     }
 
     fn read_int_at(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) -> i32 {
-        let guard = txn.pin_read_guard(block);
+        let guard = txn.pin_read_guard(block).unwrap();
         let view = guard.into_heap_view(layout).expect("heap view");
         let row = view.row(slot).expect("row exists");
         match row.get_column(INT_FIELD) {
@@ -12286,7 +12581,7 @@ mod recovery_manager_tests {
         layout: &Layout,
         slot: SlotId,
     ) -> String {
-        let guard = txn.pin_read_guard(block);
+        let guard = txn.pin_read_guard(block).unwrap();
         let view = guard.into_heap_view(layout).expect("heap view");
         let row = view.row(slot).expect("row exists");
         match row.get_column(STR_FIELD) {
@@ -12314,7 +12609,7 @@ mod recovery_manager_tests {
 
         // Verify: page is formatted, insert is rolled back
         let check_txn = db.new_tx();
-        let guard = check_txn.pin_read_guard(&block);
+        let guard = check_txn.pin_read_guard(&block).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(0).is_none(), "slot 0 should not be live");
         assert_eq!(view.live_slot_iter().count(), 0);
@@ -12362,7 +12657,7 @@ mod recovery_manager_tests {
 
         // Verify: page is formatted, all operations are rolled back
         let check_txn = db.new_tx();
-        let guard = check_txn.pin_read_guard(&block);
+        let guard = check_txn.pin_read_guard(&block).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert_eq!(view.live_slot_iter().count(), 0);
     }
@@ -12409,7 +12704,7 @@ mod recovery_manager_tests {
         let txn = db.new_tx();
         txn.recover().unwrap();
 
-        let guard = txn.pin_read_guard(&block_id);
+        let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert_eq!(view.live_slot_iter().count(), 1);
     }
@@ -12436,7 +12731,7 @@ mod recovery_manager_tests {
         let txn = db.new_tx();
         txn.recover().unwrap();
 
-        let guard = txn.pin_read_guard(&block_id);
+        let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(committed_slot).is_some());
         assert!(view.row(uncommitted_slot).is_none());
@@ -12508,7 +12803,7 @@ mod recovery_manager_tests {
 
         let txn2 = db.new_tx();
         {
-            let guard = txn2.pin_write_guard(&block);
+            let guard = txn2.pin_write_guard(&block).unwrap();
             let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
             let int_idx = layout.column_idx(INT_FIELD).unwrap();
             let str_idx = layout.column_idx(STR_FIELD).unwrap();
@@ -12560,7 +12855,7 @@ mod recovery_manager_tests {
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot1), 2);
         assert_eq!(read_string_at(&check_txn, &block_id, &layout, slot1), "two");
 
-        let guard = check_txn.pin_read_guard(&block_id);
+        let guard = check_txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(slot2).is_none());
         assert_eq!(view.live_slot_iter().count(), 2);

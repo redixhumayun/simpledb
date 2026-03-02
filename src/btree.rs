@@ -68,7 +68,7 @@ mod free_list {
             let meta_block = Self::meta_block_id(file_name);
             let tx_id = txn.id();
 
-            let meta_guard = txn.pin_write_guard(&meta_block);
+            let meta_guard = txn.pin_write_guard(&meta_block)?;
             let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
             let free_head = meta_view.first_free_block();
             if free_head == Self::NO_FREE_BLOCK {
@@ -91,7 +91,7 @@ mod free_list {
             // Read next free pointer from the block we're about to allocate
             let free_block = BlockId::new(file_name.to_string(), free_head as usize);
             let next_free = {
-                let free_guard = txn.pin_write_guard(&free_block);
+                let free_guard = txn.pin_write_guard(&free_block)?;
                 Self::read_next_free_block(free_guard.bytes())?
             };
 
@@ -112,7 +112,7 @@ mod free_list {
             drop(meta_view);
 
             // Mark meta page with actual LSN
-            let meta_guard = txn.pin_write_guard(&meta_block);
+            let meta_guard = txn.pin_write_guard(&meta_block)?;
             meta_guard.mark_modified(tx_id, lsn);
 
             Ok(AllocatedBlock {
@@ -134,7 +134,7 @@ mod free_list {
             let meta_block = Self::meta_block_id(file_name);
             let tx_id = txn.id();
 
-            let meta_guard = txn.pin_write_guard(&meta_block);
+            let meta_guard = txn.pin_write_guard(&meta_block)?;
             let mut meta_view = BTreeMetaPageViewMut::new(meta_guard)?;
             let old_head = meta_view.first_free_block();
             let new_head = block_num as u32;
@@ -152,7 +152,7 @@ mod free_list {
             let lsn = record.write_log_record(&txn.log_manager())?;
 
             // Mark target block as free and link it to the free list
-            let mut target_guard = txn.pin_write_guard(&target_block);
+            let mut target_guard = txn.pin_write_guard(&target_block)?;
             let bytes = target_guard.bytes_mut();
             bytes.fill(0); // Clear the page
             bytes[0] = PageType::Free as u8; // Set page type discriminator
@@ -166,7 +166,7 @@ mod free_list {
             drop(meta_view);
 
             // Mark meta page with actual LSN
-            let meta_guard = txn.pin_write_guard(&meta_block);
+            let meta_guard = txn.pin_write_guard(&meta_block)?;
             meta_guard.mark_modified(tx_id, lsn);
 
             Ok(())
@@ -284,7 +284,7 @@ impl BTreeIndex {
             }
             .write_log_record(&txn.log_manager())?;
             {
-                let mut guard = txn.pin_write_guard(&meta_id);
+                let mut guard = txn.pin_write_guard(&meta_id)?;
                 guard.mark_modified(txn.id(), append_lsn);
                 guard.format_as_btree_meta(1, 1, 1, u32::MAX)?;
             }
@@ -299,7 +299,7 @@ impl BTreeIndex {
             }
             .write_log_record(&txn.log_manager())?;
             {
-                let mut guard = txn.pin_write_guard(&root_id);
+                let mut guard = txn.pin_write_guard(&root_id)?;
                 guard.mark_modified(txn.id(), append_lsn);
                 // rightmost child will point to first leaf (block 2)
                 guard.format_as_btree_internal(0, Some(2))?;
@@ -315,14 +315,14 @@ impl BTreeIndex {
             }
             .write_log_record(&txn.log_manager())?;
             {
-                let mut guard = txn.pin_write_guard(&leaf_id);
+                let mut guard = txn.pin_write_guard(&leaf_id)?;
                 guard.mark_modified(txn.id(), append_lsn);
                 guard.format_as_btree_leaf(None)?;
             }
             (root_id, 1)
         } else {
             // Load meta
-            let guard = txn.pin_read_guard(&meta_block);
+            let guard = txn.pin_read_guard(&meta_block)?;
             let meta_view = BTreeMetaPageView::new(guard)?;
             let root_blk = meta_view.root_block() as usize;
             let height = meta_view.tree_height();
@@ -355,7 +355,7 @@ impl BTreeIndex {
     }
 
     fn update_meta(&mut self, lsn: Lsn) -> Result<(), Box<dyn Error>> {
-        let guard = self.txn.pin_write_guard(&self.meta_block);
+        let guard = self.txn.pin_write_guard(&self.meta_block)?;
         guard.mark_modified(self.txn.id(), lsn);
         let mut view = BTreeMetaPageViewMut::new(guard)?;
         view.set_tree_height(self.tree_height);
@@ -431,7 +431,7 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let block = self.current_block.clone()?;
-            let guard = self.txn.pin_read_guard(&block);
+            let guard = self.txn.pin_read_guard(&block).ok()?;
             let view = guard.into_btree_leaf_page_view(self.layout).ok()?;
 
             // Hop right if we’re past this page’s high key
@@ -640,7 +640,7 @@ mod btree_index_tests {
             index.internal_layout.clone(),
             index.index_file_name.clone(),
         );
-        let guard = index.txn.pin_read_guard(&root.block_id);
+        let guard = index.txn.pin_read_guard(&root.block_id).unwrap();
         let view = BTreeInternalPageView::new(guard, &root.layout).unwrap();
         assert_eq!(view.slot_count(), 0);
         assert_eq!(view.rightmost_child_block(), Some(2));
@@ -696,7 +696,8 @@ mod btree_index_tests {
         {
             let guard = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0));
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0))
+                .unwrap();
             let meta = BTreeMetaPageView::new(guard).expect("meta page view");
             assert_eq!(meta.version(), 1);
             assert_eq!(meta.tree_height(), 1);
@@ -708,7 +709,8 @@ mod btree_index_tests {
         {
             let guard = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 1));
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 1))
+                .unwrap();
             let view = guard
                 .into_btree_internal_page_view(&index.internal_layout)
                 .expect("root internal view");
@@ -721,7 +723,8 @@ mod btree_index_tests {
         {
             let guard = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 2));
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 2))
+                .unwrap();
             let view = guard
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .expect("leaf view");
@@ -751,7 +754,8 @@ mod btree_index_tests {
         {
             let guard = index
                 .txn
-                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0));
+                .pin_read_guard(&BlockId::new(index.index_file_name.clone(), 0))
+                .unwrap();
             let meta = BTreeMetaPageView::new(guard).expect("meta page view");
             assert_eq!(meta.root_block() as usize, index.root_block.block_num);
             assert_eq!(meta.tree_height(), index.tree_height);
@@ -778,7 +782,7 @@ mod btree_index_tests {
             let blk = root.search(&lower).unwrap();
             let block_id = BlockId::new(index.index_file_name.clone(), blk);
             let slot = {
-                let guard = index.txn.pin_read_guard(&block_id);
+                let guard = index.txn.pin_read_guard(&block_id).unwrap();
                 let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
                 view.find_slot_before(&lower)
             };
@@ -815,7 +819,7 @@ mod btree_index_tests {
             let blk = root.search(&lower_b).unwrap();
             let block_id = BlockId::new(index.index_file_name.clone(), blk);
             let slot = {
-                let guard = index.txn.pin_read_guard(&block_id);
+                let guard = index.txn.pin_read_guard(&block_id).unwrap();
                 let view = guard.into_btree_leaf_page_view(&index.leaf_layout).unwrap();
                 view.find_slot_before(&lower_b)
             };
@@ -864,6 +868,7 @@ mod btree_index_tests {
             let left_view = index
                 .txn
                 .pin_read_guard(&left_id)
+                .unwrap()
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let rsib = left_view
@@ -873,6 +878,7 @@ mod btree_index_tests {
             let right_view = index
                 .txn
                 .pin_read_guard(&right_id)
+                .unwrap()
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let right_first = right_view.get_entry(0).unwrap().key;
@@ -906,6 +912,7 @@ mod btree_index_tests {
                 let view = index
                     .txn
                     .pin_read_guard(&BlockId::new(index.index_file_name.clone(), current))
+                    .unwrap()
                     .into_btree_leaf_page_view(&index.leaf_layout)
                     .unwrap();
                 if let Some(rs) = view.right_sibling_block() {
@@ -925,16 +932,19 @@ mod btree_index_tests {
             let l0 = index
                 .txn
                 .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[0]))
+                .unwrap()
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let l1 = index
                 .txn
                 .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[1]))
+                .unwrap()
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
             let l2 = index
                 .txn
                 .pin_read_guard(&BlockId::new(index.index_file_name.clone(), blocks[2]))
+                .unwrap()
                 .into_btree_leaf_page_view(&index.leaf_layout)
                 .unwrap();
 
@@ -973,7 +983,7 @@ mod btree_index_tests {
         IndexFreeList::deallocate(&index.txn, &index.index_file_name, spare.block_num).unwrap();
 
         {
-            let guard = index.txn.pin_read_guard(&index.meta_block);
+            let guard = index.txn.pin_read_guard(&index.meta_block).unwrap();
             let meta = BTreeMetaPageView::new(guard).unwrap();
             assert_eq!(meta.first_free_block(), spare.block_num as u32);
         }
@@ -983,7 +993,7 @@ mod btree_index_tests {
         assert_eq!(reused.block_id.block_num, spare.block_num);
 
         {
-            let guard = index.txn.pin_read_guard(&index.meta_block);
+            let guard = index.txn.pin_read_guard(&index.meta_block).unwrap();
             let meta = BTreeMetaPageView::new(guard).unwrap();
             assert_eq!(meta.first_free_block(), IndexFreeList::no_free_block());
         }
@@ -1055,7 +1065,9 @@ mod btree_index_tests {
         }
 
         // Meta state should match committed baseline.
-        let guard = verify_tx.pin_read_guard(&BlockId::new(index_file_name, 0));
+        let guard = verify_tx
+            .pin_read_guard(&BlockId::new(index_file_name, 0))
+            .unwrap();
         let meta = BTreeMetaPageView::new(guard).unwrap();
         assert_eq!(meta.root_block(), committed_root_block);
         assert_eq!(meta.tree_height(), committed_tree_height);
@@ -1113,7 +1125,9 @@ mod btree_index_tests {
         }
 
         // Meta should match committed baseline.
-        let meta_guard = t3.pin_read_guard(&BlockId::new(index_file_name.clone(), 0));
+        let meta_guard = t3
+            .pin_read_guard(&BlockId::new(index_file_name.clone(), 0))
+            .unwrap();
         let meta = BTreeMetaPageView::new(meta_guard).unwrap();
         assert_eq!(meta.root_block(), baseline_root_block);
         assert_eq!(meta.tree_height(), baseline_tree_height);
@@ -1175,13 +1189,13 @@ impl BTreeInternal {
     /// Helper method to split an internal page by moving entries from [split_slot..] onwards
     fn split_page(&self, split_slot: usize) -> Result<BlockId, Box<dyn Error>> {
         let txn_id = self.txn.id();
-        let orig_guard = self.txn.pin_write_guard(&self.block_id);
+        let orig_guard = self.txn.pin_write_guard(&self.block_id)?;
         let (old_left_high_key, old_left_rightmost_child) =
             split_wal::read_internal_split_state(orig_guard.bytes())?;
         let mut orig_view = BTreeInternalPageViewMut::new(orig_guard, &self.layout)?;
 
         let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id);
+        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id)?;
         if let Some(append_lsn) = allocated.append_lsn {
             new_guard.mark_modified(txn_id, append_lsn);
         }
@@ -1261,11 +1275,11 @@ impl BTreeInternal {
     /// number of the leaf node that contains the key
     fn search(&mut self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
         let mut child_block = self.find_child_block(search_key)?;
-        let mut guard = self.txn.pin_read_guard(&self.block_id);
+        let mut guard = self.txn.pin_read_guard(&self.block_id)?;
         let mut view = guard.into_btree_internal_page_view(&self.layout)?;
         while view.btree_level() != 0 {
             child_block = self.find_child_block(search_key)?;
-            guard = self.txn.pin_read_guard(&child_block);
+            guard = self.txn.pin_read_guard(&child_block)?;
             view = guard.into_btree_internal_page_view(&self.layout)?;
         }
         Ok(child_block.block_num)
@@ -1275,14 +1289,14 @@ impl BTreeInternal {
     fn make_new_root(&self, split: SplitResult) -> Result<BlockId, Box<dyn Error>> {
         // read current level
         let level = {
-            let guard = self.txn.pin_read_guard(&self.block_id);
+            let guard = self.txn.pin_read_guard(&self.block_id)?;
             let view = guard.into_btree_internal_page_view(&self.layout)?;
             view.btree_level()
         };
 
         // Allocate a fresh root page and point its rightmost child at the left split child.
         let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut guard = self.txn.pin_write_guard(&allocated.block_id);
+        let mut guard = self.txn.pin_write_guard(&allocated.block_id)?;
         if let Some(append_lsn) = allocated.append_lsn {
             guard.mark_modified(self.txn.id(), append_lsn);
         }
@@ -1303,7 +1317,7 @@ impl BTreeInternal {
         &self,
         entry: BTreeInternalEntry,
     ) -> Result<Option<SplitResult>, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id);
+        let guard = self.txn.pin_read_guard(&self.block_id)?;
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
         if view.btree_level() == 0 {
             drop(view);
@@ -1335,7 +1349,7 @@ impl BTreeInternal {
         entry: BTreeInternalEntry,
     ) -> Result<Option<SplitResult>, Box<dyn Error>> {
         let split_point_opt = {
-            let guard = self.txn.pin_write_guard(&self.block_id);
+            let guard = self.txn.pin_write_guard(&self.block_id)?;
             let mut view = BTreeInternalPageViewMut::new(guard, &self.layout)?;
             view.insert_entry(entry.key, entry.child_block)?;
             if view.is_full() {
@@ -1350,7 +1364,7 @@ impl BTreeInternal {
 
         let new_block_id = self.split_page(split_point)?;
 
-        let guard = self.txn.pin_read_guard(&new_block_id);
+        let guard = self.txn.pin_read_guard(&new_block_id)?;
         let right_view = guard.into_btree_internal_page_view(&self.layout)?;
         let sep_key = right_view.get_entry(0)?.key.clone();
 
@@ -1364,7 +1378,7 @@ impl BTreeInternal {
     /// This method will find the child block for a given search key in a [BTreeInternal] node
     /// It uses textbook separator search: first key > search_key => take that entry's child; otherwise take header.rightmost_child.
     fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id);
+        let guard = self.txn.pin_read_guard(&self.block_id)?;
         let view = BTreeInternalPageView::new(guard, &self.layout)?;
         let mut left = 0;
         let mut right = view.slot_count();
@@ -1411,7 +1425,7 @@ mod btree_internal_tests {
         let meta = tx.append(&filename);
         assert_eq!(meta.block_num, 0);
         {
-            let mut guard = tx.pin_write_guard(&meta);
+            let mut guard = tx.pin_write_guard(&meta).unwrap();
             guard.format_as_btree_meta(1, 1, 1, u32::MAX).unwrap();
             guard.mark_modified(tx.id(), Lsn::MAX);
         }
@@ -1420,7 +1434,7 @@ mod btree_internal_tests {
         let dummy_child = tx.append(&filename);
 
         // Format the page as internal node
-        let mut guard = tx.pin_write_guard(&block);
+        let mut guard = tx.pin_write_guard(&block).unwrap();
         guard
             .format_as_btree_internal(0, Some(dummy_child.block_num))
             .unwrap();
@@ -1438,7 +1452,7 @@ mod btree_internal_tests {
 
         // Insert some entries to create a simple path
         {
-            let guard = txn.pin_write_guard(&internal.block_id);
+            let guard = txn.pin_write_guard(&internal.block_id).unwrap();
             let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
             view.insert_entry(Constant::Int(10), 2).unwrap();
             view.insert_entry(Constant::Int(20), 3).unwrap();
@@ -1484,7 +1498,7 @@ mod btree_internal_tests {
 
         // Setup initial entries
         {
-            let guard = txn.pin_write_guard(&internal.block_id);
+            let guard = txn.pin_write_guard(&internal.block_id).unwrap();
             let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
             view.insert_entry(Constant::Int(10), 2).unwrap();
             view.insert_entry(Constant::Int(20), 3).unwrap();
@@ -1502,13 +1516,13 @@ mod btree_internal_tests {
         assert_ne!(new_root.block_num, internal.block_id.block_num);
 
         // Old root should remain unchanged.
-        let old_guard = txn.pin_read_guard(&internal.block_id);
+        let old_guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let old_view = BTreeInternalPageView::new(old_guard, &internal.layout).unwrap();
         assert!(matches!(old_view.btree_level(), 0));
         assert_eq!(old_view.slot_count(), 2);
 
         // New root should have one separator and two children.
-        let guard = txn.pin_read_guard(&new_root);
+        let guard = txn.pin_read_guard(&new_root).unwrap();
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
         assert!(matches!(view.btree_level(), 1));
         assert_eq!(view.slot_count(), 1);
@@ -1551,7 +1565,7 @@ mod btree_internal_tests {
 
         // Test inserting duplicate keys
         {
-            let guard = txn.pin_write_guard(&internal.block_id);
+            let guard = txn.pin_write_guard(&internal.block_id).unwrap();
             let mut view = BTreeInternalPageViewMut::new(guard, &internal.layout).unwrap();
             view.insert_entry(Constant::Int(10), 1).unwrap();
             view.insert_entry(Constant::Int(10), 2).unwrap();
@@ -1612,7 +1626,7 @@ mod btree_internal_tests {
         assert!(split.right_block > split.left_block);
 
         // Read left page and verify child invariants
-        let left_guard = txn.pin_read_guard(&internal.block_id);
+        let left_guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let left_view = BTreeInternalPageView::new(left_guard, &internal.layout).unwrap();
 
         // Verify left page structure
@@ -1638,7 +1652,7 @@ mod btree_internal_tests {
 
         // Read right page and verify child invariants
         let right_block = BlockId::new(internal.file_name.clone(), split.right_block);
-        let right_guard = txn.pin_read_guard(&right_block);
+        let right_guard = txn.pin_read_guard(&right_block).unwrap();
         let right_view = BTreeInternalPageView::new(right_guard, &internal.layout).unwrap();
 
         // Verify right page structure
@@ -1732,13 +1746,13 @@ impl BTreeLeaf {
         overflow_block: Option<usize>,
     ) -> Result<BlockId, Box<dyn Error>> {
         let txn_id = self.txn.id();
-        let orig_guard = self.txn.pin_write_guard(&self.current_block_id);
+        let orig_guard = self.txn.pin_write_guard(&self.current_block_id)?;
         let (old_left_high_key, old_left_right_sibling, old_left_overflow) =
             split_wal::read_leaf_split_state(orig_guard.bytes())?;
         let mut orig_view = orig_guard.into_btree_leaf_page_view_mut(&self.layout)?;
 
         let allocated = IndexFreeList::allocate(&self.txn, &self.file_name)?;
-        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id);
+        let mut new_guard = self.txn.pin_write_guard(&allocated.block_id)?;
         if let Some(append_lsn) = allocated.append_lsn {
             new_guard.mark_modified(txn_id, append_lsn);
         }
@@ -1792,7 +1806,7 @@ impl BTreeLeaf {
     ) -> Result<Self, Box<dyn Error>> {
         // Calculate initial slot using a temporary guard
         let current_slot = {
-            let guard = txn.pin_read_guard(&block_id);
+            let guard = txn.pin_read_guard(&block_id)?;
             let view = guard.into_btree_leaf_page_view(&layout)?;
             view.find_slot_before(&search_key)
         };
@@ -1812,7 +1826,7 @@ impl BTreeLeaf {
     /// Follow right siblings while search_key is >= this page's high key.
     fn hop_right_if_needed(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
-            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let guard = self.txn.pin_read_guard(&self.current_block_id)?;
             let view = guard.into_btree_leaf_page_view(&self.layout)?;
             let Some(hk) = view.high_key() else {
                 break;
@@ -1825,7 +1839,7 @@ impl BTreeLeaf {
             };
             // move to sibling and recompute slot
             self.current_block_id = BlockId::new(self.file_name.clone(), rsib);
-            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let guard = self.txn.pin_read_guard(&self.current_block_id)?;
             let view = guard.into_btree_leaf_page_view(&self.layout)?;
             self.current_slot = view.find_slot_before(&self.search_key);
             continue;
@@ -1845,7 +1859,7 @@ impl BTreeLeaf {
         };
 
         let (at_end, key_matches) = {
-            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let guard = self.txn.pin_read_guard(&self.current_block_id)?;
             let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
             // Skip over any dead slots to find next live entry
@@ -1879,7 +1893,7 @@ impl BTreeLeaf {
     /// Requires that current_slot is initialized
     fn delete(&mut self, rid: RID) -> Result<(), Box<dyn Error>> {
         while (self.next()?).is_some() {
-            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let guard = self.txn.pin_write_guard(&self.current_block_id)?;
             let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             let slot = self.current_slot.unwrap();
 
@@ -1901,7 +1915,7 @@ impl BTreeLeaf {
 
         // Check for overflow + smaller key case
         {
-            let guard = self.txn.pin_read_guard(&self.current_block_id);
+            let guard = self.txn.pin_read_guard(&self.current_block_id)?;
             let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
             if let Some(overflow_block) = view.overflow_block() {
@@ -1914,7 +1928,7 @@ impl BTreeLeaf {
                     let new_block_id = self.split_page(0, Some(overflow_block))?;
 
                     // Clear overflow on current page and insert new entry
-                    let guard = self.txn.pin_write_guard(&self.current_block_id);
+                    let guard = self.txn.pin_write_guard(&self.current_block_id)?;
                     let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
                     view.set_overflow_block(None)?;
                     view.insert_entry(self.search_key.clone(), rid)?;
@@ -1939,7 +1953,7 @@ impl BTreeLeaf {
         };
 
         {
-            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let guard = self.txn.pin_write_guard(&self.current_block_id)?;
             let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             view.insert_entry(self.search_key.clone(), rid)?;
 
@@ -1964,7 +1978,7 @@ impl BTreeLeaf {
         //  If the split key is not identical to the first key, move it left until the the first instance of the split key is found
         debug!("Splitting BTreeLeaf");
 
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let guard = self.txn.pin_read_guard(&self.current_block_id)?;
         let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
         let first_key = view.get_entry(0)?.key;
@@ -1977,7 +1991,7 @@ impl BTreeLeaf {
             let new_block_id = self.split_page(1, None)?;
 
             // Set overflow on current page
-            let guard = self.txn.pin_write_guard(&self.current_block_id);
+            let guard = self.txn.pin_write_guard(&self.current_block_id)?;
             let mut view = guard.into_btree_leaf_page_view_mut(&self.layout)?;
             view.set_overflow_block(Some(new_block_id.block_num))?;
 
@@ -2019,7 +2033,7 @@ impl BTreeLeaf {
     /// An overflow page for a specific page will contain entries that are the same as the first key of the current page
     /// If no overflow page can be found, just return. Otherwise swap out the current contents for the overflow contents
     fn try_overflow(&mut self) -> Result<Option<()>, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let guard = self.txn.pin_read_guard(&self.current_block_id)?;
         let view = guard.into_btree_leaf_page_view(&self.layout)?;
 
         // Find first live slot
@@ -2057,7 +2071,7 @@ impl BTreeLeaf {
             .current_slot
             .expect("Current slot not set in BTreeLeaf::get_data_rid");
 
-        let guard = self.txn.pin_read_guard(&self.current_block_id);
+        let guard = self.txn.pin_read_guard(&self.current_block_id)?;
         let view = guard.into_btree_leaf_page_view(&self.layout)?;
         let entry = view.get_entry(slot)?;
         Ok(entry.rid)
@@ -2090,7 +2104,7 @@ mod btree_leaf_tests {
 
         // Keep block 0 as meta so split allocation can safely consult free-list metadata.
         {
-            let mut guard = txn.pin_write_guard(&meta);
+            let mut guard = txn.pin_write_guard(&meta).unwrap();
             guard
                 .format_as_btree_meta(1, 1, block.block_num as u32, u32::MAX)
                 .unwrap();
@@ -2099,7 +2113,7 @@ mod btree_leaf_tests {
 
         // Format the page as a leaf using new page format
         {
-            let mut guard = txn.pin_write_guard(&block);
+            let mut guard = txn.pin_write_guard(&block).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(txn.id(), Lsn::MAX);
         }
@@ -2118,7 +2132,7 @@ mod btree_leaf_tests {
         assert!(leaf.insert(RID::new(1, 1)).unwrap().is_none());
 
         // Verify the record was inserted
-        let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+        let guard = leaf.txn.pin_read_guard(&leaf.current_block_id).unwrap();
         let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
         assert_eq!(view.slot_count(), 1);
         assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
@@ -2157,7 +2171,7 @@ mod btree_leaf_tests {
         loop {
             leaf.insert(RID::new(1, counter)).unwrap();
             {
-                let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+                let guard = leaf.txn.pin_read_guard(&leaf.current_block_id).unwrap();
                 let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
                 if view.overflow_block().is_some() {
                     break;
@@ -2168,13 +2182,13 @@ mod btree_leaf_tests {
 
         //  verify both the leaf and the overflow page have the same first key
         {
-            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id).unwrap();
             let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
             assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
         }
         assert!(leaf.try_overflow().unwrap().is_some());
         {
-            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id);
+            let guard = leaf.txn.pin_read_guard(&leaf.current_block_id).unwrap();
             let view = guard.into_btree_leaf_page_view(&leaf.layout).unwrap();
             assert_eq!(view.get_entry(0).unwrap().key, Constant::Int(10));
         }
@@ -2214,12 +2228,12 @@ mod btree_leaf_tests {
         let t1 = db.new_tx();
         let block = t1.append(&filename);
         {
-            let mut guard = t1.pin_write_guard(&block);
+            let mut guard = t1.pin_write_guard(&block).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(t1.id(), crate::Lsn::MAX);
         }
         {
-            let guard = t1.pin_write_guard(&block);
+            let guard = t1.pin_write_guard(&block).unwrap();
             let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
             view.insert_entry(Constant::Int(10), RID::new(1, 1))
                 .unwrap();
@@ -2231,7 +2245,7 @@ mod btree_leaf_tests {
         // Transaction 2: Mixed insert/delete operations that will be rolled back
         let t2 = db.new_tx();
         let slot_to_delete = {
-            let guard = t2.pin_read_guard(&block);
+            let guard = t2.pin_read_guard(&block).unwrap();
             let view = guard.into_btree_leaf_page_view(&layout).unwrap();
             // Find slot for key=20
             (0..view.slot_count())
@@ -2246,7 +2260,7 @@ mod btree_leaf_tests {
                 .unwrap()
         };
         {
-            let guard = t2.pin_write_guard(&block);
+            let guard = t2.pin_write_guard(&block).unwrap();
             let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
             // Delete existing entry (should be undone)
             view.delete_entry(slot_to_delete).unwrap();
@@ -2261,7 +2275,7 @@ mod btree_leaf_tests {
 
         // Transaction 3: Verify committed entries remain, rolled-back entries are gone
         let t3 = db.new_tx();
-        let guard = t3.pin_read_guard(&block);
+        let guard = t3.pin_read_guard(&block).unwrap();
         let view = guard.into_btree_leaf_page_view(&layout).unwrap();
 
         // Collect live entries sorted by key
@@ -2291,12 +2305,12 @@ mod btree_leaf_tests {
             let t1 = db.new_tx();
             let block = t1.append(&filename);
             {
-                let mut guard = t1.pin_write_guard(&block);
+                let mut guard = t1.pin_write_guard(&block).unwrap();
                 guard.format_as_btree_leaf(None).unwrap();
                 guard.mark_modified(t1.id(), crate::Lsn::MAX);
             }
             {
-                let guard = t1.pin_write_guard(&block);
+                let guard = t1.pin_write_guard(&block).unwrap();
                 let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
                 view.insert_entry(Constant::Int(100), RID::new(1, 1))
                     .unwrap();
@@ -2308,7 +2322,7 @@ mod btree_leaf_tests {
             // Transaction 2: Committed operation
             let t2 = db.new_tx();
             {
-                let guard = t2.pin_write_guard(&block);
+                let guard = t2.pin_write_guard(&block).unwrap();
                 let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
                 view.insert_entry(Constant::Int(150), RID::new(1, 3))
                     .unwrap();
@@ -2318,7 +2332,7 @@ mod btree_leaf_tests {
             // Transaction 3: Uncommitted operations (simulates crash)
             let t3 = db.new_tx();
             {
-                let guard = t3.pin_write_guard(&block);
+                let guard = t3.pin_write_guard(&block).unwrap();
                 let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
                 // Insert new entries without committing
                 view.insert_entry(Constant::Int(175), RID::new(1, 4))
@@ -2336,7 +2350,7 @@ mod btree_leaf_tests {
 
         // Transaction 4: Verify only committed state remains
         let t4 = db.new_tx();
-        let guard = t4.pin_read_guard(&block);
+        let guard = t4.pin_read_guard(&block).unwrap();
         let view = guard.into_btree_leaf_page_view(&layout).unwrap();
 
         // Collect live entries sorted by key
@@ -2365,13 +2379,13 @@ mod btree_leaf_tests {
         let t1 = db.new_tx();
         let block = t1.append(&filename);
         {
-            let mut guard = t1.pin_write_guard(&block);
+            let mut guard = t1.pin_write_guard(&block).unwrap();
             guard.format_as_btree_leaf(None).unwrap();
             guard.mark_modified(t1.id(), crate::Lsn::MAX);
         }
         let slot_to_delete;
         {
-            let guard = t1.pin_write_guard(&block);
+            let guard = t1.pin_write_guard(&block).unwrap();
             let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
             view.insert_entry(Constant::Int(10), RID::new(1, 1))
                 .unwrap();
@@ -2387,7 +2401,7 @@ mod btree_leaf_tests {
         let t2 = db.new_tx();
         println!("Deleting slot {}", slot_to_delete);
         {
-            let guard = t2.pin_write_guard(&block);
+            let guard = t2.pin_write_guard(&block).unwrap();
             let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
             view.delete_entry(slot_to_delete).unwrap();
         }
@@ -2397,7 +2411,7 @@ mod btree_leaf_tests {
 
         // Transaction 3: Verify all entries still present
         let t3 = db.new_tx();
-        let guard = t3.pin_read_guard(&block);
+        let guard = t3.pin_read_guard(&block).unwrap();
         let view = guard.into_btree_leaf_page_view(&layout).unwrap();
 
         println!("\nAfter rollback:");
@@ -2441,11 +2455,11 @@ mod btree_leaf_tests {
             let t1 = db.new_tx();
             let block = t1.append(&filename);
             {
-                let mut guard = t1.pin_write_guard(&block);
+                let mut guard = t1.pin_write_guard(&block).unwrap();
                 guard.format_as_btree_leaf(None).unwrap();
             }
             let slot_to_delete = {
-                let guard = t1.pin_write_guard(&block);
+                let guard = t1.pin_write_guard(&block).unwrap();
                 let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
                 view.insert_entry(Constant::Int(100), RID::new(1, 1))
                     .unwrap();
@@ -2460,7 +2474,7 @@ mod btree_leaf_tests {
 
             let t2 = db.new_tx();
             {
-                let guard = t2.pin_write_guard(&block);
+                let guard = t2.pin_write_guard(&block).unwrap();
                 let mut view = guard.into_btree_leaf_page_view_mut(&layout).unwrap();
                 view.delete_entry(slot_to_delete).unwrap();
             }
@@ -2475,7 +2489,7 @@ mod btree_leaf_tests {
 
         // Transaction 3: Verify all entries still present
         let t3 = db.new_tx();
-        let guard = t3.pin_read_guard(&block);
+        let guard = t3.pin_read_guard(&block).unwrap();
         let view = guard.into_btree_leaf_page_view(&layout).unwrap();
 
         let mut live_keys: Vec<_> = (0..view.slot_count())

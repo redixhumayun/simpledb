@@ -123,7 +123,7 @@ fn bench_phase1(c: &mut Criterion) {
         let txn = db.new_tx();
         for i in 0..nb {
             let block_id = BlockId::new(test_file.clone(), i);
-            let mut guard = txn.pin_write_guard(&block_id);
+            let mut guard = txn.pin_write_guard(&block_id).unwrap();
             write_i32_at(guard.bytes_mut(), 60, 999);
             guard.mark_modified(txn.id(), Lsn::MAX);
         }
