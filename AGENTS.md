@@ -92,6 +92,38 @@ There is a test suite which provides basic coverage to ensure the code still wor
 
 8. **Address feedback as separate commits**
 
+### Profiling Workflow (REQUIRED for bottleneck analysis)
+Use this workflow when asked to profile a benchmark/workload and identify hotspots.
+
+1. **Build benchmark binaries first**
+   ```bash
+   cargo bench --bench simple_bench --no-run
+   BIN=$(find target/release/deps -maxdepth 1 -type f -name 'simple_bench-*' -executable | head -n1)
+   ```
+
+2. **Use profiling-oriented benchmark settings (not quick CI settings)**
+   - Prefer longer runs for stable perf samples: `--warm-up-time 3 --measurement-time 15 --sample-size 20`
+
+3. **Record perf data for one filtered workload**
+   ```bash
+   mkdir -p /tmp/sql_profile
+   perf record -e cpu-clock -F 199 -g -o /tmp/sql_profile/workload_perf.data -- \
+     "$BIN" --bench --noplot --warm-up-time 3 --measurement-time 15 --sample-size 20 \
+     "Concurrent UPDATE same-page disjoint-id"
+   ```
+
+4. **Generate flamegraph from perf.data**
+   ```bash
+   # Prefer Brendan Gregg FlameGraph scripts on this machine
+   perf script -i /tmp/sql_profile/workload_perf.data | /home/ci/FlameGraph/stackcollapse-perf.pl > /tmp/sql_profile/workload_perf.folded
+   /home/ci/FlameGraph/flamegraph.pl /tmp/sql_profile/workload_perf.folded > /tmp/sql_profile/workload_flamegraph.svg
+   ```
+
+5. **Interpretation guardrails**
+   - Start with kernel vs user split. If syscall/FS paths dominate (`pwrite/fsync/ext4`), engine CPU is likely not the primary bottleneck.
+   - In lock-heavy workloads, flamegraphs alone may miss causal waiting details. If lock wait paths dominate, add targeted lock wait metrics in code and rerun.
+   - Always report sample count from perf output. Very low sample counts reduce confidence.
+
 ## Response Style
 
 Follow these rules when you are responding to the user.
