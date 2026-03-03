@@ -7339,7 +7339,7 @@ impl IndexManager {
         let indexed_table_id = self
             .table_manager
             .get_table_id(table_name, Arc::clone(&txn))
-            .unwrap_or(u32::MAX);
+            .expect("index metadata references table missing from catalog");
         let mut table_scan = TableScan::new(
             Arc::clone(&txn),
             self.layout.clone(),

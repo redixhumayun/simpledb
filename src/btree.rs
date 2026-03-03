@@ -526,8 +526,6 @@ impl Index for BTreeIndex {
     }
 
     fn next(&mut self) -> bool {
-        self.lock_for_read()
-            .expect("failed to acquire index table-S");
         self.leaf
             .as_mut()
             .expect("Leaf not initialized, did you forget to call before_first?")
@@ -1373,7 +1371,7 @@ impl BTreeInternal {
         loop {
             let guard = self.txn.pin_read_guard(&current_block)?;
             let view = guard.into_btree_internal_page_view(&self.layout)?;
-            let child_block = self.find_child_block_in(&view, search_key)?;
+            let child_block = self.find_child_block(&view, search_key)?;
             if view.btree_level() == 0 {
                 return Ok(child_block.block_num);
             }
@@ -1413,14 +1411,14 @@ impl BTreeInternal {
         &self,
         entry: BTreeInternalEntry,
     ) -> Result<Option<SplitResult>, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id)?;
-        let view = BTreeInternalPageView::new(guard, &self.layout)?;
-        if view.btree_level() == 0 {
-            drop(view);
-            return self.insert_internal_node_entry(entry);
-        }
-
-        let child_block = self.find_child_block(&entry.key)?;
+        let child_block = {
+            let guard = self.txn.pin_read_guard(&self.block_id)?;
+            let view = BTreeInternalPageView::new(guard, &self.layout)?;
+            if view.btree_level() == 0 {
+                return self.insert_internal_node_entry(entry);
+            }
+            self.find_child_block(&view, &entry.key)?
+        };
         let child_internal_node = BTreeInternal::new(
             Arc::clone(&self.txn),
             child_block,
@@ -1471,15 +1469,7 @@ impl BTreeInternal {
         }))
     }
 
-    /// This method will find the child block for a given search key in a [BTreeInternal] node
-    /// It uses textbook separator search: first key > search_key => take that entry's child; otherwise take header.rightmost_child.
-    fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id)?;
-        let view = BTreeInternalPageView::new(guard, &self.layout)?;
-        self.find_child_block_in(&view, search_key)
-    }
-
-    fn find_child_block_in(
+    fn find_child_block(
         &self,
         view: &BTreeInternalPageView<'_>,
         search_key: &Constant,
@@ -1505,6 +1495,7 @@ impl BTreeInternal {
             Ok(BlockId::new(self.file_name.clone(), block_num))
         }
     }
+
 }
 
 #[cfg(test)]
@@ -1564,10 +1555,14 @@ mod btree_internal_tests {
         }
 
         // Search for a value - should return correct child block
-        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(15)).unwrap();
         assert_eq!(result.block_num, 2); // Should return block 2 since 15 < 20
 
-        let result = internal.find_child_block(&Constant::Int(25)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(25)).unwrap();
         assert_eq!(result.block_num, 3); // Should return block 3 since 20 < 25 < 30
     }
 
@@ -1685,17 +1680,23 @@ mod btree_internal_tests {
         //  Slot 1: Key=Int(10), Child Block=2  (inserted second, rightmost)
         //  ====================
         // Search should return the rightmost child for duplicate key
-        let result = internal.find_child_block(&Constant::Int(10)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(10)).unwrap();
         assert_eq!(result.block_num, 2);
 
         // Test searching for key less than all entries.
         // With separator semantics this returns C0, which is the initial
         // rightmost child seeded during setup (block 2 in this fixture).
-        let result = internal.find_child_block(&Constant::Int(5)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(5)).unwrap();
         assert_eq!(result.block_num, 2);
 
         // Test searching for key greater than all entries
-        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(15)).unwrap();
         assert_eq!(result.block_num, 2); // Rightmost entry
     }
 
