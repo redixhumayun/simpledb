@@ -29,3 +29,4 @@
 ### Performance & Benchmarking
 1. [Tracking: Performance Alignment Plan](https://github.com/redixhumayun/simpledb/issues/46) - Stabilize benchmarking infrastructure, add instrumentation for latency/queue metrics, implement admission control and background maintenance
 2. [Evaluate planner plan ownership and reduce Arc usage](https://github.com/redixhumayun/simpledb/issues/50) - Audit Arc<dyn Plan> usage and prototype alternatives (Rc, owned structs) to clarify single-thread semantics and reduce overhead
+3. [Add macro benchmarks for index-heavy workloads](https://github.com/redixhumayun/simpledb/issues/87) - Measure index lookup/range/DML/mixed RW performance and contention behavior under B-tree logical locking
