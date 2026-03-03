@@ -8,6 +8,9 @@ Wait-die was proposed as an improvement: instead of waiting up to the full timeo
 
 Wait-die was implemented in PR #85 (`LockError` typed enum + wait-die checks in both the new-lock and upgrade paths of `acquire`), benchmarked, and then removed.
 
+- **Implemented:** commit `52b376b`
+- **Removed:** commit `56c84c9`
+
 ## Decision
 
 Remove the wait-die checks. Keep the typed `LockError` enum (`Timeout` | `WaitDieAbort`) as it is a strict improvement over string matching regardless of deadlock strategy.
