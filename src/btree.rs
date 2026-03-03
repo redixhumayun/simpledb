@@ -1411,12 +1411,18 @@ impl BTreeInternal {
         &self,
         entry: BTreeInternalEntry,
     ) -> Result<Option<SplitResult>, Box<dyn Error>> {
+        let level_zero = {
+            let guard = self.txn.pin_read_guard(&self.block_id)?;
+            let view = BTreeInternalPageView::new(guard, &self.layout)?;
+            view.btree_level() == 0
+        };
+        if level_zero {
+            return self.insert_internal_node_entry(entry);
+        }
+
         let child_block = {
             let guard = self.txn.pin_read_guard(&self.block_id)?;
             let view = BTreeInternalPageView::new(guard, &self.layout)?;
-            if view.btree_level() == 0 {
-                return self.insert_internal_node_entry(entry);
-            }
             self.find_child_block(&view, &entry.key)?
         };
         let child_internal_node = BTreeInternal::new(
