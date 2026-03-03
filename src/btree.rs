@@ -1501,7 +1501,6 @@ impl BTreeInternal {
             Ok(BlockId::new(self.file_name.clone(), block_num))
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1563,12 +1562,16 @@ mod btree_internal_tests {
         // Search for a value - should return correct child block
         let guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
-        let result = internal.find_child_block(&view, &Constant::Int(15)).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(15))
+            .unwrap();
         assert_eq!(result.block_num, 2); // Should return block 2 since 15 < 20
 
         let guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
-        let result = internal.find_child_block(&view, &Constant::Int(25)).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(25))
+            .unwrap();
         assert_eq!(result.block_num, 3); // Should return block 3 since 20 < 25 < 30
     }
 
@@ -1688,7 +1691,9 @@ mod btree_internal_tests {
         // Search should return the rightmost child for duplicate key
         let guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
-        let result = internal.find_child_block(&view, &Constant::Int(10)).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(10))
+            .unwrap();
         assert_eq!(result.block_num, 2);
 
         // Test searching for key less than all entries.
@@ -1702,7 +1707,9 @@ mod btree_internal_tests {
         // Test searching for key greater than all entries
         let guard = txn.pin_read_guard(&internal.block_id).unwrap();
         let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
-        let result = internal.find_child_block(&view, &Constant::Int(15)).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(15))
+            .unwrap();
         assert_eq!(result.block_num, 2); // Rightmost entry
     }
 
