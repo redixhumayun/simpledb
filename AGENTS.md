@@ -124,6 +124,14 @@ Use this workflow when asked to profile a benchmark/workload and identify hotspo
    - In lock-heavy workloads, flamegraphs alone may miss causal waiting details. If lock wait paths dominate, add targeted lock wait metrics in code and rerun.
    - Always report sample count from perf output. Very low sample counts reduce confidence.
 
+## Architecture Decisions
+
+Significant design decisions are tracked in `DECISIONS.md` at the repo root. Each entry is a one-line summary with a pointer to a detail file in `docs/decisions/`.
+
+Before making a significant architectural change — deadlock strategy, lock granularity, concurrency model, storage layout, etc. — check `DECISIONS.md` first. The detail files capture context, alternatives considered, and the reasoning behind what was chosen. This prevents re-litigating settled decisions and helps understand why the code is the way it is.
+
+When a decision is made or reversed, add or update the relevant entry and detail file as part of the same commit.
+
 ## Response Style
 
 Follow these rules when you are responding to the user.

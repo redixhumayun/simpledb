@@ -1,7 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use simpledb::{Layout, Scan, SimpleDB, TableScan, Transaction, UpdateScan};
+use simpledb::{Layout, LockError, Scan, SimpleDB, TableScan, Transaction, UpdateScan};
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread;
@@ -62,6 +62,7 @@ struct ConcurrencyRuntime {
 struct RunStats {
     retries: u64,
     timeouts: u64,
+    aborts: u64,
     errors: u64,
 }
 
@@ -179,14 +180,20 @@ fn run_with_retry(
                 return stats;
             }
             Err(err) => {
-                let is_timeout = err.to_string().contains("Timeout");
-                if is_timeout {
-                    stats.timeouts += 1;
-                } else {
-                    stats.errors += 1;
-                }
-                if is_timeout && attempts < CONC_MAX_RETRIES {
-                    continue;
+                match err.downcast_ref::<LockError>() {
+                    Some(LockError::Timeout) => {
+                        stats.timeouts += 1;
+                        if attempts < CONC_MAX_RETRIES {
+                            continue;
+                        }
+                    }
+                    Some(LockError::WaitDieAbort) => {
+                        stats.aborts += 1;
+                        if attempts < CONC_MAX_RETRIES {
+                            continue;
+                        }
+                    }
+                    None => stats.errors += 1,
                 }
                 stats.retries = (attempts.saturating_sub(1)) as u64;
                 return stats;
@@ -214,6 +221,7 @@ fn run_concurrent_disjoint_ids(
                 let s = op(&rt, id, i);
                 stats.retries += s.retries;
                 stats.timeouts += s.timeouts;
+                stats.aborts += s.aborts;
                 stats.errors += s.errors;
             }
             stats
@@ -225,6 +233,7 @@ fn run_concurrent_disjoint_ids(
         let s = handle.join().unwrap();
         stats.retries += s.retries;
         stats.timeouts += s.timeouts;
+        stats.aborts += s.aborts;
         stats.errors += s.errors;
     }
     stats
@@ -405,11 +414,12 @@ fn bench_sql_concurrency(c: &mut Criterion) {
                 let s = run_concurrent_disjoint_ids(&rt, Arc::clone(&op));
                 total.retries += s.retries;
                 total.timeouts += s.timeouts;
+                total.aborts += s.aborts;
                 total.errors += s.errors;
             }
             eprintln!(
-                "bench=select_same_page_disjoint_id iters={iters} retries={} timeouts={} errors={}",
-                total.retries, total.timeouts, total.errors
+                "bench=select_same_page_disjoint_id iters={iters} retries={} timeouts={} aborts={} errors={}",
+                total.retries, total.timeouts, total.aborts, total.errors
             );
             start.elapsed()
         });
@@ -425,11 +435,12 @@ fn bench_sql_concurrency(c: &mut Criterion) {
                 let s = run_concurrent_disjoint_ids(&rt, Arc::clone(&op));
                 total.retries += s.retries;
                 total.timeouts += s.timeouts;
+                total.aborts += s.aborts;
                 total.errors += s.errors;
             }
             eprintln!(
-                "bench=update_same_page_disjoint_id iters={iters} retries={} timeouts={} errors={}",
-                total.retries, total.timeouts, total.errors
+                "bench=update_same_page_disjoint_id iters={iters} retries={} timeouts={} aborts={} errors={}",
+                total.retries, total.timeouts, total.aborts, total.errors
             );
             start.elapsed()
         });
@@ -454,11 +465,12 @@ fn bench_sql_concurrency(c: &mut Criterion) {
                 let s = run_concurrent_disjoint_ids(&rt, Arc::clone(&op));
                 total.retries += s.retries;
                 total.timeouts += s.timeouts;
+                total.aborts += s.aborts;
                 total.errors += s.errors;
             }
             eprintln!(
-                "bench=mixed_80_20_same_page_disjoint_id iters={iters} retries={} timeouts={} errors={}",
-                total.retries, total.timeouts, total.errors
+                "bench=mixed_80_20_same_page_disjoint_id iters={iters} retries={} timeouts={} aborts={} errors={}",
+                total.retries, total.timeouts, total.aborts, total.errors
             );
             start.elapsed()
         });
