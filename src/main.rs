@@ -6005,6 +6005,7 @@ mod index_join_scan_tests {
         let index_info = IndexInfo::new(
             "test_index",
             "C",
+            2,
             Arc::clone(&txn),
             schema2,
             StatInfo::new(0, 0),
@@ -6188,6 +6189,7 @@ mod index_select_scan_tests {
         let index_info = IndexInfo::new(
             "test_index",
             "A",
+            1,
             Arc::clone(&txn),
             schema,
             StatInfo::new(0, 0),
@@ -7334,6 +7336,10 @@ impl IndexManager {
         txn: Arc<Transaction>,
     ) -> HashMap<String, IndexInfo> {
         let mut hash_map = HashMap::new();
+        let indexed_table_id = self
+            .table_manager
+            .get_table_id(table_name, Arc::clone(&txn))
+            .expect("index metadata references table missing from catalog");
         let mut table_scan = TableScan::new(
             Arc::clone(&txn),
             self.layout.clone(),
@@ -7352,6 +7358,7 @@ impl IndexManager {
                 let index_info = IndexInfo::new(
                     &index_name,
                     &field_name,
+                    indexed_table_id,
                     Arc::clone(&txn),
                     layout.schema,
                     stat_info,
@@ -7367,6 +7374,7 @@ impl IndexManager {
 pub struct IndexInfo {
     index_name: String,
     field_name: String,
+    indexed_table_id: u32,
     txn: Arc<Transaction>,
     table_schema: Schema,
     index_layout: Layout,
@@ -7390,6 +7398,7 @@ impl IndexInfo {
     pub fn new(
         index_name: &str,
         field_name: &str,
+        indexed_table_id: u32,
         txn: Arc<Transaction>,
         table_schema: Schema,
         stat_info: StatInfo,
@@ -7411,6 +7420,7 @@ impl IndexInfo {
         Self {
             index_name: index_name.to_string(),
             field_name: field_name.to_string(),
+            indexed_table_id,
             txn,
             table_schema,
             index_layout,
@@ -7428,6 +7438,7 @@ impl IndexInfo {
             Arc::clone(&self.txn),
             &self.index_name,
             self.index_layout.clone(),
+            self.indexed_table_id,
         )
         .unwrap()
     }

@@ -244,6 +244,8 @@ mod split_wal {
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
     index_name: String,
+    indexed_table_id: u32,
+    index_lock_table_id: u32,
     index_file_name: String,
     internal_layout: Layout,
     leaf_layout: Layout,
@@ -260,12 +262,21 @@ impl std::fmt::Display for BTreeIndex {
 }
 
 impl BTreeIndex {
+    const INDEX_LOCK_NAMESPACE_PREFIX: u32 = 0x4000_0000;
+    const TABLE_ID_NAMESPACE_MASK: u32 = 0x3fff_ffff;
+
+    pub(crate) const fn index_lock_table_id_for(indexed_table_id: u32) -> u32 {
+        Self::INDEX_LOCK_NAMESPACE_PREFIX | (indexed_table_id & Self::TABLE_ID_NAMESPACE_MASK)
+    }
+
     pub fn new(
         txn: Arc<Transaction>,
         index_name: &str,
         leaf_layout: Layout,
+        indexed_table_id: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let index_file_name = format!("{index_name}.idx");
+        let index_lock_table_id = Self::index_lock_table_id_for(indexed_table_id);
         let meta_block = BlockId::new(index_file_name.clone(), 0);
         let mut internal_schema = Schema::new();
         internal_schema.add_from_schema(IndexInfo::BLOCK_NUM_FIELD, &leaf_layout.schema)?;
@@ -333,6 +344,8 @@ impl BTreeIndex {
         Ok(Self {
             txn,
             index_name: index_name.to_string(),
+            indexed_table_id,
+            index_lock_table_id,
             index_file_name,
             internal_layout,
             leaf_layout,
@@ -352,6 +365,18 @@ impl BTreeIndex {
     /// Returns the name of this index
     pub fn index_name(&self) -> &str {
         &self.index_name
+    }
+
+    pub fn indexed_table_id(&self) -> u32 {
+        self.indexed_table_id
+    }
+
+    fn lock_for_read(&self) -> Result<(), Box<dyn Error>> {
+        self.txn.lock_table_s(self.index_lock_table_id)
+    }
+
+    fn lock_for_write(&self) -> Result<(), Box<dyn Error>> {
+        self.txn.lock_table_x(self.index_lock_table_id)
     }
 
     fn update_meta(&mut self, lsn: Lsn) -> Result<(), Box<dyn Error>> {
@@ -478,7 +503,9 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
 
 impl Index for BTreeIndex {
     fn before_first(&mut self, search_key: &Constant) {
-        let mut root = BTreeInternal::new(
+        self.lock_for_read()
+            .expect("failed to acquire index table-S");
+        let root = BTreeInternal::new(
             Arc::clone(&self.txn),
             self.root_block.clone(),
             self.internal_layout.clone(),
@@ -512,6 +539,8 @@ impl Index for BTreeIndex {
     }
 
     fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.lock_for_write()
+            .expect("failed to acquire index table-X");
         debug!(
             "Inserting value {:?} for rid {:?} into index",
             data_val, data_rid
@@ -554,6 +583,8 @@ impl Index for BTreeIndex {
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
+        self.lock_for_write()
+            .expect("failed to acquire index table-X");
         self.before_first(data_val);
         self.leaf.as_mut().unwrap().delete(*data_rid).unwrap();
         //  TODO: Should the leaf be set to None here?
@@ -568,6 +599,7 @@ mod btree_index_tests {
         test_utils::{generate_filename, generate_random_number},
         Schema, SimpleDB, TestDir,
     };
+    const TEST_INDEXED_TABLE_ID: u32 = 7;
 
     fn create_test_layout() -> Layout {
         let mut schema = Schema::new();
@@ -581,7 +613,7 @@ mod btree_index_tests {
         let tx = db.new_tx();
         let layout = create_test_layout();
         let index_name = generate_filename();
-        BTreeIndex::new(Arc::clone(&tx), &index_name, layout).unwrap()
+        BTreeIndex::new(Arc::clone(&tx), &index_name, layout, TEST_INDEXED_TABLE_ID).unwrap()
     }
 
     /// Insert ascending keys until the leaf file reaches `target_blocks` size.
@@ -763,6 +795,33 @@ mod btree_index_tests {
     }
 
     #[test]
+    fn test_before_first_on_height_two_tree() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let mut index = setup_index(&db);
+
+        let mut next_key = 0_i32;
+        let cap = 200_000_i32;
+        while index.tree_height < 2 && next_key < cap {
+            index.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
+            next_key += 1;
+        }
+        assert!(
+            index.tree_height >= 2,
+            "failed to grow index to height >= 2 within cap={cap}, reached height={}",
+            index.tree_height
+        );
+
+        let lookup_key = next_key / 2;
+        index.before_first(&Constant::Int(lookup_key));
+        assert!(index.next(), "expected to find key {lookup_key}");
+        assert_eq!(
+            index.get_data_rid(),
+            RID::new(1, lookup_key as usize),
+            "lookup should land on the matching RID for key {lookup_key}"
+        );
+    }
+
+    #[test]
     fn test_range_iterator_across_siblings() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
         let mut index = setup_index(&db);
@@ -773,7 +832,7 @@ mod btree_index_tests {
         // Unbounded range
         let lower = Constant::Int(0);
         let start = {
-            let mut root = BTreeInternal::new(
+            let root = BTreeInternal::new(
                 Arc::clone(&index.txn),
                 index.root_block.clone(),
                 index.internal_layout.clone(),
@@ -810,7 +869,7 @@ mod btree_index_tests {
         let lower_b = Constant::Int(10);
         let upper_b = Constant::Int(50);
         let start_b = {
-            let mut root = BTreeInternal::new(
+            let root = BTreeInternal::new(
                 Arc::clone(&index.txn),
                 index.root_block.clone(),
                 index.internal_layout.clone(),
@@ -1014,7 +1073,13 @@ mod btree_index_tests {
 
             // Transaction 1: establish committed baseline.
             let t1 = db.new_tx();
-            let mut idx = BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&t1),
+                &index_name,
+                layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             for key in 0..120 {
                 idx.insert(&Constant::Int(key), &RID::new(1, key as usize));
             }
@@ -1025,7 +1090,13 @@ mod btree_index_tests {
 
             // Transaction 2: force many uncommitted splits/cascades.
             let t2 = db.new_tx();
-            let mut idx2 = BTreeIndex::new(Arc::clone(&t2), &index_name, layout.clone()).unwrap();
+            let mut idx2 = BTreeIndex::new(
+                Arc::clone(&t2),
+                &index_name,
+                layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             let blocks_before = idx2.txn.size(&idx2.index_file_name);
             for key in 1000..1600 {
                 idx2.insert(&Constant::Int(key), &RID::new(2, key as usize));
@@ -1045,8 +1116,13 @@ mod btree_index_tests {
         recovery_tx.recover().unwrap();
 
         let verify_tx = db.new_tx();
-        let mut verify_index =
-            BTreeIndex::new(Arc::clone(&verify_tx), &index_name, layout.clone()).unwrap();
+        let mut verify_index = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
 
         // Baseline committed keys must remain queryable.
         for key in 0..120 {
@@ -1081,8 +1157,13 @@ mod btree_index_tests {
 
         // Transaction 1: committed baseline with enough keys to form a non-trivial tree.
         let t1 = db.new_tx();
-        let mut baseline_idx =
-            BTreeIndex::new(Arc::clone(&t1), &index_name, layout.clone()).unwrap();
+        let mut baseline_idx = BTreeIndex::new(
+            Arc::clone(&t1),
+            &index_name,
+            layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
         for key in 0..120 {
             baseline_idx.insert(&Constant::Int(key), &RID::new(1, key as usize));
         }
@@ -1093,7 +1174,13 @@ mod btree_index_tests {
 
         // Transaction 2: uncommitted heavy insert workload causing split cascades.
         let t2 = db.new_tx();
-        let mut idx2 = BTreeIndex::new(Arc::clone(&t2), &index_name, layout.clone()).unwrap();
+        let mut idx2 = BTreeIndex::new(
+            Arc::clone(&t2),
+            &index_name,
+            layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
         let blocks_before = idx2.txn.size(&idx2.index_file_name);
         for key in 1000..1600 {
             idx2.insert(&Constant::Int(key), &RID::new(2, key as usize));
@@ -1107,7 +1194,13 @@ mod btree_index_tests {
 
         // Transaction 3: verify logical state restored to baseline.
         let t3 = db.new_tx();
-        let mut verify_idx = BTreeIndex::new(Arc::clone(&t3), &index_name, layout.clone()).unwrap();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&t3),
+            &index_name,
+            layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
         for key in 0..120 {
             verify_idx.before_first(&Constant::Int(key));
             assert!(
@@ -1273,16 +1366,17 @@ impl BTreeInternal {
     /// This method will search for a given key in the [BTreeInternal] node
     /// It will loop until it finds the terminal internal node and then return the block
     /// number of the leaf node that contains the key
-    fn search(&mut self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
-        let mut child_block = self.find_child_block(search_key)?;
-        let mut guard = self.txn.pin_read_guard(&self.block_id)?;
-        let mut view = guard.into_btree_internal_page_view(&self.layout)?;
-        while view.btree_level() != 0 {
-            child_block = self.find_child_block(search_key)?;
-            guard = self.txn.pin_read_guard(&child_block)?;
-            view = guard.into_btree_internal_page_view(&self.layout)?;
+    fn search(&self, search_key: &Constant) -> Result<usize, Box<dyn Error>> {
+        let mut current_block = self.block_id.clone();
+        loop {
+            let guard = self.txn.pin_read_guard(&current_block)?;
+            let view = guard.into_btree_internal_page_view(&self.layout)?;
+            let child_block = self.find_child_block(&view, search_key)?;
+            if view.btree_level() == 0 {
+                return Ok(child_block.block_num);
+            }
+            current_block = child_block;
         }
-        Ok(child_block.block_num)
     }
 
     /// Create a new root above current root after a split.
@@ -1317,14 +1411,20 @@ impl BTreeInternal {
         &self,
         entry: BTreeInternalEntry,
     ) -> Result<Option<SplitResult>, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id)?;
-        let view = BTreeInternalPageView::new(guard, &self.layout)?;
-        if view.btree_level() == 0 {
-            drop(view);
+        let level_zero = {
+            let guard = self.txn.pin_read_guard(&self.block_id)?;
+            let view = BTreeInternalPageView::new(guard, &self.layout)?;
+            view.btree_level() == 0
+        };
+        if level_zero {
             return self.insert_internal_node_entry(entry);
         }
 
-        let child_block = self.find_child_block(&entry.key)?;
+        let child_block = {
+            let guard = self.txn.pin_read_guard(&self.block_id)?;
+            let view = BTreeInternalPageView::new(guard, &self.layout)?;
+            self.find_child_block(&view, &entry.key)?
+        };
         let child_internal_node = BTreeInternal::new(
             Arc::clone(&self.txn),
             child_block,
@@ -1375,11 +1475,11 @@ impl BTreeInternal {
         }))
     }
 
-    /// This method will find the child block for a given search key in a [BTreeInternal] node
-    /// It uses textbook separator search: first key > search_key => take that entry's child; otherwise take header.rightmost_child.
-    fn find_child_block(&self, search_key: &Constant) -> Result<BlockId, Box<dyn Error>> {
-        let guard = self.txn.pin_read_guard(&self.block_id)?;
-        let view = BTreeInternalPageView::new(guard, &self.layout)?;
+    fn find_child_block(
+        &self,
+        view: &BTreeInternalPageView<'_>,
+        search_key: &Constant,
+    ) -> Result<BlockId, Box<dyn Error>> {
         let mut left = 0;
         let mut right = view.slot_count();
         while left < right {
@@ -1460,10 +1560,18 @@ mod btree_internal_tests {
         }
 
         // Search for a value - should return correct child block
-        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(15))
+            .unwrap();
         assert_eq!(result.block_num, 2); // Should return block 2 since 15 < 20
 
-        let result = internal.find_child_block(&Constant::Int(25)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(25))
+            .unwrap();
         assert_eq!(result.block_num, 3); // Should return block 3 since 20 < 25 < 30
     }
 
@@ -1538,7 +1646,7 @@ mod btree_internal_tests {
     #[test]
     fn test_insert_recursive_split() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
-        let (_, mut internal) = setup_internal_node(&db);
+        let (_, internal) = setup_internal_node(&db);
 
         let mut block_num = 0;
         let mut split_entry = None;
@@ -1581,17 +1689,27 @@ mod btree_internal_tests {
         //  Slot 1: Key=Int(10), Child Block=2  (inserted second, rightmost)
         //  ====================
         // Search should return the rightmost child for duplicate key
-        let result = internal.find_child_block(&Constant::Int(10)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(10))
+            .unwrap();
         assert_eq!(result.block_num, 2);
 
         // Test searching for key less than all entries.
         // With separator semantics this returns C0, which is the initial
         // rightmost child seeded during setup (block 2 in this fixture).
-        let result = internal.find_child_block(&Constant::Int(5)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal.find_child_block(&view, &Constant::Int(5)).unwrap();
         assert_eq!(result.block_num, 2);
 
         // Test searching for key greater than all entries
-        let result = internal.find_child_block(&Constant::Int(15)).unwrap();
+        let guard = txn.pin_read_guard(&internal.block_id).unwrap();
+        let view = BTreeInternalPageView::new(guard, &internal.layout).unwrap();
+        let result = internal
+            .find_child_block(&view, &Constant::Int(15))
+            .unwrap();
         assert_eq!(result.block_num, 2); // Rightmost entry
     }
 
