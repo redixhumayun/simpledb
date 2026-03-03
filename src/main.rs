@@ -10075,20 +10075,6 @@ impl LockTable {
                 if !other_incompatible && front_is_us {
                     break;
                 }
-                if other_incompatible && !front_is_us {
-                    // Wait-die on upgrade: die if any incompatible other holder is older
-                    let must_die = state.holders.iter().any(|(&id, &h)| {
-                        id != tx_id && !LockMode::compatible(h, target_mode) && id < tx_id
-                    });
-                    if must_die {
-                        guard
-                            .get_mut(&target)
-                            .unwrap()
-                            .upgrade_requests
-                            .retain(|&id| id != tx_id);
-                        return Err(Box::new(LockError::WaitDieAbort));
-                    }
-                }
                 let timeout = deadline.saturating_duration_since(Instant::now());
                 if timeout.is_zero() {
                     guard
@@ -10129,13 +10115,6 @@ impl LockTable {
                 || (mode == LockMode::S && !state.upgrade_requests.is_empty());
             if !blocked {
                 break;
-            }
-            // Wait-die: if any incompatible holder is older (lower tx_id), die immediately
-            let must_die = state.holders.iter().any(|(&holder_id, &held)| {
-                holder_id != tx_id && !LockMode::compatible(held, mode) && holder_id < tx_id
-            });
-            if must_die {
-                return Err(Box::new(LockError::WaitDieAbort));
             }
             let timeout = deadline.saturating_duration_since(Instant::now());
             if timeout.is_zero() {
