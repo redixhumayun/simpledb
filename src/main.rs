@@ -7473,6 +7473,18 @@ impl IndexInfo {
     pub fn stat_info(&self) -> &StatInfo {
         &self.stat_info
     }
+
+    pub fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    pub fn index_layout(&self) -> &Layout {
+        &self.index_layout
+    }
+
+    pub fn indexed_table_id(&self) -> u32 {
+        self.indexed_table_id
+    }
 }
 
 pub struct HashIndex {
