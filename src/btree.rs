@@ -1245,32 +1245,6 @@ mod btree_index_tests {
     // Concurrent correctness tests
     // -------------------------------------------------------------------------
 
-    /// Build a new Transaction using the shared resources extracted from a SimpleDB.
-    fn make_txn(
-        file_manager: &Arc<dyn crate::FileSystemInterface + Send + Sync + 'static>,
-        log_manager: &Arc<std::sync::Mutex<crate::LogManager>>,
-        buffer_manager: &Arc<crate::BufferManager>,
-        lock_table: &Arc<crate::LockTable>,
-    ) -> Arc<Transaction> {
-        Arc::new(Transaction::new(
-            Arc::clone(file_manager),
-            Arc::clone(log_manager),
-            Arc::clone(buffer_manager),
-            Arc::clone(lock_table),
-        ))
-    }
-
-    /// Open (or re-open) the test index with a given transaction.
-    fn open_index(txn: &Arc<Transaction>, index_name: &str, leaf_layout: &Layout) -> BTreeIndex {
-        BTreeIndex::new(
-            Arc::clone(txn),
-            index_name,
-            leaf_layout.clone(),
-            TEST_INDEXED_TABLE_ID,
-        )
-        .unwrap()
-    }
-
     /// 4 reader threads each do 50 point-lookups on 200 pre-committed keys.
     /// Verifies that concurrent S-lock holders do not interfere.
     #[test]
@@ -1289,7 +1263,13 @@ mod btree_index_tests {
         // Pre-populate with PRELOAD keys in a single committed transaction.
         {
             let setup_tx = db.new_tx();
-            let mut idx = open_index(&setup_tx, &index_name, &leaf_layout);
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             for k in 0..PRELOAD {
                 idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
             }
@@ -1319,8 +1299,19 @@ mod btree_index_tests {
                 let mut all_found = true;
                 for i in 0..LOOKUPS_PER_READER {
                     let key = ((reader_id * LOOKUPS_PER_READER + i) % PRELOAD as usize) as i32;
-                    let txn = make_txn(&fm, &lm, &bm, &lt);
-                    let mut idx = open_index(&txn, &iname, &ilayout);
+                    let txn = Arc::new(Transaction::new(
+                        Arc::clone(&fm),
+                        Arc::clone(&lm),
+                        Arc::clone(&bm),
+                        Arc::clone(&lt),
+                    ));
+                    let mut idx = BTreeIndex::new(
+                        Arc::clone(&txn),
+                        &iname,
+                        (*ilayout).clone(),
+                        TEST_INDEXED_TABLE_ID,
+                    )
+                    .unwrap();
                     idx.before_first(&Constant::Int(key));
                     if !idx.next() {
                         all_found = false;
@@ -1353,7 +1344,13 @@ mod btree_index_tests {
         // Bootstrap the index file (no pre-inserted keys).
         {
             let setup_tx = db.new_tx();
-            let _ = open_index(&setup_tx, &index_name, &leaf_layout);
+            let _ = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             setup_tx.commit().unwrap();
         }
 
@@ -1379,8 +1376,19 @@ mod btree_index_tests {
                 bar.wait();
                 let base = (writer_id * KEYS_PER_WRITER) as i32;
                 for k in base..base + KEYS_PER_WRITER as i32 {
-                    let txn = make_txn(&fm, &lm, &bm, &lt);
-                    let mut idx = open_index(&txn, &iname, &ilayout);
+                    let txn = Arc::new(Transaction::new(
+                        Arc::clone(&fm),
+                        Arc::clone(&lm),
+                        Arc::clone(&bm),
+                        Arc::clone(&lt),
+                    ));
+                    let mut idx = BTreeIndex::new(
+                        Arc::clone(&txn),
+                        &iname,
+                        (*ilayout).clone(),
+                        TEST_INDEXED_TABLE_ID,
+                    )
+                    .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
                     txn.commit().unwrap();
                 }
@@ -1392,8 +1400,19 @@ mod btree_index_tests {
         }
 
         // Verify all 400 keys are present and tree is structurally sound.
-        let val_txn = make_txn(&file_manager, &log_manager, &buffer_manager, &lock_table);
-        let mut val_idx = open_index(&val_txn, &index_name, &leaf_layout);
+        let val_txn = Arc::new(Transaction::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            Arc::clone(&buffer_manager),
+            Arc::clone(&lock_table),
+        ));
+        let mut val_idx = BTreeIndex::new(
+            Arc::clone(&val_txn),
+            &index_name,
+            (*leaf_layout).clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
         let total = WRITERS * KEYS_PER_WRITER;
         for k in 0..total as i32 {
             val_idx.before_first(&Constant::Int(k));
@@ -1402,7 +1421,7 @@ mod btree_index_tests {
                 "key {k} missing after concurrent disjoint writes"
             );
         }
-        validate_btree_integrity(&val_txn, &val_idx).unwrap();
+        super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
         val_txn.commit().unwrap();
     }
 
@@ -1422,7 +1441,13 @@ mod btree_index_tests {
 
         {
             let setup_tx = db.new_tx();
-            let _ = open_index(&setup_tx, &index_name, &leaf_layout);
+            let _ = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             setup_tx.commit().unwrap();
         }
 
@@ -1449,8 +1474,19 @@ mod btree_index_tests {
                 // Thread i inserts keys: i, i+4, i+8, …
                 for j in 0..KEYS_PER_WRITER {
                     let k = (writer_id + j * WRITERS) as i32;
-                    let txn = make_txn(&fm, &lm, &bm, &lt);
-                    let mut idx = open_index(&txn, &iname, &ilayout);
+                    let txn = Arc::new(Transaction::new(
+                        Arc::clone(&fm),
+                        Arc::clone(&lm),
+                        Arc::clone(&bm),
+                        Arc::clone(&lt),
+                    ));
+                    let mut idx = BTreeIndex::new(
+                        Arc::clone(&txn),
+                        &iname,
+                        (*ilayout).clone(),
+                        TEST_INDEXED_TABLE_ID,
+                    )
+                    .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
                     txn.commit().unwrap();
                 }
@@ -1462,13 +1498,24 @@ mod btree_index_tests {
         }
 
         let total = WRITERS * KEYS_PER_WRITER; // 600 keys: 0..600
-        let val_txn = make_txn(&file_manager, &log_manager, &buffer_manager, &lock_table);
-        let mut val_idx = open_index(&val_txn, &index_name, &leaf_layout);
+        let val_txn = Arc::new(Transaction::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            Arc::clone(&buffer_manager),
+            Arc::clone(&lock_table),
+        ));
+        let mut val_idx = BTreeIndex::new(
+            Arc::clone(&val_txn),
+            &index_name,
+            (*leaf_layout).clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
         for k in 0..total as i32 {
             val_idx.before_first(&Constant::Int(k));
             assert!(val_idx.next(), "key {k} missing after split stress");
         }
-        validate_btree_integrity(&val_txn, &val_idx).unwrap();
+        super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
         val_txn.commit().unwrap();
     }
 
@@ -1493,7 +1540,13 @@ mod btree_index_tests {
 
         {
             let setup_tx = db.new_tx();
-            let mut idx = open_index(&setup_tx, &index_name, &leaf_layout);
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+            )
+            .unwrap();
             for k in 0..PRELOAD {
                 idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
             }
@@ -1525,8 +1578,19 @@ mod btree_index_tests {
             handles.push(thread::spawn(move || {
                 bar.wait();
                 for k in PRELOAD..PRELOAD + WRITER_KEYS {
-                    let txn = make_txn(&fm, &lm, &bm, &lt);
-                    let mut idx = open_index(&txn, &iname, &ilayout);
+                    let txn = Arc::new(Transaction::new(
+                        Arc::clone(&fm),
+                        Arc::clone(&lm),
+                        Arc::clone(&bm),
+                        Arc::clone(&lt),
+                    ));
+                    let mut idx = BTreeIndex::new(
+                        Arc::clone(&txn),
+                        &iname,
+                        (*ilayout).clone(),
+                        TEST_INDEXED_TABLE_ID,
+                    )
+                    .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(2, k as usize));
                     txn.commit().unwrap();
                 }
@@ -1548,8 +1612,19 @@ mod btree_index_tests {
                 bar.wait();
                 for i in 0..LOOKUPS_PER_READER {
                     let k = ((reader_id * LOOKUPS_PER_READER + i) % PRELOAD as usize) as i32;
-                    let txn = make_txn(&fm, &lm, &bm, &lt);
-                    let mut idx = open_index(&txn, &iname, &ilayout);
+                    let txn = Arc::new(Transaction::new(
+                        Arc::clone(&fm),
+                        Arc::clone(&lm),
+                        Arc::clone(&bm),
+                        Arc::clone(&lt),
+                    ));
+                    let mut idx = BTreeIndex::new(
+                        Arc::clone(&txn),
+                        &iname,
+                        (*ilayout).clone(),
+                        TEST_INDEXED_TABLE_ID,
+                    )
+                    .unwrap();
                     idx.before_first(&Constant::Int(k));
                     if !idx.next() {
                         missed_ref.fetch_add(1, Ordering::Relaxed);
@@ -1569,180 +1644,201 @@ mod btree_index_tests {
             "readers missed pre-committed keys during concurrent writes"
         );
 
-        let val_txn = make_txn(&file_manager, &log_manager, &buffer_manager, &lock_table);
-        let val_idx = open_index(&val_txn, &index_name, &leaf_layout);
-        validate_btree_integrity(&val_txn, &val_idx).unwrap();
+        let val_txn = Arc::new(Transaction::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&log_manager),
+            Arc::clone(&buffer_manager),
+            Arc::clone(&lock_table),
+        ));
+        let val_idx = BTreeIndex::new(
+            Arc::clone(&val_txn),
+            &index_name,
+            (*leaf_layout).clone(),
+            TEST_INDEXED_TABLE_ID,
+        )
+        .unwrap();
+        super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
         val_txn.commit().unwrap();
     }
 }
 
-/// Walk one internal page, verify key ordering, and return children in left-to-right order.
-/// For level-0 pages the children are leaf block numbers; for higher levels, recurse.
-#[cfg(test)]
-fn collect_leaf_blocks(
-    txn: &Arc<Transaction>,
-    internal_layout: &Layout,
-    file_name: &str,
-    block_id: &BlockId,
-) -> SimpleDBResult<Vec<usize>> {
-    let guard = txn.pin_read_guard(block_id)?;
-    let view = guard.into_btree_internal_page_view(internal_layout)?;
-    let level = view.btree_level();
-    let slot_count = view.slot_count();
-
-    // Verify keys are sorted strictly ascending within the page.
-    for i in 1..slot_count {
-        let prev = view.get_entry(i - 1)?.key.clone();
-        let curr = view.get_entry(i)?.key.clone();
-        if prev >= curr {
-            return Err(format!(
-                "Internal page block {}: keys out of order at slot {}: {:?} >= {:?}",
-                block_id.block_num, i, prev, curr
-            )
-            .into());
-        }
-    }
-
-    // Collect child block numbers in traversal order:
-    // entry[0].child_block, entry[1].child_block, ..., entry[n-1].child_block, rightmost
-    let mut children = Vec::with_capacity(slot_count + 1);
-    for i in 0..slot_count {
-        children.push(view.get_entry(i)?.child_block);
-    }
-    let rightmost = view.rightmost_child_block().ok_or_else(|| {
-        format!(
-            "Internal page block {} missing rightmost child",
-            block_id.block_num
-        )
-    })?;
-    children.push(rightmost);
-    drop(view);
-
-    if level == 0 {
-        Ok(children)
-    } else {
-        let mut leaves = Vec::new();
-        for child_num in children {
-            let child_id = BlockId::new(file_name.to_string(), child_num);
-            let child_leaves = collect_leaf_blocks(txn, internal_layout, file_name, &child_id)?;
-            leaves.extend(child_leaves);
-        }
-        Ok(leaves)
-    }
-}
-
-/// Verify structural invariants of a B-tree index after all concurrent operations.
+/// Structural integrity validator for a B-tree index.
 ///
-/// Phase 1: Walk internal pages top-down to collect leaf block numbers in order.
-/// Phase 2: Walk the leaf sibling chain and verify:
-///   - Keys within each page are sorted ascending.
-///   - All keys on a page are < the page's high_key (if set).
-///   - The high_key of page N equals the first key of page N+1 (separator invariant).
-///   - The sibling chain visits exactly the same blocks as Phase 1 collected.
+/// Exposes `validate_btree_integrity` for use in tests across the crate.
+/// Keep `collect_leaf_blocks` private to this module — callers only need the top-level validator.
 #[cfg(test)]
-fn validate_btree_integrity(txn: &Arc<Transaction>, index: &BTreeIndex) -> SimpleDBResult<()> {
-    // Phase 1
-    let leaf_blocks = collect_leaf_blocks(
-        txn,
-        &index.internal_layout,
-        &index.index_file_name,
-        &index.root_block,
-    )?;
-    if leaf_blocks.is_empty() {
-        return Err("B-tree has no leaf blocks".into());
-    }
+pub mod validator {
+    use super::*;
 
-    // Phase 2
-    let mut sibling_chain: Vec<usize> = Vec::new();
-    let mut expected_first_key: Option<Constant> = None;
-    let mut global_prev_key: Option<Constant> = None;
-    let mut current_block = leaf_blocks[0];
-
-    loop {
-        let block_id = BlockId::new(index.index_file_name.clone(), current_block);
-        let guard = txn.pin_read_guard(&block_id)?;
-        let view = guard.into_btree_leaf_page_view(&index.leaf_layout)?;
-
-        sibling_chain.push(current_block);
+    /// Walk one internal page, verify key ordering, and return children in left-to-right order.
+    /// For level-0 pages the children are leaf block numbers; for higher levels, recurse.
+    pub(super) fn collect_leaf_blocks(
+        txn: &Arc<Transaction>,
+        internal_layout: &Layout,
+        file_name: &str,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<Vec<usize>> {
+        let guard = txn.pin_read_guard(block_id)?;
+        let view = guard.into_btree_internal_page_view(internal_layout)?;
+        let level = view.btree_level();
         let slot_count = view.slot_count();
-        let high_key = view.high_key();
-        let rsib = view.right_sibling_block();
 
-        // Check first key matches the previous page's high_key.
-        if let Some(ref expected) = expected_first_key {
-            if slot_count > 0 {
-                let first = view.get_entry(0)?.key.clone();
-                if first != *expected {
-                    return Err(format!(
-                        "Leaf block {}: first key ({:?}) != expected separator ({:?})",
-                        current_block, first, expected
-                    )
-                    .into());
-                }
-            }
-        }
-
-        // Verify keys within page are sorted ascending.
+        // Verify keys are sorted strictly ascending within the page.
         for i in 1..slot_count {
             let prev = view.get_entry(i - 1)?.key.clone();
             let curr = view.get_entry(i)?.key.clone();
-            if prev > curr {
+            if prev >= curr {
                 return Err(format!(
-                    "Leaf block {}: keys out of order at slot {}: {:?} > {:?}",
-                    current_block, i, prev, curr
+                    "Internal page block {}: keys out of order at slot {}: {:?} >= {:?}",
+                    block_id.block_num, i, prev, curr
                 )
                 .into());
             }
         }
 
-        // Verify all keys are strictly below the high_key.
-        if let Some(ref hk) = high_key {
-            for i in 0..slot_count {
-                let k = view.get_entry(i)?.key.clone();
-                if k >= *hk {
+        // Collect child block numbers in traversal order:
+        // entry[0].child_block, entry[1].child_block, ..., entry[n-1].child_block, rightmost
+        let mut children = Vec::with_capacity(slot_count + 1);
+        for i in 0..slot_count {
+            children.push(view.get_entry(i)?.child_block);
+        }
+        let rightmost = view.rightmost_child_block().ok_or_else(|| {
+            format!(
+                "Internal page block {} missing rightmost child",
+                block_id.block_num
+            )
+        })?;
+        children.push(rightmost);
+        drop(view);
+
+        if level == 0 {
+            Ok(children)
+        } else {
+            let mut leaves = Vec::new();
+            for child_num in children {
+                let child_id = BlockId::new(file_name.to_string(), child_num);
+                let child_leaves = collect_leaf_blocks(txn, internal_layout, file_name, &child_id)?;
+                leaves.extend(child_leaves);
+            }
+            Ok(leaves)
+        }
+    }
+
+    /// Verify structural invariants of a B-tree index.
+    ///
+    /// Phase 1: Walk internal pages top-down to collect leaf block numbers in order.
+    /// Phase 2: Walk the leaf sibling chain and verify:
+    ///   - Keys within each page are sorted ascending.
+    ///   - All keys on a page are < the page's high_key (if set).
+    ///   - The high_key of page N equals the first key of page N+1 (separator invariant).
+    ///   - The sibling chain visits exactly the same blocks as Phase 1 collected.
+    pub fn validate_btree_integrity(
+        txn: &Arc<Transaction>,
+        index: &BTreeIndex,
+    ) -> SimpleDBResult<()> {
+        // Phase 1
+        let leaf_blocks = collect_leaf_blocks(
+            txn,
+            &index.internal_layout,
+            &index.index_file_name,
+            &index.root_block,
+        )?;
+        if leaf_blocks.is_empty() {
+            return Err("B-tree has no leaf blocks".into());
+        }
+
+        // Phase 2
+        let mut sibling_chain: Vec<usize> = Vec::new();
+        let mut expected_first_key: Option<Constant> = None;
+        let mut global_prev_key: Option<Constant> = None;
+        let mut current_block = leaf_blocks[0];
+
+        loop {
+            let block_id = BlockId::new(index.index_file_name.clone(), current_block);
+            let guard = txn.pin_read_guard(&block_id)?;
+            let view = guard.into_btree_leaf_page_view(&index.leaf_layout)?;
+
+            sibling_chain.push(current_block);
+            let slot_count = view.slot_count();
+            let high_key = view.high_key();
+            let rsib = view.right_sibling_block();
+
+            // Check first key matches the previous page's high_key.
+            if let Some(ref expected) = expected_first_key {
+                if slot_count > 0 {
+                    let first = view.get_entry(0)?.key.clone();
+                    if first != *expected {
+                        return Err(format!(
+                            "Leaf block {}: first key ({:?}) != expected separator ({:?})",
+                            current_block, first, expected
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            // Verify keys within page are sorted ascending.
+            for i in 1..slot_count {
+                let prev = view.get_entry(i - 1)?.key.clone();
+                let curr = view.get_entry(i)?.key.clone();
+                if prev > curr {
                     return Err(format!(
-                        "Leaf block {}: key at slot {} ({:?}) >= high_key ({:?})",
-                        current_block, i, k, hk
+                        "Leaf block {}: keys out of order at slot {}: {:?} > {:?}",
+                        current_block, i, prev, curr
                     )
                     .into());
                 }
             }
-        }
 
-        // Verify global ordering: first key of this page >= last key of previous page.
-        if let Some(ref prev_k) = global_prev_key {
+            // Verify all keys are strictly below the high_key.
+            if let Some(ref hk) = high_key {
+                for i in 0..slot_count {
+                    let k = view.get_entry(i)?.key.clone();
+                    if k >= *hk {
+                        return Err(format!(
+                            "Leaf block {}: key at slot {} ({:?}) >= high_key ({:?})",
+                            current_block, i, k, hk
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            // Verify global ordering: first key of this page >= last key of previous page.
+            if let Some(ref prev_k) = global_prev_key {
+                if slot_count > 0 {
+                    let first = view.get_entry(0)?.key.clone();
+                    if first < *prev_k {
+                        return Err(format!(
+                            "Leaf block {}: first key ({:?}) < prev page last key ({:?})",
+                            current_block, first, prev_k
+                        )
+                        .into());
+                    }
+                }
+            }
+
             if slot_count > 0 {
-                let first = view.get_entry(0)?.key.clone();
-                if first < *prev_k {
-                    return Err(format!(
-                        "Leaf block {}: first key ({:?}) < prev page last key ({:?})",
-                        current_block, first, prev_k
-                    )
-                    .into());
-                }
+                global_prev_key = Some(view.get_entry(slot_count - 1)?.key.clone());
+            }
+            expected_first_key = high_key;
+
+            match rsib {
+                Some(rsib_block) => current_block = rsib_block,
+                None => break,
             }
         }
 
-        if slot_count > 0 {
-            global_prev_key = Some(view.get_entry(slot_count - 1)?.key.clone());
+        if sibling_chain != leaf_blocks {
+            return Err(format!(
+                "Sibling chain {:?} != internal-page leaf list {:?}",
+                sibling_chain, leaf_blocks
+            )
+            .into());
         }
-        expected_first_key = high_key;
 
-        match rsib {
-            Some(rsib_block) => current_block = rsib_block,
-            None => break,
-        }
+        Ok(())
     }
-
-    if sibling_chain != leaf_blocks {
-        return Err(format!(
-            "Sibling chain {:?} != internal-page leaf list {:?}",
-            sibling_chain, leaf_blocks
-        )
-        .into());
-    }
-
-    Ok(())
 }
 
 /// The general format of the BTreePage
