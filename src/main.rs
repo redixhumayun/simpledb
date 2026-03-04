@@ -9367,6 +9367,10 @@ impl Transaction {
         self.concurrency_manager.lock_row_x(table_id, rid)
     }
 
+    pub fn lock_table_is(&self, table_id: u32) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_table_is(table_id)
+    }
+
     pub fn lock_table_ix(&self, table_id: u32) -> SimpleDBResult<()> {
         self.concurrency_manager.lock_table_ix(table_id)
     }
@@ -9377,6 +9381,22 @@ impl Transaction {
 
     pub fn lock_table_x(&self, table_id: u32) -> SimpleDBResult<()> {
         self.concurrency_manager.lock_table_x(table_id)
+    }
+
+    pub fn lock_index_key_s(&self, index_id: u32, key: Constant) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_index_key_s(index_id, key)
+    }
+
+    pub fn lock_index_key_x(&self, index_id: u32, key: Constant) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_index_key_x(index_id, key)
+    }
+
+    pub fn lock_index_range_s(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_index_range_s(index_id, low, high)
+    }
+
+    pub fn lock_index_range_x(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+        self.concurrency_manager.lock_index_range_x(index_id, low, high)
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -10189,12 +10209,19 @@ impl LockTable {
         // New lock request — wait until compatible with all current holders
         let deadline = Instant::now() + Duration::from_millis(self.timeout);
         loop {
-            let state = guard.get(&target).unwrap();
-            let blocked = state
-                .holders
-                .iter()
-                .any(|(&id, &held)| id != tx_id && !LockMode::compatible(held, mode))
-                || (mode == LockMode::S && !state.upgrade_requests.is_empty());
+            let blocked = {
+                let state = guard.get(&target).unwrap();
+                let exact_blocked = state
+                    .holders
+                    .iter()
+                    .any(|(&id, &held)| id != tx_id && !LockMode::compatible(held, mode))
+                    || (mode == LockMode::S && !state.upgrade_requests.is_empty());
+                let overlap_blocked = matches!(
+                    target,
+                    LockTarget::IndexKey { .. } | LockTarget::IndexRange { .. }
+                ) && index_overlap_blocked(&guard, tx_id, &target, mode);
+                exact_blocked || overlap_blocked
+            };
             if !blocked {
                 break;
             }
@@ -10346,6 +10373,165 @@ mod lock_table_tests {
         lock_table.release(2, &target).unwrap();
         assert!(rx.recv().unwrap() == *"Acquired write lock");
     }
+
+    // --- Phase 1: IndexKey / IndexRange lock tests ---
+
+    #[test]
+    fn test_index_key_same_key_ss_compatible() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        lt.acquire(1, t.clone(), LockMode::S).unwrap();
+        lt.acquire(2, t.clone(), LockMode::S).unwrap();
+        lt.release(1, &t).unwrap();
+        lt.release(2, &t).unwrap();
+    }
+
+    #[test]
+    fn test_index_key_same_key_sx_conflict() {
+        let lt = Arc::new(LockTable::new(1));
+        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        lt.acquire(1, t.clone(), LockMode::X).unwrap();
+        assert!(lt.acquire(2, t.clone(), LockMode::S).is_err());
+        lt.release(1, &t).unwrap();
+    }
+
+    #[test]
+    fn test_index_key_same_key_xx_conflict() {
+        let lt = Arc::new(LockTable::new(1));
+        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        lt.acquire(1, t.clone(), LockMode::X).unwrap();
+        assert!(lt.acquire(2, t.clone(), LockMode::X).is_err());
+        lt.release(1, &t).unwrap();
+    }
+
+    #[test]
+    fn test_index_key_different_keys_no_conflict() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let t1 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(10) };
+        let t2 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(99) };
+        lt.acquire(1, t1.clone(), LockMode::X).unwrap();
+        // different key — should succeed even with S vs X
+        lt.acquire(2, t2.clone(), LockMode::X).unwrap();
+        lt.release(1, &t1).unwrap();
+        lt.release(2, &t2).unwrap();
+    }
+
+    #[test]
+    fn test_index_range_overlapping_ss_compatible() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let r1 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(10),
+            high: crate::Constant::Int(30),
+        };
+        let r2 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(40),
+        };
+        lt.acquire(1, r1.clone(), LockMode::S).unwrap();
+        lt.acquire(2, r2.clone(), LockMode::S).unwrap();
+        lt.release(1, &r1).unwrap();
+        lt.release(2, &r2).unwrap();
+    }
+
+    #[test]
+    fn test_index_range_overlapping_sx_conflict() {
+        let lt = Arc::new(LockTable::new(1));
+        let r1 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(10),
+            high: crate::Constant::Int(30),
+        };
+        let r2 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(40),
+        };
+        lt.acquire(1, r1.clone(), LockMode::X).unwrap();
+        // r2 overlaps r1 → conflict
+        assert!(lt.acquire(2, r2.clone(), LockMode::S).is_err());
+        lt.release(1, &r1).unwrap();
+    }
+
+    #[test]
+    fn test_index_range_disjoint_no_conflict() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let r1 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(10),
+            high: crate::Constant::Int(20),
+        };
+        let r2 = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(30),
+        };
+        // [10,20) and [20,30) are disjoint (half-open)
+        lt.acquire(1, r1.clone(), LockMode::X).unwrap();
+        lt.acquire(2, r2.clone(), LockMode::X).unwrap();
+        lt.release(1, &r1).unwrap();
+        lt.release(2, &r2).unwrap();
+    }
+
+    #[test]
+    fn test_index_key_inside_range_conflict() {
+        let lt = Arc::new(LockTable::new(1));
+        let range = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(30),
+        };
+        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        lt.acquire(1, range.clone(), LockMode::S).unwrap();
+        // key 25 is inside [20,30) → X on key conflicts with S on range
+        assert!(lt.acquire(2, key.clone(), LockMode::X).is_err());
+        lt.release(1, &range).unwrap();
+    }
+
+    #[test]
+    fn test_index_key_outside_range_no_conflict() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let range = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(30),
+        };
+        // key 40 is outside [20,30)
+        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(40) };
+        lt.acquire(1, range.clone(), LockMode::X).unwrap();
+        lt.acquire(2, key.clone(), LockMode::S).unwrap();
+        lt.release(1, &range).unwrap();
+        lt.release(2, &key).unwrap();
+    }
+
+    #[test]
+    fn test_index_boundary_key_at_high_no_overlap() {
+        // [20,30) — key 30 is NOT contained (half-open upper bound)
+        let lt = Arc::new(LockTable::new(1_000));
+        let range = LockTarget::IndexRange {
+            index_id: 1,
+            low: crate::Constant::Int(20),
+            high: crate::Constant::Int(30),
+        };
+        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(30) };
+        lt.acquire(1, range.clone(), LockMode::X).unwrap();
+        lt.acquire(2, key.clone(), LockMode::X).unwrap();
+        lt.release(1, &range).unwrap();
+        lt.release(2, &key).unwrap();
+    }
+
+    #[test]
+    fn test_index_different_index_ids_no_conflict() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let t1 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        let t2 = LockTarget::IndexKey { index_id: 2, key: crate::Constant::Int(25) };
+        lt.acquire(1, t1.clone(), LockMode::X).unwrap();
+        // Different index_id: no conflict even with same key value
+        lt.acquire(2, t2.clone(), LockMode::X).unwrap();
+        lt.release(1, &t1).unwrap();
+        lt.release(2, &t2).unwrap();
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -10358,6 +10544,85 @@ enum LockTarget {
         block: u32,
         slot: u32,
     },
+    /// Protects a single logical index key (all duplicate entries under that key).
+    IndexKey {
+        index_id: u32,
+        key: Constant,
+    },
+    /// Protects a half-open key interval [low, high) in an index.
+    IndexRange {
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    },
+}
+
+/// Returns true if `a` and `b` are index lock targets that overlap in keyspace.
+fn index_targets_overlap(a: &LockTarget, b: &LockTarget) -> bool {
+    match (a, b) {
+        (
+            LockTarget::IndexRange {
+                index_id: id1,
+                low: l1,
+                high: h1,
+            },
+            LockTarget::IndexRange {
+                index_id: id2,
+                low: l2,
+                high: h2,
+            },
+        ) => id1 == id2 && l1 < h2 && l2 < h1,
+        (
+            LockTarget::IndexKey {
+                index_id: id1,
+                key: k,
+            },
+            LockTarget::IndexRange {
+                index_id: id2,
+                low,
+                high,
+            },
+        )
+        | (
+            LockTarget::IndexRange {
+                index_id: id2,
+                low,
+                high,
+            },
+            LockTarget::IndexKey {
+                index_id: id1,
+                key: k,
+            },
+        ) => id1 == id2 && low <= k && k < high,
+        _ => false,
+    }
+}
+
+/// Returns true if `tx_id` requesting `mode` on an index target is blocked by
+/// an overlapping index lock held by a different transaction.
+fn index_overlap_blocked(
+    map: &HashMap<LockTarget, LockState>,
+    tx_id: TransactionID,
+    target: &LockTarget,
+    mode: LockMode,
+) -> bool {
+    for (held_target, state) in map.iter() {
+        if held_target == target {
+            continue; // already handled by exact-match path
+        }
+        if !index_targets_overlap(target, held_target) {
+            continue;
+        }
+        for (&holder_tx, &held_mode) in &state.holders {
+            if holder_tx == tx_id {
+                continue;
+            }
+            if !LockMode::compatible(held_mode, mode) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10421,6 +10686,18 @@ enum RowLockMode {
     X,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexLockMode {
+    S,
+    X,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+enum IndexLockKey {
+    Key { index_id: u32, key: Constant },
+    Range { index_id: u32, low: Constant, high: Constant },
+}
+
 impl From<TableLockMode> for LockMode {
     fn from(m: TableLockMode) -> Self {
         match m {
@@ -10441,11 +10718,21 @@ impl From<RowLockMode> for LockMode {
     }
 }
 
+impl From<IndexLockMode> for LockMode {
+    fn from(m: IndexLockMode) -> Self {
+        match m {
+            IndexLockMode::S => LockMode::S,
+            IndexLockMode::X => LockMode::X,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ConcurrencyManager {
     lock_table: Arc<LockTable>,
     table_locks: RefCell<HashMap<u32, TableLockMode>>,
     row_locks: RefCell<HashMap<(u32, u32, u32), RowLockMode>>,
+    index_locks: RefCell<HashMap<IndexLockKey, IndexLockMode>>,
     tx_id: TransactionID,
 }
 
@@ -10455,6 +10742,7 @@ impl ConcurrencyManager {
             lock_table,
             table_locks: RefCell::new(HashMap::new()),
             row_locks: RefCell::new(HashMap::new()),
+            index_locks: RefCell::new(HashMap::new()),
             tx_id,
         }
     }
@@ -10513,9 +10801,53 @@ impl ConcurrencyManager {
         self.acquire_row(table_id, rid, RowLockMode::X)
     }
 
+    fn acquire_index_key(&self, index_id: u32, key: Constant, mode: IndexLockMode) -> SimpleDBResult<()> {
+        self.lock_table
+            .acquire(self.tx_id, LockTarget::IndexKey { index_id, key: key.clone() }, mode.into())?;
+        self.index_locks
+            .borrow_mut()
+            .insert(IndexLockKey::Key { index_id, key }, mode);
+        Ok(())
+    }
+
+    fn acquire_index_range(
+        &self,
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+        mode: IndexLockMode,
+    ) -> SimpleDBResult<()> {
+        self.lock_table.acquire(
+            self.tx_id,
+            LockTarget::IndexRange { index_id, low: low.clone(), high: high.clone() },
+            mode.into(),
+        )?;
+        self.index_locks
+            .borrow_mut()
+            .insert(IndexLockKey::Range { index_id, low, high }, mode);
+        Ok(())
+    }
+
+    fn lock_index_key_s(&self, index_id: u32, key: Constant) -> SimpleDBResult<()> {
+        self.acquire_index_key(index_id, key, IndexLockMode::S)
+    }
+
+    fn lock_index_key_x(&self, index_id: u32, key: Constant) -> SimpleDBResult<()> {
+        self.acquire_index_key(index_id, key, IndexLockMode::X)
+    }
+
+    fn lock_index_range_s(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+        self.acquire_index_range(index_id, low, high, IndexLockMode::S)
+    }
+
+    fn lock_index_range_x(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+        self.acquire_index_range(index_id, low, high, IndexLockMode::X)
+    }
+
     fn release(&self) -> SimpleDBResult<()> {
         let table_ids: Vec<u32> = self.table_locks.borrow().keys().cloned().collect();
         let row_ids: Vec<(u32, u32, u32)> = self.row_locks.borrow().keys().cloned().collect();
+        let index_keys: Vec<IndexLockKey> = self.index_locks.borrow().keys().cloned().collect();
         for table_id in &table_ids {
             self.lock_table.release(
                 self.tx_id,
@@ -10534,8 +10866,23 @@ impl ConcurrencyManager {
                 },
             )?;
         }
+        for key in &index_keys {
+            let target = match key {
+                IndexLockKey::Key { index_id, key } => LockTarget::IndexKey {
+                    index_id: *index_id,
+                    key: key.clone(),
+                },
+                IndexLockKey::Range { index_id, low, high } => LockTarget::IndexRange {
+                    index_id: *index_id,
+                    low: low.clone(),
+                    high: high.clone(),
+                },
+            };
+            self.lock_table.release(self.tx_id, &target)?;
+        }
         self.table_locks.borrow_mut().clear();
         self.row_locks.borrow_mut().clear();
+        self.index_locks.borrow_mut().clear();
         Ok(())
     }
 }
