@@ -2730,6 +2730,7 @@ pub struct PageWriteGuard<'a> {
     _frame: Arc<BufferFrame>,
     handle: BufferHandle,
     log_manager: Arc<Mutex<LogManager>>,
+    pending_modified: Cell<Option<(usize, usize)>>,
 }
 
 impl<'a> PageWriteGuard<'a> {
@@ -2745,15 +2746,22 @@ impl<'a> PageWriteGuard<'a> {
             _frame: frame,
             handle,
             log_manager,
+            pending_modified: Cell::new(None),
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.page.bytes()
+        self.page
+            .as_ref()
+            .expect("page guard missing page lock")
+            .bytes()
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        self.page.bytes_mut()
+        self.page
+            .as_mut()
+            .expect("page guard missing page lock")
+            .bytes_mut()
     }
 
     /// Returns the block ID of the pinned page.
@@ -2771,6 +2779,11 @@ impl<'a> PageWriteGuard<'a> {
     }
 
     /// Marks the page as modified for WAL.
+    ///
+    /// The frame metadata publish is deferred until this guard is dropped.
+    /// This avoids taking frame-meta while still holding the page write lock
+    /// (`page -> meta`), which deadlocks with flush/commit paths that lock
+    /// in `meta -> page` order.
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
         self.handle.mark_modified(txn_id, lsn);
     }
@@ -2921,7 +2934,20 @@ impl Deref for PageWriteGuard<'_> {
     type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
-        &self.page
+        self.page.as_ref().expect("page guard missing page lock")
+    }
+}
+
+impl Drop for PageWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release page write-latch before publishing dirty metadata.
+        // Keeping a single global lock order (`meta -> page`) avoids inversion.
+        if let Some(page_guard) = self.page.take() {
+            drop(page_guard);
+        }
+        if let Some((txn_id, lsn)) = self.pending_modified.get() {
+            self.frame.set_modified(txn_id, lsn);
+        }
     }
 }
 
@@ -4517,6 +4543,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         if lsn > current {
             self.page_lsn.set(Some(lsn));
         }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.guard.bytes()
     }
 
     fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageMut<'_>> {
