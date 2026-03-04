@@ -887,6 +887,26 @@ Phase-oriented rollout:
 
 Guardrail: up through step 2, correctness should remain protected by coarse entry-point serialization.
 
+## Implementation Notes
+
+Use staged rollout to preserve stability while refactoring:
+
+1. Add required tests/benchmarks first and capture baseline numbers under current serialized index
+   locking.
+2. Implement read-path refactor first.
+3. Implement write-path refactor next.
+4. Enable/complete latch-crabbing behavior internally while keeping current serialized logical
+   locking in place.
+5. Remove serialized index locking last (`S/X` at index entry points), switching to `IS/IX` plus
+   `IndexKey`/`IndexRange` logical locks.
+
+Guardrails for this rollout:
+
+- Up through step 4, existing correctness should continue to pass because coarse serialized
+  logical locks are still active.
+- Phantom/key-range semantic tests may be added early but should be expected to fail (or be
+  ignored) until step 5 introduces `IndexKey`/`IndexRange` locking.
+
 ## References
 
 - `docs/benchmarks/btree_concurrency_baseline.md` — full baseline benchmark details
