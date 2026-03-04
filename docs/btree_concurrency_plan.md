@@ -135,6 +135,22 @@ Current lock release behavior uses `notify_all()`; keep this as-is for now.
 
 Goal: implement latch crabbing in B-tree code paths, independent of logical 2PL locks.
 
+### 0. Boundary rule (must hold)
+
+Keep traversal concerns and structural-update concerns separated in control flow:
+
+- No implicit traversal during structural updates.
+- No structural mutation inside traversal helpers.
+
+Rationale:
+
+- Prevents relatch races: structural code must mutate using the already-latched path, not by
+  re-searching and reacquiring pages after tree state may have changed.
+- Preserves latch-order predictability: traversal owns top-down latch coupling; structural code
+  should not introduce ad hoc latch acquisition order.
+- Makes restart behavior explicit: structural code can return `restart`/`retry` signals at clear
+  boundaries rather than embedding hidden traversal side effects.
+
 ### 1. Add traversal primitives that hold parent + child temporarily
 
 Current search/insert logic acquires a latch on one node, reads child pointer, then releases.
@@ -178,6 +194,206 @@ No public planner/scan API change is required for crabbing. Existing `Index` tra
 - `delete`
 
 Required changes are inside `BTreeIndex`, `BTreeInternal`, and `BTreeLeaf` internals.
+
+### Code Sketches
+
+This section is illustrative. Names/signatures may change during implementation, but boundary
+rules and ownership intent should remain.
+
+#### A. Internal module shape
+
+```text
+btree.rs
+  mod traversal {
+    // latch protocol only
+    struct ReadCursor { ... }
+    struct WriteCtx { ... }
+
+    fn descend_read(...) -> ReadCursor
+    fn descend_write(...) -> WriteCtx
+    fn hop_right_read(cursor: &mut ReadCursor, ...) -> Result<...>
+  }
+
+  mod structural {
+    // page mutation + split propagation only
+    struct Separator {
+      key: Constant,
+      left_block: usize,
+      right_block: usize,
+    }
+
+    struct LeafSplit(Separator);
+    struct InternalSplit(Separator);
+
+    enum StructuralOutcome {
+      Stable,
+      Retry,
+      SplitLeaf(LeafSplit),
+      SplitInternal(InternalSplit),
+    }
+
+    enum PropagationOutcome {
+      Absorbed,
+      Retry,
+      RootSplit(InternalSplit),
+    }
+
+    fn apply_leaf_insert(
+      ctx: &mut WriteCtx,
+      key: &Constant,
+      rid: RID
+    ) -> Result<StructuralOutcome>
+    fn apply_internal_insert(
+      ctx: &mut WriteCtx,
+      split: InternalSplit
+    ) -> Result<StructuralOutcome>
+    fn apply_leaf_delete(ctx: &mut WriteCtx, key: &Constant, rid: RID) -> Result<...>
+    fn propagate_split_up(ctx: &mut WriteCtx, split: LeafSplit) -> Result<PropagationOutcome>
+    fn maybe_make_new_root(...) -> Result<...>
+  }
+```
+
+`BTreeInternal` / `BTreeLeaf` remain page-level helpers (slot ops, split primitives, header
+updates). They do not own top-down traversal policy.
+
+#### B. Core internal types
+
+```text
+ReadCursor
+  - current_leaf_block: BlockId
+  - current_slot: Option<usize>
+  - search_key: Constant
+  - (optional) cached leaf read-guard while scanning
+
+WriteCtx
+  - leaf_block: BlockId
+  - ancestor_path: Vec<BlockId>   // or latched ancestor handles
+  - op: Insert | Delete
+  - key: Constant
+```
+
+Implementation may store full guards instead of `BlockId`s where lifetimes permit. If not, store
+stable path metadata plus explicit relatch/revalidate steps.
+
+Type boundary between traversal and structural:
+
+- `traversal::descend_read(...) -> ReadCursor`: consumed by read orchestration (`before_first`,
+  `next`, sibling hops). Not passed to structural mutation APIs.
+- `traversal::descend_write(...) -> WriteCtx`: handoff object passed into structural APIs for
+  insert/delete/split propagation.
+
+Split outcome boundary:
+
+- Keep split kinds explicit at the structural API boundary:
+  - `SplitLeaf(LeafSplit)`
+  - `SplitInternal(InternalSplit)`
+- Distinguish root-creating propagation explicitly via `PropagationOutcome::RootSplit(...)`.
+- Carry transient restart explicitly as `Retry` in both structural and propagation outcomes.
+- This improves API readability and makes cascade handling explicit in the type system.
+
+#### C. `BTreeIndex` control-flow sketch
+
+```rust
+impl Index for BTreeIndex {
+    fn before_first(&mut self, key: &Constant) {
+        self.txn.lock_table_is(self.index_lock_table_id).unwrap();
+        self.read_cursor = Some(traversal::descend_read(
+            &self.txn,
+            &self.root_block,
+            &self.internal_layout,
+            &self.leaf_layout,
+            &self.index_file_name,
+            key,
+        ).unwrap());
+    }
+
+    fn next(&mut self) -> bool {
+        let cursor = self.read_cursor.as_mut().expect("before_first first");
+        cursor.next_matching(
+            &self.txn,
+            &self.leaf_layout,
+            &self.index_file_name,
+        ).unwrap_or(false)
+    }
+
+    fn insert(&mut self, key: &Constant, rid: &RID) {
+        self.txn.lock_table_ix(self.index_lock_table_id).unwrap();
+        const MAX_RETRIES: usize = 16;
+        for _attempt in 0..MAX_RETRIES {
+            let mut ctx = traversal::descend_write(/*...*/, key, /*Insert*/).unwrap();
+            match structural::apply_leaf_insert(&mut ctx, key, *rid).unwrap() {
+                structural::StructuralOutcome::Stable => return,
+                structural::StructuralOutcome::Retry => continue,
+                structural::StructuralOutcome::SplitLeaf(leaf_split) => {
+                    match structural::propagate_split_up(&mut ctx, leaf_split).unwrap() {
+                        structural::PropagationOutcome::Absorbed => return,
+                        structural::PropagationOutcome::Retry => continue,
+                        structural::PropagationOutcome::RootSplit(root_split) => {
+                            structural::maybe_make_new_root(/*...*/, root_split).unwrap();
+                            return;
+                        }
+                    }
+                }
+                structural::StructuralOutcome::SplitInternal(_) => {
+                    unreachable!("leaf insert should not directly yield internal split")
+                }
+            }
+        }
+        panic!("btree insert exceeded retry budget");
+    }
+
+    fn delete(&mut self, key: &Constant, rid: &RID) {
+        self.txn.lock_table_ix(self.index_lock_table_id).unwrap();
+        let mut ctx = traversal::descend_write(/*...*/, key, /*Delete*/).unwrap();
+        structural::apply_leaf_delete(&mut ctx, key, *rid).unwrap();
+    }
+}
+```
+
+#### D. Why separate `descend_read` and `descend_write`
+
+Separate paths are intentional:
+
+- Different latch modes (`R` vs `W`).
+- Different release policy (read always crab-down; write crab-down with safety checks).
+- Different outputs (`ReadCursor` vs `WriteCtx` with split-propagation context).
+- Different restart behavior (writes may require structural retry).
+
+Shared helpers are still encouraged for child selection, key comparisons, and interval logic.
+
+#### E. Split cascade usage sketch
+
+```rust
+fn propagate_split_up(ctx: &mut WriteCtx, mut split: LeafSplit) -> Result<PropagationOutcome> {
+    loop {
+        let parent = match ctx.next_parent() {
+            Some(p) => p,
+            None => {
+                // no parent left => old root overflow must be materialized as a new root
+                return Ok(PropagationOutcome::RootSplit(InternalSplit(split.0)));
+            }
+        };
+
+        match apply_internal_insert(ctx, InternalSplit(split.0))? {
+            StructuralOutcome::Stable => return Ok(PropagationOutcome::Absorbed),
+            StructuralOutcome::Retry => return Ok(PropagationOutcome::Retry),
+            StructuralOutcome::SplitInternal(next_split) => {
+                split = LeafSplit(next_split.0);
+                continue;
+            }
+            StructuralOutcome::SplitLeaf(_) => unreachable!("internal insert cannot yield leaf split"),
+        }
+    }
+}
+```
+
+The exact wrapper conversions can be adjusted (for example, separate constructors instead of tuple
+wrappers), but the intended boundary remains:
+
+- leaf mutation yields `SplitLeaf`,
+- parent/internal propagation yields `SplitInternal`,
+- transient structural races may yield `Retry` and trigger bounded re-descent from root,
+- escaping the old root yields `RootSplit`.
 
 ## Acceptance Criteria
 
@@ -290,6 +506,26 @@ After latch crabbing + `IS`/`IX` / `IndexKey`/`IndexRange` logical locking:
 - INSERT throughput should scale toward multi-writer concurrency (expected significant gain).
 - LOOKUP throughput should remain roughly the same or improve slightly (already concurrent).
 - Mixed throughput should approach LOOKUP levels as write-induced serialization decreases.
+
+## Implementation Notes
+
+Use staged rollout to preserve stability while refactoring:
+
+1. Add required tests/benchmarks first and capture baseline numbers under current serialized index
+   locking.
+2. Implement read-path refactor first.
+3. Implement write-path refactor next.
+4. Enable/complete latch-crabbing behavior internally while keeping current serialized logical
+   locking in place.
+5. Remove serialized index locking last (`S/X` at index entry points), switching to `IS/IX` plus
+   `IndexKey`/`IndexRange` logical locks.
+
+Guardrails for this rollout:
+
+- Up through step 4, existing correctness should continue to pass because coarse serialized
+  logical locks are still active.
+- Phantom/key-range semantic tests may be added early but should be expected to fail (or be
+  ignored) until step 5 introduces `IndexKey`/`IndexRange` locking.
 
 ## References
 
