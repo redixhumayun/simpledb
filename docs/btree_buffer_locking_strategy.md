@@ -1,112 +1,106 @@
-# B-Tree Buffer/Locking Deadlock RCA and Architecture Direction
+# B-Tree Buffer/Locking Deadlock RCA and Direction
 
 ## Why this document exists
 
-We have repeatedly hit lock-order deadlocks while implementing B-tree latch crabbing under concurrency.
+We repeatedly hit lock-order deadlocks while implementing B-tree latch crabbing under concurrency.
 
-This is not a one-off bug in a single function. The issue is architectural: page latches and buffer metadata/replacement bookkeeping are intertwined in ways that allow opposite lock orders across code paths.
+This is not a one-off bug in one function. Page-latch operations and buffer metadata/replacement operations were interleaved without a strict boundary, so opposite lock orders became possible.
 
-The goal of this note is to capture:
-- what started the issue,
-- why small local fixes keep failing,
-- the architecture-level direction required to remove this entire class of deadlocks.
+This note captures:
+- what triggered the failures,
+- what deadlock cycles we observed,
+- what decision we are now taking.
 
 ## What triggered the issue
 
-During Phase 3 B-tree write-latch crabbing, writers hold write latches across parent->child descent and split propagation.
+During Phase 3 write-latch crabbing, writers held parent->child latches through descent and split propagation.
 
-At the same time, transactions commit frequently in write-heavy tests (`test_concurrent_writes_disjoint_ranges`, `test_concurrent_split_stress`), which drives `flush_all()` heavily.
+At the same time, write-heavy tests (`test_concurrent_writes_disjoint_ranges`, `test_concurrent_split_stress`) committed frequently, driving `flush_all()` often.
 
-This increased overlap between:
-- page-latch holding code (`btree::structural::descend_write`, mutable page/view drops), and
-- buffer manager metadata/replacement code (`flush_all`, `record_hit`, `unpin`).
-
-That overlap exposed lock-order inversion cycles.
+That increased overlap between:
+- page-latch holding code (`btree::structural::descend_write`, mutable page/view drop paths),
+- buffer-manager lifecycle/replacement code (`flush_all`, `record_hit`, `unpin`, eviction paths).
 
 ## Concrete deadlock cycles observed
 
 ### Cycle A (initial)
 
-- Writer path held page write lock and, during mutable page/view drop, called `mark_modified()`.
+- Writer path held page write latch and, during mutable view drop, called `mark_modified()`.
 - `mark_modified()` acquired frame metadata mutex.
-- Commit flush path held frame metadata mutex and then waited for page write lock.
+- Commit flush path held frame metadata mutex and then waited for page write latch.
 
 Cycle: `page -> meta` (writer) vs `meta -> page` (flush).
 
-### Cycle B (after local fix for A)
+### Cycle B (after narrow fix attempt)
 
-Even after removing the direct `mark_modified` inversion, deadlocks remained.
+Even after removing one `mark_modified` inversion, deadlocks remained through crabbing + replacement bookkeeping:
 
-- Writer path holds `page(root)` while crabbing.
-- Writer calls `pin_write_guard(child)`; `pin` calls replacement `record_hit`.
-- Under LRU, `record_hit` can lock metadata for multiple frames (target + head/prev/next), not just the child frame.
-- Commit flush holds `meta(root)` and waits for `page(root)`.
-- Writer, while holding `page(root)`, waits for `meta(root)` indirectly via `record_hit` or `unpin` side effects.
+- Writer holds `page(root)` while crabbing.
+- Writer attempts to pin child; pin path may run replacement hit bookkeeping.
+- Under LRU/SIEVE-style updates, hit bookkeeping can lock metadata for multiple frames.
+- Commit/flush holds `meta(root)` and waits for `page(root)`.
+- Writer, while holding `page(root)`, waits on metadata lock(s) that can include/root through replacement structure coupling.
 
-Same cycle class reappears through a different entry point.
+Same class reappears through a different entry point.
 
-## Root cause class
+## Root architectural mismatch
 
-`FrameMeta` currently multiplexes unrelated concerns behind one mutex:
-- pin count,
-- dirty info (`txn`/`lsn`),
-- block binding,
-- replacement-policy node state.
+Two lock domains are being mixed in the same critical sections:
 
-Because pin/unpin/hit/flush/evict all touch this same lock, and page operations run concurrently, multiple paths can create opposite lock orders involving `page` and `meta`.
+- `page` latch: tight, structural/data-path lock (B-tree correctness during traversal/modification),
+- `frame/meta` and replacement locks: broader lifecycle/cache-management locks (pin/hit/evict/flush accounting).
 
-Local fixes (field drop order, one call-site reorder) can remove one instance, but other paths still recreate the cycle.
+When page-latched code enters lifecycle/replacement locking, or lifecycle code waits on page latches while holding metadata locks, opposite order cycles are easy to create.
 
-## Why this cannot be solved reliably with more local patches
+## Decision: global ordering and phase boundary
 
-As long as all metadata concerns share one coarse frame mutex:
-- any new path that touches metadata while a page latch is held can reintroduce `page -> meta`,
-- any maintenance path that holds metadata while waiting on page can reintroduce `meta -> page`.
+We are **not** moving to a lock-free buffer manager in this phase.
 
-Given current replacement code shape (especially LRU multi-node updates), this is structurally fragile.
+We are adopting:
 
-## Architecture direction (single coherent strategy)
+1. **Global lock order**
+- `meta -> page` is the only allowed order whenever both are needed.
+- `page -> meta` is disallowed everywhere.
 
-### Principle
+2. **Eliminate existing `page -> meta` inversions**
+- Remove/rework all paths that call metadata-locking operations while a page latch is held.
+- This includes page/view drop-time `mark_modified`-style paths and any equivalent write/undo/format flows.
 
-Remove frame-local blocking metadata mutex from transaction hot paths. Keep page-content locking (`RwLock<Page>`) and manage metadata with non-blocking primitives + policy-owned synchronization.
+3. **Fast vs slow buffer-manager pin semantics**
+- Fast pin path: resident-only, no replacement/eviction bookkeeping that can block on global/frame metadata structures.
+- Slow path: hit bookkeeping and miss/eviction lifecycle work.
 
-### High-level shape
+4. **Crabbing constraint**
+- While holding B-tree latches, crabbing may use only the fast pin path.
+- If operation needs non-fast behavior (e.g., miss or slow-path hit/eviction work), it must:
+  - release all held B-tree latches first,
+  - run slow path,
+  - re-enter descent/retry.
 
-1. Per-frame hot metadata via atomics
-- `pin_count`
-- dirty markers (`dirty`, `txn`, `lsn`)
-- eviction/reservation state flag
+## Buffer-manager semantics required to avoid future deadlocks
 
-2. Replacement policy state under policy mutex
-- LRU/Clock/Sieve structures owned by policy module
-- keyed by stable `frame_idx`, not frame mutex guards
+To make the above stable, buffer manager must guarantee:
 
-3. Strict lock-phase rule
-- No code holding page latch may acquire policy/resident-management locks.
-- No maintenance path may hold policy lock while waiting for page lock.
+1. No `page -> meta` acquisition path exists.
+2. Eviction/replacement bookkeeping does not hold policy/global metadata locks while waiting for page latches.
+3. Slow-path waits are done without B-tree latches held by caller thread.
+4. Fast-path pin while latched never triggers slow-path bookkeeping implicitly.
+5. If no evictable frame exists, waiting is on global availability progression, not on a specific page-latched frame dependency.
 
-4. Eviction reservation protocol
-- select candidate frame with `pin_count == 0`
-- reserve it (`evicting` CAS/state transition)
-- perform flush/rebind outside policy critical section
+## Why this direction
 
-### Result expected
+This keeps current architecture intact (no lock-free rewrite) while enforcing a strict, auditable lock discipline:
 
-This removes the lock edge that causes recurring inversion cycles.
-
-## Tradeoff and complexity note
-
-This direction increases interleaving and requires explicit state-machine invariants.
-
-Correctness must be enforced via:
-- frame lifecycle state transitions,
-- pin/evict exclusion invariants,
-- conditional dirty clear semantics,
-- residency map consistency guarantees.
-
-So this is not a tiny patch; it is an architectural refactor. But it is the clear path to stop recurring deadlock regressions under latch crabbing.
+- structural page-latch work remains tight-scoped,
+- lifecycle/replacement work remains broader-scoped but outside latched crabbing sections,
+- global order stays consistent (`meta -> page`), removing the inversion class that caused current deadlocks.
 
 ## Scope decision
 
-This document intentionally avoids proposing another narrow hotfix. The recommendation is to execute the architecture refactor above rather than stacking local lock-order patches.
+Current decision is:
+
+- do a full inversion cleanup (`page -> meta` removal),
+- enforce fast/slow pin split in crabbing,
+- codify and test required buffer-manager semantics above.
+
+We are intentionally not taking on a full lock-free/state-machine buffer-manager redesign in this iteration.
