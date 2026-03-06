@@ -4524,6 +4524,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         }
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        self.guard.bytes()
+    }
+
     fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageMut<'_>> {
         BTreeInternalPageMut::new(self.guard.bytes_mut())
     }
