@@ -77,6 +77,11 @@ We are adopting:
   - run slow path,
   - re-enter descent/retry.
 
+**Enforcement note (non-deferred policy updates):**
+- This boundary must be enforced by API shape, not call-site convention.
+- Provide distinct pin entry points (fast resident-only vs full slow pin) so crabbing code cannot accidentally trigger slow behavior while latched.
+- Replacement policy updates (`record_hit`/eviction bookkeeping) remain immediate on the slow path; they are not deferred.
+
 ## Buffer-manager semantics required to avoid future deadlocks
 
 To make the above stable, buffer manager must guarantee:
