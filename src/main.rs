@@ -9108,22 +9108,20 @@ impl Schema {
 /// The buffer is automatically unpinned when the handle is dropped
 ///
 /// This uses RAII semantics to ensure that manual unpinning is not required which will reduce programmer error as well
-///
-/// # Example
-/// ```ignore
-/// let handle = txn.pin(&block_id);
-/// let value = txn.get_int(handle.block_id(), offset)?;
-/// //  handle will drop after scope end and automatically unpin
-/// ```
 pub struct BufferHandle {
     block_id: BlockId,
     txn: Arc<Transaction>,
+    pending_modified: Cell<Option<(usize, usize)>>,
 }
 
 impl BufferHandle {
     pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
         txn.pin_internal(&block_id);
-        BufferHandle { block_id, txn }
+        BufferHandle {
+            block_id,
+            txn,
+            pending_modified: Cell::new(None),
+        }
     }
 
     pub fn block_id(&self) -> &BlockId {
@@ -9133,6 +9131,10 @@ impl BufferHandle {
     pub fn txn_id(&self) -> usize {
         self.txn.id()
     }
+
+    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
+        self.pending_modified.set(Some((txn_id, lsn)));
+    }
 }
 
 impl Clone for BufferHandle {
@@ -9141,12 +9143,18 @@ impl Clone for BufferHandle {
         Self {
             block_id: self.block_id.clone(),
             txn: Arc::clone(&self.txn),
+            // A clone represents a distinct pin handle; it does not inherit pending
+            // dirty state from the source handle.
+            pending_modified: Cell::new(None),
         }
     }
 }
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
+        if let Some((txn_id, lsn)) = self.pending_modified.get() {
+            self.txn.set_modified_internal(&self.block_id, txn_id, lsn);
+        }
         self.txn.unpin_internal(&self.block_id);
     }
 }
@@ -9264,17 +9272,36 @@ impl Transaction {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
+    fn make_read_guard_from_frame<'a>(
+        self: &'a Arc<Self>,
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+    ) -> PageReadGuard<'a> {
+        let raw = Arc::into_raw(Arc::clone(&frame));
+        let page = unsafe { (*raw).read_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        PageReadGuard::new(handle, frame_for_guard, page)
+    }
+
+    fn make_write_guard_from_frame<'a>(
+        self: &'a Arc<Self>,
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+    ) -> PageWriteGuard<'a> {
+        let raw = Arc::into_raw(Arc::clone(&frame));
+        let page = unsafe { (*raw).write_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        let log_manager = Arc::clone(&self.log_manager);
+        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
+    }
+
     pub fn pin_read_guard(
         self: &Arc<Self>,
         block_id: &BlockId,
     ) -> SimpleDBResult<PageReadGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).read_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        Ok(PageReadGuard::new(handle, frame_for_guard, page))
+        Ok(self.make_read_guard_from_frame(handle, frame))
     }
 
     pub fn pin_write_guard(
@@ -9283,17 +9310,41 @@ impl Transaction {
     ) -> SimpleDBResult<PageWriteGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).write_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        let log_manager = Arc::clone(&self.log_manager);
-        Ok(PageWriteGuard::new(
-            handle,
-            frame_for_guard,
-            page,
-            log_manager,
-        ))
+        Ok(self.make_write_guard_from_frame(handle, frame))
+    }
+
+    /// Fast resident-only read pin. Returns `None` when the page is not already resident.
+    pub fn pin_read_guard_fast(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<Option<PageReadGuard<'_>>> {
+        if !self.pin_internal_fast(block_id) {
+            return Ok(None);
+        }
+        let handle = BufferHandle {
+            block_id: block_id.clone(),
+            txn: Arc::clone(self),
+            pending_modified: Cell::new(None),
+        };
+        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        Ok(Some(self.make_read_guard_from_frame(handle, frame)))
+    }
+
+    /// Fast resident-only write pin. Returns `None` when the page is not already resident.
+    pub fn pin_write_guard_fast(
+        self: &Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<Option<PageWriteGuard<'_>>> {
+        if !self.pin_internal_fast(block_id) {
+            return Ok(None);
+        }
+        let handle = BufferHandle {
+            block_id: block_id.clone(),
+            txn: Arc::clone(self),
+            pending_modified: Cell::new(None),
+        };
+        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        Ok(Some(self.make_write_guard_from_frame(handle, frame)))
     }
 
     pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
@@ -9323,9 +9374,17 @@ impl Transaction {
         self.buffer_list.pin(block_id);
     }
 
+    fn pin_internal_fast(&self, block_id: &BlockId) -> bool {
+        self.buffer_list.pin_fast(block_id)
+    }
+
     /// Unpin this [`BlockId`] since it is no longer needed by this transaction
     fn unpin_internal(&self, block_id: &BlockId) {
         self.buffer_list.unpin(block_id);
+    }
+
+    fn set_modified_internal(&self, block_id: &BlockId, txn_num: usize, lsn: usize) {
+        self.buffer_list.mark_modified(block_id, txn_num, lsn);
     }
 
     /// Get the available buffers for this transaction
@@ -12939,6 +12998,34 @@ impl BufferList {
             .or_insert(HashMapValue { buffer, count: 1 });
     }
 
+    /// Fast resident-only pin.
+    fn pin_fast(&self, block_id: &BlockId) -> bool {
+        let Some(buffer) = self.buffer_manager.pin_fast(block_id) else {
+            return false;
+        };
+        self.buffers
+            .borrow_mut()
+            .entry(block_id.clone())
+            .and_modify(|v| v.count += 1)
+            .or_insert(HashMapValue { buffer, count: 1 });
+        true
+    }
+
+    fn mark_modified(&self, block_id: &BlockId, txn_num: usize, lsn: usize) {
+        if self.txn_committed.get() {
+            return;
+        }
+        let frame = Arc::clone(
+            &self
+                .buffers
+                .borrow()
+                .get(block_id)
+                .expect("mark_modified called for non-pinned block")
+                .buffer,
+        );
+        self.buffer_manager.mark_modified(&frame, txn_num, lsn);
+    }
+
     /// Unpin the buffer associated with the provided [`BlockId`]
     fn unpin(&self, block_id: &BlockId) {
         // If transaction has committed/rolled back, BufferHandles may outlive the transaction
@@ -13094,7 +13181,7 @@ mod buffer_manager_tests {
             })
             .expect("initialize heap page");
         }
-        buffer.set_modified(0, Lsn::MAX);
+        buffer_manager.mark_modified(&buffer, 0, Lsn::MAX);
         buffer_manager.unpin(buffer);
     }
 

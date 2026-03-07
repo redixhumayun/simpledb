@@ -183,7 +183,7 @@ impl BufferFrame {
         self.page.write().unwrap()
     }
 
-    pub(crate) fn set_modified(&self, txn_num: usize, lsn: usize) {
+    fn set_modified(&self, txn_num: usize, lsn: usize) {
         let mut meta = self.lock_meta();
         meta.txn = Some(txn_num);
         meta.lsn = Some(lsn);
@@ -607,6 +607,52 @@ impl BufferManager {
         }
     }
 
+    /// Fast path for latch-crabbing callers.
+    ///
+    /// This is resident-only and never performs replacement policy bookkeeping,
+    /// eviction, or blocking waits.
+    pub fn pin_fast(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
+        let shard_index = self.shard_index(block_id);
+        let latch_table_guard = LatchTableGuard::new(&self.latch_shards, block_id, shard_index);
+        let _block_latch = latch_table_guard.lock();
+
+        let frame_ptr = {
+            let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
+            match resident_guard.get(block_id) {
+                Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
+                    Some(frame_ptr) => Some(frame_ptr),
+                    None => {
+                        resident_guard.remove(block_id);
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        }?;
+
+        {
+            let mut meta_guard = frame_ptr.lock_meta();
+            if !meta_guard
+                .block_id
+                .as_ref()
+                .is_some_and(|current| current == block_id)
+            {
+                self.resident_shards[shard_index]
+                    .lock()
+                    .unwrap()
+                    .remove(block_id);
+                return None;
+            }
+            let was_unpinned = meta_guard.pin();
+            if was_unpinned {
+                self.num_available.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        Some(frame_ptr)
+    }
+
+    /// Full pin path with immediate replacement policy updates and eviction.
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<BufferFrame>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
@@ -706,6 +752,12 @@ impl BufferManager {
             self.num_available.fetch_add(1, Ordering::AcqRel);
             self.cond.notify_all();
         }
+    }
+
+    /// Applies dirty metadata updates through the buffer manager boundary so
+    /// callers cannot mutate frame metadata directly.
+    pub(crate) fn mark_modified(&self, frame: &Arc<BufferFrame>, txn_num: usize, lsn: usize) {
+        frame.set_modified(txn_num, lsn);
     }
 
     fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
