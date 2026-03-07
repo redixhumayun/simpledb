@@ -2727,7 +2727,7 @@ impl<'a> PageReadGuard<'a> {
 /// Automatically unpins when dropped.
 pub struct PageWriteGuard<'a> {
     page: RwLockWriteGuard<'a, PageBytes>,
-    frame: Arc<BufferFrame>,
+    _frame: Arc<BufferFrame>,
     handle: BufferHandle,
     log_manager: Arc<Mutex<LogManager>>,
 }
@@ -2742,7 +2742,7 @@ impl<'a> PageWriteGuard<'a> {
     ) -> Self {
         Self {
             page,
-            frame,
+            _frame: frame,
             handle,
             log_manager,
         }
@@ -2768,11 +2768,6 @@ impl<'a> PageWriteGuard<'a> {
 
     pub fn log_manager(&self) -> Arc<Mutex<LogManager>> {
         Arc::clone(&self.log_manager)
-    }
-
-    /// Returns the buffer frame.
-    pub fn frame(&self) -> &BufferFrame {
-        &self.frame
     }
 
     /// Marks the page as modified for WAL.

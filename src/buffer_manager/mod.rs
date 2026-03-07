@@ -754,6 +754,8 @@ impl BufferManager {
         }
     }
 
+    /// Applies dirty metadata updates through the buffer manager boundary so
+    /// callers cannot mutate frame metadata directly.
     pub(crate) fn mark_modified(&self, frame: &Arc<BufferFrame>, txn_num: usize, lsn: usize) {
         frame.set_modified(txn_num, lsn);
     }

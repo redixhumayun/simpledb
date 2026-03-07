@@ -9143,6 +9143,8 @@ impl Clone for BufferHandle {
         Self {
             block_id: self.block_id.clone(),
             txn: Arc::clone(&self.txn),
+            // A clone represents a distinct pin handle; it does not inherit pending
+            // dirty state from the source handle.
             pending_modified: Cell::new(None),
         }
     }
@@ -9270,17 +9272,36 @@ impl Transaction {
         BufferHandle::new(block_id.clone(), Arc::clone(self))
     }
 
+    fn make_read_guard_from_frame<'a>(
+        self: &'a Arc<Self>,
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+    ) -> PageReadGuard<'a> {
+        let raw = Arc::into_raw(Arc::clone(&frame));
+        let page = unsafe { (*raw).read_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        PageReadGuard::new(handle, frame_for_guard, page)
+    }
+
+    fn make_write_guard_from_frame<'a>(
+        self: &'a Arc<Self>,
+        handle: BufferHandle,
+        frame: Arc<BufferFrame>,
+    ) -> PageWriteGuard<'a> {
+        let raw = Arc::into_raw(Arc::clone(&frame));
+        let page = unsafe { (*raw).write_page() };
+        let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        let log_manager = Arc::clone(&self.log_manager);
+        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
+    }
+
     pub fn pin_read_guard(
         self: &Arc<Self>,
         block_id: &BlockId,
     ) -> SimpleDBResult<PageReadGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).read_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        Ok(PageReadGuard::new(handle, frame_for_guard, page))
+        Ok(self.make_read_guard_from_frame(handle, frame))
     }
 
     pub fn pin_write_guard(
@@ -9289,17 +9310,7 @@ impl Transaction {
     ) -> SimpleDBResult<PageWriteGuard<'_>> {
         let handle = self.pin(block_id);
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).write_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        let log_manager = Arc::clone(&self.log_manager);
-        Ok(PageWriteGuard::new(
-            handle,
-            frame_for_guard,
-            page,
-            log_manager,
-        ))
+        Ok(self.make_write_guard_from_frame(handle, frame))
     }
 
     /// Fast resident-only read pin. Returns `None` when the page is not already resident.
@@ -9316,11 +9327,7 @@ impl Transaction {
             pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).read_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        Ok(Some(PageReadGuard::new(handle, frame_for_guard, page)))
+        Ok(Some(self.make_read_guard_from_frame(handle, frame)))
     }
 
     /// Fast resident-only write pin. Returns `None` when the page is not already resident.
@@ -9337,17 +9344,7 @@ impl Transaction {
             pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        let frame_clone = Arc::clone(&frame);
-        let raw = Arc::into_raw(frame_clone);
-        let page = unsafe { (*raw).write_page() };
-        let frame_for_guard = unsafe { Arc::from_raw(raw) };
-        let log_manager = Arc::clone(&self.log_manager);
-        Ok(Some(PageWriteGuard::new(
-            handle,
-            frame_for_guard,
-            page,
-            log_manager,
-        )))
+        Ok(Some(self.make_write_guard_from_frame(handle, frame)))
     }
 
     pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
