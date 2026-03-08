@@ -79,6 +79,13 @@ Why both lock types:
 - `IndexKey` keeps point operations cheap and precise.
 - `IndexRange` prevents phantoms (new/deleted keys entering/leaving a predicate result set).
 
+Range-boundary normalization requirements:
+
+- Represent unbounded predicates explicitly (`-inf`/`+inf` sentinels), not as ad hoc `None` checks in conflict code.
+- Normalize all predicates to `[low, high)` before lock acquire.
+- Empty ranges (`low >= high` after normalization) acquire no range lock.
+- Use the same comparator/collation as B-tree key ordering for overlap checks.
+
 Duplicate-key behavior:
 
 - Current B-tree index semantics are non-unique (duplicate keys are allowed).
@@ -130,6 +137,18 @@ Current lock release behavior uses `notify_all()`; keep this as-is for now.
 
 - No fairness/writer-preference redesign in this phase.
 - Revisit only if starvation/contention evidence appears under real workloads.
+
+### 5. Global logical lock acquisition order (required)
+
+To avoid cross-resource deadlocks, all code paths that combine heap/index resources must follow one
+global order.
+
+- Acquire table intent locks first (`IS`/`IX`) in ascending lock-key order.
+- Acquire index predicate locks next, in canonical order:
+  - `IndexRange(index_id, low, high)` ascending by `(index_id, low, high)`,
+  - then `IndexKey(index_id, key)` ascending by `(index_id, key)`.
+- Acquire heap row locks last (`Row(table_id, block, slot)` ascending).
+- If a path needs a lock that is earlier than one it already holds, release/restart; do not violate order.
 
 ## Required Changes: Internal B-Tree API / Latching
 
@@ -188,7 +207,10 @@ This needs new internal helpers that return guard-carrying traversal state inste
     5. release page latches, then release split gate.
   - If an escalated pass hits slow miss, release page latches and split gate, perform slow/full pin, then reacquire split gate and restart from root.
   - Split gate ordering rule: never wait on split gate while holding page latches.
-  - Read path is not split-gate-blocked; readers continue via read-latch crabbing and only wait on normal page-latch contention.
+  - Required policy for this phase (Option B): readers acquire split gate in shared mode in `before_first` and hold it for the full scan lifetime (`before_first` + all `next` calls) until scan close or transaction end.
+  - Split writers hold split gate exclusive for split windows.
+  - This is correctness-first and simpler to encode than full reader-independent split invariants.
+  - Tradeoff accepted in this phase: long scans can delay split writers; split-heavy workloads may temporarily reduce read/write overlap.
   - Re-check after escalation also serves as structural revalidation when tree shape/root-height changed while waiting for split gate.
   - Split gate lifetime must be RAII-scoped so all error/rollback paths release it deterministically.
   - Split gate fairness is not guaranteed in this phase; writer starvation under sustained split contention is accepted for now.
@@ -229,6 +251,24 @@ No public planner/scan API change is required for crabbing. Existing `Index` tra
 - `delete`
 
 Required changes are inside `BTreeIndex`, `BTreeInternal`, and `BTreeLeaf` internals.
+
+### 5. Root metadata publication protocol (required)
+
+Root pointer / height updates must be published with an explicit protocol.
+
+- Source of truth is meta page block 0 (`root_block`, `tree_height`), updated via WAL-backed root-update records.
+- Root update writer protocol:
+  1. hold split gate exclusive,
+  2. acquire meta page write latch,
+  3. append root-update WAL record,
+  4. write (`root_block`, `tree_height`) + checksum/LSN,
+  5. release meta latch, then split gate.
+- Reader protocol:
+  - read `(root_block, tree_height, structure_version)` before descent,
+  - on restart conditions (slow-miss restart, split-race detection, or changed structure version), restart from root using freshly read metadata.
+- Metadata note:
+  - Current meta `version` field is a format/layout version and must not be reused as a structure-change epoch.
+  - Add a separate monotonic `structure_version` (or equivalent epoch) if version-checked restart is implemented.
 
 ## New Code Sketches
 
@@ -713,6 +753,7 @@ impl Index for BTreeIndex {
   - No global table-`X` requirement for ordinary index writes.
 - Physical layer:
   - Read traversal uses latch coupling.
+  - Read path acquires split gate shared in `before_first` and holds it through scan completion (or transaction end) in this phase.
   - Write traversal uses safe-node latch crabbing.
   - Split path does not rely on unlatch/re-latch races for parent updates.
 - Behavior:
