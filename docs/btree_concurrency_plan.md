@@ -166,8 +166,33 @@ This needs new internal helpers that return guard-carrying traversal state inste
 
 ### 2. Separate read traversal from write traversal with safety checks
 
-- Read traversal: read-latch coupling down the tree.
+- Read traversal: read-latch coupling down the tree with explicit fast-hit/slow-miss behavior.
+  - While any B-tree latch is held, traversal may only use fast resident pin.
+  - Fast hit path: pin resident child, acquire child read latch, then release parent latch and continue.
+  - Fast miss path: release all held B-tree latches first, run slow/full pin path outside latch scope, then restart descent from root.
+  - While latched, traversal must not attempt replacement-policy metadata operations (`record_hit`-style updates), including best-effort `try_lock` variants.
+  - Missing fast-path hit accounting may degrade replacement quality; this is a performance tradeoff, not an index-correctness issue.
 - Write traversal: write-latch coupling; release ancestors once child is "safe":
+  - While any B-tree latch is held, traversal/structural code may only use fast resident pin.
+  - Fast hit path: pin resident child/newly-needed page, acquire write latch, and continue traversal.
+  - Fast miss path: release all held B-tree latches (`WriteCtx`), run slow/full pin outside latch scope, then restart from root.
+  - Before any leaf/internal insert mutation, call an exact non-mutating fit check API:
+    - `would_insert_fit(...) -> bool` on leaf/internal mutable views.
+    - If `true`, perform normal mutation path.
+    - If `false`, do not mutate; enter split escalation.
+  - Split escalation (fine-grained locking target model):
+    1. release all page latches,
+    2. acquire index-wide split gate (exclusive) that blocks other writers for the split window,
+    3. restart from root and re-check `would_insert_fit(...)`,
+    4. if still not fit, perform split/propagation under split gate,
+    5. release page latches, then release split gate.
+  - If an escalated pass hits slow miss, release page latches and split gate, perform slow/full pin, then reacquire split gate and restart from root.
+  - Split gate ordering rule: never wait on split gate while holding page latches.
+  - Read path is not split-gate-blocked; readers continue via read-latch crabbing and only wait on normal page-latch contention.
+  - Re-check after escalation also serves as structural revalidation when tree shape/root-height changed while waiting for split gate.
+  - Structural functions must not perform implicit traversal/research; they operate only on already-latched context.
+  - Pre-mutation restart rule: restart/slow-required outcomes are allowed only before first page mutation/WAL emission in an attempt.
+  - Overflow/duplicate-key edge cases must follow the same pre-mutation fit/escalation boundary (no mutation before escalation decision).
   - insert-safe: child not full
   - delete-safe: child above minimum occupancy (when delete rebalancing is introduced)
 
@@ -179,9 +204,17 @@ Current split flow is recursive and reacquires pages (`insert_entry`, `split_pag
 Crabbing-friendly flow should:
 
 - maintain an explicit path stack of latched nodes during descent,
-- perform local split,
-- propagate separator upward through latched ancestors,
-- release latches in a deterministic order.
+- perform an exact pre-mutation fit check (`would_insert_fit`) before mutating leaf/internal pages,
+- escalate to an index-wide split gate before any split mutation when fit check fails,
+- restart from root under split gate and re-check fit before mutating,
+- perform split + upward propagation while split gate is held,
+- release page latches in deterministic order, then release split gate.
+
+Ordering / safety constraints:
+
+- never wait on split gate while holding page latches,
+- restart/slow-required transitions are allowed only before first mutation/WAL emission in an attempt,
+- structural functions do not perform implicit traversal; caller controls restart boundaries.
 
 ### 4. Keep public `Index` trait stable; change internals
 
@@ -195,7 +228,323 @@ No public planner/scan API change is required for crabbing. Existing `Index` tra
 
 Required changes are inside `BTreeIndex`, `BTreeInternal`, and `BTreeLeaf` internals.
 
+## New Code Sketches
+
+> Note on type updates:
+> Existing retry-oriented sketch/result types from older sections (for example `StructuralOutcome` and `PropagationOutcome` carrying generic `Retry` paths) should be narrowed for split-gate semantics:
+> - keep explicit split results (`Absorbed`, `RootSplit`, concrete split payloads),
+> - move split escalation to write-state transitions (`NeedSplitEscalation`) before mutation,
+> - avoid post-mutation retry outcomes in structural/propagation result types.
+
+### Read Traversal State Machine
+
+```rust
+// Read traversal state machine (conceptual sketch)
+
+enum ReadState {
+    Start { search_key: Constant },
+    DescendFast { current: BlockId, search_key: Constant },
+    HopRightFast { leaf: BlockId, search_key: Constant },
+    NeedSlowPin { block: BlockId, search_key: Constant },
+    RetryFromRoot { search_key: Constant },
+    Ready { cursor: ReadCursor },
+    Failed { err: SimpleDBError },
+}
+
+fn before_first_state_machine(
+    txn: &Arc<Transaction>,
+    root: BlockId,
+    key: Constant,
+) -> Result<ReadCursor> {
+    let mut st = ReadState::Start { search_key: key };
+
+    loop {
+        st = match st {
+            ReadState::Start { search_key } => {
+                // logical locks acquired once before loop in real code
+                ReadState::DescendFast {
+                    current: root.clone(),
+                    search_key,
+                }
+            }
+
+            ReadState::DescendFast {
+                current,
+                search_key,
+            } => {
+                // hold read latch on `current`
+                let guard = txn.pin_read_guard_fast(&current)?;
+                let Some(guard) = guard else {
+                    ReadState::NeedSlowPin {
+                        block: current,
+                        search_key,
+                    }
+                };
+                let view = guard.into_btree_internal_page_view(...)?;
+
+                let child = find_child(&view, &search_key)?;
+                if view.btree_level() == 0 {
+                    // release parent before leaf positioning
+                    drop(view);
+                    ReadState::HopRightFast {
+                        leaf: child,
+                        search_key,
+                    }
+                } else {
+                    // crab: child fast-pin while parent latched
+                    let child_guard = txn.pin_read_guard_fast(&child)?;
+                    let Some(child_guard) = child_guard else {
+                        drop(view); // release parent latch before slow path
+                        ReadState::NeedSlowPin {
+                            block: child,
+                            search_key,
+                        }
+                    };
+                    let child_view = child_guard.into_btree_internal_page_view(...)?
+                    ;
+                    drop(view); // release parent
+                    let next_block = child_view.block_id().clone();
+                    drop(child_view);
+                    ReadState::DescendFast {
+                        current: next_block,
+                        search_key,
+                    }
+                }
+            }
+
+            ReadState::HopRightFast {
+                mut leaf,
+                search_key,
+            } => {
+                // hold read latch on current leaf
+                let guard = txn.pin_read_guard_fast(&leaf)?;
+                let Some(guard) = guard else {
+                    ReadState::NeedSlowPin {
+                        block: leaf,
+                        search_key,
+                    }
+                };
+                let view = guard.into_btree_leaf_page_view(...)?
+                ;
+
+                let should_hop = view.high_key().is_some_and(|hk| search_key >= hk);
+                if !should_hop {
+                    let slot = view.find_slot_before(&search_key);
+                    drop(view);
+                    ReadState::Ready {
+                        cursor: ReadCursor {
+                            leaf_block: leaf,
+                            current_slot: slot,
+                            search_key,
+                        },
+                    }
+                } else if let Some(rsib) = view.right_sibling_block() {
+                    let next = BlockId::new(..., rsib);
+                    let next_guard = txn.pin_read_guard_fast(&next)?;
+                    let Some(next_guard) = next_guard else {
+                        drop(view); // release current leaf before slow path
+                        ReadState::NeedSlowPin {
+                            block: next,
+                            search_key,
+                        }
+                    };
+                    drop(next_guard); // illustrative: would continue with next as current
+                    drop(view);
+                    leaf = next;
+                    ReadState::HopRightFast { leaf, search_key }
+                } else {
+                    let slot = view.find_slot_before(&search_key);
+                    drop(view);
+                    ReadState::Ready {
+                        cursor: ReadCursor {
+                            leaf_block: leaf,
+                            current_slot: slot,
+                            search_key,
+                        },
+                    }
+                }
+            }
+
+            ReadState::NeedSlowPin { block, search_key } => {
+                // invariant: no B-tree latches held here
+                let g = txn.pin_read_guard(&block)?; // full/slow path
+                drop(g); // warm resident state, then restart cleanly
+                ReadState::RetryFromRoot { search_key }
+            }
+
+            ReadState::RetryFromRoot { search_key } => ReadState::DescendFast {
+                current: root.clone(),
+                search_key,
+            },
+
+            ReadState::Ready { cursor } => return Ok(cursor),
+            ReadState::Failed { err } => return Err(err),
+        };
+    }
+}
+```
+
+### Write Traversal State Machine
+
+```rust
+// Write traversal state machine (conceptual sketch)
+
+enum WriteState<'a> {
+    Start { key: Constant, rid: RID },
+    DescendFastNormal { key: Constant, rid: RID },
+    NeedSlowPinNormal { block: BlockId, key: Constant, rid: RID },
+    CheckLeafFit { ctx: WriteCtx<'a>, key: Constant, rid: RID },
+    NeedSplitEscalation { key: Constant, rid: RID },
+    AcquireSplitGate { key: Constant, rid: RID },
+    DescendFastEscalated { key: Constant, rid: RID },
+    NeedSlowPinEscalated { block: BlockId, key: Constant, rid: RID },
+    ApplyInsertNoSplit { ctx: WriteCtx<'a>, key: Constant, rid: RID },
+    ApplySplitPropagate { ctx: WriteCtx<'a>, key: Constant, rid: RID },
+    ApplyRootUpdate { split: SplitResult },
+    Done,
+    Failed(SimpleDBError),
+}
+
+fn insert_state_machine(index: &mut BTreeIndex, key: Constant, rid: RID) -> Result<()> {
+    // Logical write locks acquired once before the loop.
+    index.txn.lock_table_ix(index.index_lock_table_id)?;
+    index.txn.lock_index_key_x(index.index_lock_table_id, key.clone())?;
+
+    let mut st = WriteState::Start { key, rid };
+    let mut split_gate: Option<IndexSplitGateGuard> = None;
+
+    loop {
+        st = match st {
+            WriteState::Start { key, rid } => WriteState::DescendFastNormal { key, rid },
+
+            WriteState::DescendFastNormal { key, rid } => {
+                match traversal::try_descend_write_fast(
+                    &index.txn,
+                    &index.root_block,
+                    &index.internal_layout,
+                    &index.index_file_name,
+                    &key,
+                )? {
+                    WriteTraverseOutcome::Ready(ctx) => WriteState::CheckLeafFit { ctx, key, rid },
+                    WriteTraverseOutcome::NeedSlowPin(block) => {
+                        WriteState::NeedSlowPinNormal { block, key, rid }
+                    }
+                }
+            }
+
+            WriteState::NeedSlowPinNormal { block, key, rid } => {
+                // Invariant: no B-tree latches held.
+                let g = index.txn.pin_write_guard(&block)?; // full/slow path
+                drop(g);
+                WriteState::DescendFastNormal { key, rid }
+            }
+
+            WriteState::CheckLeafFit { ctx, key, rid } => {
+                if structural::leaf_would_insert_fit(&ctx, &key, rid)? {
+                    WriteState::ApplyInsertNoSplit { ctx, key, rid }
+                } else if split_gate.is_none() {
+                    drop(ctx); // no mutation performed yet
+                    WriteState::NeedSplitEscalation { key, rid }
+                } else {
+                    // Escalated pass and still does not fit: now run split propagation.
+                    WriteState::ApplySplitPropagate { ctx, key, rid }
+                }
+            }
+
+            WriteState::NeedSplitEscalation { key, rid } => {
+                WriteState::AcquireSplitGate { key, rid }
+            }
+
+            WriteState::AcquireSplitGate { key, rid } => {
+                // Ordering rule: never wait on split gate while holding page latches.
+                split_gate = Some(index.split_gate.lock_exclusive(index.index_lock_table_id));
+                WriteState::DescendFastEscalated { key, rid }
+            }
+
+            WriteState::DescendFastEscalated { key, rid } => {
+                match traversal::try_descend_write_fast(
+                    &index.txn,
+                    &index.root_block,
+                    &index.internal_layout,
+                    &index.index_file_name,
+                    &key,
+                )? {
+                    WriteTraverseOutcome::Ready(ctx) => WriteState::CheckLeafFit { ctx, key, rid },
+                    WriteTraverseOutcome::NeedSlowPin(block) => {
+                        WriteState::NeedSlowPinEscalated { block, key, rid }
+                    }
+                }
+            }
+
+            WriteState::NeedSlowPinEscalated { block, key, rid } => {
+                // Page latches are not held here.
+                // Policy: do not hold split gate across slow I/O work.
+                split_gate = None;
+                let g = index.txn.pin_write_guard(&block)?; // full/slow path
+                drop(g);
+                WriteState::AcquireSplitGate { key, rid }
+            }
+
+            WriteState::ApplyInsertNoSplit { mut ctx, key, rid } => {
+                structural::apply_leaf_insert_no_split(&mut ctx, &index.txn, &index.leaf_layout, key, rid)?;
+                drop(ctx);
+                split_gate = None;
+                WriteState::Done
+            }
+
+            WriteState::ApplySplitPropagate { mut ctx, key, rid } => {
+                let maybe_root_split = structural::apply_leaf_split_and_propagate(
+                    &mut ctx,
+                    &index.txn,
+                    &index.leaf_layout,
+                    &index.internal_layout,
+                    &index.index_file_name,
+                    key,
+                    rid,
+                )?;
+                drop(ctx);
+                if let Some(split) = maybe_root_split {
+                    WriteState::ApplyRootUpdate { split }
+                } else {
+                    split_gate = None;
+                    WriteState::Done
+                }
+            }
+
+            WriteState::ApplyRootUpdate { split } => {
+                let new_root = structural::maybe_make_new_root(
+                    &index.txn,
+                    index.tree_height as u8,
+                    split,
+                    &index.index_file_name,
+                    &index.internal_layout,
+                )?;
+                let old_root = index.root_block.block_num;
+                let old_height = index.tree_height;
+                index.apply_root_update(
+                    old_root,
+                    new_root.block_num,
+                    old_height,
+                    old_height.saturating_add(1),
+                )?;
+                split_gate = None;
+                WriteState::Done
+            }
+
+            WriteState::Done => return Ok(()),
+            WriteState::Failed(err) => return Err(err.into()),
+        };
+    }
+}
+
+// Post-mutation rule:
+// After first WAL/page mutation in an attempt, this machine must not transition
+// to NeedSlow* or retry states; only complete or fail/rollback.
+```
+
 ### Code Sketches
+
+This section is kept for reference to earlier design direction; prefer `New Code Sketches` above for current implementation-oriented state-machine flow.
 
 This section is illustrative. Names/signatures may change during implementation, but boundary
 rules and ownership intent should remain.
@@ -350,51 +699,6 @@ impl Index for BTreeIndex {
 }
 ```
 
-#### D. Why separate `descend_read` and `descend_write`
-
-Separate paths are intentional:
-
-- Different latch modes (`R` vs `W`).
-- Different release policy (read always crab-down; write crab-down with safety checks).
-- Different outputs (`ReadCursor` vs `WriteCtx` with split-propagation context).
-- Different restart behavior (writes may require structural retry).
-
-Shared helpers are still encouraged for child selection, key comparisons, and interval logic.
-
-#### E. Split cascade usage sketch
-
-```rust
-fn propagate_split_up(ctx: &mut WriteCtx, mut split: LeafSplit) -> Result<PropagationOutcome> {
-    loop {
-        let parent = match ctx.next_parent() {
-            Some(p) => p,
-            None => {
-                // no parent left => old root overflow must be materialized as a new root
-                return Ok(PropagationOutcome::RootSplit(InternalSplit(split.0)));
-            }
-        };
-
-        match apply_internal_insert(ctx, InternalSplit(split.0))? {
-            StructuralOutcome::Stable => return Ok(PropagationOutcome::Absorbed),
-            StructuralOutcome::Retry => return Ok(PropagationOutcome::Retry),
-            StructuralOutcome::SplitInternal(next_split) => {
-                split = LeafSplit(next_split.0);
-                continue;
-            }
-            StructuralOutcome::SplitLeaf(_) => unreachable!("internal insert cannot yield leaf split"),
-        }
-    }
-}
-```
-
-The exact wrapper conversions can be adjusted (for example, separate constructors instead of tuple
-wrappers), but the intended boundary remains:
-
-- leaf mutation yields `SplitLeaf`,
-- parent/internal propagation yields `SplitInternal`,
-- transient structural races may yield `Retry` and trigger bounded re-descent from root,
-- escaping the old root yields `RootSplit`.
-
 ## Acceptance Criteria
 
 - Logical layer:
@@ -439,6 +743,23 @@ Minimum required phantom test scenario:
 Important: existing concurrent B-tree tests and 80/20 RW benchmark are useful stress/smoke
 coverage, but they do not by themselves prove `IndexKey`/`IndexRange` logical lock semantics
 or phantom prevention guarantees.
+
+### 3. State-Machine / Escalation Tests
+
+Add targeted tests for new write/read state-machine semantics:
+
+- Pre-mutation split escalation:
+  - insertion that would split must escalate before first mutation/WAL in that attempt.
+- Escalated slow miss policy:
+  - when escalated path hits slow miss, split gate is released, slow pin runs, split gate is re-acquired, and operation restarts from root.
+- Revalidation after split-gate wait:
+  - writer blocked on split gate must restart from root and re-check fit/path after acquiring gate.
+- Split gate ordering:
+  - no code path waits on split gate while holding page latches.
+- Post-mutation no-retry invariant:
+  - once first mutation/WAL is emitted in an attempt, state machine does not transition to retry/NeedSlow outcomes.
+- Duplicate-key/overflow escalation edge:
+  - duplicate-key insert paths that trigger overflow/split must still obey pre-mutation escalation boundary.
 
 ## Baseline: Index Concurrency Benchmark (table-level locking)
 
