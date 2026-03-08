@@ -190,6 +190,7 @@ This needs new internal helpers that return guard-carrying traversal state inste
   - Split gate ordering rule: never wait on split gate while holding page latches.
   - Read path is not split-gate-blocked; readers continue via read-latch crabbing and only wait on normal page-latch contention.
   - Re-check after escalation also serves as structural revalidation when tree shape/root-height changed while waiting for split gate.
+  - Split gate lifetime must be RAII-scoped so all error/rollback paths release it deterministically.
   - Structural functions must not perform implicit traversal/research; they operate only on already-latched context.
   - Pre-mutation restart rule: restart/slow-required outcomes are allowed only before first page mutation/WAL emission in an attempt.
   - Overflow/duplicate-key edge cases must follow the same pre-mutation fit/escalation boundary (no mutation before escalation decision).
@@ -540,6 +541,11 @@ fn insert_state_machine(index: &mut BTreeIndex, key: Constant, rid: RID) -> Resu
 // Post-mutation rule:
 // After first WAL/page mutation in an attempt, this machine must not transition
 // to NeedSlow* or retry states; only complete or fail/rollback.
+//
+// Retry budget rule:
+// If bounded retries are exhausted, return an operation error and rollback the
+// transaction. Because retries occur only pre-mutation, no partial structural
+// mutation from the failed attempt should remain.
 ```
 
 ### Code Sketches
