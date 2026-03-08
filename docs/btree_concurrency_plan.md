@@ -638,7 +638,7 @@ fn insert_state_machine(index: &mut BTreeIndex, key: Constant, rid: RID) -> Resu
 // mutation from the failed attempt should remain.
 ```
 
-### Code Sketches
+### Old Code Sketches
 
 This section is kept for reference to earlier design direction; prefer `New Code Sketches` above for current implementation-oriented state-machine flow.
 
