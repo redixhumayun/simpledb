@@ -19,6 +19,29 @@ What this means today:
 So current implementation is safe but coarse; it does not provide concurrent read+write index
 access.
 
+## Phases
+
+### Phase 1 (this doc's implementation target)
+
+- Logical locking: `IS`/`IX` + `IndexKey`/`IndexRange`.
+- Traversal: read/write latch crabbing.
+- Split handling: index split gate, with readers holding shared split gate for full scan lifetime (Option B).
+- Delete/rebalance: deferred (no merge/borrow implementation in this phase).
+
+### Phase 2 (deferred)
+
+- Remove reader dependence on shared split gate during scans (reader-independent split invariants).
+- Revisit split-gate fairness/writer starvation policy if needed.
+- Implement delete underflow handling (merge/borrow/rebalance) under same concurrency model.
+
+## Global Invariants (must hold)
+
+- Never wait on split gate while holding page latches.
+- Restart/slow-required transitions are allowed only before first page mutation/WAL emission in an attempt.
+- Structural functions do not perform implicit traversal/research; caller owns restart boundaries.
+- While any B-tree page latch is held, only fast resident pin paths are allowed; no replacement-policy metadata work.
+- Global logical lock order is fixed and normative (table intents -> index ranges -> index keys -> row locks).
+
 ## Required Changes: Logical Locking Layer
 
 Goal: keep 2PL correctness while removing global index serialization.
@@ -120,6 +143,15 @@ With strict 2PL plus `IndexKey`/`IndexRange` conflicts, predicate conflicts are 
 (including phantom-producing inserts/deletes into a scanned range). Under that model, the
 serializable claim is valid for indexed predicate access paths.
 
+### 2d. Operation-to-lock mapping (compact reference)
+
+| Operation | Logical locks | Physical latching |
+|---|---|---|
+| Point lookup `k=v` | table `IS`, `S(IndexKey(v))` | Read crabbing |
+| Range lookup `[low, high)` | table `IS`, `S(IndexRange(low, high))` | Read crabbing |
+| Point insert/delete `k=v` | table `IX`, `X(IndexKey(v))`, conflict against overlapping `IndexRange` | Write crabbing; split gate only on split path |
+| Range delete/update | table `IX`, `X(IndexRange(low, high))` (+ key locks if needed by executor path) | Write crabbing |
+
 ### 3. Keep lock namespace separation for indexes
 
 Continue using the existing index lock key namespace:
@@ -161,19 +193,10 @@ Goal: implement latch crabbing in B-tree code paths, independent of logical 2PL 
 
 ### 0. Boundary rule (must hold)
 
-Keep traversal concerns and structural-update concerns separated in control flow:
+Keep traversal and structural-update concerns separated:
 
 - No implicit traversal during structural updates.
 - No structural mutation inside traversal helpers.
-
-Rationale:
-
-- Prevents relatch races: structural code must mutate using the already-latched path, not by
-  re-searching and reacquiring pages after tree state may have changed.
-- Preserves latch-order predictability: traversal owns top-down latch coupling; structural code
-  should not introduce ad hoc latch acquisition order.
-- Makes restart behavior explicit: structural code can return `restart`/`retry` signals at clear
-  boundaries rather than embedding hidden traversal side effects.
 
 ### 1. Add traversal primitives that hold parent + child temporarily
 
@@ -211,7 +234,6 @@ This needs new internal helpers that return guard-carrying traversal state inste
     4. if still not fit, perform split/propagation under split gate,
     5. release page latches, then release split gate.
   - If an escalated pass hits slow miss, release page latches and split gate, perform slow/full pin, then reacquire split gate and restart from root.
-  - Split gate ordering rule: never wait on split gate while holding page latches.
   - Required policy for this phase (Option B): readers acquire split gate in shared mode in `before_first` and hold it for the full scan lifetime (`before_first` + all `next` calls) until scan close or transaction end.
   - Split writers hold split gate exclusive for split windows.
   - This is correctness-first and simpler to encode than full reader-independent split invariants.
@@ -219,11 +241,10 @@ This needs new internal helpers that return guard-carrying traversal state inste
   - Re-check after escalation also serves as structural revalidation when tree shape/root-height changed while waiting for split gate.
   - Split gate lifetime must be RAII-scoped so all error/rollback paths release it deterministically.
   - Split gate fairness is not guaranteed in this phase; writer starvation under sustained split contention is accepted for now.
-  - Structural functions must not perform implicit traversal/research; they operate only on already-latched context.
-  - Pre-mutation restart rule: restart/slow-required outcomes are allowed only before first page mutation/WAL emission in an attempt.
   - Overflow/duplicate-key edge cases must follow the same pre-mutation fit/escalation boundary (no mutation before escalation decision).
   - insert-safe: child not full
   - delete-safe: child above minimum occupancy (when delete rebalancing is introduced)
+  - Global invariants above apply to all paths.
 
 ### 3. Refactor split propagation to work with latch-held path context
 
@@ -239,11 +260,7 @@ Crabbing-friendly flow should:
 - perform split + upward propagation while split gate is held,
 - release page latches in deterministic order, then release split gate.
 
-Ordering / safety constraints:
-
-- never wait on split gate while holding page latches,
-- restart/slow-required transitions are allowed only before first mutation/WAL emission in an attempt,
-- structural functions do not perform implicit traversal; caller controls restart boundaries.
+Ordering / safety constraints: see `Global Invariants (must hold)`.
 
 ### 4. Keep public `Index` trait stable; change internals
 
@@ -841,96 +858,39 @@ Add targeted tests for new write/read state-machine semantics:
 - Duplicate-key/overflow escalation edge:
   - duplicate-key insert paths that trigger overflow/split must still obey pre-mutation escalation boundary.
 
-## Baseline: Index Concurrency Benchmark (table-level locking)
+## Baseline Performance Reference
 
-These numbers represent the performance floor before latch crabbing or fine-grained logical
-locking is introduced. Use them as the comparison reference when evaluating improvements or
-regressions.
+Full benchmark baseline details moved to:
 
-### How to reproduce
+- `docs/benchmarks/btree_concurrency_baseline.md`
 
-```bash
-# From the repository root, on the same commit that introduced the benchmark:
-CI=1 cargo bench --bench simple_bench \
-    --no-default-features --features replacement_lru --features page-4k \
-    -- "Index Concurrency"
-```
+Headline baseline (table-level index `S/X` locking):
 
-`CI=1` activates the fast criterion profile (1 s warmup, 5 s measurement, 100 samples). Remove
-it for a full run (~165 s per benchmark function at the current workload size).
+- Concurrent INSERT disjoint-key: mean **57.2 elem/s**
+- Concurrent LOOKUP pre-populated: mean **119.9 elem/s**
+- Concurrent mixed 80/20 RW: mean **94.3 elem/s**
 
-### Workload parameters
+## Out of Scope (Phase 1)
 
-| Parameter | Value |
-|---|---|
-| Workers (`CONC_WORKERS`) | 4 |
-| Ops per worker (`CONC_OPS_PER_WORKER`) | 24 |
-| Total elements per iteration | 96 |
-| Pre-populated rows (lookup baseline) | 200 |
-| Per-op transaction granularity | 1 txn per op (create `BTreeIndex` → op → commit) |
-| Locking model | table-level `S` (read) / `X` (write) on `index_lock_table_id` |
-
-### Environment
-
-| Field | Value |
-|---|---|
-| CPU | Intel Xeon E3-1275 v5 @ 3.60 GHz (8 logical cores) |
-| OS kernel | Linux 6.8.0-100-generic |
-| Rust toolchain | rustc 1.92.0 (ded5c06cf 2025-12-08) |
-| Cargo | 1.92.0 (344c4567c 2025-10-21) |
-| Feature flags | `replacement_lru`, `page-4k` |
-| Criterion profile | `CI=1` (1 s warmup, 5 s measurement, 100 samples) |
-
-### Results (branch `feature/btree-concurrency`, tree contains uncommitted changes on top of b8274f6)
-
-The benchmark code itself is part of the uncommitted diff; commit hash `b8274f6` is the last
-committed ancestor. Once this branch is merged, the commit SHA of the merge should be recorded
-here.
-
-| Benchmark | Time / iter (low–high, 95% CI) | Throughput (elem/s) |
-|---|---|---|
-| Concurrent INSERT disjoint-key | 1.654 s – 1.711 s | 56.1 – 58.0 (mean **57.2**) |
-| Concurrent LOOKUP pre-populated | 797 ms – 804 ms | 119.4 – 120.4 (mean **119.9**) |
-| Concurrent mixed 80/20 RW | 984 ms – 1.062 s | 90.4 – 97.6 (mean **94.3**) |
-
-### Interpretation
-
-- **INSERT is the slowest** (~57 elem/s) because every insert must acquire a global index
-  table-`X` lock, serializing all 4 workers. Effective throughput == single-writer throughput.
-- **LOOKUP is fastest** (~120 elem/s) because multiple readers can hold `S` simultaneously;
-  4 workers genuinely overlap.
-- **Mixed 80/20** sits between the two: the 20% write fraction introduces table-`X` interludes
-  that block the concurrent readers.
-
-After latch crabbing + `IS`/`IX` / `IndexKey`/`IndexRange` logical locking:
-
-- INSERT throughput should scale toward multi-writer concurrency (expected significant gain).
-- LOOKUP throughput should remain roughly the same or improve slightly (already concurrent).
-- Mixed throughput should approach LOOKUP levels as write-induced serialization decreases.
+- Delete underflow handling (`merge` / `borrow` / rebalance).
+- Reader-independent split protocol (readers without shared split gate).
+- Split-gate fairness redesign.
 
 ## Implementation Notes
 
-Use staged rollout to preserve stability while refactoring:
+Phase-oriented rollout:
 
-1. Add required tests/benchmarks first and capture baseline numbers under current serialized index
-   locking.
-2. Implement read-path refactor first.
-3. Implement write-path refactor next.
-4. Enable/complete latch-crabbing behavior internally while keeping current serialized logical
-   locking in place.
-5. Remove serialized index locking last (`S/X` at index entry points), switching to `IS/IX` plus
-   `IndexKey`/`IndexRange` logical locks.
+1. Capture baseline tests/bench numbers under current table-level index locking.
+2. Land internal read/write crabbing and split-gate machinery while keeping coarse entry-point `S/X`.
+3. Switch logical locking to `IS`/`IX` + `IndexKey`/`IndexRange`.
+4. Validate phantom semantics and contention behavior; tune only if evidence shows starvation/pathology.
 
-Guardrails for this rollout:
-
-- Up through step 4, existing correctness should continue to pass because coarse serialized
-  logical locks are still active.
-- Phantom/key-range semantic tests may be added early but should be expected to fail (or be
-  ignored) until step 5 introduces `IndexKey`/`IndexRange` locking.
+Guardrail: up through step 2, correctness should remain protected by coarse entry-point serialization.
 
 ## References
 
-- `docs/lock_granularity_refactor_notes.md` — lock granularity design
+- `docs/benchmarks/btree_concurrency_baseline.md` — full baseline benchmark details
+- `docs/btree_buffer_locking_strategy.md` — latch/metadata lock-order constraints
 - `docs/deadlock_handling.md` — deadlock prevention policy
 - `docs/decisions/001-wait-die.md` — timeout-only deadlock decision
 - PR #82 — heap-level row locking (prerequisite)
