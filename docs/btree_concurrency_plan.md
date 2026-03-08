@@ -191,6 +191,7 @@ This needs new internal helpers that return guard-carrying traversal state inste
   - Read path is not split-gate-blocked; readers continue via read-latch crabbing and only wait on normal page-latch contention.
   - Re-check after escalation also serves as structural revalidation when tree shape/root-height changed while waiting for split gate.
   - Split gate lifetime must be RAII-scoped so all error/rollback paths release it deterministically.
+  - Split gate fairness is not guaranteed in this phase; writer starvation under sustained split contention is accepted for now.
   - Structural functions must not perform implicit traversal/research; they operate only on already-latched context.
   - Pre-mutation restart rule: restart/slow-required outcomes are allowed only before first page mutation/WAL emission in an attempt.
   - Overflow/duplicate-key edge cases must follow the same pre-mutation fit/escalation boundary (no mutation before escalation decision).
