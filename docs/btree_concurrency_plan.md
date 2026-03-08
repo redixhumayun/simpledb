@@ -150,6 +150,11 @@ global order.
 - Acquire heap row locks last (`Row(table_id, block, slot)` ascending).
 - If a path needs a lock that is earlier than one it already holds, release/restart; do not violate order.
 
+Enforcement note (required):
+
+- The order above is normative and must be enforced via a single shared lock-acquisition helper/path.
+- Mixed heap+index DML code paths must not perform ad hoc lock acquisition ordering in callers.
+
 ## Required Changes: Internal B-Tree API / Latching
 
 Goal: implement latch crabbing in B-tree code paths, independent of logical 2PL locks.
@@ -269,6 +274,33 @@ Root pointer / height updates must be published with an explicit protocol.
 - Metadata note:
   - Current meta `version` field is a format/layout version and must not be reused as a structure-change epoch.
   - Add a separate monotonic `structure_version` (or equivalent epoch) if version-checked restart is implemented.
+
+### 6. `structure_version` contract (required)
+
+Define and enforce a structural epoch used for stale-read/restart detection.
+
+- Storage:
+  - Add `structure_version: u64` to the B-tree meta page header.
+  - Keep existing `version: u8` unchanged as format/layout version.
+- Writer update points:
+  - Increment `structure_version` on every committed structural change that can alter descent shape:
+    - root replacement / root height change,
+    - leaf split,
+    - internal split,
+    - any future merge/borrow/rebalance.
+  - Do not increment for in-page non-structural mutations (insert/delete without split/merge).
+- Publication:
+  - `structure_version` update is part of the same WAL-backed meta update transaction as structural publish.
+  - Readers must never observe new root/height with old `structure_version` (or inverse) after publish.
+- Reader protocol:
+  - Capture `(root_block, tree_height, structure_version)` before descent.
+  - On restart boundary, reread metadata; if `structure_version` changed, restart from new root.
+  - In this phase (shared split gate for scans), version-check restarts are still required for robustness.
+- Overflow:
+  - Use wrapping increment (`wrapping_add(1)`) for `u64`.
+  - Equality compare only (`changed := new != old`); do not assume monotonic ordering across wrap.
+- Recovery:
+  - Recovery must restore a self-consistent tuple `(root_block, tree_height, structure_version)`.
 
 ## New Code Sketches
 
