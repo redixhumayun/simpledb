@@ -152,6 +152,10 @@ impl BufferFrame {
         self.meta.lock().unwrap()
     }
 
+    pub(crate) fn try_lock_meta(&self) -> Option<MutexGuard<'_, FrameMeta>> {
+        self.meta.try_lock().ok()
+    }
+
     pub fn block_id_owned(&self) -> Option<BlockId> {
         self.lock_meta().block_id.clone()
     }
@@ -631,7 +635,8 @@ impl BufferManager {
         }?;
 
         {
-            let mut meta_guard = frame_ptr.lock_meta();
+            // Use try_lock to avoid blocking while page latches are held
+            let mut meta_guard = frame_ptr.try_lock_meta()?;
             if !meta_guard
                 .block_id
                 .as_ref()

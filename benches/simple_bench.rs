@@ -2,8 +2,8 @@
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use simpledb::{
-    BTreeIndex, Constant, Index, Layout, LockError, Scan, SimpleDB, TableScan, Transaction,
-    UpdateScan, RID,
+    BTreeIndex, Constant, Index, Layout, LockError, Scan, SimpleDB, SplitGate, TableScan,
+    Transaction, UpdateScan, RID,
 };
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -498,6 +498,7 @@ struct IndexConcurrencyRuntime {
     index_name: String,
     leaf_layout: Layout,
     indexed_table_id: u32,
+    split_gate: Arc<SplitGate>,
 }
 
 fn new_idx_txn(rt: &IndexConcurrencyRuntime) -> Arc<Transaction> {
@@ -565,6 +566,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
         index_name,
         leaf_layout,
         indexed_table_id,
+        split_gate: Arc::new(SplitGate::new()),
     };
 
     (Arc::new(runtime), dir)
@@ -620,6 +622,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                         &rt.index_name,
                         rt.leaf_layout.clone(),
                         rt.indexed_table_id,
+                        Arc::clone(&rt.split_gate),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
@@ -645,6 +648,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                         &rt.index_name,
                         rt.leaf_layout.clone(),
                         rt.indexed_table_id,
+                        Arc::clone(&rt.split_gate),
                     )
                     .unwrap();
                     idx.before_first(&Constant::Int(key));
@@ -670,6 +674,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                         &rt.index_name,
                         rt.leaf_layout.clone(),
                         rt.indexed_table_id,
+                        Arc::clone(&rt.split_gate),
                     )
                     .unwrap();
                     if op_idx % 5 == 0 {
