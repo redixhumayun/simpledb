@@ -9763,15 +9763,6 @@ impl Transaction {
                 OrderedLockRequest::IndexKey { index_id, key, .. } => {
                     (1, *index_id, 1, Some(key), None, 0, 0)
                 }
-                OrderedLockRequest::Row { table_id, rid, .. } => (
-                    2,
-                    *table_id,
-                    0,
-                    None,
-                    None,
-                    rid.block_num as u32,
-                    rid.slot as u32,
-                ),
             }
         }
 
@@ -9797,13 +9788,6 @@ impl Transaction {
                 } => {
                     self.concurrency_manager
                         .acquire_index_key(index_id, key, mode)?;
-                }
-                OrderedLockRequest::Row {
-                    table_id,
-                    rid,
-                    mode,
-                } => {
-                    self.concurrency_manager.acquire_row(table_id, rid, mode)?;
                 }
             }
         }
@@ -11149,11 +11133,6 @@ enum OrderedLockRequest {
         index_id: u32,
         key: Constant,
         mode: IndexLockMode,
-    },
-    Row {
-        table_id: u32,
-        rid: RID,
-        mode: RowLockMode,
     },
 }
 

@@ -1789,6 +1789,10 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().root_block()
     }
 
+    pub fn root_block_id(&self, file_name: &str) -> BlockId {
+        BlockId::new(file_name.to_string(), self.root_block() as usize)
+    }
+
     #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.page().version()
