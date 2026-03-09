@@ -632,7 +632,7 @@ impl BTreeIndex {
                     }
                 }
                 ReadState::NeedSlowPin(block) => {
-                    drop(txn.pin_read_guard(&block)?);
+                    txn.pin_read_guard(&block)?;
                     ReadState::RetryFromRoot
                 }
                 ReadState::RetryFromRoot => {
@@ -737,7 +737,7 @@ impl Index for BTreeIndex {
                 WriteState::NeedSlowPin(block) => {
                     let had_split_gate = split_gate_guard.is_some();
                     split_gate_guard = None;
-                    drop(txn.pin_write_guard(&block).unwrap());
+                    txn.pin_write_guard(&block).unwrap();
                     if had_split_gate {
                         WriteState::AcquireSplitGate
                     } else {
@@ -770,7 +770,6 @@ impl Index for BTreeIndex {
                         }
                         traversal::WriteTraverseOutcome::Ready(ctx) => {
                             if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
-                                drop(ctx);
                                 WriteState::AcquireSplitGate
                             } else {
                                 self.apply_insert_with_ctx(
@@ -822,7 +821,6 @@ impl Index for BTreeIndex {
                                 split_gate_guard = None;
                                 WriteState::Done
                             } else {
-                                drop(ctx);
                                 split_gate_guard = None;
                                 WriteState::DescendFast
                             }
@@ -865,7 +863,7 @@ impl Index for BTreeIndex {
             .unwrap();
             match outcome {
                 traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                    drop(txn.pin_write_guard(&block).unwrap());
+                    txn.pin_write_guard(&block).unwrap();
                 }
                 traversal::WriteTraverseOutcome::Ready(mut ctx) => {
                     structural::apply_leaf_delete(
@@ -1093,11 +1091,9 @@ mod traversal {
 
             let next_block = BlockId::new(file_name.to_string(), rsib);
             let Some(next_guard) = txn.pin_read_guard_fast(&next_block)? else {
-                drop(current_view);
                 return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
             };
             let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
-            drop(current_view);
             current_block = next_block;
             current_view = next_view;
         }
@@ -1128,7 +1124,6 @@ mod traversal {
             if is_leaf_level {
                 // No parent latch held after releasing current_view. Leaf/sibling hops
                 // must still use fast resident pins and restart on miss.
-                drop(current_view);
                 return try_find_initial_cursor(
                     txn,
                     child_block,
@@ -1140,14 +1135,9 @@ mod traversal {
 
             let child_guard = match txn.pin_read_guard_fast(&child_block)? {
                 Some(g) => g,
-                None => {
-                    drop(current_view);
-                    return Ok(ReadTraverseOutcome::NeedSlowPin(child_block));
-                }
+                None => return Ok(ReadTraverseOutcome::NeedSlowPin(child_block)),
             };
             let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
-            // Release parent latch (latch crabbing for read)
-            drop(current_view);
             current_view = child_view;
         }
     }
@@ -1248,7 +1238,6 @@ mod traversal {
 
             if !child_view.is_full() {
                 ancestor_views.clear();
-                drop(current_view);
             } else {
                 ancestor_views.push((current_block, current_view));
             }
@@ -1288,7 +1277,6 @@ mod traversal {
                 let leaf_guard = match txn.pin_write_guard_fast(&child_block)? {
                     Some(g) => g,
                     None => {
-                        drop(current_view);
                         ancestor_views.clear();
                         return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
                     }
@@ -1305,7 +1293,6 @@ mod traversal {
             let child_guard = match txn.pin_write_guard_fast(&child_block)? {
                 Some(g) => g,
                 None => {
-                    drop(current_view);
                     ancestor_views.clear();
                     return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
                 }
@@ -1314,7 +1301,6 @@ mod traversal {
 
             if !child_view.is_full() {
                 ancestor_views.clear();
-                drop(current_view);
             } else {
                 ancestor_views.push((current_block, current_view));
             }
@@ -2124,12 +2110,10 @@ mod btree_index_tests {
             {
                 traversal::ReadTraverseOutcome::Ready(cursor) => return cursor,
                 traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
-                    drop(
-                        index
-                            .txn
-                            .pin_read_guard(&block)
-                            .expect("slow pin for restart"),
-                    );
+                    index
+                        .txn
+                        .pin_read_guard(&block)
+                        .expect("slow pin for restart");
                 }
             }
         }
