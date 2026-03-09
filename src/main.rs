@@ -9748,25 +9748,16 @@ impl Transaction {
             .lock_index_range_x(index_id, low, high)
     }
 
+    /// Acquire a batch of logical locks in canonical order.
+    ///
+    /// Callers specify the lock set, not the order. This sorts requests before
+    /// acquisition so different call sites cannot deadlock by listing the same
+    /// locks differently.
+    ///
+    /// Current order: `Table -> IndexRange -> IndexKey`.
+    /// Lock mode is intentionally ignored. Row locks are not included here.
     fn lock_in_order(&self, mut requests: Vec<OrderedLockRequest>) -> SimpleDBResult<()> {
-        fn request_sort_key(
-            request: &OrderedLockRequest,
-        ) -> (u8, u32, u8, Option<&Constant>, Option<&Constant>, u32, u32) {
-            match request {
-                OrderedLockRequest::Table { table_id, .. } => (0, *table_id, 0, None, None, 0, 0),
-                OrderedLockRequest::IndexRange {
-                    index_id,
-                    low,
-                    high,
-                    ..
-                } => (1, *index_id, 0, Some(low), Some(high), 0, 0),
-                OrderedLockRequest::IndexKey { index_id, key, .. } => {
-                    (1, *index_id, 1, Some(key), None, 0, 0)
-                }
-            }
-        }
-
-        requests.sort_by(|lhs, rhs| request_sort_key(lhs).cmp(&request_sort_key(rhs)));
+        requests.sort();
         for request in requests {
             match request {
                 OrderedLockRequest::Table { table_id, mode } => {
@@ -11117,7 +11108,7 @@ enum IndexLockMode {
     X,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum OrderedLockRequest {
     Table {
         table_id: u32,
@@ -11134,6 +11125,36 @@ enum OrderedLockRequest {
         key: Constant,
         mode: IndexLockMode,
     },
+}
+
+impl OrderedLockRequest {
+    fn acquisition_sort_key(&self) -> (u8, u32, u8, Option<&Constant>, Option<&Constant>) {
+        match self {
+            OrderedLockRequest::Table { table_id, .. } => (0, *table_id, 0, None, None),
+            OrderedLockRequest::IndexRange {
+                index_id,
+                low,
+                high,
+                ..
+            } => (1, *index_id, 0, Some(low), Some(high)),
+            OrderedLockRequest::IndexKey { index_id, key, .. } => {
+                (1, *index_id, 1, Some(key), None)
+            }
+        }
+    }
+}
+
+impl Ord for OrderedLockRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.acquisition_sort_key()
+            .cmp(&other.acquisition_sort_key())
+    }
+}
+
+impl PartialOrd for OrderedLockRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]

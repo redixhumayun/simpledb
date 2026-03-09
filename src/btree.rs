@@ -95,6 +95,19 @@ enum WriteState {
     Done,
 }
 
+enum ReadRequest {
+    Point { key: Constant },
+    Range { low: Constant, high: Constant },
+}
+
+enum ReadState {
+    Start,
+    DescendFast,
+    NeedSlowPin(BlockId),
+    RetryFromRoot,
+    Ready { cursor: traversal::ScanCursor },
+}
+
 /// Separator promoted from a child split.
 #[derive(Debug, Clone)]
 struct SplitResult {
@@ -563,6 +576,76 @@ impl BTreeIndex {
         }
         Ok(())
     }
+
+    fn build_scan_cursor(
+        request: &ReadRequest,
+        cursor: traversal::ReadCursor,
+    ) -> traversal::ScanCursor {
+        match request {
+            ReadRequest::Point { .. } => traversal::ScanCursor::Point(cursor),
+            ReadRequest::Range { low, high } => traversal::ScanCursor::Range(
+                traversal::RangeCursor::from_read_cursor(cursor, low.clone(), high.clone()),
+            ),
+        }
+    }
+
+    fn read_search_key(request: &ReadRequest) -> &Constant {
+        match request {
+            ReadRequest::Point { key } => key,
+            ReadRequest::Range { low, .. } => low,
+        }
+    }
+
+    fn begin_read(&mut self, request: ReadRequest) -> Result<(), Box<dyn Error>> {
+        self.read_cursor = None;
+        self.scan_gate_guard = None;
+
+        let txn = Arc::clone(&self.txn);
+        let internal_layout = self.internal_layout.clone();
+        let leaf_layout = self.leaf_layout.clone();
+        let index_file_name = self.index_file_name.clone();
+        let mut root_block = self.root_block.clone();
+        let mut state = ReadState::Start;
+
+        loop {
+            state = match state {
+                ReadState::Start => {
+                    self.scan_gate_guard = Some(self.split_gate.acquire_shared());
+                    ReadState::RetryFromRoot
+                }
+                ReadState::DescendFast => {
+                    let outcome = traversal::try_descend_read(
+                        &txn,
+                        &root_block,
+                        &internal_layout,
+                        &leaf_layout,
+                        &index_file_name,
+                        Self::read_search_key(&request),
+                    )?;
+                    match outcome {
+                        traversal::ReadTraverseOutcome::Ready(cursor) => ReadState::Ready {
+                            cursor: Self::build_scan_cursor(&request, cursor),
+                        },
+                        traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
+                            ReadState::NeedSlowPin(block)
+                        }
+                    }
+                }
+                ReadState::NeedSlowPin(block) => {
+                    drop(txn.pin_read_guard(&block)?);
+                    ReadState::RetryFromRoot
+                }
+                ReadState::RetryFromRoot => {
+                    (root_block, _, _) = self.refresh_cached_meta()?;
+                    ReadState::DescendFast
+                }
+                ReadState::Ready { cursor } => {
+                    self.read_cursor = Some(cursor);
+                    return Ok(());
+                }
+            };
+        }
+    }
 }
 
 impl Index for BTreeIndex {
@@ -580,30 +663,10 @@ impl Index for BTreeIndex {
                 },
             ])
             .expect("failed to acquire ordered point-scan locks");
-
-        self.scan_gate_guard = Some(self.split_gate.acquire_shared());
-
-        let (mut root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
-
-        let cursor = loop {
-            match traversal::try_descend_read(
-                &self.txn,
-                &root_block,
-                &self.internal_layout,
-                &self.leaf_layout,
-                &self.index_file_name,
-                search_key,
-            )
-            .unwrap()
-            {
-                traversal::ReadTraverseOutcome::Ready(cursor) => break cursor,
-                traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
-                    drop(self.txn.pin_read_guard(&block).unwrap());
-                    (root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
-                }
-            }
-        };
-        self.read_cursor = Some(traversal::ScanCursor::Point(cursor));
+        self.begin_read(ReadRequest::Point {
+            key: search_key.clone(),
+        })
+        .expect("point read orchestration failed");
     }
 
     fn before_range(&mut self, low: &Constant, high: &Constant) {
@@ -621,32 +684,11 @@ impl Index for BTreeIndex {
                 },
             ])
             .expect("failed to acquire ordered range-scan locks");
-
-        self.scan_gate_guard = Some(self.split_gate.acquire_shared());
-
-        let (mut root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
-
-        let cursor = loop {
-            match traversal::try_descend_read(
-                &self.txn,
-                &root_block,
-                &self.internal_layout,
-                &self.leaf_layout,
-                &self.index_file_name,
-                low,
-            )
-            .unwrap()
-            {
-                traversal::ReadTraverseOutcome::Ready(cursor) => break cursor,
-                traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
-                    drop(self.txn.pin_read_guard(&block).unwrap());
-                    (root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
-                }
-            }
-        };
-        self.read_cursor = Some(traversal::ScanCursor::Range(
-            traversal::RangeCursor::from_read_cursor(cursor, low.clone(), high.clone()),
-        ));
+        self.begin_read(ReadRequest::Range {
+            low: low.clone(),
+            high: high.clone(),
+        })
+        .expect("range read orchestration failed");
     }
 
     fn next(&mut self) -> bool {
@@ -987,53 +1029,6 @@ mod traversal {
         }
     }
 
-    /// Follow right-sibling links with latch crabbing until we find the leaf containing
-    /// `search_key`, then return a cursor positioned just before the first match.
-    fn find_initial_cursor(
-        txn: &Arc<Transaction>,
-        mut leaf_block: BlockId,
-        leaf_layout: &Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<ReadCursor> {
-        let first_guard = txn.pin_read_guard(&leaf_block)?;
-        let mut current_view = first_guard.into_btree_leaf_page_view(leaf_layout)?;
-
-        loop {
-            let should_hop = if let Some(hk) = current_view.high_key() {
-                *search_key >= hk
-            } else {
-                false
-            };
-
-            if !should_hop {
-                let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadCursor {
-                    leaf_block,
-                    current_slot,
-                    search_key: search_key.clone(),
-                });
-            }
-
-            let Some(rsib) = current_view.right_sibling_block() else {
-                let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadCursor {
-                    leaf_block,
-                    current_slot,
-                    search_key: search_key.clone(),
-                });
-            };
-
-            let next_block = BlockId::new(file_name.to_string(), rsib);
-            let next_guard = txn.pin_read_guard(&next_block)?;
-            let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
-            // Latch crabbing: hold next before releasing current
-            drop(current_view);
-            leaf_block = next_block;
-            current_view = next_view;
-        }
-    }
-
     fn try_find_initial_cursor(
         txn: &Arc<Transaction>,
         leaf_block: BlockId,
@@ -1079,39 +1074,6 @@ mod traversal {
             drop(current_view);
             current_block = next_block;
             current_view = next_view;
-        }
-    }
-
-    /// Descend the B-tree with read-latch crabbing: hold parent latch until child is latched,
-    /// then release parent. Returns a `ReadCursor` positioned at the leaf for `search_key`.
-    #[allow(dead_code)]
-    pub(super) fn descend_read(
-        txn: &Arc<Transaction>,
-        root_block: &BlockId,
-        internal_layout: &Layout,
-        leaf_layout: &Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<ReadCursor> {
-        let guard = txn.pin_read_guard(root_block)?;
-        let mut current_view = guard.into_btree_internal_page_view(internal_layout)?;
-
-        loop {
-            let child_block = find_child_block_from_view(&current_view, search_key, file_name)?;
-            let is_leaf_level = current_view.btree_level() == 0;
-
-            if is_leaf_level {
-                // Release parent latch, then position at leaf
-                drop(current_view);
-                return find_initial_cursor(txn, child_block, leaf_layout, file_name, search_key);
-            }
-
-            // Acquire child latch while still holding parent (current_view owns parent latch)
-            let child_guard = txn.pin_read_guard(&child_block)?;
-            let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
-            // Release parent latch
-            drop(current_view);
-            current_view = child_view;
         }
     }
 
@@ -2113,6 +2075,35 @@ mod btree_index_tests {
         next_key
     }
 
+    fn descend_read_with_restart(
+        index: &mut BTreeIndex,
+        search_key: &Constant,
+    ) -> traversal::ReadCursor {
+        loop {
+            let (root_block, _, _) = index.refresh_cached_meta().expect("read index meta");
+            match traversal::try_descend_read(
+                &index.txn,
+                &root_block,
+                &index.internal_layout,
+                &index.leaf_layout,
+                &index.index_file_name,
+                search_key,
+            )
+            .expect("restart-oriented read descent")
+            {
+                traversal::ReadTraverseOutcome::Ready(cursor) => return cursor,
+                traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
+                    drop(
+                        index
+                            .txn
+                            .pin_read_guard(&block)
+                            .expect("slow pin for restart"),
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_simple_insert_and_search() {
         let (db, _dir) = SimpleDB::new_for_test(8, 5000);
@@ -2326,15 +2317,7 @@ mod btree_index_tests {
         // Unbounded range
         let lower = Constant::Int(0);
         let start = {
-            let cursor = traversal::descend_read(
-                &index.txn,
-                &index.root_block,
-                &index.internal_layout,
-                &index.leaf_layout,
-                &index.index_file_name,
-                &lower,
-            )
-            .unwrap();
+            let cursor = descend_read_with_restart(&mut index, &lower);
             (cursor.leaf_block, cursor.current_slot)
         };
         let iter = BTreeRangeIter::new(
@@ -2359,15 +2342,7 @@ mod btree_index_tests {
         let lower_b = Constant::Int(10);
         let upper_b = Constant::Int(50);
         let start_b = {
-            let cursor = traversal::descend_read(
-                &index.txn,
-                &index.root_block,
-                &index.internal_layout,
-                &index.leaf_layout,
-                &index.index_file_name,
-                &lower_b,
-            )
-            .unwrap();
+            let cursor = descend_read_with_restart(&mut index, &lower_b);
             (cursor.leaf_block, cursor.current_slot)
         };
         let iter_b = BTreeRangeIter::new(
