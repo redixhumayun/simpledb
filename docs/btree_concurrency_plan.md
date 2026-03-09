@@ -914,3 +914,64 @@ Guardrails for this rollout:
 - `docs/deadlock_handling.md` — deadlock prevention policy
 - `docs/decisions/001-wait-die.md` — timeout-only deadlock decision
 - PR #82 — heap-level row locking (prerequisite)
+
+## Current Implementation Status (March 9, 2026)
+
+Rough completion estimate for the Phase 1 work in this document: **80-85%**.
+
+### Implemented
+
+- Index logical table locking uses intent modes (`IS`/`IX`) instead of coarse `S`/`X` in the main B-tree paths.
+- `IndexKey` and `IndexRange` logical lock targets exist.
+- Key/range overlap conflict checking is implemented in the lock table.
+- Read latch crabbing is implemented.
+- Write latch crabbing is implemented.
+- Split-gate coordination exists.
+- Split gates are shared per physical index, not per transient `IndexInfo` instance.
+- Writers only escalate to the split gate on split-needed paths; non-splitting inserts do not serialize on the gate.
+- Main traversal paths follow the fast-pin / restart discipline.
+- Leaf split decisions are made before first mutation.
+- Internal split propagation now uses a pre-mutation virtual `(keys, children)` split path instead of insert-then-split.
+- Point lookup uses `IS + S(IndexKey)`.
+- Point insert/delete uses `IX + X(IndexKey)`.
+- A real half-open B-tree range cursor exists.
+- Planner/index selection has bounded predicate support for simple normalized predicates.
+- A shared logical lock-order helper exists and is used by the main B-tree/index update entry points.
+- Range-lock concurrency tests exist.
+- Range-scan correctness tests exist.
+
+### Concrete Remaining Work
+
+#### 1. Finish predicate normalization for `IndexRange`
+
+- Current planner/predicate extraction handles equality and bounded `AND` ranges cleanly.
+- Still missing robust handling for one-sided predicates:
+  - `k >= v`
+  - `k > v`
+  - `k <= v`
+  - `k < v`
+- Still missing explicit unbounded range representation in the planner/locking path.
+- `OR` / `NOT` predicate decomposition into range locks is not implemented.
+
+#### 2. Finish planner/executor use of `IndexRange`
+
+- Range-scan machinery exists, but SQL planner/executor coverage is still partial.
+- Need explicit integration tests showing real SQL bounded predicates choose and execute index range scans.
+- Need end-to-end proof that predicate-based select/update/delete paths use the intended range-lock story.
+
+#### 3. Finish lock-order rollout across all mixed heap/index paths
+
+- A shared lock-order helper now exists.
+- Remaining work is to audit and route all mixed heap/index paths through that helper consistently.
+- This is now mainly a completeness problem, not a missing-mechanism problem.
+
+#### 4. Add stronger invariant/correctness coverage
+
+- More tests for restart behavior after fast-pin misses.
+- More mixed scan/write interleaving tests.
+- Ideally, test-only assertions for "no slow pin while holding B-tree latches".
+
+### Still Deferred (Per This Doc's Phase Split)
+
+- Reader-independent split invariants without shared scan gate are not implemented.
+- Delete underflow / merge / borrow / rebalance are not implemented.

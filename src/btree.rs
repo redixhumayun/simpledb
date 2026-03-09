@@ -1,18 +1,91 @@
 use std::{error::Error, sync::Arc};
 
 #[cfg(test)]
+use crate::page::BTreeInternalPageView;
+#[cfg(test)]
 use crate::page::BTreeLeafEntry;
 use crate::{
     debug,
-    page::{
-        BTreeInternalHeaderRef, BTreeMetaPageView,
-        BTreeMetaPageViewMut, PageType,
-    },
+    page::{BTreeInternalHeaderRef, BTreeMetaPageView, BTreeMetaPageViewMut, PageType},
     BlockId, Constant, Index, IndexInfo, Layout, LogRecord, Lsn, Schema, SimpleDBResult,
     Transaction, RID,
 };
-#[cfg(test)]
-use crate::page::{BTreeInternalPageView, BTreeInternalPageViewMut};
+
+mod split_gate {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    struct SplitGateInner {
+        readers: u32,
+        writer: bool,
+    }
+
+    pub struct SplitGate {
+        state: Mutex<SplitGateInner>,
+        cond: Condvar,
+    }
+
+    pub struct SplitGateReadGuard(Arc<SplitGate>);
+    pub struct SplitGateWriteGuard(Arc<SplitGate>);
+
+    impl Default for SplitGate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SplitGate {
+        pub fn new() -> Self {
+            Self {
+                state: Mutex::new(SplitGateInner {
+                    readers: 0,
+                    writer: false,
+                }),
+                cond: Condvar::new(),
+            }
+        }
+
+        pub fn acquire_shared(self: &Arc<Self>) -> SplitGateReadGuard {
+            let mut s = self.state.lock().unwrap();
+            while s.writer {
+                s = self.cond.wait(s).unwrap();
+            }
+            s.readers += 1;
+            SplitGateReadGuard(Arc::clone(self))
+        }
+
+        pub fn acquire_exclusive(self: &Arc<Self>) -> SplitGateWriteGuard {
+            let mut s = self.state.lock().unwrap();
+            while s.readers > 0 || s.writer {
+                s = self.cond.wait(s).unwrap();
+            }
+            s.writer = true;
+            SplitGateWriteGuard(Arc::clone(self))
+        }
+    }
+
+    impl Drop for SplitGateReadGuard {
+        fn drop(&mut self) {
+            let mut s = self.0.state.lock().unwrap();
+            s.readers -= 1;
+            if s.readers == 0 {
+                self.0.cond.notify_all();
+            }
+        }
+    }
+
+    impl Drop for SplitGateWriteGuard {
+        fn drop(&mut self) {
+            let mut s = self.0.state.lock().unwrap();
+            s.writer = false;
+            self.0.cond.notify_all();
+        }
+    }
+}
+
+pub use split_gate::SplitGate;
+pub use split_gate::SplitGateReadGuard;
+#[allow(unused_imports)]
+pub use split_gate::SplitGateWriteGuard;
 
 /// Separator promoted from a child split.
 #[derive(Debug, Clone)]
@@ -223,10 +296,20 @@ pub struct BTreeIndex {
     index_file_name: String,
     internal_layout: Layout,
     leaf_layout: Layout,
-    read_cursor: Option<traversal::ReadCursor>,
+    read_cursor: Option<traversal::ScanCursor>,
     meta_block: BlockId,
     root_block: BlockId,
     tree_height: u16,
+    structure_version: u64,
+    split_gate: Arc<SplitGate>,
+    scan_gate_guard: Option<SplitGateReadGuard>,
+}
+
+#[derive(Clone)]
+struct MetaState {
+    root_block: BlockId,
+    tree_height: u16,
+    structure_version: u64,
 }
 
 impl std::fmt::Display for BTreeIndex {
@@ -248,6 +331,7 @@ impl BTreeIndex {
         index_name: &str,
         leaf_layout: Layout,
         indexed_table_id: u32,
+        split_gate: Arc<SplitGate>,
     ) -> Result<Self, Box<dyn Error>> {
         let index_file_name = format!("{index_name}.idx");
         let index_lock_table_id = Self::index_lock_table_id_for(indexed_table_id);
@@ -258,7 +342,7 @@ impl BTreeIndex {
         let internal_layout = Layout::new(internal_schema.clone());
 
         // Bootstrap single-file index if missing.
-        let (root_block, tree_height) = if txn.size(&index_file_name) == 0 {
+        let meta_state = if txn.size(&index_file_name) == 0 {
             // Block 0: meta
             let meta_id = txn.append(&index_file_name);
             assert_eq!(meta_id.block_num, 0);
@@ -304,15 +388,20 @@ impl BTreeIndex {
                 guard.mark_modified(txn.id(), append_lsn);
                 guard.format_as_btree_leaf(None)?;
             }
-            (root_id, 1)
+            MetaState {
+                root_block: root_id,
+                tree_height: 1,
+                structure_version: 0,
+            }
         } else {
             // Load meta
             let guard = txn.pin_read_guard(&meta_block)?;
             let meta_view = BTreeMetaPageView::new(guard)?;
-            let root_blk = meta_view.root_block() as usize;
-            let height = meta_view.tree_height();
-            let root_block = BlockId::new(index_file_name.clone(), root_blk);
-            (root_block, height)
+            MetaState {
+                root_block: BlockId::new(index_file_name.clone(), meta_view.root_block() as usize),
+                tree_height: meta_view.tree_height(),
+                structure_version: meta_view.structure_version(),
+            }
         };
 
         Ok(Self {
@@ -324,9 +413,12 @@ impl BTreeIndex {
             internal_layout,
             leaf_layout,
             meta_block,
-            root_block,
+            root_block: meta_state.root_block,
             read_cursor: None,
-            tree_height,
+            tree_height: meta_state.tree_height,
+            structure_version: meta_state.structure_version,
+            split_gate,
+            scan_gate_guard: None,
         })
     }
 
@@ -345,13 +437,28 @@ impl BTreeIndex {
         self.indexed_table_id
     }
 
-    fn update_meta(&mut self, lsn: Lsn) -> Result<(), Box<dyn Error>> {
+    fn read_meta_state(&self) -> Result<MetaState, Box<dyn Error>> {
+        let guard = self.txn.pin_read_guard(&self.meta_block)?;
+        let meta_view = BTreeMetaPageView::new(guard)?;
+        Ok(MetaState {
+            root_block: BlockId::new(
+                self.index_file_name.clone(),
+                meta_view.root_block() as usize,
+            ),
+            tree_height: meta_view.tree_height(),
+            structure_version: meta_view.structure_version(),
+        })
+    }
+
+    fn update_meta(&mut self, lsn: Lsn, structure_version: u64) -> Result<(), Box<dyn Error>> {
         let guard = self.txn.pin_write_guard(&self.meta_block)?;
         guard.mark_modified(self.txn.id(), lsn);
         let mut view = BTreeMetaPageViewMut::new(guard)?;
         view.set_tree_height(self.tree_height);
         view.set_root_block(self.root_block.block_num as u32);
+        view.set_structure_version(structure_version);
         view.update_crc32();
+        self.structure_version = structure_version;
         Ok(())
     }
 
@@ -361,6 +468,8 @@ impl BTreeIndex {
         new_root_block: usize,
         old_tree_height: u16,
         new_tree_height: u16,
+        old_structure_version: u64,
+        new_structure_version: u64,
     ) -> Result<(), Box<dyn Error>> {
         let record = LogRecord::BTreeRootUpdate {
             txnum: self.txn.id(),
@@ -369,12 +478,90 @@ impl BTreeIndex {
             new_root_block: new_root_block as u32,
             old_tree_height,
             new_tree_height,
+            old_structure_version,
+            new_structure_version,
         };
         let lsn = record.write_log_record(&self.txn.log_manager())?;
 
         self.root_block = BlockId::new(self.index_file_name.clone(), new_root_block);
         self.tree_height = new_tree_height;
-        self.update_meta(lsn)
+        self.update_meta(lsn, new_structure_version)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_insert_with_ctx<'a>(
+        &mut self,
+        txn: &'a Arc<Transaction>,
+        mut ctx: structural::WriteCtx<'a>,
+        data_val: &Constant,
+        data_rid: &RID,
+        internal_layout: &'a Layout,
+        leaf_layout: &'a Layout,
+        index_file_name: &str,
+    ) {
+        let root_level_saved = ctx.root_level;
+        let leaf_split = structural::apply_leaf_insert(
+            &mut ctx,
+            txn,
+            leaf_layout,
+            index_file_name,
+            data_val.clone(),
+            *data_rid,
+        )
+        .unwrap();
+        let root_split = match leaf_split.clone() {
+            None => None,
+            Some(split) => {
+                debug!("Insert in index caused a leaf split");
+                structural::propagate_split_up(
+                    &mut ctx,
+                    txn,
+                    internal_layout,
+                    index_file_name,
+                    split,
+                )
+                .unwrap()
+            }
+        };
+        drop(ctx);
+
+        if leaf_split.is_some() {
+            let old_root_block = self.root_block.block_num;
+            let old_tree_height = self.tree_height;
+            let old_structure_version = self.structure_version;
+            let new_structure_version = old_structure_version.wrapping_add(1);
+
+            if let Some(root_split) = root_split {
+                debug!("Insert in index caused a root split");
+                let new_root_block = structural::maybe_make_new_root(
+                    txn,
+                    root_level_saved,
+                    root_split,
+                    index_file_name,
+                    internal_layout,
+                )
+                .unwrap();
+                self.apply_root_update(
+                    old_root_block,
+                    new_root_block.block_num,
+                    old_tree_height,
+                    old_tree_height.saturating_add(1),
+                    old_structure_version,
+                    new_structure_version,
+                )
+                .unwrap();
+            } else {
+                self.apply_root_update(
+                    old_root_block,
+                    old_root_block,
+                    old_tree_height,
+                    old_tree_height,
+                    old_structure_version,
+                    new_structure_version,
+                )
+                .unwrap();
+            }
+        }
     }
 }
 
@@ -478,6 +665,18 @@ mod traversal {
         pub(super) search_key: Constant,
     }
 
+    pub(super) struct RangeCursor {
+        pub(super) leaf_block: BlockId,
+        pub(super) current_slot: Option<usize>,
+        pub(super) lower_bound: Constant,
+        pub(super) upper_bound: Constant,
+    }
+
+    pub(super) enum ScanCursor {
+        Point(ReadCursor),
+        Range(RangeCursor),
+    }
+
     /// Find the child block pointer in an internal node page view for search_key.
     fn find_child_block_from_view(
         view: &crate::page::BTreeInternalPageView<'_>,
@@ -499,7 +698,9 @@ mod traversal {
             let block_num = view.get_entry(left)?.child_block;
             Ok(BlockId::new(file_name.to_string(), block_num))
         } else {
-            let block_num = view.rightmost_child_block().ok_or("missing rightmost child")?;
+            let block_num = view
+                .rightmost_child_block()
+                .ok_or("missing rightmost child")?;
             Ok(BlockId::new(file_name.to_string(), block_num))
         }
     }
@@ -525,12 +726,20 @@ mod traversal {
 
             if !should_hop {
                 let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadCursor { leaf_block, current_slot, search_key: search_key.clone() });
+                return Ok(ReadCursor {
+                    leaf_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                });
             }
 
             let Some(rsib) = current_view.right_sibling_block() else {
                 let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadCursor { leaf_block, current_slot, search_key: search_key.clone() });
+                return Ok(ReadCursor {
+                    leaf_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                });
             };
 
             let next_block = BlockId::new(file_name.to_string(), rsib);
@@ -543,8 +752,57 @@ mod traversal {
         }
     }
 
+    fn try_find_initial_cursor(
+        txn: &Arc<Transaction>,
+        leaf_block: BlockId,
+        leaf_layout: &Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<ReadTraverseOutcome> {
+        let first_guard = txn.pin_read_guard(&leaf_block)?;
+        let mut current_block = leaf_block;
+        let mut current_view = first_guard.into_btree_leaf_page_view(leaf_layout)?;
+
+        loop {
+            let should_hop = if let Some(hk) = current_view.high_key() {
+                *search_key >= hk
+            } else {
+                false
+            };
+
+            if !should_hop {
+                let current_slot = current_view.find_slot_before(search_key);
+                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
+                    leaf_block: current_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                }));
+            }
+
+            let Some(rsib) = current_view.right_sibling_block() else {
+                let current_slot = current_view.find_slot_before(search_key);
+                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
+                    leaf_block: current_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                }));
+            };
+
+            let next_block = BlockId::new(file_name.to_string(), rsib);
+            let Some(next_guard) = txn.pin_read_guard_fast(&next_block)? else {
+                drop(current_view);
+                return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
+            };
+            let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
+            drop(current_view);
+            current_block = next_block;
+            current_view = next_view;
+        }
+    }
+
     /// Descend the B-tree with read-latch crabbing: hold parent latch until child is latched,
     /// then release parent. Returns a `ReadCursor` positioned at the leaf for `search_key`.
+    #[allow(dead_code)]
     pub(super) fn descend_read(
         txn: &Arc<Transaction>,
         root_block: &BlockId,
@@ -570,6 +828,60 @@ mod traversal {
             let child_guard = txn.pin_read_guard(&child_block)?;
             let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
             // Release parent latch
+            drop(current_view);
+            current_view = child_view;
+        }
+    }
+
+    pub(super) enum ReadTraverseOutcome {
+        Ready(ReadCursor),
+        NeedSlowPin(BlockId),
+    }
+
+    /// Descend the B-tree with fast (non-blocking) pin attempts for internal nodes.
+    /// At leaf level, uses slow pin (no latches held at that point).
+    /// Returns `Ready` with a positioned cursor, or `NeedSlowPin(block)` if an
+    /// internal page was not resident (all latches released).
+    pub(super) fn try_descend_read(
+        txn: &Arc<Transaction>,
+        root_block: &BlockId,
+        internal_layout: &Layout,
+        leaf_layout: &Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<ReadTraverseOutcome> {
+        let guard = match txn.pin_read_guard_fast(root_block)? {
+            Some(g) => g,
+            None => return Ok(ReadTraverseOutcome::NeedSlowPin(root_block.clone())),
+        };
+        let mut current_view = guard.into_btree_internal_page_view(internal_layout)?;
+
+        loop {
+            let child_block = find_child_block_from_view(&current_view, search_key, file_name)?;
+            let is_leaf_level = current_view.btree_level() == 0;
+
+            if is_leaf_level {
+                // No parent latch held after releasing current_view. Leaf/sibling hops
+                // must still use fast resident pins and restart on miss.
+                drop(current_view);
+                return try_find_initial_cursor(
+                    txn,
+                    child_block,
+                    leaf_layout,
+                    file_name,
+                    search_key,
+                );
+            }
+
+            let child_guard = match txn.pin_read_guard_fast(&child_block)? {
+                Some(g) => g,
+                None => {
+                    drop(current_view);
+                    return Ok(ReadTraverseOutcome::NeedSlowPin(child_block));
+                }
+            };
+            let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
+            // Release parent latch (latch crabbing for read)
             drop(current_view);
             current_view = child_view;
         }
@@ -644,6 +956,109 @@ mod traversal {
             Ok(view.get_entry(slot)?.rid)
         }
     }
+
+    impl RangeCursor {
+        pub(super) fn from_read_cursor(
+            cursor: ReadCursor,
+            lower_bound: Constant,
+            upper_bound: Constant,
+        ) -> Self {
+            Self {
+                leaf_block: cursor.leaf_block,
+                current_slot: cursor.current_slot,
+                lower_bound,
+                upper_bound,
+            }
+        }
+
+        pub(super) fn next_in_range(
+            &mut self,
+            txn: &Arc<Transaction>,
+            leaf_layout: &Layout,
+            file_name: &str,
+        ) -> SimpleDBResult<bool> {
+            self.current_slot = Some(self.current_slot.map(|s| s + 1).unwrap_or(0));
+
+            loop {
+                let guard = txn.pin_read_guard(&self.leaf_block)?;
+                let view = guard.into_btree_leaf_page_view(leaf_layout)?;
+
+                if let Some(hk) = view.high_key() {
+                    if self.lower_bound >= hk {
+                        let Some(rsib) = view.right_sibling_block() else {
+                            return Ok(false);
+                        };
+                        self.leaf_block = BlockId::new(file_name.to_string(), rsib);
+                        self.current_slot = None;
+                        continue;
+                    }
+                }
+
+                let slot_start = self.current_slot.unwrap_or_else(|| {
+                    view.find_slot_before(&self.lower_bound)
+                        .map(|s| s + 1)
+                        .unwrap_or(0)
+                });
+
+                for slot in slot_start..view.slot_count() {
+                    if !view.is_slot_live(slot) {
+                        continue;
+                    }
+                    let entry = view.get_entry(slot)?;
+                    if entry.key < self.lower_bound {
+                        continue;
+                    }
+                    if entry.key >= self.upper_bound {
+                        return Ok(false);
+                    }
+                    self.current_slot = Some(slot);
+                    return Ok(true);
+                }
+
+                let Some(rsib) = view.right_sibling_block() else {
+                    return Ok(false);
+                };
+                self.leaf_block = BlockId::new(file_name.to_string(), rsib);
+                self.current_slot = None;
+            }
+        }
+
+        pub(super) fn get_data_rid(
+            &self,
+            txn: &Arc<Transaction>,
+            leaf_layout: &Layout,
+        ) -> SimpleDBResult<RID> {
+            let slot = self.current_slot.expect("no current slot in RangeCursor");
+            let guard = txn.pin_read_guard(&self.leaf_block)?;
+            let view = guard.into_btree_leaf_page_view(leaf_layout)?;
+            Ok(view.get_entry(slot)?.rid)
+        }
+    }
+
+    impl ScanCursor {
+        pub(super) fn next(
+            &mut self,
+            txn: &Arc<Transaction>,
+            leaf_layout: &Layout,
+            file_name: &str,
+        ) -> SimpleDBResult<bool> {
+            match self {
+                ScanCursor::Point(cursor) => cursor.next_matching(txn, leaf_layout, file_name),
+                ScanCursor::Range(cursor) => cursor.next_in_range(txn, leaf_layout, file_name),
+            }
+        }
+
+        pub(super) fn get_data_rid(
+            &self,
+            txn: &Arc<Transaction>,
+            leaf_layout: &Layout,
+        ) -> SimpleDBResult<RID> {
+            match self {
+                ScanCursor::Point(cursor) => cursor.get_data_rid(txn, leaf_layout),
+                ScanCursor::Range(cursor) => cursor.get_data_rid(txn, leaf_layout),
+            }
+        }
+    }
 }
 
 mod structural {
@@ -663,6 +1078,27 @@ mod structural {
         pub(super) ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)>,
         /// B-tree level of the root at descent time (for new-root allocation).
         pub(super) root_level: u8,
+    }
+
+    impl<'a> WriteCtx<'a> {
+        #[allow(dead_code)]
+        pub(super) fn leaf_is_full(&self, layout: &crate::Layout) -> bool {
+            let guard = self.leaf_guard.as_ref().expect("leaf guard present");
+            !crate::page::btree_leaf_would_fit(guard.bytes(), layout)
+        }
+    }
+
+    pub(super) fn leaf_needs_split(
+        ctx: &WriteCtx<'_>,
+        leaf_layout: &Layout,
+        search_key: &Constant,
+    ) -> SimpleDBResult<bool> {
+        let guard = ctx.leaf_guard.as_ref().expect("leaf guard present");
+        Ok(crate::page::btree_leaf_insert_requires_split(
+            guard.bytes(),
+            leaf_layout,
+            search_key,
+        ))
     }
 
     fn find_child_write(
@@ -685,7 +1121,9 @@ mod structural {
             let block_num = view.get_entry(left)?.child_block;
             Ok(BlockId::new(file_name.to_string(), block_num))
         } else {
-            let block_num = view.rightmost_child_block().ok_or("missing rightmost child")?;
+            let block_num = view
+                .rightmost_child_block()
+                .ok_or("missing rightmost child")?;
             Ok(BlockId::new(file_name.to_string(), block_num))
         }
     }
@@ -693,6 +1131,7 @@ mod structural {
     /// Descend the B-tree with write-latch crabbing.
     /// Safe ancestors (not full ⟹ cannot cause split propagation) have their latches released.
     /// Returns a WriteCtx holding the leaf write-latch and any unsafe ancestor latches.
+    #[allow(dead_code)]
     pub(super) fn descend_write<'a>(
         txn: &'a Arc<Transaction>,
         root_block: &BlockId,
@@ -730,6 +1169,77 @@ mod structural {
 
             // Safe-node optimisation: if child is not full, no split can propagate past it,
             // so all ancestor latches (including current) can be released.
+            if !child_view.is_full() {
+                ancestor_views.clear();
+                drop(current_view);
+            } else {
+                ancestor_views.push((current_block, current_view));
+            }
+
+            current_block = child_block;
+            current_view = child_view;
+        }
+    }
+
+    pub(super) enum WriteTraverseOutcome<'a> {
+        Ready(WriteCtx<'a>),
+        NeedSlowPin(BlockId),
+    }
+
+    /// Descend with fast (non-blocking) pin attempts. Returns `Ready` with latches held,
+    /// or `NeedSlowPin(block)` if a page was not resident (all latches released).
+    pub(super) fn try_descend_write_fast<'a>(
+        txn: &'a Arc<Transaction>,
+        root_block: &BlockId,
+        internal_layout: &'a Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<WriteTraverseOutcome<'a>> {
+        let root_guard = match txn.pin_write_guard_fast(root_block)? {
+            Some(g) => g,
+            None => return Ok(WriteTraverseOutcome::NeedSlowPin(root_block.clone())),
+        };
+        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
+        let root_level = root_view.btree_level();
+
+        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
+        let mut current_block = root_block.clone();
+        let mut current_view = root_view;
+
+        loop {
+            let child_block = find_child_write(&current_view, search_key, file_name)?;
+            let level = current_view.btree_level();
+
+            if level == 0 {
+                // Try fast pin for leaf
+                let leaf_guard = match txn.pin_write_guard_fast(&child_block)? {
+                    Some(g) => g,
+                    None => {
+                        drop(current_view);
+                        ancestor_views.clear();
+                        return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                    }
+                };
+                ancestor_views.push((current_block, current_view));
+                return Ok(WriteTraverseOutcome::Ready(WriteCtx {
+                    leaf_guard: Some(leaf_guard),
+                    leaf_block_id: child_block,
+                    ancestor_views,
+                    root_level,
+                }));
+            }
+
+            let child_guard = match txn.pin_write_guard_fast(&child_block)? {
+                Some(g) => g,
+                None => {
+                    drop(current_view);
+                    ancestor_views.clear();
+                    return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                }
+            };
+            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
+
+            // Safe-node optimisation
             if !child_view.is_full() {
                 ancestor_views.clear();
                 drop(current_view);
@@ -812,6 +1322,7 @@ mod structural {
 
     /// Split an internal page using an already-held mutable view (no re-acquisition).
     /// Returns (new_block_id, separator_key_to_push_up).
+    #[allow(dead_code)]
     fn split_internal_inplace<'a>(
         orig_view: &mut BTreeInternalPageViewMut<'a>,
         orig_block_id: &BlockId,
@@ -856,7 +1367,11 @@ mod structural {
         for i in 0..orig_slot_count {
             children.push(orig_view.get_entry(i)?.child_block);
         }
-        children.push(orig_view.rightmost_child_block().ok_or("missing rightmost child")?);
+        children.push(
+            orig_view
+                .rightmost_child_block()
+                .ok_or("missing rightmost child")?,
+        );
 
         let (left_children, right_children) = children.split_at(split_slot);
 
@@ -896,6 +1411,123 @@ mod structural {
         Ok((allocated.block_id, sep_key))
     }
 
+    fn collect_internal_keys_children(
+        view: &BTreeInternalPageViewMut<'_>,
+    ) -> SimpleDBResult<(Vec<Constant>, Vec<usize>)> {
+        let slot_count = view.slot_count();
+        let mut keys = Vec::with_capacity(slot_count);
+        let mut children = Vec::with_capacity(slot_count + 1);
+
+        for i in 0..slot_count {
+            let entry = view.get_entry(i)?;
+            keys.push(entry.key);
+            children.push(entry.child_block);
+        }
+        children.push(
+            view.rightmost_child_block()
+                .ok_or("missing rightmost child")?,
+        );
+
+        Ok((keys, children))
+    }
+
+    fn upper_bound_slot(keys: &[Constant], search_key: &Constant) -> usize {
+        let mut left = 0usize;
+        let mut right = keys.len();
+        while left < right {
+            let mid = (left + right) / 2;
+            if keys[mid] > *search_key {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+        left
+    }
+
+    fn rebuild_internal_page(
+        view: &mut BTreeInternalPageViewMut<'_>,
+        keys: &[Constant],
+        children: &[usize],
+        high_key: Option<&Constant>,
+    ) -> SimpleDBResult<()> {
+        assert_eq!(children.len(), keys.len() + 1);
+
+        for slot in (0..view.slot_count()).rev() {
+            view.delete_entry(slot)?;
+        }
+
+        view.set_rightmost_child_block(children[0])?;
+        for (idx, key) in keys.iter().enumerate() {
+            view.insert_entry(key.clone(), children[idx + 1])?;
+        }
+
+        if let Some(high_key) = high_key {
+            let high_key_bytes: Vec<u8> = high_key.clone().try_into()?;
+            view.set_high_key(&high_key_bytes)?;
+        } else {
+            view.clear_high_key()?;
+        }
+
+        Ok(())
+    }
+
+    fn split_internal_with_incoming<'a>(
+        orig_view: &mut BTreeInternalPageViewMut<'a>,
+        orig_block_id: &BlockId,
+        txn: &'a Arc<Transaction>,
+        internal_layout: &'a Layout,
+        file_name: &str,
+        incoming_key: Constant,
+        incoming_right_child: usize,
+    ) -> SimpleDBResult<(BlockId, Constant)> {
+        let (mut keys, mut children) = collect_internal_keys_children(orig_view)?;
+        let slot = upper_bound_slot(&keys, &incoming_key);
+        keys.insert(slot, incoming_key);
+        children.insert(slot + 1, incoming_right_child);
+
+        let split_slot = keys.len() / 2;
+        let left_keys = keys[..split_slot].to_vec();
+        let right_keys = keys[split_slot..].to_vec();
+        let left_children = children[..split_slot + 1].to_vec();
+        let right_children = children[split_slot..].to_vec();
+        let sep_key = right_keys
+            .first()
+            .cloned()
+            .ok_or("internal split requires at least one right-side key")?;
+
+        let txn_id = txn.id();
+        let (old_left_high_key, old_left_rightmost_child) =
+            split_wal::read_internal_split_state(orig_view.bytes())?;
+
+        let allocated = IndexFreeList::allocate(txn, file_name)?;
+        let mut new_guard = txn.pin_write_guard(&allocated.block_id)?;
+        if let Some(append_lsn) = allocated.append_lsn {
+            new_guard.mark_modified(txn_id, append_lsn);
+        }
+        new_guard.format_as_btree_internal(orig_view.btree_level(), Some(right_children[0]))?;
+        let mut new_view = new_guard.into_btree_internal_page_view_mut(internal_layout)?;
+
+        let split_lsn = LogRecord::BTreePageSplit {
+            txnum: txn_id,
+            left_block_id: orig_block_id.clone(),
+            right_block_id: allocated.block_id.clone(),
+            is_leaf: false,
+            old_left_high_key,
+            old_left_right_sibling: None,
+            old_left_overflow: None,
+            old_left_rightmost_child,
+        }
+        .write_log_record(&txn.log_manager())?;
+        orig_view.update_page_lsn(split_lsn);
+        new_view.update_page_lsn(split_lsn);
+
+        rebuild_internal_page(orig_view, &left_keys, &left_children, Some(&sep_key))?;
+        rebuild_internal_page(&mut new_view, &right_keys, &right_children, None)?;
+
+        Ok((allocated.block_id, sep_key))
+    }
+
     /// Insert (search_key, rid) into the leaf held in ctx.
     /// Returns Some(SplitResult) when the leaf split and a separator must propagate up.
     pub(super) fn apply_leaf_insert<'a>(
@@ -906,7 +1538,10 @@ mod structural {
         search_key: Constant,
         rid: RID,
     ) -> SimpleDBResult<Option<SplitResult>> {
-        let leaf_guard = ctx.leaf_guard.take().expect("leaf_guard missing in WriteCtx");
+        let leaf_guard = ctx
+            .leaf_guard
+            .take()
+            .expect("leaf_guard missing in WriteCtx");
         let leaf_block_id = ctx.leaf_block_id.clone();
         let mut leaf_view = leaf_guard.into_btree_leaf_page_view_mut(leaf_layout)?;
 
@@ -948,8 +1583,15 @@ mod structural {
 
         if first_key == last_key {
             // All identical keys: create an overflow page.
-            let new_block_id =
-                split_leaf_inplace(&mut leaf_view, &leaf_block_id, txn, leaf_layout, file_name, 1, None)?;
+            let new_block_id = split_leaf_inplace(
+                &mut leaf_view,
+                &leaf_block_id,
+                txn,
+                leaf_layout,
+                file_name,
+                1,
+                None,
+            )?;
             leaf_view.set_overflow_block(Some(new_block_id.block_num))?;
             return Ok(None); // Overflow split: no separator to propagate.
         }
@@ -984,6 +1626,25 @@ mod structural {
         }))
     }
 
+    /// Insert (search_key, rid) into the leaf without splitting.
+    /// Caller must have verified the leaf has space (leaf_is_full returned false).
+    #[allow(dead_code)]
+    pub(super) fn apply_leaf_insert_no_split<'a>(
+        ctx: &mut WriteCtx<'a>,
+        leaf_layout: &'a Layout,
+        search_key: Constant,
+        rid: RID,
+    ) -> SimpleDBResult<()> {
+        let leaf_guard = ctx
+            .leaf_guard
+            .take()
+            .expect("leaf_guard missing in WriteCtx");
+        ctx.ancestor_views.clear(); // no split, don't need ancestors
+        let mut leaf_view = leaf_guard.into_btree_leaf_page_view_mut(leaf_layout)?;
+        leaf_view.insert_entry(search_key, rid)?;
+        Ok(())
+    }
+
     /// Propagate a leaf split up the ancestor stack.
     /// Returns None when the split was absorbed; Some(SplitResult) when the root itself split.
     pub(super) fn propagate_split_up<'a>(
@@ -994,15 +1655,22 @@ mod structural {
         mut split: SplitResult,
     ) -> SimpleDBResult<Option<SplitResult>> {
         while let Some((ancestor_block, mut ancestor_view)) = ctx.ancestor_views.pop() {
-            ancestor_view.insert_entry(split.sep_key.clone(), split.right_block)?;
             if !ancestor_view.is_full() {
+                ancestor_view.insert_entry(split.sep_key.clone(), split.right_block)?;
                 // Ancestor absorbed the separator; release remaining latches.
                 ctx.ancestor_views.clear();
                 return Ok(None);
             }
-            // Ancestor also full: split it and continue propagation.
-            let (new_block_id, sep_key) =
-                split_internal_inplace(&mut ancestor_view, &ancestor_block, txn, internal_layout, file_name)?;
+
+            let (new_block_id, sep_key) = split_internal_with_incoming(
+                &mut ancestor_view,
+                &ancestor_block,
+                txn,
+                internal_layout,
+                file_name,
+                split.sep_key.clone(),
+                split.right_block,
+            )?;
             split = SplitResult {
                 sep_key,
                 left_block: ancestor_block.block_num,
@@ -1045,12 +1713,18 @@ mod structural {
     ) -> SimpleDBResult<()> {
         // Delete doesn't need ancestors; release them.
         ctx.ancestor_views.clear();
-        let leaf_guard = ctx.leaf_guard.take().expect("leaf_guard missing in WriteCtx");
+        let leaf_guard = ctx
+            .leaf_guard
+            .take()
+            .expect("leaf_guard missing in WriteCtx");
 
         // Scan the initial leaf page (already write-latched) for the target entry.
         let overflow_from_initial = {
             let mut leaf_view = leaf_guard.into_btree_leaf_page_view_mut(leaf_layout)?;
-            let start_slot = leaf_view.find_slot_before(search_key).map(|s| s + 1).unwrap_or(0);
+            let start_slot = leaf_view
+                .find_slot_before(search_key)
+                .map(|s| s + 1)
+                .unwrap_or(0);
             for slot in start_slot..leaf_view.slot_count() {
                 if !leaf_view.is_slot_live(slot) {
                     continue;
@@ -1114,22 +1788,99 @@ mod structural {
 impl Index for BTreeIndex {
     fn before_first(&mut self, search_key: &Constant) {
         self.txn
-            .lock_table_is(self.index_lock_table_id)
-            .expect("failed to acquire index IS lock");
-        self.txn
-            .lock_index_key_s(self.index_lock_table_id, search_key.clone())
-            .expect("failed to acquire index key-S lock");
-        self.read_cursor = Some(
-            traversal::descend_read(
+            .lock_in_order(vec![
+                crate::OrderedLockRequest::Table {
+                    table_id: self.index_lock_table_id,
+                    mode: crate::TableLockMode::IS,
+                },
+                crate::OrderedLockRequest::IndexKey {
+                    index_id: self.index_lock_table_id,
+                    key: search_key.clone(),
+                    mode: crate::IndexLockMode::S,
+                },
+            ])
+            .expect("failed to acquire ordered point-scan locks");
+
+        // Acquire split gate shared; held until next before_first or drop
+        self.scan_gate_guard = Some(self.split_gate.acquire_shared());
+
+        let mut meta_state = self.read_meta_state().expect("read index meta");
+        self.root_block = meta_state.root_block.clone();
+        self.tree_height = meta_state.tree_height;
+        self.structure_version = meta_state.structure_version;
+
+        let cursor = loop {
+            match traversal::try_descend_read(
                 &self.txn,
-                &self.root_block,
+                &meta_state.root_block,
                 &self.internal_layout,
                 &self.leaf_layout,
                 &self.index_file_name,
                 search_key,
             )
-            .unwrap(),
-        );
+            .unwrap()
+            {
+                traversal::ReadTraverseOutcome::Ready(cursor) => break cursor,
+                traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
+                    // No latches held; warm the page then retry
+                    drop(self.txn.pin_read_guard(&block).unwrap());
+                    meta_state = self.read_meta_state().expect("read index meta");
+                    self.root_block = meta_state.root_block.clone();
+                    self.tree_height = meta_state.tree_height;
+                    self.structure_version = meta_state.structure_version;
+                }
+            }
+        };
+        self.read_cursor = Some(traversal::ScanCursor::Point(cursor));
+    }
+
+    fn before_range(&mut self, low: &Constant, high: &Constant) {
+        self.txn
+            .lock_in_order(vec![
+                crate::OrderedLockRequest::Table {
+                    table_id: self.index_lock_table_id,
+                    mode: crate::TableLockMode::IS,
+                },
+                crate::OrderedLockRequest::IndexRange {
+                    index_id: self.index_lock_table_id,
+                    low: low.clone(),
+                    high: high.clone(),
+                    mode: crate::IndexLockMode::S,
+                },
+            ])
+            .expect("failed to acquire ordered range-scan locks");
+
+        self.scan_gate_guard = Some(self.split_gate.acquire_shared());
+
+        let mut meta_state = self.read_meta_state().expect("read index meta");
+        self.root_block = meta_state.root_block.clone();
+        self.tree_height = meta_state.tree_height;
+        self.structure_version = meta_state.structure_version;
+
+        let cursor = loop {
+            match traversal::try_descend_read(
+                &self.txn,
+                &meta_state.root_block,
+                &self.internal_layout,
+                &self.leaf_layout,
+                &self.index_file_name,
+                low,
+            )
+            .unwrap()
+            {
+                traversal::ReadTraverseOutcome::Ready(cursor) => break cursor,
+                traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
+                    drop(self.txn.pin_read_guard(&block).unwrap());
+                    meta_state = self.read_meta_state().expect("read index meta");
+                    self.root_block = meta_state.root_block.clone();
+                    self.tree_height = meta_state.tree_height;
+                    self.structure_version = meta_state.structure_version;
+                }
+            }
+        };
+        self.read_cursor = Some(traversal::ScanCursor::Range(
+            traversal::RangeCursor::from_read_cursor(cursor, low.clone(), high.clone()),
+        ));
     }
 
     fn next(&mut self) -> bool {
@@ -1138,8 +1889,8 @@ impl Index for BTreeIndex {
             .as_mut()
             .expect("ReadCursor not initialized, did you forget to call before_first?");
         cursor
-            .next_matching(&self.txn, &self.leaf_layout, &self.index_file_name)
-            .expect("next_matching failed")
+            .next(&self.txn, &self.leaf_layout, &self.index_file_name)
+            .expect("scan next failed")
     }
 
     fn get_data_rid(&self) -> RID {
@@ -1152,104 +1903,197 @@ impl Index for BTreeIndex {
 
     fn insert(&mut self, data_val: &Constant, data_rid: &RID) {
         self.txn
-            .lock_table_ix(self.index_lock_table_id)
-            .expect("failed to acquire index IX lock");
-        self.txn
-            .lock_index_key_x(self.index_lock_table_id, data_val.clone())
-            .expect("failed to acquire index key-X lock");
+            .lock_in_order(vec![
+                crate::OrderedLockRequest::Table {
+                    table_id: self.index_lock_table_id,
+                    mode: crate::TableLockMode::IX,
+                },
+                crate::OrderedLockRequest::IndexKey {
+                    index_id: self.index_lock_table_id,
+                    key: data_val.clone(),
+                    mode: crate::IndexLockMode::X,
+                },
+            ])
+            .expect("failed to acquire ordered insert locks");
         debug!(
             "Inserting value {:?} for rid {:?} into index",
             data_val, data_rid
         );
 
-        // Clone Arc so the WriteCtx borrow does not overlap with later &mut self calls.
         let txn = Arc::clone(&self.txn);
 
-        let root_split_info = {
-            let mut ctx = structural::descend_write(
-                &txn,
-                &self.root_block,
-                &self.internal_layout,
-                &self.index_file_name,
-                data_val,
-            )
-            .unwrap();
-            let root_level = ctx.root_level;
+        enum WriteState {
+            DescendFast,
+            NeedSlowPin(BlockId),
+            AcquireSplitGate,
+            DescendUnderSplitGate,
+            Done,
+        }
 
-            let leaf_split =
-                structural::apply_leaf_insert(&mut ctx, &txn, &self.leaf_layout, &self.index_file_name, data_val.clone(), *data_rid)
+        let mut state = WriteState::DescendFast;
+        let mut split_gate_guard = None;
+        loop {
+            state = match state {
+                WriteState::Done => break,
+                WriteState::NeedSlowPin(block) => {
+                    // No latches held; warm the page then retry
+                    let had_split_gate = split_gate_guard.is_some();
+                    split_gate_guard = None;
+                    drop(txn.pin_write_guard(&block).unwrap());
+                    if had_split_gate {
+                        WriteState::AcquireSplitGate
+                    } else {
+                        WriteState::DescendFast
+                    }
+                }
+                WriteState::AcquireSplitGate => {
+                    // Never wait on the split gate while holding page latches.
+                    self.scan_gate_guard = None;
+                    split_gate_guard = Some(self.split_gate.acquire_exclusive());
+                    WriteState::DescendUnderSplitGate
+                }
+                WriteState::DescendFast => {
+                    let meta_state = self.read_meta_state().expect("read index meta");
+                    self.root_block = meta_state.root_block.clone();
+                    self.tree_height = meta_state.tree_height;
+                    self.structure_version = meta_state.structure_version;
+                    let root_block = meta_state.root_block;
+                    let internal_layout = self.internal_layout.clone();
+                    let leaf_layout = self.leaf_layout.clone();
+                    let index_file_name = self.index_file_name.clone();
+
+                    let outcome = structural::try_descend_write_fast(
+                        &txn,
+                        &root_block,
+                        &internal_layout,
+                        &index_file_name,
+                        data_val,
+                    )
                     .unwrap();
 
-            let root_split = match leaf_split {
-                None => None,
-                Some(split) => {
-                    debug!("Insert in index caused a leaf split");
-                    structural::propagate_split_up(
-                        &mut ctx,
+                    match outcome {
+                        structural::WriteTraverseOutcome::NeedSlowPin(block) => {
+                            WriteState::NeedSlowPin(block)
+                        }
+                        structural::WriteTraverseOutcome::Ready(ctx) => {
+                            if structural::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
+                                drop(ctx);
+                                WriteState::AcquireSplitGate
+                            } else {
+                                self.apply_insert_with_ctx(
+                                    &txn,
+                                    ctx,
+                                    data_val,
+                                    data_rid,
+                                    &internal_layout,
+                                    &leaf_layout,
+                                    &index_file_name,
+                                );
+                                WriteState::Done
+                            }
+                        }
+                    }
+                }
+                WriteState::DescendUnderSplitGate => {
+                    let meta_state = self.read_meta_state().expect("read index meta");
+                    self.root_block = meta_state.root_block.clone();
+                    self.tree_height = meta_state.tree_height;
+                    self.structure_version = meta_state.structure_version;
+                    let root_block = meta_state.root_block;
+                    let internal_layout = self.internal_layout.clone();
+                    let leaf_layout = self.leaf_layout.clone();
+                    let index_file_name = self.index_file_name.clone();
+
+                    let outcome = structural::try_descend_write_fast(
                         &txn,
-                        &self.internal_layout,
-                        &self.index_file_name,
-                        split,
+                        &root_block,
+                        &internal_layout,
+                        &index_file_name,
+                        data_val,
                     )
-                    .unwrap()
+                    .unwrap();
+
+                    match outcome {
+                        structural::WriteTraverseOutcome::NeedSlowPin(block) => {
+                            WriteState::NeedSlowPin(block)
+                        }
+                        structural::WriteTraverseOutcome::Ready(ctx) => {
+                            if structural::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
+                                self.apply_insert_with_ctx(
+                                    &txn,
+                                    ctx,
+                                    data_val,
+                                    data_rid,
+                                    &internal_layout,
+                                    &leaf_layout,
+                                    &index_file_name,
+                                );
+                                split_gate_guard = None;
+                                WriteState::Done
+                            } else {
+                                drop(ctx);
+                                split_gate_guard = None;
+                                WriteState::DescendFast
+                            }
+                        }
+                    }
                 }
             };
-            // ctx dropped here: all write-latches released.
-            root_split.map(|s| (root_level, s))
-        };
-
-        if let Some((root_level, root_split)) = root_split_info {
-            debug!("Insert in index caused a root split");
-            let new_root_block = structural::maybe_make_new_root(
-                &self.txn,
-                root_level,
-                root_split,
-                &self.index_file_name,
-                &self.internal_layout,
-            )
-            .unwrap();
-            let old_root_block = self.root_block.block_num;
-            let old_tree_height = self.tree_height;
-            self.apply_root_update(
-                old_root_block,
-                new_root_block.block_num,
-                old_tree_height,
-                old_tree_height.saturating_add(1),
-            )
-            .unwrap();
         }
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
         self.txn
-            .lock_table_ix(self.index_lock_table_id)
-            .expect("failed to acquire index IX lock");
-        self.txn
-            .lock_index_key_x(self.index_lock_table_id, data_val.clone())
-            .expect("failed to acquire index key-X lock");
+            .lock_in_order(vec![
+                crate::OrderedLockRequest::Table {
+                    table_id: self.index_lock_table_id,
+                    mode: crate::TableLockMode::IX,
+                },
+                crate::OrderedLockRequest::IndexKey {
+                    index_id: self.index_lock_table_id,
+                    key: data_val.clone(),
+                    mode: crate::IndexLockMode::X,
+                },
+            ])
+            .expect("failed to acquire ordered delete locks");
 
         // Clone Arc so the WriteCtx borrow does not overlap with later &mut self calls.
         let txn = Arc::clone(&self.txn);
+        let internal_layout = self.internal_layout.clone();
+        let leaf_layout = self.leaf_layout.clone();
+        let index_file_name = self.index_file_name.clone();
 
-        {
-            let mut ctx = structural::descend_write(
+        loop {
+            let meta_state = self.read_meta_state().expect("read index meta");
+            self.root_block = meta_state.root_block.clone();
+            self.tree_height = meta_state.tree_height;
+            self.structure_version = meta_state.structure_version;
+            let outcome = structural::try_descend_write_fast(
                 &txn,
-                &self.root_block,
-                &self.internal_layout,
-                &self.index_file_name,
+                &meta_state.root_block,
+                &internal_layout,
+                &index_file_name,
                 data_val,
             )
             .unwrap();
-            structural::apply_leaf_delete(
-                &mut ctx,
-                &txn,
-                &self.leaf_layout,
-                &self.index_file_name,
-                data_val,
-                *data_rid,
-            )
-            .unwrap();
-            // ctx dropped here: all write-latches released.
+            match outcome {
+                structural::WriteTraverseOutcome::NeedSlowPin(block) => {
+                    // No latches held; warm the page then retry
+                    drop(txn.pin_write_guard(&block).unwrap());
+                }
+                structural::WriteTraverseOutcome::Ready(mut ctx) => {
+                    structural::apply_leaf_delete(
+                        &mut ctx,
+                        &txn,
+                        &leaf_layout,
+                        &index_file_name,
+                        data_val,
+                        *data_rid,
+                    )
+                    .unwrap();
+                    break;
+                }
+            }
         }
     }
 }
@@ -1275,7 +2119,14 @@ mod btree_index_tests {
         let tx = db.new_tx();
         let layout = create_test_layout();
         let index_name = generate_filename();
-        BTreeIndex::new(Arc::clone(&tx), &index_name, layout, TEST_INDEXED_TABLE_ID).unwrap()
+        BTreeIndex::new(
+            Arc::clone(&tx),
+            &index_name,
+            layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
+        )
+        .unwrap()
     }
 
     /// Insert ascending keys until the leaf file reaches `target_blocks` size.
@@ -1316,6 +2167,26 @@ mod btree_index_tests {
         index.before_first(&Constant::Int(10));
         assert!(index.next());
         assert_eq!(index.get_data_rid(), RID::new(1, 1));
+    }
+
+    #[test]
+    fn test_range_scan_returns_only_keys_in_half_open_interval() {
+        let (db, _dir) = SimpleDB::new_for_test(8, 5000);
+        let mut index = setup_index(&db);
+
+        index.insert(&Constant::Int(10), &RID::new(1, 1));
+        index.insert(&Constant::Int(20), &RID::new(1, 2));
+        index.insert(&Constant::Int(25), &RID::new(1, 3));
+        index.insert(&Constant::Int(30), &RID::new(1, 4));
+
+        index.before_range(&Constant::Int(20), &Constant::Int(30));
+
+        let mut found = Vec::new();
+        while index.next() {
+            found.push(index.get_data_rid());
+        }
+
+        assert_eq!(found, vec![RID::new(1, 2), RID::new(1, 3)]);
     }
 
     /// Combined test replacing:
@@ -1391,6 +2262,7 @@ mod btree_index_tests {
             assert_eq!(meta.tree_height(), 1);
             assert_eq!(meta.root_block(), 1);
             assert_eq!(meta.first_free_block(), u32::MAX);
+            assert_eq!(meta.structure_version(), 0);
         }
 
         // Root internal assertions
@@ -1447,6 +2319,8 @@ mod btree_index_tests {
             let meta = BTreeMetaPageView::new(guard).expect("meta page view");
             assert_eq!(meta.root_block() as usize, index.root_block.block_num);
             assert_eq!(meta.tree_height(), index.tree_height);
+            assert_eq!(meta.structure_version(), index.structure_version);
+            assert!(meta.structure_version() > 0);
         }
     }
 
@@ -1495,7 +2369,8 @@ mod btree_index_tests {
                 &index.leaf_layout,
                 &index.index_file_name,
                 &lower,
-            ).unwrap();
+            )
+            .unwrap();
             (cursor.leaf_block, cursor.current_slot)
         };
         let iter = BTreeRangeIter::new(
@@ -1527,7 +2402,8 @@ mod btree_index_tests {
                 &index.leaf_layout,
                 &index.index_file_name,
                 &lower_b,
-            ).unwrap();
+            )
+            .unwrap();
             (cursor.leaf_block, cursor.current_slot)
         };
         let iter_b = BTreeRangeIter::new(
@@ -1724,6 +2600,7 @@ mod btree_index_tests {
                 &index_name,
                 layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             for key in 0..120 {
@@ -1741,6 +2618,7 @@ mod btree_index_tests {
                 &index_name,
                 layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             let blocks_before = idx2.txn.size(&idx2.index_file_name);
@@ -1767,6 +2645,7 @@ mod btree_index_tests {
             &index_name,
             layout.clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
 
@@ -1808,6 +2687,7 @@ mod btree_index_tests {
             &index_name,
             layout.clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         for key in 0..120 {
@@ -1825,6 +2705,7 @@ mod btree_index_tests {
             &index_name,
             layout.clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         let blocks_before = idx2.txn.size(&idx2.index_file_name);
@@ -1845,6 +2726,7 @@ mod btree_index_tests {
             &index_name,
             layout.clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         for key in 0..120 {
@@ -1915,6 +2797,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             for k in 0..PRELOAD {
@@ -1957,6 +2840,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
+                        Arc::new(SplitGate::new()),
                     )
                     .unwrap();
                     idx.before_first(&Constant::Int(key));
@@ -1997,6 +2881,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             setup_tx.commit().unwrap();
@@ -2035,6 +2920,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
+                        Arc::new(SplitGate::new()),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
@@ -2059,6 +2945,7 @@ mod btree_index_tests {
             &index_name,
             (*leaf_layout).clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         let total = WRITERS * KEYS_PER_WRITER;
@@ -2095,6 +2982,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             setup_tx.commit().unwrap();
@@ -2134,6 +3022,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
+                        Arc::new(SplitGate::new()),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
@@ -2158,6 +3047,7 @@ mod btree_index_tests {
             &index_name,
             (*leaf_layout).clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         for k in 0..total as i32 {
@@ -2195,6 +3085,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
             )
             .unwrap();
             for k in 0..PRELOAD {
@@ -2239,6 +3130,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
+                        Arc::new(SplitGate::new()),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(2, k as usize));
@@ -2273,6 +3165,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
+                        Arc::new(SplitGate::new()),
                     )
                     .unwrap();
                     idx.before_first(&Constant::Int(k));
@@ -2305,10 +3198,175 @@ mod btree_index_tests {
             &index_name,
             (*leaf_layout).clone(),
             TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
         )
         .unwrap();
         super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
         val_txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_range_lock_blocks_overlapping_insert() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (db, _dir) = SimpleDB::new_for_test(64, 2_000);
+        db.set_wal_mode(WalMode::UnsafeNoWal);
+        let index_name = generate_filename();
+        let leaf_layout = create_test_layout();
+
+        let setup_tx = db.new_tx();
+        let _idx = BTreeIndex::new(
+            Arc::clone(&setup_tx),
+            &index_name,
+            leaf_layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
+        )
+        .unwrap();
+        setup_tx.commit().unwrap();
+
+        let holder_tx = db.new_tx();
+        let index_lock_table_id = BTreeIndex::index_lock_table_id_for(TEST_INDEXED_TABLE_ID);
+        holder_tx.lock_table_is(index_lock_table_id).unwrap();
+        holder_tx
+            .lock_index_range_s(index_lock_table_id, Constant::Int(20), Constant::Int(30))
+            .unwrap();
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = db.log_manager();
+        let buffer_manager = db.buffer_manager();
+        let lock_table = db.lock_table();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let index_name_thread = index_name.clone();
+        let leaf_layout_thread = leaf_layout.clone();
+
+        let handle = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(
+                file_manager,
+                log_manager,
+                buffer_manager,
+                lock_table,
+            ));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &index_name_thread,
+                leaf_layout_thread,
+                TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
+            )
+            .unwrap();
+            started_tx.send(()).unwrap();
+            idx.insert(&Constant::Int(25), &RID::new(9, 25));
+            txn.commit().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "overlapping insert should block while range-S lock is held"
+        );
+
+        holder_tx.commit().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("insert should complete after range lock is released");
+        handle.join().unwrap();
+
+        let verify_tx = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            leaf_layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
+        )
+        .unwrap();
+        verify_idx.before_first(&Constant::Int(25));
+        assert!(verify_idx.next());
+        assert_eq!(verify_idx.get_data_rid(), RID::new(9, 25));
+        verify_tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_range_lock_allows_disjoint_insert() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (db, _dir) = SimpleDB::new_for_test(64, 2_000);
+        db.set_wal_mode(WalMode::UnsafeNoWal);
+        let index_name = generate_filename();
+        let leaf_layout = create_test_layout();
+
+        let setup_tx = db.new_tx();
+        let _idx = BTreeIndex::new(
+            Arc::clone(&setup_tx),
+            &index_name,
+            leaf_layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
+        )
+        .unwrap();
+        setup_tx.commit().unwrap();
+
+        let holder_tx = db.new_tx();
+        let index_lock_table_id = BTreeIndex::index_lock_table_id_for(TEST_INDEXED_TABLE_ID);
+        holder_tx.lock_table_is(index_lock_table_id).unwrap();
+        holder_tx
+            .lock_index_range_s(index_lock_table_id, Constant::Int(20), Constant::Int(30))
+            .unwrap();
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = db.log_manager();
+        let buffer_manager = db.buffer_manager();
+        let lock_table = db.lock_table();
+        let (done_tx, done_rx) = mpsc::channel();
+        let index_name_thread = index_name.clone();
+        let leaf_layout_thread = leaf_layout.clone();
+
+        let handle = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(
+                file_manager,
+                log_manager,
+                buffer_manager,
+                lock_table,
+            ));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &index_name_thread,
+                leaf_layout_thread,
+                TEST_INDEXED_TABLE_ID,
+                Arc::new(SplitGate::new()),
+            )
+            .unwrap();
+            idx.insert(&Constant::Int(40), &RID::new(9, 40));
+            txn.commit().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("disjoint insert should not block on non-overlapping range lock");
+        handle.join().unwrap();
+        holder_tx.commit().unwrap();
+
+        let verify_tx = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            leaf_layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::new(SplitGate::new()),
+        )
+        .unwrap();
+        verify_idx.before_first(&Constant::Int(40));
+        assert!(verify_idx.next());
+        assert_eq!(verify_idx.get_data_rid(), RID::new(9, 40));
+        verify_tx.commit().unwrap();
     }
 }
 

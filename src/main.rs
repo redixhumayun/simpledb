@@ -19,12 +19,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock, RwLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
     },
     time::{Duration, Instant},
 };
 pub mod test_utils;
 pub use btree::BTreeIndex;
+pub use btree::SplitGate;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
     QueryData,
@@ -3569,7 +3570,11 @@ impl UpdatePlanner for IndexUpdatePlanner {
         let indexes = self
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
-        let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let plan = TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        );
         let schema = plan.schema();
         let field_map: std::collections::HashMap<&str, Constant> = data
             .fields
@@ -3589,6 +3594,20 @@ impl UpdatePlanner for IndexUpdatePlanner {
                 })
             })
             .collect();
+        let mut lock_requests = vec![OrderedLockRequest::Table {
+            table_id: plan.table_id(),
+            mode: TableLockMode::IX,
+        }];
+        for (field, value) in data.fields.iter().zip(data.values.iter()) {
+            if let Some(ii) = indexes.get(field) {
+                lock_requests.push(OrderedLockRequest::IndexKey {
+                    index_id: ii.index_lock_table_id(),
+                    key: value.clone(),
+                    mode: IndexLockMode::X,
+                });
+            }
+        }
+        txn.lock_in_order(lock_requests)?;
         let mut scan = plan.open();
         scan.insert_values(&values)?;
         let rid = scan.get_rid()?;
@@ -3606,15 +3625,27 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: DeleteData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
+        let predicate = data.predicate.clone();
         let indexes = self
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
-        let plan = Arc::new(TablePlan::new(
+        let table_plan = TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
+        );
+        let mut lock_requests = vec![OrderedLockRequest::Table {
+            table_id: table_plan.table_id(),
+            mode: TableLockMode::IX,
+        }];
+        lock_requests.extend(predicate_lock_requests(
+            &indexes,
+            &predicate,
+            IndexLockMode::X,
         ));
-        let plan = SelectPlan::new(plan, data.predicate);
+        txn.lock_in_order(lock_requests)?;
+        let plan = Arc::new(table_plan);
+        let plan = SelectPlan::new(plan, predicate);
         let mut scan = plan.open();
         let mut rows_deleted = 0;
 
@@ -3636,15 +3667,27 @@ impl UpdatePlanner for IndexUpdatePlanner {
         data: ModifyData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
+        let predicate = data.predicate.clone();
         let indexes = self
             .metadata_manager
             .get_index_info(&data.table_name, Arc::clone(&txn));
-        let plan = Arc::new(TablePlan::new(
+        let table_plan = TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
+        );
+        let mut lock_requests = vec![OrderedLockRequest::Table {
+            table_id: table_plan.table_id(),
+            mode: TableLockMode::IX,
+        }];
+        lock_requests.extend(predicate_lock_requests(
+            &indexes,
+            &predicate,
+            IndexLockMode::X,
         ));
-        let plan = SelectPlan::new(plan, data.predicate);
+        txn.lock_in_order(lock_requests)?;
+        let plan = Arc::new(table_plan);
+        let plan = SelectPlan::new(plan, predicate);
         let mut scan = plan.open();
         let mut update_count = 0;
 
@@ -3982,15 +4025,12 @@ impl TablePlanner {
     /// TODO: Fix this to use the most selective index and to use more than one index
     fn make_index_select_plan(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
         for field in self.indexes.keys() {
-            match self.predicate.equates_with_constant(field) {
-                Some(value) => {
-                    return Arc::new(IndexSelectPlan::new(
-                        plan,
-                        self.indexes.get(field).unwrap().clone(),
-                        value,
-                    ));
-                }
-                None => continue,
+            if let Some(bounds) = self.predicate.bounded_index_search_bounds(field) {
+                return Arc::new(IndexSelectPlan::new(
+                    plan,
+                    self.indexes.get(field).unwrap().clone(),
+                    bounds,
+                ));
             }
         }
         plan
@@ -4801,12 +4841,12 @@ impl Plan for ProjectPlan {
 pub struct IndexSelectPlan {
     plan: Arc<dyn Plan>,
     ii: IndexInfo,
-    value: Constant,
+    bounds: IndexSearchBounds,
 }
 
 impl IndexSelectPlan {
-    pub fn new(plan: Arc<dyn Plan>, ii: IndexInfo, value: Constant) -> Self {
-        Self { plan, ii, value }
+    fn new(plan: Arc<dyn Plan>, ii: IndexInfo, bounds: IndexSearchBounds) -> Self {
+        Self { plan, ii, bounds }
     }
 }
 
@@ -4819,7 +4859,7 @@ impl Plan for IndexSelectPlan {
         Box::new(IndexSelectScan::new(
             scan,
             self.ii.open(),
-            self.value.clone(),
+            self.bounds.clone(),
         ))
     }
 
@@ -4843,7 +4883,7 @@ impl Plan for IndexSelectPlan {
         let prefix = "  ".repeat(indent);
         println!("{prefix}╭─ IndexSelectPlan");
         println!("{}├─ Index: {}", prefix, self.ii.index_name);
-        println!("{}├─ Search Value: {:?}", prefix, self.value);
+        println!("{}├─ Search Bounds: {:?}", prefix, self.bounds);
         println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{prefix}├─ Child Plan:");
@@ -4932,6 +4972,10 @@ impl TablePlan {
             stat_info,
             table_id,
         }
+    }
+
+    fn table_id(&self) -> u32 {
+        self.table_id
     }
 }
 
@@ -6077,15 +6121,19 @@ where
 {
     scan: TableScan,
     index: I,
-    value: Constant,
+    bounds: IndexSearchBounds,
 }
 
 impl<I> IndexSelectScan<I>
 where
     I: Index,
 {
-    pub fn new(scan: TableScan, index: I, value: Constant) -> Self {
-        Self { scan, index, value }
+    fn new(scan: TableScan, index: I, bounds: IndexSearchBounds) -> Self {
+        Self {
+            scan,
+            index,
+            bounds,
+        }
     }
 }
 
@@ -6111,7 +6159,20 @@ where
     I: Index,
 {
     fn before_first(&mut self) -> SimpleDBResult<()> {
-        self.index.before_first(&self.value);
+        self.scan
+            .txn
+            .lock_in_order(vec![OrderedLockRequest::Table {
+                table_id: self.scan.table_id,
+                mode: TableLockMode::IS,
+            }])?;
+        match &self.bounds {
+            IndexSearchBounds::Key(value) => {
+                self.index.before_first(value);
+            }
+            IndexSearchBounds::Range { low, high } => {
+                self.index.before_range(low, high);
+            }
+        }
         Ok(())
     }
 
@@ -6171,8 +6232,8 @@ mod index_select_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        test_utils::generate_random_number, Constant, Index, IndexInfo, IndexSelectScan, Layout,
-        Scan, Schema, SimpleDB, StatInfo, TableScan,
+        test_utils::generate_random_number, Constant, Index, IndexInfo, IndexSearchBounds,
+        IndexSelectScan, Layout, Scan, Schema, SimpleDB, StatInfo, TableScan,
     };
 
     #[test]
@@ -6236,7 +6297,8 @@ mod index_select_scan_tests {
             let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
             let value = Constant::Int(10);
             let index = index_info.open();
-            let mut index_select_scan = IndexSelectScan::new(scan, index, value);
+            let mut index_select_scan =
+                IndexSelectScan::new(scan, index, IndexSearchBounds::Key(value));
             index_select_scan.before_first().unwrap();
             while let Some(Ok(())) = index_select_scan.next() {
                 assert_eq!(index_select_scan.get_int("A").unwrap(), 10);
@@ -6420,6 +6482,12 @@ pub struct Predicate {
     root: PredicateNode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IndexSearchBounds {
+    Key(Constant),
+    Range { low: Constant, high: Constant },
+}
+
 #[derive(Clone, Debug)]
 enum PredicateNode {
     Empty,
@@ -6582,6 +6650,125 @@ impl Predicate {
     /// - Non-equality comparisons and equalities with constants are ignored.
     fn equates_with_field(&self, field_name: &str) -> Option<String> {
         Predicate::evaluate_equates_with_field(&self.root, field_name)
+    }
+
+    fn bounded_index_search_bounds(&self, field_name: &str) -> Option<IndexSearchBounds> {
+        #[derive(Clone)]
+        struct RangeState {
+            lower: Option<(Constant, bool)>,
+            upper: Option<(Constant, bool)>,
+            equality: Option<Constant>,
+        }
+
+        impl RangeState {
+            fn merge_lower(&mut self, value: Constant, inclusive: bool) {
+                match &self.lower {
+                    Some((existing, existing_inclusive)) => {
+                        if value > *existing
+                            || (value == *existing && !inclusive && *existing_inclusive)
+                        {
+                            self.lower = Some((value, inclusive));
+                        }
+                    }
+                    None => self.lower = Some((value, inclusive)),
+                }
+            }
+
+            fn merge_upper(&mut self, value: Constant, inclusive: bool) {
+                match &self.upper {
+                    Some((existing, existing_inclusive)) => {
+                        if value < *existing
+                            || (value == *existing && !inclusive && *existing_inclusive)
+                        {
+                            self.upper = Some((value, inclusive));
+                        }
+                    }
+                    None => self.upper = Some((value, inclusive)),
+                }
+            }
+
+            fn apply(&mut self, constraint: TermFieldConstantConstraint) -> Option<()> {
+                match constraint {
+                    TermFieldConstantConstraint::Equal(value) => {
+                        if let Some(existing) = &self.equality {
+                            if existing != &value {
+                                return None;
+                            }
+                        }
+                        self.equality = Some(value);
+                    }
+                    TermFieldConstantConstraint::Lower { value, inclusive } => {
+                        self.merge_lower(value, inclusive);
+                    }
+                    TermFieldConstantConstraint::Upper { value, inclusive } => {
+                        self.merge_upper(value, inclusive);
+                    }
+                }
+                Some(())
+            }
+
+            fn finalize(self) -> Option<IndexSearchBounds> {
+                if let Some(value) = self.equality {
+                    if let Some((lower, inclusive)) = &self.lower {
+                        if value < *lower || (value == *lower && !inclusive) {
+                            return None;
+                        }
+                    }
+                    if let Some((upper, inclusive)) = &self.upper {
+                        if value > *upper || (value == *upper && !inclusive) {
+                            return None;
+                        }
+                    }
+                    return Some(IndexSearchBounds::Key(value));
+                }
+
+                let (low, low_inclusive) = self.lower?;
+                let (high, high_inclusive) = self.upper?;
+                let normalized_low = if low_inclusive { low } else { low.successor()? };
+                let normalized_high = if high_inclusive {
+                    high.successor()?
+                } else {
+                    high
+                };
+                if normalized_low >= normalized_high {
+                    return None;
+                }
+                Some(IndexSearchBounds::Range {
+                    low: normalized_low,
+                    high: normalized_high,
+                })
+            }
+        }
+
+        fn visit(node: &PredicateNode, field_name: &str, state: &mut RangeState) -> Option<()> {
+            match node {
+                PredicateNode::Empty => Some(()),
+                PredicateNode::Term(term) => {
+                    if let Some(constraint) = term.field_constant_constraint(field_name) {
+                        state.apply(constraint)?;
+                    }
+                    Some(())
+                }
+                PredicateNode::Composite {
+                    op: BooleanConnective::And,
+                    operands,
+                } => {
+                    for operand in operands {
+                        visit(operand, field_name, state)?;
+                    }
+                    Some(())
+                }
+                PredicateNode::Composite { .. } => None,
+            }
+        }
+
+        let mut state = RangeState {
+            lower: None,
+            upper: None,
+            equality: None,
+        };
+        visit(&self.root, field_name, &mut state)?;
+        state.finalize()
     }
 
     /// Helper used by [equates_with_field] to recursively search the predicate tree
@@ -6776,6 +6963,13 @@ enum ComparisonOp {
     NotEqual,
 }
 
+#[derive(Clone, Debug)]
+enum TermFieldConstantConstraint {
+    Equal(Constant),
+    Lower { value: Constant, inclusive: bool },
+    Upper { value: Constant, inclusive: bool },
+}
+
 impl Term {
     pub fn new(lhs: Expression, rhs: Expression) -> Self {
         Self {
@@ -6870,6 +7064,62 @@ impl Term {
             return self.lhs.get_field_name().cloned();
         }
         None
+    }
+
+    fn field_constant_constraint(&self, field_name: &str) -> Option<TermFieldConstantConstraint> {
+        if self.lhs.is_field_name()
+            && (self.lhs.get_field_name().unwrap() == field_name)
+            && !self.rhs.is_field_name()
+        {
+            return Self::constraint_from_field_side(
+                self.rhs.get_constant_value()?.clone(),
+                &self.comparison_op,
+                true,
+            );
+        }
+        if self.rhs.is_field_name()
+            && (self.rhs.get_field_name().unwrap() == field_name)
+            && !self.lhs.is_field_name()
+        {
+            return Self::constraint_from_field_side(
+                self.lhs.get_constant_value()?.clone(),
+                &self.comparison_op,
+                false,
+            );
+        }
+        None
+    }
+
+    fn constraint_from_field_side(
+        constant: Constant,
+        op: &ComparisonOp,
+        field_on_lhs: bool,
+    ) -> Option<TermFieldConstantConstraint> {
+        use ComparisonOp::*;
+        match (field_on_lhs, op) {
+            (_, Equal) => Some(TermFieldConstantConstraint::Equal(constant)),
+            (true, GreaterThan) | (false, LessThan) => Some(TermFieldConstantConstraint::Lower {
+                value: constant,
+                inclusive: false,
+            }),
+            (true, GreaterThanOrEqual) | (false, LessThanOrEqual) => {
+                Some(TermFieldConstantConstraint::Lower {
+                    value: constant,
+                    inclusive: true,
+                })
+            }
+            (true, LessThan) | (false, GreaterThan) => Some(TermFieldConstantConstraint::Upper {
+                value: constant,
+                inclusive: false,
+            }),
+            (true, LessThanOrEqual) | (false, GreaterThanOrEqual) => {
+                Some(TermFieldConstantConstraint::Upper {
+                    value: constant,
+                    inclusive: true,
+                })
+            }
+            (_, NotEqual) => None,
+        }
     }
 
     /// Check that both sides of this expression apply to the provided [Schema]
@@ -7379,6 +7629,46 @@ pub struct IndexInfo {
     table_schema: Schema,
     index_layout: Layout,
     stat_info: StatInfo,
+    split_gate: Arc<btree::SplitGate>,
+}
+
+fn shared_index_split_gate(index_name: &str) -> Arc<btree::SplitGate> {
+    static SPLIT_GATES: OnceLock<RwLock<HashMap<String, Weak<btree::SplitGate>>>> = OnceLock::new();
+    let registry = SPLIT_GATES.get_or_init(|| RwLock::new(HashMap::new()));
+
+    if let Some(existing) = registry
+        .read()
+        .unwrap()
+        .get(index_name)
+        .and_then(Weak::upgrade)
+    {
+        return existing;
+    }
+
+    let mut guard = registry.write().unwrap();
+    if let Some(existing) = guard.get(index_name).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    let split_gate = Arc::new(btree::SplitGate::new());
+    guard.insert(index_name.to_string(), Arc::downgrade(&split_gate));
+    split_gate
+}
+
+#[cfg(test)]
+mod split_gate_registry_tests {
+    use super::shared_index_split_gate;
+    use std::sync::Arc;
+
+    #[test]
+    fn shared_index_split_gate_reuses_same_arc_for_same_index() {
+        let gate1 = shared_index_split_gate("shared_gate_test_idx");
+        let gate2 = shared_index_split_gate("shared_gate_test_idx");
+        let gate3 = shared_index_split_gate("shared_gate_test_idx_other");
+
+        assert!(Arc::ptr_eq(&gate1, &gate2));
+        assert!(!Arc::ptr_eq(&gate1, &gate3));
+    }
 }
 
 impl std::fmt::Display for IndexInfo {
@@ -7425,20 +7715,17 @@ impl IndexInfo {
             table_schema,
             index_layout,
             stat_info,
+            split_gate: shared_index_split_gate(index_name),
         }
     }
 
     pub fn open(&self) -> impl Index {
-        // HashIndex::new(
-        //     Arc::clone(&self.txn),
-        //     &self.index_name,
-        //     self.index_layout.clone(),
-        // )
         BTreeIndex::new(
             Arc::clone(&self.txn),
             &self.index_name,
             self.index_layout.clone(),
             self.indexed_table_id,
+            Arc::clone(&self.split_gate),
         )
         .unwrap()
     }
@@ -7485,6 +7772,38 @@ impl IndexInfo {
     pub fn indexed_table_id(&self) -> u32 {
         self.indexed_table_id
     }
+
+    pub fn index_lock_table_id(&self) -> u32 {
+        btree::BTreeIndex::index_lock_table_id_for(self.indexed_table_id)
+    }
+}
+
+fn predicate_lock_requests(
+    indexes: &HashMap<String, IndexInfo>,
+    predicate: &Predicate,
+    mode: IndexLockMode,
+) -> Vec<OrderedLockRequest> {
+    indexes
+        .iter()
+        .filter_map(
+            |(field, ii)| match predicate.bounded_index_search_bounds(field) {
+                Some(IndexSearchBounds::Key(key)) => Some(OrderedLockRequest::IndexKey {
+                    index_id: ii.index_lock_table_id(),
+                    key,
+                    mode,
+                }),
+                Some(IndexSearchBounds::Range { low, high }) => {
+                    Some(OrderedLockRequest::IndexRange {
+                        index_id: ii.index_lock_table_id(),
+                        low,
+                        high,
+                        mode,
+                    })
+                }
+                None => None,
+            },
+        )
+        .collect()
 }
 
 pub struct HashIndex {
@@ -7529,6 +7848,10 @@ impl Index for HashIndex {
         )
         .unwrap();
         self.table_scan = Some(table_scan);
+    }
+
+    fn before_range(&mut self, _low: &Constant, _high: &Constant) {
+        unimplemented!("range scans are not supported for HashIndex")
     }
 
     fn next(&mut self) -> bool {
@@ -7580,6 +7903,9 @@ impl Index for HashIndex {
 pub trait Index {
     /// Position the index before the first record having the specified search key
     fn before_first(&mut self, search_key: &Constant);
+
+    /// Position the index before the first record with `low <= key < high`.
+    fn before_range(&mut self, low: &Constant, high: &Constant);
 
     /// Move to the next record having the search key specified in before_first
     /// Returns false if there are no more index records with that search key
@@ -8529,6 +8855,17 @@ impl Constant {
                 Constant::String(s) => STR_LEN_SIZE + s.len(),
             }
     }
+
+    fn successor(&self) -> Option<Constant> {
+        match self {
+            Constant::Int(value) => value.checked_add(1).map(Constant::Int),
+            Constant::String(value) => {
+                let mut next = value.clone();
+                next.push('\0');
+                Some(Constant::String(next))
+            }
+        }
+    }
 }
 
 impl TryInto<Vec<u8>> for Constant {
@@ -9391,12 +9728,86 @@ impl Transaction {
         self.concurrency_manager.lock_index_key_x(index_id, key)
     }
 
-    pub fn lock_index_range_s(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
-        self.concurrency_manager.lock_index_range_s(index_id, low, high)
+    pub fn lock_index_range_s(
+        &self,
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    ) -> SimpleDBResult<()> {
+        self.concurrency_manager
+            .lock_index_range_s(index_id, low, high)
     }
 
-    pub fn lock_index_range_x(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
-        self.concurrency_manager.lock_index_range_x(index_id, low, high)
+    pub fn lock_index_range_x(
+        &self,
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    ) -> SimpleDBResult<()> {
+        self.concurrency_manager
+            .lock_index_range_x(index_id, low, high)
+    }
+
+    fn lock_in_order(&self, mut requests: Vec<OrderedLockRequest>) -> SimpleDBResult<()> {
+        fn request_sort_key(
+            request: &OrderedLockRequest,
+        ) -> (u8, u32, u8, Option<&Constant>, Option<&Constant>, u32, u32) {
+            match request {
+                OrderedLockRequest::Table { table_id, .. } => (0, *table_id, 0, None, None, 0, 0),
+                OrderedLockRequest::IndexRange {
+                    index_id,
+                    low,
+                    high,
+                    ..
+                } => (1, *index_id, 0, Some(low), Some(high), 0, 0),
+                OrderedLockRequest::IndexKey { index_id, key, .. } => {
+                    (1, *index_id, 1, Some(key), None, 0, 0)
+                }
+                OrderedLockRequest::Row { table_id, rid, .. } => (
+                    2,
+                    *table_id,
+                    0,
+                    None,
+                    None,
+                    rid.block_num as u32,
+                    rid.slot as u32,
+                ),
+            }
+        }
+
+        requests.sort_by(|lhs, rhs| request_sort_key(lhs).cmp(&request_sort_key(rhs)));
+        for request in requests {
+            match request {
+                OrderedLockRequest::Table { table_id, mode } => {
+                    self.concurrency_manager.acquire_table(table_id, mode)?;
+                }
+                OrderedLockRequest::IndexRange {
+                    index_id,
+                    low,
+                    high,
+                    mode,
+                } => {
+                    self.concurrency_manager
+                        .acquire_index_range(index_id, low, high, mode)?;
+                }
+                OrderedLockRequest::IndexKey {
+                    index_id,
+                    key,
+                    mode,
+                } => {
+                    self.concurrency_manager
+                        .acquire_index_key(index_id, key, mode)?;
+                }
+                OrderedLockRequest::Row {
+                    table_id,
+                    rid,
+                    mode,
+                } => {
+                    self.concurrency_manager.acquire_row(table_id, rid, mode)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pin this [`BlockId`] to be used in this transaction
@@ -10379,7 +10790,10 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_same_key_ss_compatible() {
         let lt = Arc::new(LockTable::new(1_000));
-        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        let t = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(25),
+        };
         lt.acquire(1, t.clone(), LockMode::S).unwrap();
         lt.acquire(2, t.clone(), LockMode::S).unwrap();
         lt.release(1, &t).unwrap();
@@ -10389,7 +10803,10 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_same_key_sx_conflict() {
         let lt = Arc::new(LockTable::new(1));
-        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        let t = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(25),
+        };
         lt.acquire(1, t.clone(), LockMode::X).unwrap();
         assert!(lt.acquire(2, t.clone(), LockMode::S).is_err());
         lt.release(1, &t).unwrap();
@@ -10398,7 +10815,10 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_same_key_xx_conflict() {
         let lt = Arc::new(LockTable::new(1));
-        let t = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        let t = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(25),
+        };
         lt.acquire(1, t.clone(), LockMode::X).unwrap();
         assert!(lt.acquire(2, t.clone(), LockMode::X).is_err());
         lt.release(1, &t).unwrap();
@@ -10407,8 +10827,14 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_different_keys_no_conflict() {
         let lt = Arc::new(LockTable::new(1_000));
-        let t1 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(10) };
-        let t2 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(99) };
+        let t1 = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(10),
+        };
+        let t2 = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(99),
+        };
         lt.acquire(1, t1.clone(), LockMode::X).unwrap();
         // different key — should succeed even with S vs X
         lt.acquire(2, t2.clone(), LockMode::X).unwrap();
@@ -10482,7 +10908,10 @@ mod lock_table_tests {
             low: crate::Constant::Int(20),
             high: crate::Constant::Int(30),
         };
-        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
+        let key = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(25),
+        };
         lt.acquire(1, range.clone(), LockMode::S).unwrap();
         // key 25 is inside [20,30) → X on key conflicts with S on range
         assert!(lt.acquire(2, key.clone(), LockMode::X).is_err());
@@ -10498,7 +10927,10 @@ mod lock_table_tests {
             high: crate::Constant::Int(30),
         };
         // key 40 is outside [20,30)
-        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(40) };
+        let key = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(40),
+        };
         lt.acquire(1, range.clone(), LockMode::X).unwrap();
         lt.acquire(2, key.clone(), LockMode::S).unwrap();
         lt.release(1, &range).unwrap();
@@ -10514,7 +10946,10 @@ mod lock_table_tests {
             low: crate::Constant::Int(20),
             high: crate::Constant::Int(30),
         };
-        let key = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(30) };
+        let key = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(30),
+        };
         lt.acquire(1, range.clone(), LockMode::X).unwrap();
         lt.acquire(2, key.clone(), LockMode::X).unwrap();
         lt.release(1, &range).unwrap();
@@ -10524,8 +10959,14 @@ mod lock_table_tests {
     #[test]
     fn test_index_different_index_ids_no_conflict() {
         let lt = Arc::new(LockTable::new(1_000));
-        let t1 = LockTarget::IndexKey { index_id: 1, key: crate::Constant::Int(25) };
-        let t2 = LockTarget::IndexKey { index_id: 2, key: crate::Constant::Int(25) };
+        let t1 = LockTarget::IndexKey {
+            index_id: 1,
+            key: crate::Constant::Int(25),
+        };
+        let t2 = LockTarget::IndexKey {
+            index_id: 2,
+            key: crate::Constant::Int(25),
+        };
         lt.acquire(1, t1.clone(), LockMode::X).unwrap();
         // Different index_id: no conflict even with same key value
         lt.acquire(2, t2.clone(), LockMode::X).unwrap();
@@ -10692,10 +11133,41 @@ enum IndexLockMode {
     X,
 }
 
+#[derive(Clone, Debug)]
+enum OrderedLockRequest {
+    Table {
+        table_id: u32,
+        mode: TableLockMode,
+    },
+    IndexRange {
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+        mode: IndexLockMode,
+    },
+    IndexKey {
+        index_id: u32,
+        key: Constant,
+        mode: IndexLockMode,
+    },
+    Row {
+        table_id: u32,
+        rid: RID,
+        mode: RowLockMode,
+    },
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 enum IndexLockKey {
-    Key { index_id: u32, key: Constant },
-    Range { index_id: u32, low: Constant, high: Constant },
+    Key {
+        index_id: u32,
+        key: Constant,
+    },
+    Range {
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    },
 }
 
 impl From<TableLockMode> for LockMode {
@@ -10801,9 +11273,20 @@ impl ConcurrencyManager {
         self.acquire_row(table_id, rid, RowLockMode::X)
     }
 
-    fn acquire_index_key(&self, index_id: u32, key: Constant, mode: IndexLockMode) -> SimpleDBResult<()> {
-        self.lock_table
-            .acquire(self.tx_id, LockTarget::IndexKey { index_id, key: key.clone() }, mode.into())?;
+    fn acquire_index_key(
+        &self,
+        index_id: u32,
+        key: Constant,
+        mode: IndexLockMode,
+    ) -> SimpleDBResult<()> {
+        self.lock_table.acquire(
+            self.tx_id,
+            LockTarget::IndexKey {
+                index_id,
+                key: key.clone(),
+            },
+            mode.into(),
+        )?;
         self.index_locks
             .borrow_mut()
             .insert(IndexLockKey::Key { index_id, key }, mode);
@@ -10819,12 +11302,21 @@ impl ConcurrencyManager {
     ) -> SimpleDBResult<()> {
         self.lock_table.acquire(
             self.tx_id,
-            LockTarget::IndexRange { index_id, low: low.clone(), high: high.clone() },
+            LockTarget::IndexRange {
+                index_id,
+                low: low.clone(),
+                high: high.clone(),
+            },
             mode.into(),
         )?;
-        self.index_locks
-            .borrow_mut()
-            .insert(IndexLockKey::Range { index_id, low, high }, mode);
+        self.index_locks.borrow_mut().insert(
+            IndexLockKey::Range {
+                index_id,
+                low,
+                high,
+            },
+            mode,
+        );
         Ok(())
     }
 
@@ -10836,11 +11328,21 @@ impl ConcurrencyManager {
         self.acquire_index_key(index_id, key, IndexLockMode::X)
     }
 
-    fn lock_index_range_s(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+    fn lock_index_range_s(
+        &self,
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    ) -> SimpleDBResult<()> {
         self.acquire_index_range(index_id, low, high, IndexLockMode::S)
     }
 
-    fn lock_index_range_x(&self, index_id: u32, low: Constant, high: Constant) -> SimpleDBResult<()> {
+    fn lock_index_range_x(
+        &self,
+        index_id: u32,
+        low: Constant,
+        high: Constant,
+    ) -> SimpleDBResult<()> {
         self.acquire_index_range(index_id, low, high, IndexLockMode::X)
     }
 
@@ -10872,7 +11374,11 @@ impl ConcurrencyManager {
                     index_id: *index_id,
                     key: key.clone(),
                 },
-                IndexLockKey::Range { index_id, low, high } => LockTarget::IndexRange {
+                IndexLockKey::Range {
+                    index_id,
+                    low,
+                    high,
+                } => LockTarget::IndexRange {
                     index_id: *index_id,
                     low: low.clone(),
                     high: high.clone(),
@@ -11087,6 +11593,8 @@ enum LogRecord {
         new_root_block: u32,
         old_tree_height: u16,
         new_tree_height: u16,
+        old_structure_version: u64,
+        new_structure_version: u64,
     },
     /// Free-list pop: allocating a block from the free list
     BTreeFreeListPop {
@@ -11278,9 +11786,11 @@ impl Display for LogRecord {
                 new_root_block,
                 old_tree_height,
                 new_tree_height,
+                old_structure_version,
+                new_structure_version,
             } => write!(
                 f,
-                "BTreeRootUpdate(txnum: {txnum}, meta: {meta_block_id:?}, old_root: {old_root_block}, new_root: {new_root_block}, old_height: {old_tree_height}, new_height: {new_tree_height})"
+                "BTreeRootUpdate(txnum: {txnum}, meta: {meta_block_id:?}, old_root: {old_root_block}, new_root: {new_root_block}, old_height: {old_tree_height}, new_height: {new_tree_height}, old_struct_ver: {old_structure_version}, new_struct_ver: {new_structure_version})"
             ),
             LogRecord::BTreeFreeListPop {
                 txnum,
@@ -11347,6 +11857,10 @@ impl Display for LogRecord {
 impl From<&LogRecord> for Vec<u8> {
     fn from(val: &LogRecord) -> Self {
         fn push_i32(buf: &mut Vec<u8>, value: i32) {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+
+        fn push_u64(buf: &mut Vec<u8>, value: u64) {
             buf.extend_from_slice(&value.to_be_bytes());
         }
 
@@ -11598,6 +12112,8 @@ impl From<&LogRecord> for Vec<u8> {
                 new_root_block,
                 old_tree_height,
                 new_tree_height,
+                old_structure_version,
+                new_structure_version,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &meta_block_id.filename);
@@ -11606,6 +12122,8 @@ impl From<&LogRecord> for Vec<u8> {
                 push_i32(&mut buf, *new_root_block as i32);
                 push_i32(&mut buf, *old_tree_height as i32);
                 push_i32(&mut buf, *new_tree_height as i32);
+                push_u64(&mut buf, *old_structure_version);
+                push_u64(&mut buf, *new_structure_version);
             }
             LogRecord::BTreeFreeListPop {
                 txnum,
@@ -11715,6 +12233,16 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 return Err("negative value in log record".into());
             }
             Ok(val as usize)
+        }
+
+        fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, Box<dyn Error>> {
+            if *pos + 8 > bytes.len() {
+                return Err("truncated u64 in log record".into());
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[*pos..*pos + 8]);
+            *pos += 8;
+            Ok(u64::from_be_bytes(buf))
         }
 
         fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, Box<dyn Error>> {
@@ -11957,6 +12485,8 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 new_root_block: read_usize(&value, &mut pos)? as u32,
                 old_tree_height: read_usize(&value, &mut pos)? as u16,
                 new_tree_height: read_usize(&value, &mut pos)? as u16,
+                old_structure_version: read_u64(&value, &mut pos)?,
+                new_structure_version: read_u64(&value, &mut pos)?,
             }),
             15 => Ok(LogRecord::BTreeFreeListPop {
                 txnum: read_usize(&value, &mut pos)?,
@@ -12051,6 +12581,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
 
 impl LogRecord {
     const INT_BYTES: usize = 4;
+    const U64_BYTES: usize = 8;
     // Size constants for different components
     const DISCRIMINANT_SIZE: usize = Self::INT_BYTES;
     const TXNUM_SIZE: usize = Self::INT_BYTES;
@@ -12279,6 +12810,8 @@ impl LogRecord {
                     + Self::INT_BYTES // new_root_block
                     + Self::INT_BYTES // old_tree_height
                     + Self::INT_BYTES // new_tree_height
+                    + Self::U64_BYTES // old_structure_version
+                    + Self::U64_BYTES // new_structure_version
             }
             LogRecord::BTreeFreeListPop {
                 meta_block_id,
@@ -12713,6 +13246,7 @@ impl LogRecord {
                     old_root_block,
                     new_root_block,
                     old_tree_height,
+                    old_structure_version,
                     ..
                 } = self
                 else {
@@ -12731,6 +13265,7 @@ impl LogRecord {
                 let old_free_head = meta_view.first_free_block();
                 meta_view.set_root_block(*old_root_block);
                 meta_view.set_tree_height(*old_tree_height);
+                meta_view.set_structure_version(*old_structure_version);
 
                 // If root moved to a newly allocated page, deallocate it by pushing to free-list.
                 if old_root_block != new_root_block {

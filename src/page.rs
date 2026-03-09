@@ -576,7 +576,6 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         self.free_upper().saturating_sub(self.free_lower())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[8..10].try_into().unwrap())
     }
@@ -585,7 +584,6 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[10..12].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn right_sibling(&self) -> u32 {
         u32::from_le_bytes(self.bytes[12..16].try_into().unwrap())
     }
@@ -806,7 +804,6 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
@@ -1571,6 +1568,10 @@ impl<'a> BTreeMetaHeaderRef<'a> {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
+    pub fn structure_version(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[12..20].try_into().unwrap())
+    }
+
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
     }
@@ -1607,6 +1608,10 @@ impl<'a> BTreeMetaHeaderMut<'a> {
 
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
         self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn set_structure_version(&mut self, v: u64) {
+        self.write(12, v.to_le_bytes());
     }
 
     pub fn init_meta(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
@@ -1688,6 +1693,10 @@ impl<'a> BTreeMetaPage<'a> {
         self.header.first_free_block()
     }
 
+    pub fn structure_version(&self) -> u64 {
+        self.header.structure_version()
+    }
+
     #[allow(dead_code)]
     pub fn lsn(&self) -> u64 {
         self.header.lsn()
@@ -1723,6 +1732,15 @@ impl<'a> BTreeMetaPageMut<'a> {
 
     pub(super) fn set_first_free_block(&mut self, first_free: u32) {
         self.header.write(8, first_free.to_le_bytes());
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn structure_version(&self) -> u64 {
+        self.header.as_ref().structure_version()
+    }
+
+    pub(super) fn set_structure_version(&mut self, v: u64) {
+        self.header.set_structure_version(v);
     }
 
     #[allow(dead_code)]
@@ -1781,6 +1799,10 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().first_free_block()
     }
 
+    pub fn structure_version(&self) -> u64 {
+        self.page().structure_version()
+    }
+
     #[allow(dead_code)]
     pub fn lsn(&self) -> u64 {
         self.page().lsn()
@@ -1817,6 +1839,15 @@ impl<'a> BTreeMetaPageViewMut<'a> {
 
     pub(crate) fn set_first_free_block(&mut self, first_free: u32) {
         self.page_mut().set_first_free_block(first_free);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn structure_version(&mut self) -> u64 {
+        self.page_mut().structure_version()
+    }
+
+    pub(crate) fn set_structure_version(&mut self, v: u64) {
+        self.page_mut().set_structure_version(v);
     }
 
     #[allow(dead_code)]
@@ -5933,6 +5964,48 @@ impl<'a> BTreeLeafPage<'a> {
         } else {
             Some(raw as usize)
         }
+    }
+}
+
+/// Returns true if inserting one more entry of `layout`'s max size would fit in this leaf page.
+#[allow(dead_code)]
+pub(crate) fn btree_leaf_would_fit(bytes: &[u8], layout: &Layout) -> bool {
+    match BTreeLeafPage::new(bytes) {
+        Ok(page) => !page.is_full(layout),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn btree_leaf_insert_requires_split(
+    bytes: &[u8],
+    layout: &Layout,
+    search_key: &Constant,
+) -> bool {
+    let Ok(page) = BTreeLeafPage::new(bytes) else {
+        return true;
+    };
+
+    if let Some(_overflow_block) = page.overflow_block() {
+        if page.slot_count() > 0 {
+            if let Some(first_entry) = page
+                .entry_bytes(0)
+                .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
+            {
+                if first_entry.key > *search_key {
+                    return true;
+                }
+            }
+        }
+    }
+
+    page.is_full(layout)
+}
+
+#[allow(dead_code)]
+pub(crate) fn btree_internal_would_fit(bytes: &[u8], layout: &Layout) -> bool {
+    match BTreeInternalPage::new(bytes) {
+        Ok(page) => !page.is_full(layout),
+        Err(_) => false,
     }
 }
 
