@@ -1001,7 +1001,10 @@ mod traversal {
         Range(RangeCursor),
     }
 
-    /// Find the child block pointer in an internal node page view for search_key.
+    /// Choose the child pointer to follow from one internal page.
+    ///
+    /// This does the internal-node search only; it does not pin or descend into the
+    /// child. If `search_key` is >= every separator, this returns the rightmost child.
     fn find_child_block_from_view(
         view: &crate::page::BTreeInternalPageView<'_>,
         search_key: &Constant,
@@ -1029,6 +1032,12 @@ mod traversal {
         }
     }
 
+    /// Position a read cursor on the leaf that should contain `search_key`.
+    ///
+    /// The starting leaf is already known. This may hop right through sibling leaves
+    /// while `search_key` is beyond the current page's high key. Sibling hops use
+    /// fast pins; if a sibling is not resident the function returns `NeedSlowPin`
+    /// so the caller can pin outside latch scope and restart from the root.
     fn try_find_initial_cursor(
         txn: &Arc<Transaction>,
         leaf_block: BlockId,
@@ -1127,8 +1136,11 @@ mod traversal {
     }
 
     impl ReadCursor {
-        /// Advance to the next index entry matching `search_key`, following overflow blocks
-        /// for duplicate keys. Returns `true` if positioned at a match, `false` when done.
+        /// Advance to the next live entry equal to `search_key`.
+        ///
+        /// This walks forward from the current slot and follows overflow pages for duplicate
+        /// keys when needed. Returns `true` when positioned on a matching entry and `false`
+        /// once the duplicate chain is exhausted.
         pub(super) fn next_matching(
             &mut self,
             txn: &Arc<Transaction>,
@@ -1183,7 +1195,7 @@ mod traversal {
             }
         }
 
-        /// Return the RID at the current cursor position.
+        /// Read the RID at the cursor's current slot.
         pub(super) fn get_data_rid(
             &self,
             txn: &Arc<Transaction>,
@@ -1197,6 +1209,9 @@ mod traversal {
     }
 
     impl RangeCursor {
+        /// Convert a point-positioned leaf cursor into a bounded range cursor.
+        ///
+        /// The lower bound position is reused; only the cursor semantics change.
         pub(super) fn from_read_cursor(
             cursor: ReadCursor,
             lower_bound: Constant,
@@ -1210,6 +1225,11 @@ mod traversal {
             }
         }
 
+        /// Advance to the next live entry within `[lower_bound, upper_bound)`.
+        ///
+        /// This may hop right through sibling leaves when the current page is entirely below
+        /// the lower bound or when the scan reaches the end of the page. Returns `false`
+        /// once the upper bound is reached or the sibling chain ends.
         pub(super) fn next_in_range(
             &mut self,
             txn: &Arc<Transaction>,
@@ -1262,6 +1282,7 @@ mod traversal {
             }
         }
 
+        /// Read the RID at the range cursor's current slot.
         pub(super) fn get_data_rid(
             &self,
             txn: &Arc<Transaction>,
@@ -1275,6 +1296,7 @@ mod traversal {
     }
 
     impl ScanCursor {
+        /// Advance whichever scan cursor variant is active.
         pub(super) fn next(
             &mut self,
             txn: &Arc<Transaction>,
@@ -1287,6 +1309,7 @@ mod traversal {
             }
         }
 
+        /// Read the RID at the active scan cursor position.
         pub(super) fn get_data_rid(
             &self,
             txn: &Arc<Transaction>,

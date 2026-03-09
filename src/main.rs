@@ -6025,8 +6025,8 @@ mod index_join_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Constant, Index, IndexInfo, IndexJoinScan, Layout, Scan, Schema, SimpleDB, StatInfo,
-        TableScan,
+        Constant, Index, IndexInfo, IndexJoinScan, Layout, Scan, Schema, SimpleDB, SplitGate,
+        StatInfo, TableScan,
     };
 
     #[test]
@@ -6053,6 +6053,7 @@ mod index_join_scan_tests {
             Arc::clone(&txn),
             schema2,
             StatInfo::new(0, 0),
+            Arc::new(SplitGate::new()),
         );
 
         // Insert data into both tables
@@ -6233,7 +6234,7 @@ mod index_select_scan_tests {
 
     use crate::{
         test_utils::generate_random_number, Constant, Index, IndexInfo, IndexSearchBounds,
-        IndexSelectScan, Layout, Scan, Schema, SimpleDB, StatInfo, TableScan,
+        IndexSelectScan, Layout, Scan, Schema, SimpleDB, SplitGate, StatInfo, TableScan,
     };
 
     #[test]
@@ -6254,6 +6255,7 @@ mod index_select_scan_tests {
             Arc::clone(&txn),
             schema,
             StatInfo::new(0, 0),
+            Arc::new(SplitGate::new()),
         );
         //  insertion block
         {
@@ -7527,6 +7529,7 @@ struct IndexManager {
     layout: Layout,
     table_manager: Arc<TableManager>,
     stat_manager: Arc<StatManager>,
+    split_gates: RwLock<HashMap<String, Weak<btree::SplitGate>>>,
 }
 
 impl IndexManager {
@@ -7554,7 +7557,29 @@ impl IndexManager {
             layout,
             table_manager,
             stat_manager,
+            split_gates: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn shared_split_gate(&self, index_name: &str) -> Arc<btree::SplitGate> {
+        if let Some(existing) = self
+            .split_gates
+            .read()
+            .unwrap()
+            .get(index_name)
+            .and_then(Weak::upgrade)
+        {
+            return existing;
+        }
+
+        let mut guard = self.split_gates.write().unwrap();
+        if let Some(existing) = guard.get(index_name).and_then(Weak::upgrade) {
+            return existing;
+        }
+
+        let split_gate = Arc::new(btree::SplitGate::new());
+        guard.insert(index_name.to_string(), Arc::downgrade(&split_gate));
+        split_gate
     }
 
     fn create_index(
@@ -7612,6 +7637,7 @@ impl IndexManager {
                     Arc::clone(&txn),
                     layout.schema,
                     stat_info,
+                    self.shared_split_gate(&index_name),
                 );
                 hash_map.insert(field_name, index_info);
             }
@@ -7632,39 +7658,18 @@ pub struct IndexInfo {
     split_gate: Arc<btree::SplitGate>,
 }
 
-fn shared_index_split_gate(index_name: &str) -> Arc<btree::SplitGate> {
-    static SPLIT_GATES: OnceLock<RwLock<HashMap<String, Weak<btree::SplitGate>>>> = OnceLock::new();
-    let registry = SPLIT_GATES.get_or_init(|| RwLock::new(HashMap::new()));
-
-    if let Some(existing) = registry
-        .read()
-        .unwrap()
-        .get(index_name)
-        .and_then(Weak::upgrade)
-    {
-        return existing;
-    }
-
-    let mut guard = registry.write().unwrap();
-    if let Some(existing) = guard.get(index_name).and_then(Weak::upgrade) {
-        return existing;
-    }
-
-    let split_gate = Arc::new(btree::SplitGate::new());
-    guard.insert(index_name.to_string(), Arc::downgrade(&split_gate));
-    split_gate
-}
-
 #[cfg(test)]
 mod split_gate_registry_tests {
-    use super::shared_index_split_gate;
+    use super::SimpleDB;
     use std::sync::Arc;
 
     #[test]
     fn shared_index_split_gate_reuses_same_arc_for_same_index() {
-        let gate1 = shared_index_split_gate("shared_gate_test_idx");
-        let gate2 = shared_index_split_gate("shared_gate_test_idx");
-        let gate3 = shared_index_split_gate("shared_gate_test_idx_other");
+        let (db, _dir) = SimpleDB::new_for_test(8, 5_000);
+        let manager = &db.metadata_manager.index_manager;
+        let gate1 = manager.shared_split_gate("shared_gate_test_idx");
+        let gate2 = manager.shared_split_gate("shared_gate_test_idx");
+        let gate3 = manager.shared_split_gate("shared_gate_test_idx_other");
 
         assert!(Arc::ptr_eq(&gate1, &gate2));
         assert!(!Arc::ptr_eq(&gate1, &gate3));
@@ -7692,6 +7697,7 @@ impl IndexInfo {
         txn: Arc<Transaction>,
         table_schema: Schema,
         stat_info: StatInfo,
+        split_gate: Arc<btree::SplitGate>,
     ) -> Self {
         //  Construct the schema for the index
         let mut schema = Schema::new();
@@ -7715,7 +7721,7 @@ impl IndexInfo {
             table_schema,
             index_layout,
             stat_info,
-            split_gate: shared_index_split_gate(index_name),
+            split_gate,
         }
     }
 
