@@ -3638,11 +3638,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
             table_id: table_plan.table_id(),
             mode: TableLockMode::IX,
         }];
-        lock_requests.extend(predicate_lock_requests(
-            &indexes,
-            &predicate,
-            IndexLockMode::X,
-        ));
+        lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
         let plan = Arc::new(table_plan);
         let plan = SelectPlan::new(plan, predicate);
@@ -3680,11 +3676,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
             table_id: table_plan.table_id(),
             mode: TableLockMode::IX,
         }];
-        lock_requests.extend(predicate_lock_requests(
-            &indexes,
-            &predicate,
-            IndexLockMode::X,
-        ));
+        lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
         let plan = Arc::new(table_plan);
         let plan = SelectPlan::new(plan, predicate);
@@ -6484,10 +6476,23 @@ pub struct Predicate {
     root: PredicateNode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum IndexBound {
+    NegInf,
+    Key(Constant),
+    PosInf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IndexSearchBounds {
     Key(Constant),
     Range { low: Constant, high: Constant },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IndexLockBounds {
+    Key(Constant),
+    Range { low: IndexBound, high: IndexBound },
 }
 
 #[derive(Clone, Debug)]
@@ -6508,6 +6513,85 @@ enum BooleanConnective {
 }
 
 impl Predicate {
+    /// Convert optional predicate endpoints into canonical half-open lock bounds.
+    ///
+    /// Unbounded sides become `NegInf`/`PosInf`, exclusive/inclusive edges are normalized,
+    /// and empty intervals are dropped.
+    fn normalize_index_range_bounds(
+        lower: Option<(Constant, bool)>,
+        upper: Option<(Constant, bool)>,
+    ) -> Option<(IndexBound, IndexBound)> {
+        let low = match lower {
+            None => IndexBound::NegInf,
+            Some((value, true)) => IndexBound::Key(value),
+            Some((value, false)) => IndexBound::Key(value.successor()?),
+        };
+        let high = match upper {
+            None => IndexBound::PosInf,
+            Some((value, false)) => IndexBound::Key(value),
+            Some((value, true)) => match value.successor() {
+                Some(next) => IndexBound::Key(next),
+                None => IndexBound::PosInf,
+            },
+        };
+        if low >= high {
+            return None;
+        }
+        Some((low, high))
+    }
+
+    /// Collect all constraints in this predicate that apply to one field.
+    ///
+    /// The result is an intersected intermediate state that can later be finalized
+    /// either for concrete index scans or for logical lock bounds.
+    fn collect_field_range_state(&self, field_name: &str) -> Option<PredicateRangeState> {
+        let mut state = PredicateRangeState {
+            lower: None,
+            upper: None,
+            equality: None,
+        };
+        self.collect_field_constant_constraints_into(field_name, &mut state)?;
+        Some(state)
+    }
+
+    /// Walk the predicate tree and fold field-vs-constant constraints into `state`.
+    ///
+    /// Only conjunctions are supported here; predicates that require OR/NOT decomposition
+    /// return `None` so callers do not infer unsound index ranges.
+    fn collect_field_constant_constraints_into(
+        &self,
+        field_name: &str,
+        state: &mut PredicateRangeState,
+    ) -> Option<()> {
+        fn visit(
+            node: &PredicateNode,
+            field_name: &str,
+            state: &mut PredicateRangeState,
+        ) -> Option<()> {
+            match node {
+                PredicateNode::Empty => Some(()),
+                PredicateNode::Term(term) => {
+                    if let Some(constraint) = term.field_constant_constraint(field_name) {
+                        state.apply(constraint)?;
+                    }
+                    Some(())
+                }
+                PredicateNode::Composite {
+                    op: BooleanConnective::And,
+                    operands,
+                } => {
+                    for operand in operands {
+                        visit(operand, field_name, state)?;
+                    }
+                    Some(())
+                }
+                PredicateNode::Composite { .. } => None,
+            }
+        }
+
+        visit(&self.root, field_name, state)
+    }
+
     pub fn new(terms: Vec<Term>) -> Self {
         match terms.len() {
             0 => Self {
@@ -6654,123 +6738,51 @@ impl Predicate {
         Predicate::evaluate_equates_with_field(&self.root, field_name)
     }
 
+    /// Derive concrete bounded search keys for an index scan on `field_name`.
+    ///
+    /// This keeps only ranges that can be executed as a real bounded `[low, high)` scan.
     fn bounded_index_search_bounds(&self, field_name: &str) -> Option<IndexSearchBounds> {
-        #[derive(Clone)]
-        struct RangeState {
-            lower: Option<(Constant, bool)>,
-            upper: Option<(Constant, bool)>,
-            equality: Option<Constant>,
-        }
+        let state = self.collect_field_range_state(field_name)?;
+        state.finalize_search_bounds()
+    }
 
-        impl RangeState {
-            fn merge_lower(&mut self, value: Constant, inclusive: bool) {
-                match &self.lower {
-                    Some((existing, existing_inclusive)) => {
-                        if value > *existing
-                            || (value == *existing && !inclusive && *existing_inclusive)
-                        {
-                            self.lower = Some((value, inclusive));
-                        }
-                    }
-                    None => self.lower = Some((value, inclusive)),
-                }
-            }
+    /// Derive logical lock bounds for `field_name`.
+    ///
+    /// Unlike scan bounds, lock bounds may be unbounded and use explicit sentinels so
+    /// overlap checks do not need ad hoc `None` handling.
+    fn index_lock_bounds(&self, field_name: &str) -> Option<IndexLockBounds> {
+        let state = self.collect_field_range_state(field_name)?;
+        state.finalize_lock_bounds()
+    }
 
-            fn merge_upper(&mut self, value: Constant, inclusive: bool) {
-                match &self.upper {
-                    Some((existing, existing_inclusive)) => {
-                        if value < *existing
-                            || (value == *existing && !inclusive && *existing_inclusive)
-                        {
-                            self.upper = Some((value, inclusive));
-                        }
-                    }
-                    None => self.upper = Some((value, inclusive)),
+    /// Build canonical logical index lock requests for every indexed predicate field.
+    ///
+    /// This is the single path that turns normalized predicate bounds into `IndexKey`
+    /// or `IndexRange` lock targets for lock acquisition.
+    fn index_lock_requests(
+        &self,
+        indexes: &HashMap<String, IndexInfo>,
+        mode: IndexLockMode,
+    ) -> Vec<OrderedLockRequest> {
+        indexes
+            .iter()
+            .filter_map(|(field, ii)| match self.index_lock_bounds(field) {
+                Some(IndexLockBounds::Key(key)) => Some(OrderedLockRequest::IndexKey {
+                    index_id: ii.index_lock_table_id(),
+                    key,
+                    mode,
+                }),
+                Some(IndexLockBounds::Range { low, high }) => {
+                    Some(OrderedLockRequest::IndexRange {
+                        index_id: ii.index_lock_table_id(),
+                        low,
+                        high,
+                        mode,
+                    })
                 }
-            }
-
-            fn apply(&mut self, constraint: TermFieldConstantConstraint) -> Option<()> {
-                match constraint {
-                    TermFieldConstantConstraint::Equal(value) => {
-                        if let Some(existing) = &self.equality {
-                            if existing != &value {
-                                return None;
-                            }
-                        }
-                        self.equality = Some(value);
-                    }
-                    TermFieldConstantConstraint::Lower { value, inclusive } => {
-                        self.merge_lower(value, inclusive);
-                    }
-                    TermFieldConstantConstraint::Upper { value, inclusive } => {
-                        self.merge_upper(value, inclusive);
-                    }
-                }
-                Some(())
-            }
-
-            fn finalize(self) -> Option<IndexSearchBounds> {
-                if let Some(value) = self.equality {
-                    if let Some((lower, inclusive)) = &self.lower {
-                        if value < *lower || (value == *lower && !inclusive) {
-                            return None;
-                        }
-                    }
-                    if let Some((upper, inclusive)) = &self.upper {
-                        if value > *upper || (value == *upper && !inclusive) {
-                            return None;
-                        }
-                    }
-                    return Some(IndexSearchBounds::Key(value));
-                }
-
-                let (low, low_inclusive) = self.lower?;
-                let (high, high_inclusive) = self.upper?;
-                let normalized_low = if low_inclusive { low } else { low.successor()? };
-                let normalized_high = if high_inclusive {
-                    high.successor()?
-                } else {
-                    high
-                };
-                if normalized_low >= normalized_high {
-                    return None;
-                }
-                Some(IndexSearchBounds::Range {
-                    low: normalized_low,
-                    high: normalized_high,
-                })
-            }
-        }
-
-        fn visit(node: &PredicateNode, field_name: &str, state: &mut RangeState) -> Option<()> {
-            match node {
-                PredicateNode::Empty => Some(()),
-                PredicateNode::Term(term) => {
-                    if let Some(constraint) = term.field_constant_constraint(field_name) {
-                        state.apply(constraint)?;
-                    }
-                    Some(())
-                }
-                PredicateNode::Composite {
-                    op: BooleanConnective::And,
-                    operands,
-                } => {
-                    for operand in operands {
-                        visit(operand, field_name, state)?;
-                    }
-                    Some(())
-                }
-                PredicateNode::Composite { .. } => None,
-            }
-        }
-
-        let mut state = RangeState {
-            lower: None,
-            upper: None,
-            equality: None,
-        };
-        visit(&self.root, field_name, &mut state)?;
-        state.finalize()
+                None => None,
+            })
+            .collect()
     }
 
     /// Helper used by [equates_with_field] to recursively search the predicate tree
@@ -6970,6 +6982,122 @@ enum TermFieldConstantConstraint {
     Equal(Constant),
     Lower { value: Constant, inclusive: bool },
     Upper { value: Constant, inclusive: bool },
+}
+
+/// Intersected field-level constraints gathered from one predicate tree walk.
+///
+/// This is an intermediate form: callers finalize it either into bounded scan keys
+/// or into logical lock bounds with explicit infinities.
+#[derive(Clone)]
+struct PredicateRangeState {
+    lower: Option<(Constant, bool)>,
+    upper: Option<(Constant, bool)>,
+    equality: Option<Constant>,
+}
+
+impl PredicateRangeState {
+    /// Tighten the current lower bound with a newly discovered predicate term.
+    fn merge_lower(&mut self, value: Constant, inclusive: bool) {
+        match &self.lower {
+            Some((existing, existing_inclusive)) => {
+                if value > *existing || (value == *existing && !inclusive && *existing_inclusive) {
+                    self.lower = Some((value, inclusive));
+                }
+            }
+            None => self.lower = Some((value, inclusive)),
+        }
+    }
+
+    fn merge_upper(&mut self, value: Constant, inclusive: bool) {
+        match &self.upper {
+            Some((existing, existing_inclusive)) => {
+                if value < *existing || (value == *existing && !inclusive && *existing_inclusive) {
+                    self.upper = Some((value, inclusive));
+                }
+            }
+            None => self.upper = Some((value, inclusive)),
+        }
+    }
+
+    /// Fold one field-vs-constant predicate term into the accumulated state.
+    fn apply(&mut self, constraint: TermFieldConstantConstraint) -> Option<()> {
+        match constraint {
+            TermFieldConstantConstraint::Equal(value) => {
+                if let Some(existing) = &self.equality {
+                    if existing != &value {
+                        return None;
+                    }
+                }
+                self.equality = Some(value);
+            }
+            TermFieldConstantConstraint::Lower { value, inclusive } => {
+                self.merge_lower(value, inclusive);
+            }
+            TermFieldConstantConstraint::Upper { value, inclusive } => {
+                self.merge_upper(value, inclusive);
+            }
+        }
+        Some(())
+    }
+
+    /// Finalize the accumulated state into concrete bounded scan keys.
+    ///
+    /// This only succeeds when the predicate can be represented as an executable
+    /// bounded `[low, high)` index scan.
+    fn finalize_search_bounds(self) -> Option<IndexSearchBounds> {
+        if let Some(value) = self.equality {
+            if let Some((lower, inclusive)) = &self.lower {
+                if value < *lower || (value == *lower && !inclusive) {
+                    return None;
+                }
+            }
+            if let Some((upper, inclusive)) = &self.upper {
+                if value > *upper || (value == *upper && !inclusive) {
+                    return None;
+                }
+            }
+            return Some(IndexSearchBounds::Key(value));
+        }
+
+        let (low, low_inclusive) = self.lower?;
+        let (high, high_inclusive) = self.upper?;
+        let normalized_low = if low_inclusive { low } else { low.successor()? };
+        let normalized_high = if high_inclusive {
+            high.successor()?
+        } else {
+            high
+        };
+        if normalized_low >= normalized_high {
+            return None;
+        }
+        Some(IndexSearchBounds::Range {
+            low: normalized_low,
+            high: normalized_high,
+        })
+    }
+
+    /// Finalize the accumulated state into logical lock bounds.
+    ///
+    /// This keeps the same half-open semantics as scans, but allows unbounded sides
+    /// to become explicit `NegInf`/`PosInf` sentinels.
+    fn finalize_lock_bounds(self) -> Option<IndexLockBounds> {
+        if let Some(value) = self.equality {
+            if let Some((lower, inclusive)) = &self.lower {
+                if value < *lower || (value == *lower && !inclusive) {
+                    return None;
+                }
+            }
+            if let Some((upper, inclusive)) = &self.upper {
+                if value > *upper || (value == *upper && !inclusive) {
+                    return None;
+                }
+            }
+            return Some(IndexLockBounds::Key(value));
+        }
+
+        let (low, high) = Predicate::normalize_index_range_bounds(self.lower, self.upper)?;
+        Some(IndexLockBounds::Range { low, high })
+    }
 }
 
 impl Term {
@@ -7782,34 +7910,6 @@ impl IndexInfo {
     pub fn index_lock_table_id(&self) -> u32 {
         btree::BTreeIndex::index_lock_table_id_for(self.indexed_table_id)
     }
-}
-
-fn predicate_lock_requests(
-    indexes: &HashMap<String, IndexInfo>,
-    predicate: &Predicate,
-    mode: IndexLockMode,
-) -> Vec<OrderedLockRequest> {
-    indexes
-        .iter()
-        .filter_map(
-            |(field, ii)| match predicate.bounded_index_search_bounds(field) {
-                Some(IndexSearchBounds::Key(key)) => Some(OrderedLockRequest::IndexKey {
-                    index_id: ii.index_lock_table_id(),
-                    key,
-                    mode,
-                }),
-                Some(IndexSearchBounds::Range { low, high }) => {
-                    Some(OrderedLockRequest::IndexRange {
-                        index_id: ii.index_lock_table_id(),
-                        low,
-                        high,
-                        mode,
-                    })
-                }
-                None => None,
-            },
-        )
-        .collect()
 }
 
 pub struct HashIndex {
@@ -9740,8 +9840,11 @@ impl Transaction {
         low: Constant,
         high: Constant,
     ) -> SimpleDBResult<()> {
-        self.concurrency_manager
-            .lock_index_range_s(index_id, low, high)
+        self.concurrency_manager.lock_index_range_s(
+            index_id,
+            IndexBound::Key(low),
+            IndexBound::Key(high),
+        )
     }
 
     pub fn lock_index_range_x(
@@ -9750,8 +9853,11 @@ impl Transaction {
         low: Constant,
         high: Constant,
     ) -> SimpleDBResult<()> {
-        self.concurrency_manager
-            .lock_index_range_x(index_id, low, high)
+        self.concurrency_manager.lock_index_range_x(
+            index_id,
+            IndexBound::Key(low),
+            IndexBound::Key(high),
+        )
     }
 
     /// Acquire a batch of logical locks in canonical order.
@@ -10647,7 +10753,15 @@ impl LockTable {
 mod lock_table_tests {
     use std::{sync::Arc, time::Duration};
 
-    use crate::{LockMode, LockTable, LockTarget};
+    use crate::{Constant, IndexBound, LockMode, LockTable, LockTarget};
+
+    fn int_range(index_id: u32, low: i32, high: i32) -> LockTarget {
+        LockTarget::IndexRange {
+            index_id,
+            low: IndexBound::Key(Constant::Int(low)),
+            high: IndexBound::Key(Constant::Int(high)),
+        }
+    }
 
     #[test]
     fn test_basic_shared_lock() {
@@ -10826,16 +10940,8 @@ mod lock_table_tests {
     #[test]
     fn test_index_range_overlapping_ss_compatible() {
         let lt = Arc::new(LockTable::new(1_000));
-        let r1 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(10),
-            high: crate::Constant::Int(30),
-        };
-        let r2 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(40),
-        };
+        let r1 = int_range(1, 10, 30);
+        let r2 = int_range(1, 20, 40);
         lt.acquire(1, r1.clone(), LockMode::S).unwrap();
         lt.acquire(2, r2.clone(), LockMode::S).unwrap();
         lt.release(1, &r1).unwrap();
@@ -10845,16 +10951,8 @@ mod lock_table_tests {
     #[test]
     fn test_index_range_overlapping_sx_conflict() {
         let lt = Arc::new(LockTable::new(1));
-        let r1 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(10),
-            high: crate::Constant::Int(30),
-        };
-        let r2 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(40),
-        };
+        let r1 = int_range(1, 10, 30);
+        let r2 = int_range(1, 20, 40);
         lt.acquire(1, r1.clone(), LockMode::X).unwrap();
         // r2 overlaps r1 → conflict
         assert!(lt.acquire(2, r2.clone(), LockMode::S).is_err());
@@ -10864,16 +10962,8 @@ mod lock_table_tests {
     #[test]
     fn test_index_range_disjoint_no_conflict() {
         let lt = Arc::new(LockTable::new(1_000));
-        let r1 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(10),
-            high: crate::Constant::Int(20),
-        };
-        let r2 = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(30),
-        };
+        let r1 = int_range(1, 10, 20);
+        let r2 = int_range(1, 20, 30);
         // [10,20) and [20,30) are disjoint (half-open)
         lt.acquire(1, r1.clone(), LockMode::X).unwrap();
         lt.acquire(2, r2.clone(), LockMode::X).unwrap();
@@ -10884,11 +10974,7 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_inside_range_conflict() {
         let lt = Arc::new(LockTable::new(1));
-        let range = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(30),
-        };
+        let range = int_range(1, 20, 30);
         let key = LockTarget::IndexKey {
             index_id: 1,
             key: crate::Constant::Int(25),
@@ -10902,11 +10988,7 @@ mod lock_table_tests {
     #[test]
     fn test_index_key_outside_range_no_conflict() {
         let lt = Arc::new(LockTable::new(1_000));
-        let range = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(30),
-        };
+        let range = int_range(1, 20, 30);
         // key 40 is outside [20,30)
         let key = LockTarget::IndexKey {
             index_id: 1,
@@ -10922,11 +11004,7 @@ mod lock_table_tests {
     fn test_index_boundary_key_at_high_no_overlap() {
         // [20,30) — key 30 is NOT contained (half-open upper bound)
         let lt = Arc::new(LockTable::new(1_000));
-        let range = LockTarget::IndexRange {
-            index_id: 1,
-            low: crate::Constant::Int(20),
-            high: crate::Constant::Int(30),
-        };
+        let range = int_range(1, 20, 30);
         let key = LockTarget::IndexKey {
             index_id: 1,
             key: crate::Constant::Int(30),
@@ -10935,6 +11013,35 @@ mod lock_table_tests {
         lt.acquire(2, key.clone(), LockMode::X).unwrap();
         lt.release(1, &range).unwrap();
         lt.release(2, &key).unwrap();
+    }
+
+    #[test]
+    fn test_unbounded_range_overlaps_bounded_range() {
+        let lt = Arc::new(LockTable::new(1));
+        let held = LockTarget::IndexRange {
+            index_id: 1,
+            low: IndexBound::NegInf,
+            high: IndexBound::Key(Constant::Int(30)),
+        };
+        let requested = int_range(1, 20, 40);
+        lt.acquire(1, held.clone(), LockMode::X).unwrap();
+        assert!(lt.acquire(2, requested.clone(), LockMode::S).is_err());
+        lt.release(1, &held).unwrap();
+    }
+
+    #[test]
+    fn test_unbounded_range_disjoint_at_boundary() {
+        let lt = Arc::new(LockTable::new(1_000));
+        let held = LockTarget::IndexRange {
+            index_id: 1,
+            low: IndexBound::NegInf,
+            high: IndexBound::Key(Constant::Int(20)),
+        };
+        let requested = int_range(1, 20, 30);
+        lt.acquire(1, held.clone(), LockMode::X).unwrap();
+        lt.acquire(2, requested.clone(), LockMode::X).unwrap();
+        lt.release(1, &held).unwrap();
+        lt.release(2, &requested).unwrap();
     }
 
     #[test]
@@ -10956,6 +11063,76 @@ mod lock_table_tests {
     }
 }
 
+#[cfg(test)]
+mod index_lock_normalization_tests {
+    use crate::{ComparisonOp, Constant, Expression, IndexBound, IndexLockBounds, Predicate, Term};
+
+    fn term(op: ComparisonOp, value: i32) -> Term {
+        Term::new_with_op(
+            Expression::FieldName("a".to_string()),
+            Expression::Constant(Constant::Int(value)),
+            op,
+        )
+    }
+
+    #[test]
+    fn less_than_normalizes_to_neg_inf_half_open_range() {
+        let predicate = Predicate::new(vec![term(ComparisonOp::LessThan, 30)]);
+        assert_eq!(
+            predicate.index_lock_bounds("a"),
+            Some(IndexLockBounds::Range {
+                low: IndexBound::NegInf,
+                high: IndexBound::Key(Constant::Int(30)),
+            })
+        );
+    }
+
+    #[test]
+    fn less_than_or_equal_normalizes_upper_to_successor() {
+        let predicate = Predicate::new(vec![term(ComparisonOp::LessThanOrEqual, 30)]);
+        assert_eq!(
+            predicate.index_lock_bounds("a"),
+            Some(IndexLockBounds::Range {
+                low: IndexBound::NegInf,
+                high: IndexBound::Key(Constant::Int(31)),
+            })
+        );
+    }
+
+    #[test]
+    fn greater_than_normalizes_lower_to_successor() {
+        let predicate = Predicate::new(vec![term(ComparisonOp::GreaterThan, 30)]);
+        assert_eq!(
+            predicate.index_lock_bounds("a"),
+            Some(IndexLockBounds::Range {
+                low: IndexBound::Key(Constant::Int(31)),
+                high: IndexBound::PosInf,
+            })
+        );
+    }
+
+    #[test]
+    fn greater_than_or_equal_normalizes_to_pos_inf_half_open_range() {
+        let predicate = Predicate::new(vec![term(ComparisonOp::GreaterThanOrEqual, 30)]);
+        assert_eq!(
+            predicate.index_lock_bounds("a"),
+            Some(IndexLockBounds::Range {
+                low: IndexBound::Key(Constant::Int(30)),
+                high: IndexBound::PosInf,
+            })
+        );
+    }
+
+    #[test]
+    fn contradictory_bounds_drop_empty_range() {
+        let predicate = Predicate::new(vec![
+            term(ComparisonOp::GreaterThan, 30),
+            term(ComparisonOp::LessThanOrEqual, 30),
+        ]);
+        assert_eq!(predicate.index_lock_bounds("a"), None);
+    }
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 enum LockTarget {
     Table {
@@ -10974,8 +11151,8 @@ enum LockTarget {
     /// Protects a half-open key interval [low, high) in an index.
     IndexRange {
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
     },
 }
 
@@ -11015,7 +11192,10 @@ fn index_targets_overlap(a: &LockTarget, b: &LockTarget) -> bool {
                 index_id: id1,
                 key: k,
             },
-        ) => id1 == id2 && low <= k && k < high,
+        ) => {
+            let key_bound = IndexBound::Key(k.clone());
+            id1 == id2 && low <= &key_bound && &key_bound < high
+        }
         _ => false,
     }
 }
@@ -11122,8 +11302,8 @@ enum OrderedLockRequest {
     },
     IndexRange {
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
         mode: IndexLockMode,
     },
     IndexKey {
@@ -11134,17 +11314,26 @@ enum OrderedLockRequest {
 }
 
 impl OrderedLockRequest {
-    fn acquisition_sort_key(&self) -> (u8, u32, u8, Option<&Constant>, Option<&Constant>) {
+    fn acquisition_sort_key(
+        &self,
+    ) -> (
+        u8,
+        u32,
+        u8,
+        Option<&IndexBound>,
+        Option<&Constant>,
+        Option<&IndexBound>,
+    ) {
         match self {
-            OrderedLockRequest::Table { table_id, .. } => (0, *table_id, 0, None, None),
+            OrderedLockRequest::Table { table_id, .. } => (0, *table_id, 0, None, None, None),
             OrderedLockRequest::IndexRange {
                 index_id,
                 low,
                 high,
                 ..
-            } => (1, *index_id, 0, Some(low), Some(high)),
+            } => (1, *index_id, 0, Some(low), None, Some(high)),
             OrderedLockRequest::IndexKey { index_id, key, .. } => {
-                (1, *index_id, 1, Some(key), None)
+                (1, *index_id, 1, None, Some(key), None)
             }
         }
     }
@@ -11171,8 +11360,8 @@ enum IndexLockKey {
     },
     Range {
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
     },
 }
 
@@ -11302,8 +11491,8 @@ impl ConcurrencyManager {
     fn acquire_index_range(
         &self,
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
         mode: IndexLockMode,
     ) -> SimpleDBResult<()> {
         self.lock_table.acquire(
@@ -11337,8 +11526,8 @@ impl ConcurrencyManager {
     fn lock_index_range_s(
         &self,
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
     ) -> SimpleDBResult<()> {
         self.acquire_index_range(index_id, low, high, IndexLockMode::S)
     }
@@ -11346,8 +11535,8 @@ impl ConcurrencyManager {
     fn lock_index_range_x(
         &self,
         index_id: u32,
-        low: Constant,
-        high: Constant,
+        low: IndexBound,
+        high: IndexBound,
     ) -> SimpleDBResult<()> {
         self.acquire_index_range(index_id, low, high, IndexLockMode::X)
     }

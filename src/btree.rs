@@ -825,8 +825,8 @@ impl Index for BTreeIndex {
                 },
                 crate::OrderedLockRequest::IndexRange {
                     index_id: self.index_lock_table_id,
-                    low: low.clone(),
-                    high: high.clone(),
+                    low: crate::IndexBound::Key(low.clone()),
+                    high: crate::IndexBound::Key(high.clone()),
                     mode: crate::IndexLockMode::S,
                 },
             ])
