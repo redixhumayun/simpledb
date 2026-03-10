@@ -41,7 +41,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
 3. **Work autonomously using available tools** until blocked
 
 4. **Test thoroughly before committing**:
-   Testing requires running tests with combinations of compiler flags.
+   Testing requires running tests with combinations of compiler flags. Run these tests serially.
    ```bash
    cargo build
    cargo test --no-default-features --features replacement_lru --features page-4k
@@ -57,7 +57,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    # Verify direct-io build works and tests pass
    ```
 
-5. **Run benchmarks before committing**
+5. **Run benchmarks before committing only when asked**
    ```bash
    cargo run --bin simpledb
    # verify the CLI starts up without errors
@@ -89,8 +89,6 @@ There is a test suite which provides basic coverage to ensure the code still wor
 7. **Create PR with descriptive title and summary**
    - Include what was implemented
    - Note any breaking changes
-
-8. **Address feedback as separate commits**
 
 ### Profiling Workflow (REQUIRED for bottleneck analysis)
 Use this workflow when asked to profile a benchmark/workload and identify hotspots.
