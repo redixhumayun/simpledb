@@ -2169,6 +2169,35 @@ mod btree_index_tests {
         next_key
     }
 
+    /// Insert ascending keys until inserting `next_key` would force a leaf split.
+    /// Returns that split-causing key.
+    fn insert_until_next_insert_splits(index: &mut BTreeIndex, mut next_key: i32) -> i32 {
+        let cap = 10_000;
+        loop {
+            let txn = Arc::clone(&index.txn);
+            let internal_layout = index.internal_layout.clone();
+            let leaf_layout = index.leaf_layout.clone();
+            let index_file_name = index.index_file_name.clone();
+            let search_key = Constant::Int(next_key);
+            let ctx = index
+                .begin_write(&txn, &internal_layout, &index_file_name, &search_key)
+                .expect("begin write while probing for split-causing insert");
+            if traversal::leaf_needs_split(&ctx, &leaf_layout, &search_key)
+                .expect("check whether next insert requires split")
+            {
+                return next_key;
+            }
+
+            drop(ctx);
+            index.insert(&search_key, &RID::new(1, next_key as usize));
+            next_key += 1;
+            assert!(
+                next_key < cap,
+                "insert_until_next_insert_splits exceeded safety cap without finding split-causing key"
+            );
+        }
+    }
+
     fn descend_read_with_restart(
         index: &mut BTreeIndex,
         search_key: &Constant,
@@ -3247,6 +3276,114 @@ mod btree_index_tests {
         .unwrap();
         super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
         val_txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_reader_blocks_split_insert_until_release() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (db, _dir) = SimpleDB::new_for_test(64, 5000);
+        db.set_wal_mode(WalMode::UnsafeNoWal);
+        let index_name = generate_filename();
+        let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
+
+        let next_key;
+        {
+            let setup_tx = db.new_tx();
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&split_gate),
+            )
+            .unwrap();
+            next_key = insert_until_next_insert_splits(&mut idx, 0);
+            setup_tx.commit().unwrap();
+        }
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = db.log_manager();
+        let buffer_manager = db.buffer_manager();
+        let lock_table = db.lock_table();
+        let (reader_ready_tx, reader_ready_rx) = mpsc::channel();
+        let (release_reader_tx, release_reader_rx) = mpsc::channel();
+        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+
+        let reader_gate = Arc::clone(&split_gate);
+        let reader_name = index_name.clone();
+        let reader_layout = leaf_layout.clone();
+        let reader_fm = Arc::clone(&file_manager);
+        let reader_lm = Arc::clone(&log_manager);
+        let reader_bm = Arc::clone(&buffer_manager);
+        let reader_lt = Arc::clone(&lock_table);
+        let reader = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(reader_fm, reader_lm, reader_bm, reader_lt));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &reader_name,
+                reader_layout,
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&reader_gate),
+            )
+            .unwrap();
+            idx.before_first(&Constant::Int(0));
+            reader_ready_tx.send(()).unwrap();
+            release_reader_rx.recv().unwrap();
+            txn.commit().unwrap();
+        });
+
+        reader_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should reach before_first while holding shared split gate");
+
+        let writer_gate = Arc::clone(&split_gate);
+        let writer_name = index_name.clone();
+        let writer_layout = leaf_layout.clone();
+        let writer = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(file_manager, log_manager, buffer_manager, lock_table));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &writer_name,
+                writer_layout,
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&writer_gate),
+            )
+            .unwrap();
+            idx.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
+            txn.commit().unwrap();
+            writer_done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            writer_done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "split-causing insert should block while reader holds shared split gate"
+        );
+
+        release_reader_tx.send(()).unwrap();
+        writer_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("split-causing insert should complete after reader releases");
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+
+        let verify_tx = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            leaf_layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::clone(&split_gate),
+        )
+        .unwrap();
+        verify_idx.before_first(&Constant::Int(next_key));
+        assert!(verify_idx.next(), "split-causing insert should be visible after completion");
+        super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
+        verify_tx.commit().unwrap();
     }
 
     #[test]
