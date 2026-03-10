@@ -256,7 +256,9 @@ mod split_gate_tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("writer should reach exclusive split-gate acquisition");
         assert!(
-            writer_acquired_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            writer_acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
             "writer should remain blocked while reader holds the shared split gate"
         );
         assert!(
@@ -944,7 +946,9 @@ impl BTreeIndex {
                                     }
                                 }
                                 traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                                    self.emit_test_event(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate);
+                                    self.emit_test_event(
+                                        BTreeTestEvent::WriteNeedSlowPinUnderSplitGate,
+                                    );
                                     WriteState::NeedSlowPinUnderSplitGate(block)
                                 }
                             }
@@ -2321,8 +2325,8 @@ mod structural {
 
 #[cfg(test)]
 mod btree_index_tests {
-    use super::*;
     use super::test_hooks::PauseEventHook;
+    use super::*;
     use crate::{
         test_utils::{generate_filename, generate_random_number},
         Schema, SimpleDB, TestDir, WalMode,
@@ -3510,7 +3514,9 @@ mod btree_index_tests {
         let log_manager = db.log_manager();
         let buffer_manager = db.buffer_manager();
         let lock_table = db.lock_table();
-        let hook = Arc::new(PauseEventHook::new(&[BTreeTestEvent::ReadSplitGateAcquired]));
+        let hook = Arc::new(PauseEventHook::new(&[
+            BTreeTestEvent::ReadSplitGateAcquired,
+        ]));
         let writer_done = Arc::new(AtomicBool::new(false));
 
         let reader_gate = Arc::clone(&split_gate);
@@ -3590,7 +3596,10 @@ mod btree_index_tests {
         )
         .unwrap();
         verify_idx.before_first(&Constant::Int(next_key));
-        assert!(verify_idx.next(), "split-causing insert should be visible after completion");
+        assert!(
+            verify_idx.next(),
+            "split-causing insert should be visible after completion"
+        );
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
         verify_tx.commit().unwrap();
     }
@@ -3628,7 +3637,9 @@ mod btree_index_tests {
         let buffer_manager = db.buffer_manager();
         let lock_table = db.lock_table();
 
-        let first_hook = Arc::new(PauseEventHook::new(&[BTreeTestEvent::WriteSplitGateAcquired]));
+        let first_hook = Arc::new(PauseEventHook::new(&[
+            BTreeTestEvent::WriteSplitGateAcquired,
+        ]));
         let second_hook = Arc::new(PauseEventHook::new(&[]));
         let first_done = Arc::new(AtomicBool::new(false));
         let second_done = Arc::new(AtomicBool::new(false));
@@ -3666,7 +3677,12 @@ mod btree_index_tests {
         let second_done_flag = Arc::clone(&second_done);
         let second_hook_thread = Arc::clone(&second_hook);
         let second = thread::spawn(move || {
-            let txn = Arc::new(Transaction::new(file_manager, log_manager, buffer_manager, lock_table));
+            let txn = Arc::new(Transaction::new(
+                file_manager,
+                log_manager,
+                buffer_manager,
+                lock_table,
+            ));
             let mut idx = BTreeIndex::new(
                 Arc::clone(&txn),
                 &second_name,
@@ -3676,7 +3692,10 @@ mod btree_index_tests {
             )
             .unwrap();
             idx.set_test_hook(second_hook_thread);
-            idx.insert(&Constant::Int(second_key), &RID::new(2, second_key as usize));
+            idx.insert(
+                &Constant::Int(second_key),
+                &RID::new(2, second_key as usize),
+            );
             txn.commit().unwrap();
             second_done_flag.store(true, Ordering::Release);
         });
@@ -3763,7 +3782,10 @@ mod btree_index_tests {
         idx.insert(&Constant::Int(split_key), &RID::new(1, split_key as usize));
         write_tx.commit().unwrap();
 
-        assert_eq!(hook.count(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate), 1);
+        assert_eq!(
+            hook.count(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate),
+            1
+        );
         assert_eq!(
             hook.count(BTreeTestEvent::WriteReacquiringSplitGateAfterSlowPin),
             1
