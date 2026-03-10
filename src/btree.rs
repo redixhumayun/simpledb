@@ -2758,6 +2758,7 @@ mod btree_index_tests {
         db.set_wal_mode(WalMode::UnsafeNoWal);
         let index_name = generate_filename();
         let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
 
         // Pre-populate with PRELOAD keys in a single committed transaction.
         {
@@ -2767,7 +2768,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
-                Arc::new(SplitGate::new()),
+                Arc::clone(&split_gate),
             )
             .unwrap();
             for k in 0..PRELOAD {
@@ -2782,6 +2783,7 @@ mod btree_index_tests {
         let lock_table = db.lock_table();
         let index_name = Arc::new(index_name);
         let leaf_layout = Arc::new(leaf_layout);
+        let split_gate = Arc::clone(&split_gate);
         let barrier = Arc::new(Barrier::new(READERS));
 
         let mut handles = vec![];
@@ -2792,6 +2794,7 @@ mod btree_index_tests {
             let lt = Arc::clone(&lock_table);
             let iname = Arc::clone(&index_name);
             let ilayout = Arc::clone(&leaf_layout);
+            let gate = Arc::clone(&split_gate);
             let bar = Arc::clone(&barrier);
 
             handles.push(thread::spawn(move || {
@@ -2810,7 +2813,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
-                        Arc::new(SplitGate::new()),
+                        Arc::clone(&gate),
                     )
                     .unwrap();
                     idx.before_first(&Constant::Int(key));
