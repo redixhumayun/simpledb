@@ -143,6 +143,10 @@ mod test_hooks {
             }
         }
 
+        pub(crate) fn has_seen(&self, event: BTreeTestEvent) -> bool {
+            self.state.lock().unwrap().seen.contains(&event)
+        }
+
         pub(crate) fn resume(&self, event: BTreeTestEvent) {
             let mut state = self.state.lock().unwrap();
             state.resumed.insert(event);
@@ -3505,6 +3509,135 @@ mod btree_index_tests {
         .unwrap();
         verify_idx.before_first(&Constant::Int(next_key));
         assert!(verify_idx.next(), "split-causing insert should be visible after completion");
+        super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
+        verify_tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_splitters_serialize_on_same_index_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let (db, _dir) = SimpleDB::new_for_test(64, 5000);
+        db.set_wal_mode(WalMode::UnsafeNoWal);
+        let index_name = generate_filename();
+        let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
+
+        let split_key;
+        let second_key;
+        {
+            let setup_tx = db.new_tx();
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&split_gate),
+            )
+            .unwrap();
+            split_key = insert_until_next_insert_splits(&mut idx, 0);
+            second_key = split_key + 1;
+            setup_tx.commit().unwrap();
+        }
+
+        let file_manager = Arc::clone(&db.file_manager);
+        let log_manager = db.log_manager();
+        let buffer_manager = db.buffer_manager();
+        let lock_table = db.lock_table();
+
+        let first_hook = Arc::new(PauseEventHook::new(&[BTreeTestEvent::WriteSplitGateAcquired]));
+        let second_hook = Arc::new(PauseEventHook::new(&[]));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+
+        let first_gate = Arc::clone(&split_gate);
+        let first_name = index_name.clone();
+        let first_layout = leaf_layout.clone();
+        let first_fm = Arc::clone(&file_manager);
+        let first_lm = Arc::clone(&log_manager);
+        let first_bm = Arc::clone(&buffer_manager);
+        let first_lt = Arc::clone(&lock_table);
+        let first_done_flag = Arc::clone(&first_done);
+        let first_hook_thread = Arc::clone(&first_hook);
+        let first = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(first_fm, first_lm, first_bm, first_lt));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &first_name,
+                first_layout,
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&first_gate),
+            )
+            .unwrap();
+            idx.set_test_hook(first_hook_thread);
+            idx.insert(&Constant::Int(split_key), &RID::new(1, split_key as usize));
+            txn.commit().unwrap();
+            first_done_flag.store(true, Ordering::Release);
+        });
+
+        first_hook.wait_for(BTreeTestEvent::WriteSplitGateAcquired);
+
+        let second_gate = Arc::clone(&split_gate);
+        let second_name = index_name.clone();
+        let second_layout = leaf_layout.clone();
+        let second_done_flag = Arc::clone(&second_done);
+        let second_hook_thread = Arc::clone(&second_hook);
+        let second = thread::spawn(move || {
+            let txn = Arc::new(Transaction::new(file_manager, log_manager, buffer_manager, lock_table));
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &second_name,
+                second_layout,
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&second_gate),
+            )
+            .unwrap();
+            idx.set_test_hook(second_hook_thread);
+            idx.insert(&Constant::Int(second_key), &RID::new(2, second_key as usize));
+            txn.commit().unwrap();
+            second_done_flag.store(true, Ordering::Release);
+        });
+
+        second_hook.wait_for(BTreeTestEvent::WriteAboutToAcquireSplitGate);
+        assert!(
+            !second_hook.has_seen(BTreeTestEvent::WriteSplitGateAcquired),
+            "second writer should not acquire exclusive split gate while first writer holds it"
+        );
+        assert!(
+            !second_done.load(Ordering::Acquire),
+            "second writer should remain blocked while first writer holds exclusive split gate"
+        );
+
+        first_hook.resume(BTreeTestEvent::WriteSplitGateAcquired);
+        second_hook.wait_for(BTreeTestEvent::WriteSplitGateAcquired);
+
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(first_done.load(Ordering::Acquire));
+        assert!(second_done.load(Ordering::Acquire));
+
+        let verify_tx = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            leaf_layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::clone(&split_gate),
+        )
+        .unwrap();
+        verify_idx.before_first(&Constant::Int(split_key));
+        let mut split_key_rids = vec![];
+        while verify_idx.next() {
+            split_key_rids.push(verify_idx.get_data_rid());
+        }
+        assert!(split_key_rids.contains(&RID::new(1, split_key as usize)));
+        verify_idx.before_first(&Constant::Int(second_key));
+        let mut second_key_rids = vec![];
+        while verify_idx.next() {
+            second_key_rids.push(verify_idx.get_data_rid());
+        }
+        assert!(second_key_rids.contains(&RID::new(2, second_key as usize)));
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
         verify_tx.commit().unwrap();
     }
