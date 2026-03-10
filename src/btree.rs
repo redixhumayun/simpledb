@@ -84,14 +84,14 @@ mod split_gate {
 
 pub use split_gate::SplitGate;
 pub use split_gate::SplitGateReadGuard;
-#[allow(unused_imports)]
-pub use split_gate::SplitGateWriteGuard;
 
 enum WriteState {
+    Start,
     DescendFast,
     NeedSlowPin(BlockId),
     AcquireSplitGate,
     DescendUnderSplitGate,
+    NeedSlowPinUnderSplitGate(BlockId),
     Done,
 }
 
@@ -102,9 +102,9 @@ enum ReadRequest {
 
 enum ReadState {
     Start,
+    RetryFromRoot,
     DescendFast,
     NeedSlowPin(BlockId),
-    RetryFromRoot,
     Ready { cursor: traversal::ScanCursor },
 }
 
@@ -613,6 +613,10 @@ impl BTreeIndex {
                     self.scan_gate_guard = Some(self.split_gate.acquire_shared());
                     ReadState::RetryFromRoot
                 }
+                ReadState::RetryFromRoot => {
+                    (root_block, _, _) = self.refresh_cached_meta()?;
+                    ReadState::DescendFast
+                }
                 ReadState::DescendFast => {
                     let outcome = traversal::try_descend_read(
                         &txn,
@@ -635,13 +639,65 @@ impl BTreeIndex {
                     txn.pin_read_guard(&block)?;
                     ReadState::RetryFromRoot
                 }
-                ReadState::RetryFromRoot => {
-                    (root_block, _, _) = self.refresh_cached_meta()?;
-                    ReadState::DescendFast
-                }
                 ReadState::Ready { cursor } => {
                     self.read_cursor = Some(cursor);
                     return Ok(());
+                }
+            };
+        }
+    }
+
+    fn write_descend_once<'a>(
+        &mut self,
+        txn: &'a Arc<Transaction>,
+        internal_layout: &'a Layout,
+        index_file_name: &'a str,
+        search_key: &Constant,
+    ) -> Result<traversal::WriteTraverseOutcome<'a>, Box<dyn Error>> {
+        let (root_block, _, _) = self.refresh_cached_meta()?;
+        Ok(traversal::try_descend_write_fast(
+            txn,
+            &root_block,
+            internal_layout,
+            index_file_name,
+            search_key,
+        )?)
+    }
+
+    fn begin_write<'a>(
+        &mut self,
+        txn: &'a Arc<Transaction>,
+        internal_layout: &'a Layout,
+        index_file_name: &'a str,
+        search_key: &Constant,
+    ) -> Result<traversal::WriteCtx<'a>, Box<dyn Error>> {
+        let mut state = WriteState::Start;
+
+        loop {
+            state = match state {
+                WriteState::Start => WriteState::DescendFast,
+                WriteState::DescendFast => {
+                    match self.write_descend_once(
+                        txn,
+                        internal_layout,
+                        index_file_name,
+                        search_key,
+                    )? {
+                        traversal::WriteTraverseOutcome::Ready(ctx) => return Ok(ctx),
+                        traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
+                            WriteState::NeedSlowPin(block)
+                        }
+                    }
+                }
+                WriteState::NeedSlowPin(block) => {
+                    txn.pin_write_guard(&block)?;
+                    WriteState::DescendFast
+                }
+                WriteState::AcquireSplitGate
+                | WriteState::DescendUnderSplitGate
+                | WriteState::NeedSlowPinUnderSplitGate(_)
+                | WriteState::Done => {
+                    unreachable!("begin_write only handles non-escalated descent")
                 }
             };
         }
@@ -729,40 +785,28 @@ impl Index for BTreeIndex {
         );
 
         let txn = Arc::clone(&self.txn);
-        let mut state = WriteState::DescendFast;
-        let mut split_gate_guard = None;
+        let mut state = WriteState::Start;
+        let mut _split_gate_guard = None;
         loop {
             state = match state {
-                WriteState::Done => break,
+                WriteState::Start => WriteState::DescendFast,
                 WriteState::NeedSlowPin(block) => {
-                    let had_split_gate = split_gate_guard.is_some();
-                    split_gate_guard = None;
                     txn.pin_write_guard(&block).unwrap();
-                    if had_split_gate {
-                        WriteState::AcquireSplitGate
-                    } else {
-                        WriteState::DescendFast
-                    }
+                    WriteState::DescendFast
                 }
                 WriteState::AcquireSplitGate => {
                     self.scan_gate_guard = None;
-                    split_gate_guard = Some(self.split_gate.acquire_exclusive());
+                    _split_gate_guard = Some(self.split_gate.acquire_exclusive());
                     WriteState::DescendUnderSplitGate
                 }
                 WriteState::DescendFast => {
-                    let (root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
                     let internal_layout = self.internal_layout.clone();
                     let leaf_layout = self.leaf_layout.clone();
                     let index_file_name = self.index_file_name.clone();
 
-                    let outcome = traversal::try_descend_write_fast(
-                        &txn,
-                        &root_block,
-                        &internal_layout,
-                        &index_file_name,
-                        data_val,
-                    )
-                    .unwrap();
+                    let outcome = self
+                        .write_descend_once(&txn, &internal_layout, &index_file_name, data_val)
+                        .unwrap();
 
                     match outcome {
                         traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
@@ -787,24 +831,23 @@ impl Index for BTreeIndex {
                         }
                     }
                 }
+                WriteState::NeedSlowPinUnderSplitGate(block) => {
+                    _split_gate_guard = None;
+                    txn.pin_write_guard(&block).unwrap();
+                    WriteState::AcquireSplitGate
+                }
                 WriteState::DescendUnderSplitGate => {
-                    let (root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
                     let internal_layout = self.internal_layout.clone();
                     let leaf_layout = self.leaf_layout.clone();
                     let index_file_name = self.index_file_name.clone();
 
-                    let outcome = traversal::try_descend_write_fast(
-                        &txn,
-                        &root_block,
-                        &internal_layout,
-                        &index_file_name,
-                        data_val,
-                    )
-                    .unwrap();
+                    let outcome = self
+                        .write_descend_once(&txn, &internal_layout, &index_file_name, data_val)
+                        .unwrap();
 
                     match outcome {
                         traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                            WriteState::NeedSlowPin(block)
+                            WriteState::NeedSlowPinUnderSplitGate(block)
                         }
                         traversal::WriteTraverseOutcome::Ready(ctx) => {
                             if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
@@ -818,15 +861,16 @@ impl Index for BTreeIndex {
                                     &index_file_name,
                                 )
                                 .expect("apply insert failed");
-                                split_gate_guard = None;
+                                _split_gate_guard = None;
                                 WriteState::Done
                             } else {
-                                split_gate_guard = None;
+                                _split_gate_guard = None;
                                 WriteState::DescendFast
                             }
                         }
                     }
                 }
+                WriteState::Done => break,
             };
         }
     }
@@ -845,40 +889,23 @@ impl Index for BTreeIndex {
                 },
             ])
             .expect("failed to acquire ordered delete locks");
-
         let txn = Arc::clone(&self.txn);
-        let internal_layout = self.internal_layout.clone();
         let leaf_layout = self.leaf_layout.clone();
+        let internal_layout = self.internal_layout.clone();
         let index_file_name = self.index_file_name.clone();
 
-        loop {
-            let (root_block, _, _) = self.refresh_cached_meta().expect("read index meta");
-            let outcome = traversal::try_descend_write_fast(
-                &txn,
-                &root_block,
-                &internal_layout,
-                &index_file_name,
-                data_val,
-            )
-            .unwrap();
-            match outcome {
-                traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                    txn.pin_write_guard(&block).unwrap();
-                }
-                traversal::WriteTraverseOutcome::Ready(mut ctx) => {
-                    structural::apply_leaf_delete(
-                        &mut ctx,
-                        &txn,
-                        &leaf_layout,
-                        &index_file_name,
-                        data_val,
-                        *data_rid,
-                    )
-                    .unwrap();
-                    break;
-                }
-            }
-        }
+        let mut ctx = self
+            .begin_write(&txn, &internal_layout, &index_file_name, data_val)
+            .expect("begin write descent");
+        structural::apply_leaf_delete(
+            &mut ctx,
+            &txn,
+            &leaf_layout,
+            &index_file_name,
+            data_val,
+            *data_rid,
+        )
+        .unwrap();
     }
 }
 
@@ -990,326 +1017,6 @@ mod traversal {
         pub(super) search_key: Constant,
     }
 
-    pub(super) struct RangeCursor {
-        pub(super) leaf_block: BlockId,
-        pub(super) current_slot: Option<usize>,
-        pub(super) lower_bound: Constant,
-        pub(super) upper_bound: Constant,
-    }
-
-    pub(super) struct WriteCtx<'a> {
-        pub(super) leaf_guard: Option<PageWriteGuard<'a>>,
-        pub(super) leaf_block_id: BlockId,
-        /// Ancestor write-latches root→parent order; last = direct parent of leaf.
-        pub(super) ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)>,
-        /// B-tree level of the root at descent time (for new-root allocation).
-        pub(super) root_level: u8,
-    }
-
-    pub(super) enum ScanCursor {
-        Point(ReadCursor),
-        Range(RangeCursor),
-    }
-
-    pub(super) enum WriteTraverseOutcome<'a> {
-        Ready(WriteCtx<'a>),
-        NeedSlowPin(BlockId),
-    }
-
-    /// Choose the child pointer to follow from one internal page.
-    ///
-    /// This does the internal-node search only; it does not pin or descend into the
-    /// child. If `search_key` is >= every separator, this returns the rightmost child.
-    fn find_child_block_from_view(
-        view: &crate::page::BTreeInternalPageView<'_>,
-        search_key: &Constant,
-        file_name: &str,
-    ) -> SimpleDBResult<BlockId> {
-        let mut left = 0;
-        let mut right = view.slot_count();
-        while left < right {
-            let mid = (left + right) / 2;
-            let key_mid = view.get_entry(mid)?.key;
-            if key_mid > *search_key {
-                right = mid;
-            } else {
-                left = mid + 1;
-            }
-        }
-        if left < view.slot_count() {
-            let block_num = view.get_entry(left)?.child_block;
-            Ok(BlockId::new(file_name.to_string(), block_num))
-        } else {
-            let block_num = view
-                .rightmost_child_block()
-                .ok_or("missing rightmost child")?;
-            Ok(BlockId::new(file_name.to_string(), block_num))
-        }
-    }
-
-    /// Position a read cursor on the leaf that should contain `search_key`.
-    ///
-    /// The starting leaf is already known. This may hop right through sibling leaves
-    /// while `search_key` is beyond the current page's high key. Sibling hops use
-    /// fast pins; if a sibling is not resident the function returns `NeedSlowPin`
-    /// so the caller can pin outside latch scope and restart from the root.
-    fn try_find_initial_cursor(
-        txn: &Arc<Transaction>,
-        leaf_block: BlockId,
-        leaf_layout: &Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<ReadTraverseOutcome> {
-        let first_guard = txn.pin_read_guard(&leaf_block)?;
-        let mut current_block = leaf_block;
-        let mut current_view = first_guard.into_btree_leaf_page_view(leaf_layout)?;
-
-        loop {
-            let should_hop = if let Some(hk) = current_view.high_key() {
-                *search_key >= hk
-            } else {
-                false
-            };
-
-            if !should_hop {
-                let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
-                    leaf_block: current_block,
-                    current_slot,
-                    search_key: search_key.clone(),
-                }));
-            }
-
-            let Some(rsib) = current_view.right_sibling_block() else {
-                let current_slot = current_view.find_slot_before(search_key);
-                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
-                    leaf_block: current_block,
-                    current_slot,
-                    search_key: search_key.clone(),
-                }));
-            };
-
-            let next_block = BlockId::new(file_name.to_string(), rsib);
-            let Some(next_guard) = txn.pin_read_guard_fast(&next_block)? else {
-                return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
-            };
-            let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
-            current_block = next_block;
-            current_view = next_view;
-        }
-    }
-
-    /// Descend the B-tree with fast (non-blocking) pin attempts for internal nodes.
-    /// At leaf level, uses slow pin (no latches held at that point).
-    /// Returns `Ready` with a positioned cursor, or `NeedSlowPin(block)` if an
-    /// internal page was not resident (all latches released).
-    pub(super) fn try_descend_read(
-        txn: &Arc<Transaction>,
-        root_block: &BlockId,
-        internal_layout: &Layout,
-        leaf_layout: &Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<ReadTraverseOutcome> {
-        let guard = match txn.pin_read_guard_fast(root_block)? {
-            Some(g) => g,
-            None => return Ok(ReadTraverseOutcome::NeedSlowPin(root_block.clone())),
-        };
-        let mut current_view = guard.into_btree_internal_page_view(internal_layout)?;
-
-        loop {
-            let child_block = find_child_block_from_view(&current_view, search_key, file_name)?;
-            let is_leaf_level = current_view.btree_level() == 0;
-
-            if is_leaf_level {
-                // No parent latch held after releasing current_view. Leaf/sibling hops
-                // must still use fast resident pins and restart on miss.
-                return try_find_initial_cursor(
-                    txn,
-                    child_block,
-                    leaf_layout,
-                    file_name,
-                    search_key,
-                );
-            }
-
-            let child_guard = match txn.pin_read_guard_fast(&child_block)? {
-                Some(g) => g,
-                None => return Ok(ReadTraverseOutcome::NeedSlowPin(child_block)),
-            };
-            let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
-            current_view = child_view;
-        }
-    }
-
-    impl<'a> WriteCtx<'a> {
-        #[allow(dead_code)]
-        pub(super) fn leaf_is_full(&self, layout: &crate::Layout) -> bool {
-            let guard = self.leaf_guard.as_ref().expect("leaf guard present");
-            !crate::page::btree_leaf_would_fit(guard.bytes(), layout)
-        }
-    }
-
-    /// Check whether inserting `search_key` into the descended leaf would force a split.
-    ///
-    /// This is separate from descent so the outer write state machine can decide whether
-    /// it needs to switch from the fast path into the split-gated structural path.
-    pub(super) fn leaf_needs_split(
-        ctx: &WriteCtx<'_>,
-        leaf_layout: &Layout,
-        search_key: &Constant,
-    ) -> SimpleDBResult<bool> {
-        let guard = ctx.leaf_guard.as_ref().expect("leaf guard present");
-        Ok(crate::page::btree_leaf_insert_requires_split(
-            guard.bytes(),
-            leaf_layout,
-            search_key,
-        ))
-    }
-
-    /// Choose the write-descent child pointer from one internal page.
-    ///
-    /// This mirrors read descent, but operates on a mutable internal view because write
-    /// traversal holds write latches on the path.
-    fn find_child_write(
-        view: &BTreeInternalPageViewMut<'_>,
-        search_key: &Constant,
-        file_name: &str,
-    ) -> SimpleDBResult<BlockId> {
-        let mut left = 0usize;
-        let mut right = view.slot_count();
-        while left < right {
-            let mid = (left + right) / 2;
-            let key_mid = view.get_entry(mid)?.key;
-            if key_mid > *search_key {
-                right = mid;
-            } else {
-                left = mid + 1;
-            }
-        }
-        if left < view.slot_count() {
-            let block_num = view.get_entry(left)?.child_block;
-            Ok(BlockId::new(file_name.to_string(), block_num))
-        } else {
-            let block_num = view
-                .rightmost_child_block()
-                .ok_or("missing rightmost child")?;
-            Ok(BlockId::new(file_name.to_string(), block_num))
-        }
-    }
-
-    /// Descend with write-latch crabbing using blocking pins.
-    ///
-    /// Safe ancestors are released once the child proves it cannot split, so the returned
-    /// context holds only the leaf and the unsafe ancestor chain needed for propagation.
-    #[allow(dead_code)]
-    pub(super) fn descend_write<'a>(
-        txn: &'a Arc<Transaction>,
-        root_block: &BlockId,
-        internal_layout: &'a Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<WriteCtx<'a>> {
-        let root_guard = txn.pin_write_guard(root_block)?;
-        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
-        let root_level = root_view.btree_level();
-
-        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
-        let mut current_block = root_block.clone();
-        let mut current_view = root_view;
-
-        loop {
-            let child_block = find_child_write(&current_view, search_key, file_name)?;
-            let level = current_view.btree_level();
-
-            if level == 0 {
-                let leaf_guard = txn.pin_write_guard(&child_block)?;
-                ancestor_views.push((current_block, current_view));
-                return Ok(WriteCtx {
-                    leaf_guard: Some(leaf_guard),
-                    leaf_block_id: child_block,
-                    ancestor_views,
-                    root_level,
-                });
-            }
-
-            let child_guard = txn.pin_write_guard(&child_block)?;
-            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
-
-            if !child_view.is_full() {
-                ancestor_views.clear();
-            } else {
-                ancestor_views.push((current_block, current_view));
-            }
-
-            current_block = child_block;
-            current_view = child_view;
-        }
-    }
-
-    /// Descend with write-latch crabbing using only fast resident pins.
-    ///
-    /// On a miss, all held latches are released and `NeedSlowPin(block)` is returned so the
-    /// caller can pin outside latch scope and restart from the root.
-    pub(super) fn try_descend_write_fast<'a>(
-        txn: &'a Arc<Transaction>,
-        root_block: &BlockId,
-        internal_layout: &'a Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<WriteTraverseOutcome<'a>> {
-        let root_guard = match txn.pin_write_guard_fast(root_block)? {
-            Some(g) => g,
-            None => return Ok(WriteTraverseOutcome::NeedSlowPin(root_block.clone())),
-        };
-        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
-        let root_level = root_view.btree_level();
-
-        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
-        let mut current_block = root_block.clone();
-        let mut current_view = root_view;
-
-        loop {
-            let child_block = find_child_write(&current_view, search_key, file_name)?;
-            let level = current_view.btree_level();
-
-            if level == 0 {
-                let leaf_guard = match txn.pin_write_guard_fast(&child_block)? {
-                    Some(g) => g,
-                    None => {
-                        ancestor_views.clear();
-                        return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
-                    }
-                };
-                ancestor_views.push((current_block, current_view));
-                return Ok(WriteTraverseOutcome::Ready(WriteCtx {
-                    leaf_guard: Some(leaf_guard),
-                    leaf_block_id: child_block,
-                    ancestor_views,
-                    root_level,
-                }));
-            }
-
-            let child_guard = match txn.pin_write_guard_fast(&child_block)? {
-                Some(g) => g,
-                None => {
-                    ancestor_views.clear();
-                    return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
-                }
-            };
-            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
-
-            if !child_view.is_full() {
-                ancestor_views.clear();
-            } else {
-                ancestor_views.push((current_block, current_view));
-            }
-
-            current_block = child_block;
-            current_view = child_view;
-        }
-    }
-
     impl ReadCursor {
         /// Advance to the next live entry equal to `search_key`.
         ///
@@ -1381,6 +1088,13 @@ mod traversal {
             let view = guard.into_btree_leaf_page_view(leaf_layout)?;
             Ok(view.get_entry(slot)?.rid)
         }
+    }
+
+    pub(super) struct RangeCursor {
+        pub(super) leaf_block: BlockId,
+        pub(super) current_slot: Option<usize>,
+        pub(super) lower_bound: Constant,
+        pub(super) upper_bound: Constant,
     }
 
     impl RangeCursor {
@@ -1467,6 +1181,307 @@ mod traversal {
             let guard = txn.pin_read_guard(&self.leaf_block)?;
             let view = guard.into_btree_leaf_page_view(leaf_layout)?;
             Ok(view.get_entry(slot)?.rid)
+        }
+    }
+
+    pub(super) struct WriteCtx<'a> {
+        pub(super) leaf_guard: Option<PageWriteGuard<'a>>,
+        pub(super) leaf_block_id: BlockId,
+        /// Ancestor write-latches root→parent order; last = direct parent of leaf.
+        pub(super) ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)>,
+        /// B-tree level of the root at descent time (for new-root allocation).
+        pub(super) root_level: u8,
+    }
+
+    pub(super) enum ScanCursor {
+        Point(ReadCursor),
+        Range(RangeCursor),
+    }
+
+    pub(super) enum WriteTraverseOutcome<'a> {
+        Ready(WriteCtx<'a>),
+        NeedSlowPin(BlockId),
+    }
+
+    /// Choose the child pointer to follow from one internal page.
+    ///
+    /// This does the internal-node search only; it does not pin or descend into the
+    /// child. If `search_key` is >= every separator, this returns the rightmost child.
+    fn find_child_block(
+        search_key: &Constant,
+        file_name: &str,
+        slot_count: usize,
+        mut entry_at: impl FnMut(usize) -> SimpleDBResult<(Constant, usize)>,
+        rightmost_child_block: Option<usize>,
+    ) -> SimpleDBResult<BlockId> {
+        let mut left = 0;
+        let mut right = slot_count;
+        while left < right {
+            let mid = (left + right) / 2;
+            let (key_mid, _) = entry_at(mid)?;
+            if key_mid > *search_key {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+        if left < slot_count {
+            let (_, block_num) = entry_at(left)?;
+            Ok(BlockId::new(file_name.to_string(), block_num))
+        } else {
+            let block_num = rightmost_child_block.ok_or("missing rightmost child")?;
+            Ok(BlockId::new(file_name.to_string(), block_num))
+        }
+    }
+
+    /// Position a read cursor on the leaf that should contain `search_key`.
+    ///
+    /// The starting leaf is already known. This may hop right through sibling leaves
+    /// while `search_key` is beyond the current page's high key. Sibling hops use
+    /// fast pins; if a sibling is not resident the function returns `NeedSlowPin`
+    /// so the caller can pin outside latch scope and restart from the root.
+    fn try_find_initial_cursor(
+        txn: &Arc<Transaction>,
+        leaf_block: BlockId,
+        leaf_layout: &Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<ReadTraverseOutcome> {
+        let first_guard = txn.pin_read_guard(&leaf_block)?;
+        let mut current_block = leaf_block;
+        let mut current_view = first_guard.into_btree_leaf_page_view(leaf_layout)?;
+
+        loop {
+            let should_hop = if let Some(hk) = current_view.high_key() {
+                *search_key >= hk
+            } else {
+                false
+            };
+
+            if !should_hop {
+                let current_slot = current_view.find_slot_before(search_key);
+                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
+                    leaf_block: current_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                }));
+            }
+
+            let Some(rsib) = current_view.right_sibling_block() else {
+                let current_slot = current_view.find_slot_before(search_key);
+                return Ok(ReadTraverseOutcome::Ready(ReadCursor {
+                    leaf_block: current_block,
+                    current_slot,
+                    search_key: search_key.clone(),
+                }));
+            };
+
+            let next_block = BlockId::new(file_name.to_string(), rsib);
+            let Some(next_guard) = txn.pin_read_guard_fast(&next_block)? else {
+                return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
+            };
+            let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
+            current_block = next_block;
+            current_view = next_view;
+        }
+    }
+
+    /// Descend the B-tree with fast (non-blocking) pin attempts for internal nodes.
+    /// At leaf level, uses slow pin (no latches held at that point).
+    /// Returns `Ready` with a positioned cursor, or `NeedSlowPin(block)` if an
+    /// internal page was not resident (all latches released).
+    pub(super) fn try_descend_read(
+        txn: &Arc<Transaction>,
+        root_block: &BlockId,
+        internal_layout: &Layout,
+        leaf_layout: &Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<ReadTraverseOutcome> {
+        let guard = match txn.pin_read_guard_fast(root_block)? {
+            Some(g) => g,
+            None => return Ok(ReadTraverseOutcome::NeedSlowPin(root_block.clone())),
+        };
+        let mut current_view = guard.into_btree_internal_page_view(internal_layout)?;
+
+        loop {
+            let child_block = find_child_block(
+                search_key,
+                file_name,
+                current_view.slot_count(),
+                |slot| {
+                    let entry = current_view.get_entry(slot)?;
+                    Ok((entry.key, entry.child_block))
+                },
+                current_view.rightmost_child_block(),
+            )?;
+            let is_leaf_level = current_view.btree_level() == 0;
+
+            if is_leaf_level {
+                // No parent latch held after releasing current_view. Leaf/sibling hops
+                // must still use fast resident pins and restart on miss.
+                return try_find_initial_cursor(
+                    txn,
+                    child_block,
+                    leaf_layout,
+                    file_name,
+                    search_key,
+                );
+            }
+
+            let child_guard = match txn.pin_read_guard_fast(&child_block)? {
+                Some(g) => g,
+                None => return Ok(ReadTraverseOutcome::NeedSlowPin(child_block)),
+            };
+            let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
+            current_view = child_view;
+        }
+    }
+
+    /// Check whether inserting `search_key` into the descended leaf would force a split.
+    ///
+    /// This is separate from descent so the outer write state machine can decide whether
+    /// it needs to switch from the fast path into the split-gated structural path.
+    pub(super) fn leaf_needs_split(
+        ctx: &WriteCtx<'_>,
+        leaf_layout: &Layout,
+        search_key: &Constant,
+    ) -> SimpleDBResult<bool> {
+        let guard = ctx.leaf_guard.as_ref().expect("leaf guard present");
+        crate::page::BTreeLeafPageView::bytes_insert_requires_split(
+            guard.bytes(),
+            leaf_layout,
+            search_key,
+        )
+    }
+
+    /// Descend with write-latch crabbing using blocking pins.
+    ///
+    /// Safe ancestors are released once the child proves it cannot split, so the returned
+    /// context holds only the leaf and the unsafe ancestor chain needed for propagation.
+    #[allow(dead_code)]
+    pub(super) fn descend_write<'a>(
+        txn: &'a Arc<Transaction>,
+        root_block: &BlockId,
+        internal_layout: &'a Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<WriteCtx<'a>> {
+        let root_guard = txn.pin_write_guard(root_block)?;
+        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
+        let root_level = root_view.btree_level();
+
+        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
+        let mut current_block = root_block.clone();
+        let mut current_view = root_view;
+
+        loop {
+            let child_block = find_child_block(
+                search_key,
+                file_name,
+                current_view.slot_count(),
+                |slot| {
+                    let entry = current_view.get_entry(slot)?;
+                    Ok((entry.key, entry.child_block))
+                },
+                current_view.rightmost_child_block(),
+            )?;
+            let level = current_view.btree_level();
+
+            if level == 0 {
+                let leaf_guard = txn.pin_write_guard(&child_block)?;
+                ancestor_views.push((current_block, current_view));
+                return Ok(WriteCtx {
+                    leaf_guard: Some(leaf_guard),
+                    leaf_block_id: child_block,
+                    ancestor_views,
+                    root_level,
+                });
+            }
+
+            let child_guard = txn.pin_write_guard(&child_block)?;
+            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
+
+            if !child_view.is_full() {
+                ancestor_views.clear();
+            } else {
+                ancestor_views.push((current_block, current_view));
+            }
+
+            current_block = child_block;
+            current_view = child_view;
+        }
+    }
+
+    /// Descend with write-latch crabbing using only fast resident pins.
+    ///
+    /// On a miss, all held latches are released and `NeedSlowPin(block)` is returned so the
+    /// caller can pin outside latch scope and restart from the root.
+    pub(super) fn try_descend_write_fast<'a>(
+        txn: &'a Arc<Transaction>,
+        root_block: &BlockId,
+        internal_layout: &'a Layout,
+        file_name: &str,
+        search_key: &Constant,
+    ) -> SimpleDBResult<WriteTraverseOutcome<'a>> {
+        let root_guard = match txn.pin_write_guard_fast(root_block)? {
+            Some(g) => g,
+            None => return Ok(WriteTraverseOutcome::NeedSlowPin(root_block.clone())),
+        };
+        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
+        let root_level = root_view.btree_level();
+
+        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
+        let mut current_block = root_block.clone();
+        let mut current_view = root_view;
+
+        loop {
+            let child_block = find_child_block(
+                search_key,
+                file_name,
+                current_view.slot_count(),
+                |slot| {
+                    let entry = current_view.get_entry(slot)?;
+                    Ok((entry.key, entry.child_block))
+                },
+                current_view.rightmost_child_block(),
+            )?;
+            let level = current_view.btree_level();
+
+            if level == 0 {
+                let leaf_guard = match txn.pin_write_guard_fast(&child_block)? {
+                    Some(g) => g,
+                    None => {
+                        ancestor_views.clear();
+                        return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                    }
+                };
+                ancestor_views.push((current_block, current_view));
+                return Ok(WriteTraverseOutcome::Ready(WriteCtx {
+                    leaf_guard: Some(leaf_guard),
+                    leaf_block_id: child_block,
+                    ancestor_views,
+                    root_level,
+                }));
+            }
+
+            let child_guard = match txn.pin_write_guard_fast(&child_block)? {
+                Some(g) => g,
+                None => {
+                    ancestor_views.clear();
+                    return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                }
+            };
+            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
+
+            if !child_view.is_full() {
+                ancestor_views.clear();
+            } else {
+                ancestor_views.push((current_block, current_view));
+            }
+
+            current_block = child_block;
+            current_view = child_view;
         }
     }
 

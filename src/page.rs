@@ -4209,6 +4209,43 @@ impl<'a> BTreeLeafPageView<'a> {
         self.page().high_key(self.layout)
     }
 
+    fn page_insert_requires_split(
+        page: BTreeLeafPage<'_>,
+        layout: &Layout,
+        search_key: &Constant,
+    ) -> bool {
+        if let Some(_overflow_block) = page.overflow_block() {
+            if page.slot_count() > 0 {
+                if let Some(first_entry) = page
+                    .entry_bytes(0)
+                    .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
+                {
+                    if first_entry.key > *search_key {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        page.is_full(layout)
+    }
+
+    pub(crate) fn bytes_insert_requires_split(
+        bytes: &[u8],
+        layout: &Layout,
+        search_key: &Constant,
+    ) -> SimpleDBResult<bool> {
+        Ok(Self::page_insert_requires_split(
+            BTreeLeafPage::new(bytes)?,
+            layout,
+            search_key,
+        ))
+    }
+
+    pub fn insert_requires_split(&self, search_key: &Constant) -> bool {
+        Self::page_insert_requires_split(self.page(), self.layout, search_key)
+    }
+
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
         BTreeLeafIterator::new(
             self.build_page()
@@ -4300,6 +4337,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     pub fn high_key(&self) -> Option<Constant> {
         self.page().high_key(self.layout)
+    }
+
+    pub fn insert_requires_split(&self, search_key: &Constant) -> bool {
+        BTreeLeafPageView::page_insert_requires_split(self.page(), self.layout, search_key)
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
@@ -5968,48 +6009,6 @@ impl<'a> BTreeLeafPage<'a> {
         } else {
             Some(raw as usize)
         }
-    }
-}
-
-/// Returns true if inserting one more entry of `layout`'s max size would fit in this leaf page.
-#[allow(dead_code)]
-pub(crate) fn btree_leaf_would_fit(bytes: &[u8], layout: &Layout) -> bool {
-    match BTreeLeafPage::new(bytes) {
-        Ok(page) => !page.is_full(layout),
-        Err(_) => false,
-    }
-}
-
-pub(crate) fn btree_leaf_insert_requires_split(
-    bytes: &[u8],
-    layout: &Layout,
-    search_key: &Constant,
-) -> bool {
-    let Ok(page) = BTreeLeafPage::new(bytes) else {
-        return true;
-    };
-
-    if let Some(_overflow_block) = page.overflow_block() {
-        if page.slot_count() > 0 {
-            if let Some(first_entry) = page
-                .entry_bytes(0)
-                .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
-            {
-                if first_entry.key > *search_key {
-                    return true;
-                }
-            }
-        }
-    }
-
-    page.is_full(layout)
-}
-
-#[allow(dead_code)]
-pub(crate) fn btree_internal_would_fit(bytes: &[u8], layout: &Layout) -> bool {
-    match BTreeInternalPage::new(bytes) {
-        Ok(page) => !page.is_full(layout),
-        Err(_) => false,
     }
 }
 
