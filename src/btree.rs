@@ -86,6 +86,99 @@ pub use split_gate::SplitGate;
 pub use split_gate::SplitGateReadGuard;
 
 #[cfg(test)]
+mod test_hooks {
+    //! Deterministic test hooks for B-tree traversal.
+    //!
+    //! These hooks let tests observe and pause specific state-machine transitions in the
+    //! real B-tree read/write paths. They exist to avoid timing-based concurrency tests:
+    //! instead of hoping threads interleave the right way, tests can wait for a semantic
+    //! event such as "reader acquired split gate" and resume execution explicitly.
+    //!
+    //! The module is test-only on purpose. It is narrow and B-tree-specific rather than a
+    //! generic repo-wide failpoint framework.
+
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Condvar, Mutex},
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) enum BTreeTestEvent {
+        ReadSplitGateAcquired,
+        WriteAboutToAcquireSplitGate,
+        WriteSplitGateAcquired,
+    }
+
+    pub(crate) trait BTreeTestHook: Send + Sync {
+        fn on_event(&self, event: BTreeTestEvent);
+    }
+
+    pub(crate) struct PauseEventHook {
+        state: Mutex<PauseEventHookState>,
+        cv: Condvar,
+    }
+
+    struct PauseEventHookState {
+        seen: HashSet<BTreeTestEvent>,
+        paused: HashSet<BTreeTestEvent>,
+        resumed: HashSet<BTreeTestEvent>,
+    }
+
+    impl PauseEventHook {
+        pub(crate) fn new(paused_events: &[BTreeTestEvent]) -> Self {
+            Self {
+                state: Mutex::new(PauseEventHookState {
+                    seen: HashSet::new(),
+                    paused: paused_events.iter().copied().collect(),
+                    resumed: HashSet::new(),
+                }),
+                cv: Condvar::new(),
+            }
+        }
+
+        pub(crate) fn wait_for(&self, event: BTreeTestEvent) {
+            let mut state = self.state.lock().unwrap();
+            while !state.seen.contains(&event) {
+                state = self.cv.wait(state).unwrap();
+            }
+        }
+
+        pub(crate) fn resume(&self, event: BTreeTestEvent) {
+            let mut state = self.state.lock().unwrap();
+            state.resumed.insert(event);
+            self.cv.notify_all();
+        }
+
+        fn should_pause(state: &PauseEventHookState, event: BTreeTestEvent) -> bool {
+            state.paused.contains(&event) && !state.resumed.contains(&event)
+        }
+
+        fn wait_until_resumed(&self, event: BTreeTestEvent) {
+            let mut state = self.state.lock().unwrap();
+            while Self::should_pause(&state, event) {
+                state = self.cv.wait(state).unwrap();
+            }
+        }
+    }
+
+    impl BTreeTestHook for PauseEventHook {
+        fn on_event(&self, event: BTreeTestEvent) {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.seen.insert(event);
+                self.cv.notify_all();
+            }
+            self.wait_until_resumed(event);
+        }
+    }
+
+    pub(crate) type SharedBTreeTestHook = Arc<dyn BTreeTestHook>;
+}
+
+#[cfg(test)]
+use test_hooks::{BTreeTestEvent, SharedBTreeTestHook};
+
+#[cfg(test)]
 mod split_gate_tests {
     use super::SplitGate;
     use std::sync::{
@@ -385,6 +478,8 @@ pub struct BTreeIndex {
     structure_version: u64,
     split_gate: Arc<SplitGate>,
     scan_gate_guard: Option<SplitGateReadGuard>,
+    #[cfg(test)]
+    test_hook: Option<SharedBTreeTestHook>,
 }
 
 impl std::fmt::Display for BTreeIndex {
@@ -490,6 +585,8 @@ impl BTreeIndex {
             structure_version,
             split_gate,
             scan_gate_guard: None,
+            #[cfg(test)]
+            test_hook: None,
         })
     }
 
@@ -695,6 +792,8 @@ impl BTreeIndex {
             state = match state {
                 ReadState::Start => {
                     self.scan_gate_guard = Some(self.split_gate.acquire_shared());
+                    #[cfg(test)]
+                    self.emit_test_event(BTreeTestEvent::ReadSplitGateAcquired);
                     ReadState::RetryFromRoot
                 }
                 ReadState::RetryFromRoot => {
@@ -768,7 +867,11 @@ impl BTreeIndex {
                 }
                 WriteState::AcquireSplitGate => {
                     self.scan_gate_guard = None;
+                    #[cfg(test)]
+                    self.emit_test_event(BTreeTestEvent::WriteAboutToAcquireSplitGate);
                     split_gate_guard = Some(self.split_gate.acquire_exclusive());
+                    #[cfg(test)]
+                    self.emit_test_event(BTreeTestEvent::WriteSplitGateAcquired);
                     WriteState::DescendUnderSplitGate
                 }
                 WriteState::DescendUnderSplitGate => {
@@ -853,6 +956,18 @@ impl BTreeIndex {
                 }
             };
         }
+    }
+
+    #[cfg(test)]
+    fn emit_test_event(&self, event: BTreeTestEvent) {
+        if let Some(hook) = &self.test_hook {
+            hook.on_event(event);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_hook(&mut self, hook: SharedBTreeTestHook) {
+        self.test_hook = Some(hook);
     }
 }
 
@@ -2121,6 +2236,7 @@ mod structural {
 #[cfg(test)]
 mod btree_index_tests {
     use super::*;
+    use super::test_hooks::PauseEventHook;
     use crate::{
         test_utils::{generate_filename, generate_random_number},
         Schema, SimpleDB, TestDir, WalMode,
@@ -3280,9 +3396,8 @@ mod btree_index_tests {
 
     #[test]
     fn test_reader_blocks_split_insert_until_release() {
-        use std::sync::mpsc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
-        use std::time::Duration;
 
         let (db, _dir) = SimpleDB::new_for_test(64, 5000);
         db.set_wal_mode(WalMode::UnsafeNoWal);
@@ -3309,9 +3424,8 @@ mod btree_index_tests {
         let log_manager = db.log_manager();
         let buffer_manager = db.buffer_manager();
         let lock_table = db.lock_table();
-        let (reader_ready_tx, reader_ready_rx) = mpsc::channel();
-        let (release_reader_tx, release_reader_rx) = mpsc::channel();
-        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+        let hook = Arc::new(PauseEventHook::new(&[BTreeTestEvent::ReadSplitGateAcquired]));
+        let writer_done = Arc::new(AtomicBool::new(false));
 
         let reader_gate = Arc::clone(&split_gate);
         let reader_name = index_name.clone();
@@ -3320,6 +3434,7 @@ mod btree_index_tests {
         let reader_lm = Arc::clone(&log_manager);
         let reader_bm = Arc::clone(&buffer_manager);
         let reader_lt = Arc::clone(&lock_table);
+        let reader_hook = Arc::clone(&hook);
         let reader = thread::spawn(move || {
             let txn = Arc::new(Transaction::new(reader_fm, reader_lm, reader_bm, reader_lt));
             let mut idx = BTreeIndex::new(
@@ -3330,21 +3445,25 @@ mod btree_index_tests {
                 Arc::clone(&reader_gate),
             )
             .unwrap();
+            idx.set_test_hook(reader_hook);
             idx.before_first(&Constant::Int(0));
-            reader_ready_tx.send(()).unwrap();
-            release_reader_rx.recv().unwrap();
             txn.commit().unwrap();
         });
 
-        reader_ready_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("reader should reach before_first while holding shared split gate");
+        hook.wait_for(BTreeTestEvent::ReadSplitGateAcquired);
 
         let writer_gate = Arc::clone(&split_gate);
         let writer_name = index_name.clone();
         let writer_layout = leaf_layout.clone();
+        let writer_hook = Arc::clone(&hook);
+        let writer_done_flag = Arc::clone(&writer_done);
         let writer = thread::spawn(move || {
-            let txn = Arc::new(Transaction::new(file_manager, log_manager, buffer_manager, lock_table));
+            let txn = Arc::new(Transaction::new(
+                file_manager,
+                log_manager,
+                buffer_manager,
+                lock_table,
+            ));
             let mut idx = BTreeIndex::new(
                 Arc::clone(&txn),
                 &writer_name,
@@ -3353,23 +3472,27 @@ mod btree_index_tests {
                 Arc::clone(&writer_gate),
             )
             .unwrap();
+            idx.set_test_hook(writer_hook);
             idx.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
             txn.commit().unwrap();
-            writer_done_tx.send(()).unwrap();
+            writer_done_flag.store(true, Ordering::Release);
         });
 
+        hook.wait_for(BTreeTestEvent::WriteAboutToAcquireSplitGate);
         assert!(
-            writer_done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            !writer_done.load(Ordering::Acquire),
             "split-causing insert should block while reader holds shared split gate"
         );
 
-        release_reader_tx.send(()).unwrap();
-        writer_done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("split-causing insert should complete after reader releases");
+        hook.resume(BTreeTestEvent::ReadSplitGateAcquired);
+        hook.wait_for(BTreeTestEvent::WriteSplitGateAcquired);
 
         reader.join().unwrap();
         writer.join().unwrap();
+        assert!(
+            writer_done.load(Ordering::Acquire),
+            "split-causing insert should complete after reader releases"
+        );
 
         let verify_tx = db.new_tx();
         let mut verify_idx = BTreeIndex::new(
