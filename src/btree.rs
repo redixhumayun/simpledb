@@ -85,6 +85,67 @@ mod split_gate {
 pub use split_gate::SplitGate;
 pub use split_gate::SplitGateReadGuard;
 
+#[cfg(test)]
+mod split_gate_tests {
+    use super::SplitGate;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_split_gate_shared_blocks_exclusive() {
+        let split_gate = Arc::new(SplitGate::new());
+        let writer_acquired = Arc::new(AtomicBool::new(false));
+        let (reader_holds_tx, reader_holds_rx) = mpsc::channel();
+        let (release_reader_tx, release_reader_rx) = mpsc::channel();
+        let (writer_attempting_tx, writer_attempting_rx) = mpsc::channel();
+        let (writer_acquired_tx, writer_acquired_rx) = mpsc::channel();
+
+        let reader_gate = Arc::clone(&split_gate);
+        let reader = thread::spawn(move || {
+            let _guard = reader_gate.acquire_shared();
+            reader_holds_tx.send(()).unwrap();
+            release_reader_rx.recv().unwrap();
+        });
+
+        reader_holds_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should acquire the shared split gate");
+
+        let writer_gate = Arc::clone(&split_gate);
+        let writer_acquired_flag = Arc::clone(&writer_acquired);
+        let writer = thread::spawn(move || {
+            writer_attempting_tx.send(()).unwrap();
+            let _guard = writer_gate.acquire_exclusive();
+            writer_acquired_flag.store(true, Ordering::Release);
+            writer_acquired_tx.send(()).unwrap();
+        });
+
+        writer_attempting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should reach exclusive split-gate acquisition");
+        assert!(
+            writer_acquired_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "writer should remain blocked while reader holds the shared split gate"
+        );
+        assert!(
+            !writer_acquired.load(Ordering::Acquire),
+            "writer should not acquire exclusive split gate before reader releases"
+        );
+
+        release_reader_tx.send(()).unwrap();
+        writer_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should acquire exclusive split gate after reader releases");
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
+}
+
 enum WriteState {
     Start,
     DescendFast,
