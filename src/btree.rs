@@ -93,6 +93,8 @@ mod test_hooks {
     //! real B-tree read/write paths. They exist to avoid timing-based concurrency tests:
     //! instead of hoping threads interleave the right way, tests can wait for a semantic
     //! event such as "reader acquired split gate" and resume execution explicitly.
+    //! They also support narrow test-only fault injection for rare retry branches that are
+    //! otherwise difficult to trigger deterministically.
     //!
     //! The module is test-only on purpose. It is narrow and B-tree-specific rather than a
     //! generic repo-wide failpoint framework.
@@ -107,10 +109,16 @@ mod test_hooks {
         ReadSplitGateAcquired,
         WriteAboutToAcquireSplitGate,
         WriteSplitGateAcquired,
+        WriteNeedSlowPinUnderSplitGate,
+        WriteReacquiringSplitGateAfterSlowPin,
     }
 
     pub(crate) trait BTreeTestHook: Send + Sync {
         fn on_event(&self, event: BTreeTestEvent);
+
+        fn force_need_slow_pin_under_split_gate(&self) -> bool {
+            false
+        }
     }
 
     pub(crate) struct PauseEventHook {
@@ -120,8 +128,10 @@ mod test_hooks {
 
     struct PauseEventHookState {
         seen: HashSet<BTreeTestEvent>,
+        counts: std::collections::HashMap<BTreeTestEvent, usize>,
         paused: HashSet<BTreeTestEvent>,
         resumed: HashSet<BTreeTestEvent>,
+        force_need_slow_pin_under_split_gate_remaining: usize,
     }
 
     impl PauseEventHook {
@@ -129,8 +139,10 @@ mod test_hooks {
             Self {
                 state: Mutex::new(PauseEventHookState {
                     seen: HashSet::new(),
+                    counts: std::collections::HashMap::new(),
                     paused: paused_events.iter().copied().collect(),
                     resumed: HashSet::new(),
+                    force_need_slow_pin_under_split_gate_remaining: 0,
                 }),
                 cv: Condvar::new(),
             }
@@ -147,10 +159,19 @@ mod test_hooks {
             self.state.lock().unwrap().seen.contains(&event)
         }
 
+        pub(crate) fn count(&self, event: BTreeTestEvent) -> usize {
+            *self.state.lock().unwrap().counts.get(&event).unwrap_or(&0)
+        }
+
         pub(crate) fn resume(&self, event: BTreeTestEvent) {
             let mut state = self.state.lock().unwrap();
             state.resumed.insert(event);
             self.cv.notify_all();
+        }
+
+        pub(crate) fn set_force_need_slow_pin_under_split_gate(&self, times: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.force_need_slow_pin_under_split_gate_remaining = times;
         }
 
         fn should_pause(state: &PauseEventHookState, event: BTreeTestEvent) -> bool {
@@ -170,9 +191,19 @@ mod test_hooks {
             {
                 let mut state = self.state.lock().unwrap();
                 state.seen.insert(event);
+                *state.counts.entry(event).or_insert(0) += 1;
                 self.cv.notify_all();
             }
             self.wait_until_resumed(event);
+        }
+
+        fn force_need_slow_pin_under_split_gate(&self) -> bool {
+            let mut state = self.state.lock().unwrap();
+            if state.force_need_slow_pin_under_split_gate_remaining == 0 {
+                return false;
+            }
+            state.force_need_slow_pin_under_split_gate_remaining -= 1;
+            true
         }
     }
 
@@ -880,40 +911,84 @@ impl BTreeIndex {
                 }
                 WriteState::DescendUnderSplitGate => {
                     let (root_block, _, _) = self.refresh_cached_meta()?;
-                    let outcome = traversal::try_descend_write_fast(
-                        &txn,
-                        &root_block,
-                        &internal_layout,
-                        &index_file_name,
-                        data_val,
-                    )?;
-                    match outcome {
-                        traversal::WriteTraverseOutcome::Ready(ctx) => {
-                            if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val)? {
-                                self.apply_insert_with_split(
-                                    &txn,
-                                    ctx,
-                                    data_val,
-                                    data_rid,
-                                    &internal_layout,
-                                    &leaf_layout,
-                                    &index_file_name,
-                                )?;
-                                split_gate_guard.take();
-                                WriteState::Done
-                            } else {
-                                split_gate_guard.take();
-                                WriteState::DescendFast
+                    #[cfg(test)]
+                    {
+                        if self.should_force_need_slow_pin_under_split_gate() {
+                            self.emit_test_event(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate);
+                            WriteState::NeedSlowPinUnderSplitGate(root_block)
+                        } else {
+                            let outcome = traversal::try_descend_write_fast(
+                                &txn,
+                                &root_block,
+                                &internal_layout,
+                                &index_file_name,
+                                data_val,
+                            )?;
+                            match outcome {
+                                traversal::WriteTraverseOutcome::Ready(ctx) => {
+                                    if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val)? {
+                                        self.apply_insert_with_split(
+                                            &txn,
+                                            ctx,
+                                            data_val,
+                                            data_rid,
+                                            &internal_layout,
+                                            &leaf_layout,
+                                            &index_file_name,
+                                        )?;
+                                        split_gate_guard.take();
+                                        WriteState::Done
+                                    } else {
+                                        split_gate_guard.take();
+                                        WriteState::DescendFast
+                                    }
+                                }
+                                traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
+                                    self.emit_test_event(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate);
+                                    WriteState::NeedSlowPinUnderSplitGate(block)
+                                }
                             }
                         }
-                        traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                            WriteState::NeedSlowPinUnderSplitGate(block)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        let outcome = traversal::try_descend_write_fast(
+                            &txn,
+                            &root_block,
+                            &internal_layout,
+                            &index_file_name,
+                            data_val,
+                        )?;
+                        match outcome {
+                            traversal::WriteTraverseOutcome::Ready(ctx) => {
+                                if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val)? {
+                                    self.apply_insert_with_split(
+                                        &txn,
+                                        ctx,
+                                        data_val,
+                                        data_rid,
+                                        &internal_layout,
+                                        &leaf_layout,
+                                        &index_file_name,
+                                    )?;
+                                    split_gate_guard.take();
+                                    WriteState::Done
+                                } else {
+                                    split_gate_guard.take();
+                                    WriteState::DescendFast
+                                }
+                            }
+                            traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
+                                WriteState::NeedSlowPinUnderSplitGate(block)
+                            }
                         }
                     }
                 }
                 WriteState::NeedSlowPinUnderSplitGate(block) => {
                     split_gate_guard.take();
                     txn.pin_write_guard(&block)?;
+                    #[cfg(test)]
+                    self.emit_test_event(BTreeTestEvent::WriteReacquiringSplitGateAfterSlowPin);
                     WriteState::AcquireSplitGate
                 }
                 WriteState::Done => return Ok(()),
@@ -967,6 +1042,13 @@ impl BTreeIndex {
         if let Some(hook) = &self.test_hook {
             hook.on_event(event);
         }
+    }
+
+    #[cfg(test)]
+    fn should_force_need_slow_pin_under_split_gate(&self) -> bool {
+        self.test_hook
+            .as_ref()
+            .is_some_and(|hook| hook.force_need_slow_pin_under_split_gate())
     }
 
     #[cfg(test)]
@@ -3638,6 +3720,72 @@ mod btree_index_tests {
             second_key_rids.push(verify_idx.get_data_rid());
         }
         assert!(second_key_rids.contains(&RID::new(2, second_key as usize)));
+        super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
+        verify_tx.commit().unwrap();
+    }
+
+    #[test]
+    fn test_retry_path_under_split_gate_preserves_correctness() {
+        let (db, _dir) = SimpleDB::new_for_test(64, 5000);
+        db.set_wal_mode(WalMode::UnsafeNoWal);
+        let index_name = generate_filename();
+        let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
+
+        let split_key;
+        {
+            let setup_tx = db.new_tx();
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&setup_tx),
+                &index_name,
+                leaf_layout.clone(),
+                TEST_INDEXED_TABLE_ID,
+                Arc::clone(&split_gate),
+            )
+            .unwrap();
+            split_key = insert_until_next_insert_splits(&mut idx, 0);
+            setup_tx.commit().unwrap();
+        }
+
+        let hook = Arc::new(PauseEventHook::new(&[]));
+        hook.set_force_need_slow_pin_under_split_gate(1);
+
+        let write_tx = db.new_tx();
+        let mut idx = BTreeIndex::new(
+            Arc::clone(&write_tx),
+            &index_name,
+            leaf_layout.clone(),
+            TEST_INDEXED_TABLE_ID,
+            Arc::clone(&split_gate),
+        )
+        .unwrap();
+        idx.set_test_hook(hook.clone());
+        idx.insert(&Constant::Int(split_key), &RID::new(1, split_key as usize));
+        write_tx.commit().unwrap();
+
+        assert_eq!(hook.count(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate), 1);
+        assert_eq!(
+            hook.count(BTreeTestEvent::WriteReacquiringSplitGateAfterSlowPin),
+            1
+        );
+        assert_eq!(hook.count(BTreeTestEvent::WriteAboutToAcquireSplitGate), 2);
+        assert_eq!(hook.count(BTreeTestEvent::WriteSplitGateAcquired), 2);
+
+        let verify_tx = db.new_tx();
+        let mut verify_idx = BTreeIndex::new(
+            Arc::clone(&verify_tx),
+            &index_name,
+            leaf_layout,
+            TEST_INDEXED_TABLE_ID,
+            Arc::clone(&split_gate),
+        )
+        .unwrap();
+        verify_idx.before_first(&Constant::Int(split_key));
+        assert!(
+            verify_idx.next(),
+            "split-causing insert should succeed after retry under split gate"
+        );
+        assert_eq!(verify_idx.get_data_rid(), RID::new(1, split_key as usize));
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
         verify_tx.commit().unwrap();
     }
