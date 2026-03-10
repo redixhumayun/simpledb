@@ -4227,7 +4227,18 @@ impl<'a> BTreeLeafPageView<'a> {
             }
         }
 
-        page.is_full(layout)
+        let entry_len = BTreeLeafEntry {
+            key: search_key.clone(),
+            rid: RID::new(0, 0),
+        }
+        .encode(layout)
+        .len() as u16;
+        let insert_cost = entry_len + LinePtrBytes::LINE_PTR_BYTES as u16;
+        let free_space_after_insert = page.header.free_space().saturating_sub(insert_cost);
+        let needed_for_next_insert =
+            layout.max_encoded_size() as u16 + LinePtrBytes::LINE_PTR_BYTES as u16;
+
+        free_space_after_insert < needed_for_next_insert
     }
 
     pub(crate) fn bytes_insert_requires_split(
@@ -4240,10 +4251,6 @@ impl<'a> BTreeLeafPageView<'a> {
             layout,
             search_key,
         ))
-    }
-
-    pub fn insert_requires_split(&self, search_key: &Constant) -> bool {
-        Self::page_insert_requires_split(self.page(), self.layout, search_key)
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {

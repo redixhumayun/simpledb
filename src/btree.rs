@@ -503,8 +503,31 @@ impl BTreeIndex {
         self.update_meta(lsn, new_structure_version)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn apply_insert_with_ctx<'a>(
+    fn apply_insert_no_split<'a>(
+        &self,
+        txn: &'a Arc<Transaction>,
+        mut ctx: traversal::WriteCtx<'a>,
+        data_val: &Constant,
+        data_rid: &RID,
+        leaf_layout: &'a Layout,
+        index_file_name: &'a str,
+    ) -> Result<(), Box<dyn Error>> {
+        let split = structural::apply_leaf_insert(
+            &mut ctx,
+            txn,
+            leaf_layout,
+            index_file_name,
+            data_val.clone(),
+            *data_rid,
+        )?;
+        assert!(
+            split.is_none(),
+            "leaf split on no-split insert path; leaf_needs_split precheck was wrong"
+        );
+        Ok(())
+    }
+
+    fn apply_insert_with_split<'a>(
         &mut self,
         txn: &'a Arc<Transaction>,
         mut ctx: traversal::WriteCtx<'a>,
@@ -512,7 +535,7 @@ impl BTreeIndex {
         data_rid: &RID,
         internal_layout: &'a Layout,
         leaf_layout: &'a Layout,
-        index_file_name: &str,
+        index_file_name: &'a str,
     ) -> Result<(), Box<dyn Error>> {
         let (root_level_saved, leaf_split, root_split) = {
             let root_level_saved = ctx.root_level;
@@ -647,21 +670,87 @@ impl BTreeIndex {
         }
     }
 
-    fn write_descend_once<'a>(
+    fn execute_insert(
         &mut self,
-        txn: &'a Arc<Transaction>,
-        internal_layout: &'a Layout,
-        index_file_name: &'a str,
-        search_key: &Constant,
-    ) -> Result<traversal::WriteTraverseOutcome<'a>, Box<dyn Error>> {
-        let (root_block, _, _) = self.refresh_cached_meta()?;
-        Ok(traversal::try_descend_write_fast(
-            txn,
-            &root_block,
-            internal_layout,
-            index_file_name,
-            search_key,
-        )?)
+        data_val: &Constant,
+        data_rid: &RID,
+    ) -> Result<(), Box<dyn Error>> {
+        let txn = Arc::clone(&self.txn);
+        let mut state = WriteState::Start;
+        let mut split_gate_guard: Option<split_gate::SplitGateWriteGuard> = None;
+        let internal_layout = self.internal_layout.clone();
+        let leaf_layout = self.leaf_layout.clone();
+        let index_file_name = self.index_file_name.clone();
+
+        loop {
+            state = match state {
+                WriteState::Start => WriteState::DescendFast,
+                WriteState::DescendFast => {
+                    let ctx =
+                        self.begin_write(&txn, &internal_layout, &index_file_name, data_val)?;
+                    if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val)? {
+                        WriteState::AcquireSplitGate
+                    } else {
+                        self.apply_insert_no_split(
+                            &txn,
+                            ctx,
+                            data_val,
+                            data_rid,
+                            &leaf_layout,
+                            &index_file_name,
+                        )?;
+                        WriteState::Done
+                    }
+                }
+                WriteState::NeedSlowPin(_) => {
+                    unreachable!("begin_write consumes non-escalated slow-pin retries")
+                }
+                WriteState::AcquireSplitGate => {
+                    self.scan_gate_guard = None;
+                    split_gate_guard = Some(self.split_gate.acquire_exclusive());
+                    WriteState::DescendUnderSplitGate
+                }
+                WriteState::DescendUnderSplitGate => {
+                    let (root_block, _, _) = self.refresh_cached_meta()?;
+                    let outcome = traversal::try_descend_write_fast(
+                        &txn,
+                        &root_block,
+                        &internal_layout,
+                        &index_file_name,
+                        data_val,
+                    )?;
+                    match outcome {
+                        traversal::WriteTraverseOutcome::Ready(ctx) => {
+                            if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val)? {
+                                self.apply_insert_with_split(
+                                    &txn,
+                                    ctx,
+                                    data_val,
+                                    data_rid,
+                                    &internal_layout,
+                                    &leaf_layout,
+                                    &index_file_name,
+                                )?;
+                                split_gate_guard.take();
+                                WriteState::Done
+                            } else {
+                                split_gate_guard.take();
+                                WriteState::DescendFast
+                            }
+                        }
+                        traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
+                            WriteState::NeedSlowPinUnderSplitGate(block)
+                        }
+                    }
+                }
+                WriteState::NeedSlowPinUnderSplitGate(block) => {
+                    split_gate_guard.take();
+                    txn.pin_write_guard(&block)?;
+                    WriteState::AcquireSplitGate
+                }
+                WriteState::Done => return Ok(()),
+            };
+        }
     }
 
     fn begin_write<'a>(
@@ -677,8 +766,10 @@ impl BTreeIndex {
             state = match state {
                 WriteState::Start => WriteState::DescendFast,
                 WriteState::DescendFast => {
-                    match self.write_descend_once(
+                    let (root_block, _, _) = self.refresh_cached_meta()?;
+                    match traversal::try_descend_write_fast(
                         txn,
+                        &root_block,
                         internal_layout,
                         index_file_name,
                         search_key,
@@ -783,96 +874,8 @@ impl Index for BTreeIndex {
             "Inserting value {:?} for rid {:?} into index",
             data_val, data_rid
         );
-
-        let txn = Arc::clone(&self.txn);
-        let mut state = WriteState::Start;
-        let mut _split_gate_guard = None;
-        loop {
-            state = match state {
-                WriteState::Start => WriteState::DescendFast,
-                WriteState::NeedSlowPin(block) => {
-                    txn.pin_write_guard(&block).unwrap();
-                    WriteState::DescendFast
-                }
-                WriteState::AcquireSplitGate => {
-                    self.scan_gate_guard = None;
-                    _split_gate_guard = Some(self.split_gate.acquire_exclusive());
-                    WriteState::DescendUnderSplitGate
-                }
-                WriteState::DescendFast => {
-                    let internal_layout = self.internal_layout.clone();
-                    let leaf_layout = self.leaf_layout.clone();
-                    let index_file_name = self.index_file_name.clone();
-
-                    let outcome = self
-                        .write_descend_once(&txn, &internal_layout, &index_file_name, data_val)
-                        .unwrap();
-
-                    match outcome {
-                        traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                            WriteState::NeedSlowPin(block)
-                        }
-                        traversal::WriteTraverseOutcome::Ready(ctx) => {
-                            if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
-                                WriteState::AcquireSplitGate
-                            } else {
-                                self.apply_insert_with_ctx(
-                                    &txn,
-                                    ctx,
-                                    data_val,
-                                    data_rid,
-                                    &internal_layout,
-                                    &leaf_layout,
-                                    &index_file_name,
-                                )
-                                .expect("apply insert failed");
-                                WriteState::Done
-                            }
-                        }
-                    }
-                }
-                WriteState::NeedSlowPinUnderSplitGate(block) => {
-                    _split_gate_guard = None;
-                    txn.pin_write_guard(&block).unwrap();
-                    WriteState::AcquireSplitGate
-                }
-                WriteState::DescendUnderSplitGate => {
-                    let internal_layout = self.internal_layout.clone();
-                    let leaf_layout = self.leaf_layout.clone();
-                    let index_file_name = self.index_file_name.clone();
-
-                    let outcome = self
-                        .write_descend_once(&txn, &internal_layout, &index_file_name, data_val)
-                        .unwrap();
-
-                    match outcome {
-                        traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
-                            WriteState::NeedSlowPinUnderSplitGate(block)
-                        }
-                        traversal::WriteTraverseOutcome::Ready(ctx) => {
-                            if traversal::leaf_needs_split(&ctx, &leaf_layout, data_val).unwrap() {
-                                self.apply_insert_with_ctx(
-                                    &txn,
-                                    ctx,
-                                    data_val,
-                                    data_rid,
-                                    &internal_layout,
-                                    &leaf_layout,
-                                    &index_file_name,
-                                )
-                                .expect("apply insert failed");
-                                _split_gate_guard = None;
-                                WriteState::Done
-                            } else {
-                                _split_gate_guard = None;
-                                WriteState::DescendFast
-                            }
-                        }
-                    }
-                }
-                WriteState::Done => break,
-            };
-        }
+        self.execute_insert(data_val, data_rid)
+            .expect("insert orchestration failed");
     }
 
     fn delete(&mut self, data_val: &Constant, data_rid: &RID) {
@@ -890,18 +893,16 @@ impl Index for BTreeIndex {
             ])
             .expect("failed to acquire ordered delete locks");
         let txn = Arc::clone(&self.txn);
-        let leaf_layout = self.leaf_layout.clone();
         let internal_layout = self.internal_layout.clone();
         let index_file_name = self.index_file_name.clone();
-
         let mut ctx = self
             .begin_write(&txn, &internal_layout, &index_file_name, data_val)
             .expect("begin write descent");
         structural::apply_leaf_delete(
             &mut ctx,
             &txn,
-            &leaf_layout,
-            &index_file_name,
+            &self.leaf_layout,
+            &self.index_file_name,
             data_val,
             *data_rid,
         )
