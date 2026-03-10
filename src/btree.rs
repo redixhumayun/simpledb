@@ -2950,6 +2950,7 @@ mod btree_index_tests {
         db.set_wal_mode(WalMode::UnsafeNoWal);
         let index_name = generate_filename();
         let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
 
         {
             let setup_tx = db.new_tx();
@@ -2958,7 +2959,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
-                Arc::new(SplitGate::new()),
+                Arc::clone(&split_gate),
             )
             .unwrap();
             setup_tx.commit().unwrap();
@@ -2970,6 +2971,7 @@ mod btree_index_tests {
         let lock_table = db.lock_table();
         let index_name = Arc::new(index_name);
         let leaf_layout = Arc::new(leaf_layout);
+        let split_gate = Arc::clone(&split_gate);
         let barrier = Arc::new(Barrier::new(WRITERS));
 
         let mut handles = vec![];
@@ -2980,6 +2982,7 @@ mod btree_index_tests {
             let lt = Arc::clone(&lock_table);
             let iname = Arc::clone(&index_name);
             let ilayout = Arc::clone(&leaf_layout);
+            let gate = Arc::clone(&split_gate);
             let bar = Arc::clone(&barrier);
 
             handles.push(thread::spawn(move || {
@@ -2998,7 +3001,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
-                        Arc::new(SplitGate::new()),
+                        Arc::clone(&gate),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
@@ -3023,7 +3026,7 @@ mod btree_index_tests {
             &index_name,
             (*leaf_layout).clone(),
             TEST_INDEXED_TABLE_ID,
-            Arc::new(SplitGate::new()),
+            Arc::clone(&split_gate),
         )
         .unwrap();
         for k in 0..total as i32 {
@@ -3053,6 +3056,7 @@ mod btree_index_tests {
         db.set_wal_mode(WalMode::UnsafeNoWal);
         let index_name = generate_filename();
         let leaf_layout = create_test_layout();
+        let split_gate = Arc::new(SplitGate::new());
 
         {
             let setup_tx = db.new_tx();
@@ -3061,7 +3065,7 @@ mod btree_index_tests {
                 &index_name,
                 leaf_layout.clone(),
                 TEST_INDEXED_TABLE_ID,
-                Arc::new(SplitGate::new()),
+                Arc::clone(&split_gate),
             )
             .unwrap();
             for k in 0..PRELOAD {
@@ -3076,6 +3080,7 @@ mod btree_index_tests {
         let lock_table = db.lock_table();
         let index_name = Arc::new(index_name);
         let leaf_layout = Arc::new(leaf_layout);
+        let split_gate = Arc::clone(&split_gate);
 
         let barrier = Arc::new(Barrier::new(1 + READERS));
         let missed = Arc::new(AtomicUsize::new(0));
@@ -3090,6 +3095,7 @@ mod btree_index_tests {
             let lt = Arc::clone(&lock_table);
             let iname = Arc::clone(&index_name);
             let ilayout = Arc::clone(&leaf_layout);
+            let gate = Arc::clone(&split_gate);
             let bar = Arc::clone(&barrier);
 
             handles.push(thread::spawn(move || {
@@ -3106,7 +3112,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
-                        Arc::new(SplitGate::new()),
+                        Arc::clone(&gate),
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(2, k as usize));
@@ -3123,6 +3129,7 @@ mod btree_index_tests {
             let lt = Arc::clone(&lock_table);
             let iname = Arc::clone(&index_name);
             let ilayout = Arc::clone(&leaf_layout);
+            let gate = Arc::clone(&split_gate);
             let bar = Arc::clone(&barrier);
             let missed_ref = Arc::clone(&missed);
 
@@ -3141,7 +3148,7 @@ mod btree_index_tests {
                         &iname,
                         (*ilayout).clone(),
                         TEST_INDEXED_TABLE_ID,
-                        Arc::new(SplitGate::new()),
+                        Arc::clone(&gate),
                     )
                     .unwrap();
                     idx.before_first(&Constant::Int(k));
