@@ -3963,14 +3963,16 @@ mod btree_index_tests {
 pub mod validator {
     use super::*;
 
-    /// Walk one internal page, verify key ordering, and return children in left-to-right order.
-    /// For level-0 pages the children are leaf block numbers; for higher levels, recurse.
+    /// Walk one internal page, verify key ordering, and return `(leaf_blocks, subtree_first_key)`
+    /// where `leaf_blocks` is the ordered leaf block numbers and `subtree_first_key` is the first
+    /// key of the leftmost leaf in this subtree (used by the parent to validate separator keys).
     pub(super) fn collect_leaf_blocks(
         txn: &Arc<Transaction>,
         internal_layout: &Layout,
+        leaf_layout: &Layout,
         file_name: &str,
         block_id: &BlockId,
-    ) -> SimpleDBResult<Vec<usize>> {
+    ) -> SimpleDBResult<(Vec<usize>, Option<Constant>)> {
         let guard = txn.pin_read_guard(block_id)?;
         let view = guard.into_btree_internal_page_view(internal_layout)?;
         let level = view.btree_level();
@@ -3989,11 +3991,17 @@ pub mod validator {
             }
         }
 
-        // Collect child block numbers in traversal order:
-        // entry[0].child_block, entry[1].child_block, ..., entry[n-1].child_block, rightmost
+        // Collect child block numbers and separator keys.
+        // Layout: entry[i].child_block is the LEFT child of entry[i].key, so:
+        //   children = [entry[0].child, entry[1].child, ..., entry[n-1].child, rightmost]
+        //   sep_keys  = [entry[0].key,  entry[1].key,  ..., entry[n-1].key]
+        // Invariant: sep_keys[i] must equal the first key of children[i+1].
         let mut children = Vec::with_capacity(slot_count + 1);
+        let mut sep_keys = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
-            children.push(view.get_entry(i)?.child_block);
+            let entry = view.get_entry(i)?;
+            children.push(entry.child_block);
+            sep_keys.push(entry.key.clone());
         }
         let rightmost = view.rightmost_child_block().ok_or_else(|| {
             format!(
@@ -4005,21 +4013,67 @@ pub mod validator {
         drop(view);
 
         if level == 0 {
-            Ok(children)
+            // Children are leaf blocks. Read each leaf to get its first key, then validate
+            // that each separator equals the first key of its right child leaf.
+            let mut first_keys: Vec<Option<Constant>> = Vec::with_capacity(children.len());
+            for &child_num in &children {
+                let child_id = BlockId::new(file_name.to_string(), child_num);
+                let leaf_guard = txn.pin_read_guard(&child_id)?;
+                let leaf_view = leaf_guard.into_btree_leaf_page_view(leaf_layout)?;
+                let first_key = if leaf_view.slot_count() > 0 {
+                    Some(leaf_view.get_entry(0)?.key.clone())
+                } else {
+                    None
+                };
+                first_keys.push(first_key);
+            }
+
+            for (i, sep_key) in sep_keys.iter().enumerate() {
+                if let Some(ref right_first) = first_keys[i + 1] {
+                    if sep_key != right_first {
+                        return Err(format!(
+                            "Internal page block {}: separator at slot {} ({:?}) != first key of right child block {} ({:?})",
+                            block_id.block_num, i, sep_key, children[i + 1], right_first
+                        ).into());
+                    }
+                }
+            }
+
+            let subtree_first = first_keys.into_iter().next().flatten();
+            Ok((children, subtree_first))
         } else {
             let mut leaves = Vec::new();
-            for child_num in children {
+            let mut subtree_first_keys: Vec<Option<Constant>> = Vec::with_capacity(children.len());
+
+            for &child_num in &children {
                 let child_id = BlockId::new(file_name.to_string(), child_num);
-                let child_leaves = collect_leaf_blocks(txn, internal_layout, file_name, &child_id)?;
+                let (child_leaves, child_first) =
+                    collect_leaf_blocks(txn, internal_layout, leaf_layout, file_name, &child_id)?;
+                subtree_first_keys.push(child_first);
                 leaves.extend(child_leaves);
             }
-            Ok(leaves)
+
+            for (i, sep_key) in sep_keys.iter().enumerate() {
+                if let Some(ref right_first) = subtree_first_keys[i + 1] {
+                    if sep_key != right_first {
+                        return Err(format!(
+                            "Internal page block {}: separator at slot {} ({:?}) != first key of right child subtree (block {}, first key {:?})",
+                            block_id.block_num, i, sep_key, children[i + 1], right_first
+                        ).into());
+                    }
+                }
+            }
+
+            let subtree_first = subtree_first_keys.into_iter().next().flatten();
+            Ok((leaves, subtree_first))
         }
     }
 
     /// Verify structural invariants of a B-tree index.
     ///
     /// Phase 1: Walk internal pages top-down to collect leaf block numbers in order.
+    ///   - Internal page keys are verified to be strictly ascending.
+    ///   - Each separator key is verified to equal the first key of its right child's subtree.
     /// Phase 2: Walk the leaf sibling chain and verify:
     ///   - Keys within each page are sorted ascending.
     ///   - All keys on a page are < the page's high_key (if set).
@@ -4030,9 +4084,10 @@ pub mod validator {
         index: &BTreeIndex,
     ) -> SimpleDBResult<()> {
         // Phase 1
-        let leaf_blocks = collect_leaf_blocks(
+        let (leaf_blocks, _) = collect_leaf_blocks(
             txn,
             &index.internal_layout,
+            &index.leaf_layout,
             &index.index_file_name,
             &index.root_block,
         )?;
