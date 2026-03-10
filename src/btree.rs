@@ -722,6 +722,7 @@ impl BTreeIndex {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_insert_with_split<'a>(
         &mut self,
         txn: &'a Arc<Transaction>,
