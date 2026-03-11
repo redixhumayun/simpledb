@@ -41,7 +41,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
 3. **Work autonomously using available tools** until blocked
 
 4. **Test thoroughly before committing**:
-   Testing requires running tests with combinations of compiler flags. Run these tests serially.
+   Testing requires running tests with combinations of compiler flags. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
    cargo test --no-default-features --features replacement_lru --features page-4k
