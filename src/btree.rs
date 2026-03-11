@@ -1110,9 +1110,13 @@ impl Index for BTreeIndex {
             .read_cursor
             .as_mut()
             .expect("ReadCursor not initialized, did you forget to call before_first?");
-        cursor
+        let advanced = cursor
             .next(&self.txn, &self.leaf_layout, &self.index_file_name)
-            .expect("scan next failed")
+            .expect("scan next failed");
+        if !advanced {
+            self.scan_gate_guard = None;
+        }
+        advanced
     }
 
     fn get_data_rid(&self) -> RID {
