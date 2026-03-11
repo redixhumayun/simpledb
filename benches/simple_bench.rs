@@ -19,6 +19,14 @@ fn ci_fast() -> Option<(Duration, Duration, usize)> {
         .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 100))
 }
 
+/// CI config for heavy index concurrency macros: keep the same timing window,
+/// but use fewer samples so the suite finishes in a practical amount of time.
+fn ci_index() -> Option<(Duration, Duration, usize)> {
+    std::env::var("CI")
+        .ok()
+        .map(|_| (Duration::from_secs(1), Duration::from_secs(5), 25))
+}
+
 fn setup_db() -> (SimpleDB, simpledb::TestDir) {
     let (db, dir) = SimpleDB::new_for_test(64, 100);
     let txn = db.new_tx();
@@ -600,7 +608,7 @@ fn run_idx_concurrent(
 
 fn bench_index_concurrency(c: &mut Criterion) {
     let mut group = c.benchmark_group("Index Concurrency");
-    if let Some((wu, mt, ss)) = ci_fast() {
+    if let Some((wu, mt, ss)) = ci_index() {
         group.warm_up_time(wu);
         group.measurement_time(mt);
         group.sample_size(ss);
