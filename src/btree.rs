@@ -1623,64 +1623,6 @@ mod traversal {
         )
     }
 
-    /// Descend with write-latch crabbing using blocking pins.
-    ///
-    /// Safe ancestors are released once the child proves it cannot split, so the returned
-    /// context holds only the leaf and the unsafe ancestor chain needed for propagation.
-    #[allow(dead_code)]
-    pub(super) fn descend_write<'a>(
-        txn: &'a Arc<Transaction>,
-        root_block: &BlockId,
-        internal_layout: &'a Layout,
-        file_name: &str,
-        search_key: &Constant,
-    ) -> SimpleDBResult<WriteCtx<'a>> {
-        let root_guard = txn.pin_write_guard(root_block)?;
-        let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
-        let root_level = root_view.btree_level();
-
-        let mut ancestor_views: Vec<(BlockId, BTreeInternalPageViewMut<'a>)> = Vec::new();
-        let mut current_block = root_block.clone();
-        let mut current_view = root_view;
-
-        loop {
-            let child_block = find_child_block(
-                search_key,
-                file_name,
-                current_view.slot_count(),
-                |slot| {
-                    let entry = current_view.get_entry(slot)?;
-                    Ok((entry.key, entry.child_block))
-                },
-                current_view.rightmost_child_block(),
-            )?;
-            let level = current_view.btree_level();
-
-            if level == 0 {
-                let leaf_guard = txn.pin_write_guard(&child_block)?;
-                ancestor_views.push((current_block, current_view));
-                return Ok(WriteCtx {
-                    leaf_guard: Some(leaf_guard),
-                    leaf_block_id: child_block,
-                    ancestor_views,
-                    root_level,
-                });
-            }
-
-            let child_guard = txn.pin_write_guard(&child_block)?;
-            let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
-
-            if !child_view.is_full() {
-                ancestor_views.clear();
-            } else {
-                ancestor_views.push((current_block, current_view));
-            }
-
-            current_block = child_block;
-            current_view = child_view;
-        }
-    }
-
     /// Descend with write-latch crabbing using only fast resident pins.
     ///
     /// On a miss, all held latches are released and `NeedSlowPin(block)` is returned so the
@@ -1857,97 +1799,6 @@ mod structural {
         new_view.clear_high_key()?;
 
         Ok(allocated.block_id)
-    }
-
-    /// Split an internal page using an already-held mutable view (no re-acquisition).
-    /// Returns (new_block_id, separator_key_to_push_up).
-    #[allow(dead_code)]
-    fn split_internal_inplace<'a>(
-        orig_view: &mut BTreeInternalPageViewMut<'a>,
-        orig_block_id: &BlockId,
-        txn: &'a Arc<Transaction>,
-        internal_layout: &'a Layout,
-        file_name: &str,
-    ) -> SimpleDBResult<(BlockId, Constant)> {
-        let txn_id = txn.id();
-        let split_slot = orig_view.slot_count() / 2;
-
-        // Read WAL split state from raw bytes before any mutations.
-        let (old_left_high_key, old_left_rightmost_child) =
-            split_wal::read_internal_split_state(orig_view.bytes())?;
-
-        // Allocate new internal page.
-        let allocated = IndexFreeList::allocate(txn, file_name)?;
-        let mut new_guard = txn.pin_write_guard(&allocated.block_id)?;
-        if let Some(append_lsn) = allocated.append_lsn {
-            new_guard.mark_modified(txn_id, append_lsn);
-        }
-        new_guard.format_as_btree_internal(orig_view.btree_level(), None)?;
-        let mut new_view = new_guard.into_btree_internal_page_view_mut(internal_layout)?;
-
-        // Emit WAL split record.
-        let split_lsn = LogRecord::BTreePageSplit {
-            txnum: txn_id,
-            left_block_id: orig_block_id.clone(),
-            right_block_id: allocated.block_id.clone(),
-            is_leaf: false,
-            old_left_high_key,
-            old_left_right_sibling: None,
-            old_left_overflow: None,
-            old_left_rightmost_child,
-        }
-        .write_log_record(&txn.log_manager())?;
-        orig_view.update_page_lsn(split_lsn);
-        new_view.update_page_lsn(split_lsn);
-
-        // Snapshot children array C0..Ck.
-        let orig_slot_count = orig_view.slot_count();
-        let mut children = Vec::with_capacity(orig_slot_count + 1);
-        for i in 0..orig_slot_count {
-            children.push(orig_view.get_entry(i)?.child_block);
-        }
-        children.push(
-            orig_view
-                .rightmost_child_block()
-                .ok_or("missing rightmost child")?,
-        );
-
-        let (left_children, right_children) = children.split_at(split_slot);
-
-        // Collect entries [split_slot, end) to move to right page.
-        let mut moved = Vec::new();
-        for rel_idx in split_slot..orig_slot_count {
-            let entry = orig_view.get_entry(rel_idx)?;
-            let rc = right_children
-                .get(rel_idx - split_slot + 1)
-                .copied()
-                .ok_or("right child missing for moved entry")?;
-            moved.push((entry.key.clone(), rc));
-        }
-
-        // Delete moved entries from original.
-        for _ in split_slot..orig_slot_count {
-            orig_view.delete_entry(split_slot)?;
-        }
-
-        // Fix up child pointers.
-        if let Some(&last_left) = left_children.last() {
-            orig_view.set_rightmost_child_block(last_left)?;
-        }
-        if let Some(&last_right) = right_children.last() {
-            new_view.set_rightmost_child_block(last_right)?;
-        }
-        for (k, rc) in moved {
-            new_view.insert_entry(k, rc)?;
-        }
-
-        // Set high keys: left gets separator, right gets +∞ sentinel.
-        let sep_key = new_view.get_entry(0)?.key.clone();
-        let sep_bytes: Vec<u8> = sep_key.clone().try_into()?;
-        orig_view.set_high_key(&sep_bytes)?;
-        new_view.clear_high_key()?;
-
-        Ok((allocated.block_id, sep_key))
     }
 
     fn collect_internal_keys_children(
@@ -2163,25 +2014,6 @@ mod structural {
             left_block: leaf_block_id.block_num,
             right_block: new_block_id.block_num,
         }))
-    }
-
-    /// Insert (search_key, rid) into the leaf without splitting.
-    /// Caller must have verified the leaf has space (leaf_is_full returned false).
-    #[allow(dead_code)]
-    pub(super) fn apply_leaf_insert_no_split<'a>(
-        ctx: &mut WriteCtx<'a>,
-        leaf_layout: &'a Layout,
-        search_key: Constant,
-        rid: RID,
-    ) -> SimpleDBResult<()> {
-        let leaf_guard = ctx
-            .leaf_guard
-            .take()
-            .expect("leaf_guard missing in WriteCtx");
-        ctx.ancestor_views.clear(); // no split, don't need ancestors
-        let mut leaf_view = leaf_guard.into_btree_leaf_page_view_mut(leaf_layout)?;
-        leaf_view.insert_entry(search_key, rid)?;
-        Ok(())
     }
 
     /// Propagate a leaf split up the ancestor stack.

@@ -242,11 +242,6 @@ impl<'a> HeapHeaderRef<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reserved_flags(&self) -> u8 {
-        self.bytes[1]
-    }
-
     pub fn slot_count(&self) -> u16 {
         u16::from_le_bytes(self.range::<2>(2))
     }
@@ -259,18 +254,8 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(6))
     }
 
-    #[allow(dead_code)]
-    pub fn free_ptr(&self) -> u32 {
-        u32::from_le_bytes(self.range::<4>(8))
-    }
-
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.range::<4>(12))
-    }
-
-    #[allow(dead_code)]
-    pub fn latch_word(&self) -> u64 {
-        u64::from_le_bytes(self.range::<8>(16))
     }
 
     pub fn free_head(&self) -> u16 {
@@ -808,7 +793,6 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_off(&self) -> u16 {
         u16::from_le_bytes(self.bytes[14..16].try_into().unwrap())
     }
@@ -1696,11 +1680,6 @@ impl<'a> BTreeMetaPage<'a> {
     pub fn structure_version(&self) -> u64 {
         self.header.structure_version()
     }
-
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.header.lsn()
-    }
 }
 
 /// Mutable zero-copy view over an entire B-tree meta page.
@@ -1734,18 +1713,8 @@ impl<'a> BTreeMetaPageMut<'a> {
         self.header.write(8, first_free.to_le_bytes());
     }
 
-    #[allow(dead_code)]
-    pub(super) fn structure_version(&self) -> u64 {
-        self.header.as_ref().structure_version()
-    }
-
     pub(super) fn set_structure_version(&mut self, v: u64) {
         self.header.set_structure_version(v);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_lsn(&mut self, lsn: u64) {
-        self.header.set_lsn(lsn);
     }
 
     pub fn update_crc32(&mut self) {
@@ -1754,11 +1723,6 @@ impl<'a> BTreeMetaPageMut<'a> {
 
     pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(self.body_bytes)
-    }
-
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.header.as_ref().lsn()
     }
 }
 
@@ -1807,11 +1771,6 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().structure_version()
     }
 
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.page().lsn()
-    }
-
     fn page(&self) -> BTreeMetaPage<'_> {
         BTreeMetaPage::new(self.guard.bytes())
             .expect("meta page view constructed with valid meta page")
@@ -1845,23 +1804,8 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().set_first_free_block(first_free);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn structure_version(&mut self) -> u64 {
-        self.page_mut().structure_version()
-    }
-
     pub(crate) fn set_structure_version(&mut self, v: u64) {
         self.page_mut().set_structure_version(v);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_lsn(&mut self, lsn: u64) {
-        self.page_mut().set_lsn(lsn);
-    }
-
-    #[allow(dead_code)]
-    pub fn lsn(&mut self) -> u64 {
-        self.page_mut().lsn()
     }
 
     pub fn update_crc32(&mut self) {
