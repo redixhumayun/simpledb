@@ -95,7 +95,7 @@ jobs:
             --testbed self-hosted \
             --adapter rust_criterion \
             --threshold-measure latency \
-            --threshold-test t-test \
+            --threshold-test t_test \
             --threshold-upper-boundary 0.95 \
             --github-actions "${{ secrets.GITHUB_TOKEN }}" \
             "SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench $bench -- --noplot"

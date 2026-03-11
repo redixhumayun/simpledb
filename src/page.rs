@@ -242,11 +242,6 @@ impl<'a> HeapHeaderRef<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reserved_flags(&self) -> u8 {
-        self.bytes[1]
-    }
-
     pub fn slot_count(&self) -> u16 {
         u16::from_le_bytes(self.range::<2>(2))
     }
@@ -259,18 +254,8 @@ impl<'a> HeapHeaderRef<'a> {
         u16::from_le_bytes(self.range::<2>(6))
     }
 
-    #[allow(dead_code)]
-    pub fn free_ptr(&self) -> u32 {
-        u32::from_le_bytes(self.range::<4>(8))
-    }
-
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.range::<4>(12))
-    }
-
-    #[allow(dead_code)]
-    pub fn latch_word(&self) -> u64 {
-        u64::from_le_bytes(self.range::<8>(16))
     }
 
     pub fn free_head(&self) -> u16 {
@@ -576,7 +561,6 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         self.free_upper().saturating_sub(self.free_lower())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[8..10].try_into().unwrap())
     }
@@ -585,7 +569,6 @@ impl<'a> BTreeLeafHeaderRef<'a> {
         u16::from_le_bytes(self.bytes[10..12].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn right_sibling(&self) -> u32 {
         u32::from_le_bytes(self.bytes[12..16].try_into().unwrap())
     }
@@ -806,12 +789,10 @@ impl<'a> BTreeInternalHeaderRef<'a> {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_len(&self) -> u16 {
         u16::from_le_bytes(self.bytes[12..14].try_into().unwrap())
     }
 
-    #[allow(dead_code)]
     pub fn high_key_off(&self) -> u16 {
         u16::from_le_bytes(self.bytes[14..16].try_into().unwrap())
     }
@@ -1571,6 +1552,10 @@ impl<'a> BTreeMetaHeaderRef<'a> {
         u32::from_le_bytes(self.bytes[8..12].try_into().unwrap())
     }
 
+    pub fn structure_version(&self) -> u64 {
+        u64::from_le_bytes(self.bytes[12..20].try_into().unwrap())
+    }
+
     pub fn crc32(&self) -> u32 {
         u32::from_le_bytes(self.bytes[20..24].try_into().unwrap())
     }
@@ -1607,6 +1592,10 @@ impl<'a> BTreeMetaHeaderMut<'a> {
 
     fn write<const N: usize>(&mut self, start: usize, value: [u8; N]) {
         self.bytes[start..start + N].copy_from_slice(&value);
+    }
+
+    pub fn set_structure_version(&mut self, v: u64) {
+        self.write(12, v.to_le_bytes());
     }
 
     pub fn init_meta(&mut self, version: u8, tree_height: u16, root_block: u32, first_free: u32) {
@@ -1688,9 +1677,8 @@ impl<'a> BTreeMetaPage<'a> {
         self.header.first_free_block()
     }
 
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.header.lsn()
+    pub fn structure_version(&self) -> u64 {
+        self.header.structure_version()
     }
 }
 
@@ -1725,9 +1713,8 @@ impl<'a> BTreeMetaPageMut<'a> {
         self.header.write(8, first_free.to_le_bytes());
     }
 
-    #[allow(dead_code)]
-    pub fn set_lsn(&mut self, lsn: u64) {
-        self.header.set_lsn(lsn);
+    pub(super) fn set_structure_version(&mut self, v: u64) {
+        self.header.set_structure_version(v);
     }
 
     pub fn update_crc32(&mut self) {
@@ -1736,11 +1723,6 @@ impl<'a> BTreeMetaPageMut<'a> {
 
     pub fn verify_crc32(&mut self) -> bool {
         self.header.verify_crc32(self.body_bytes)
-    }
-
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.header.as_ref().lsn()
     }
 }
 
@@ -1771,6 +1753,10 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().root_block()
     }
 
+    pub fn root_block_id(&self, file_name: &str) -> BlockId {
+        BlockId::new(file_name.to_string(), self.root_block() as usize)
+    }
+
     #[cfg(test)]
     pub fn version(&self) -> u8 {
         self.page().version()
@@ -1781,9 +1767,8 @@ impl<'a> BTreeMetaPageView<'a> {
         self.page().first_free_block()
     }
 
-    #[allow(dead_code)]
-    pub fn lsn(&self) -> u64 {
-        self.page().lsn()
+    pub fn structure_version(&self) -> u64 {
+        self.page().structure_version()
     }
 
     fn page(&self) -> BTreeMetaPage<'_> {
@@ -1819,14 +1804,8 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().set_first_free_block(first_free);
     }
 
-    #[allow(dead_code)]
-    pub fn set_lsn(&mut self, lsn: u64) {
-        self.page_mut().set_lsn(lsn);
-    }
-
-    #[allow(dead_code)]
-    pub fn lsn(&mut self) -> u64 {
-        self.page_mut().lsn()
+    pub(crate) fn set_structure_version(&mut self, v: u64) {
+        self.page_mut().set_structure_version(v);
     }
 
     pub fn update_crc32(&mut self) {
@@ -4174,6 +4153,50 @@ impl<'a> BTreeLeafPageView<'a> {
         self.page().high_key(self.layout)
     }
 
+    fn page_insert_requires_split(
+        page: BTreeLeafPage<'_>,
+        layout: &Layout,
+        search_key: &Constant,
+    ) -> bool {
+        if let Some(_overflow_block) = page.overflow_block() {
+            if page.slot_count() > 0 {
+                if let Some(first_entry) = page
+                    .entry_bytes(0)
+                    .and_then(|bytes| BTreeLeafEntry::decode(layout, bytes).ok())
+                {
+                    if first_entry.key > *search_key {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        let entry_len = BTreeLeafEntry {
+            key: search_key.clone(),
+            rid: RID::new(0, 0),
+        }
+        .encode(layout)
+        .len() as u16;
+        let insert_cost = entry_len + LinePtrBytes::LINE_PTR_BYTES as u16;
+        let free_space_after_insert = page.header.free_space().saturating_sub(insert_cost);
+        let needed_for_next_insert =
+            layout.max_encoded_size() as u16 + LinePtrBytes::LINE_PTR_BYTES as u16;
+
+        free_space_after_insert < needed_for_next_insert
+    }
+
+    pub(crate) fn bytes_insert_requires_split(
+        bytes: &[u8],
+        layout: &Layout,
+        search_key: &Constant,
+    ) -> SimpleDBResult<bool> {
+        Ok(Self::page_insert_requires_split(
+            BTreeLeafPage::new(bytes)?,
+            layout,
+            search_key,
+        ))
+    }
+
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
         BTreeLeafIterator::new(
             self.build_page()
@@ -4265,6 +4288,10 @@ impl<'a> BTreeLeafPageViewMut<'a> {
 
     pub fn high_key(&self) -> Option<Constant> {
         self.page().high_key(self.layout)
+    }
+
+    pub fn insert_requires_split(&self, search_key: &Constant) -> bool {
+        BTreeLeafPageView::page_insert_requires_split(self.page(), self.layout, search_key)
     }
 
     pub fn iter(&self) -> BTreeLeafIterator<'_> {
@@ -4517,6 +4544,10 @@ impl<'a> BTreeInternalPageViewMut<'a> {
         if lsn > current {
             self.page_lsn.set(Some(lsn));
         }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.guard.bytes()
     }
 
     fn build_mut_page(&mut self) -> SimpleDBResult<BTreeInternalPageMut<'_>> {
