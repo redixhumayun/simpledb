@@ -110,7 +110,6 @@ jobs:
             --token "${{ secrets.BENCHER_API_TOKEN }}" \
             --branch "${{ github.head_ref }}" \
             --start-point "${{ github.base_ref }}" \
-            --start-point-hash "${{ github.event.pull_request.base.sha }}" \
             --start-point-clone-thresholds \
             --start-point-reset \
             --testbed self-hosted \
