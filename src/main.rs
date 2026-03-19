@@ -14601,7 +14601,7 @@ impl LogManager {
 
     pub fn new_with_mode(file_manager: SharedFS, log_file: &str, wal_mode: WalMode) -> Self {
         let mut log_page = WalPage::new();
-        let log_size = file_manager.length(log_file.to_string());
+        let log_size = file_manager.wal_length(log_file.to_string());
         let current_block = if log_size == 0 {
             LogManager::append_new_block(&file_manager, log_file, &mut log_page)
         } else {
@@ -14650,7 +14650,7 @@ impl LogManager {
         }
         self.file_manager
             .write_wal_block(&self.current_block, self.log_page.bytes());
-        self.file_manager.sync(&self.log_file);
+        self.file_manager.sync_wal(&self.log_file);
         self.file_manager.sync_directory();
         self.last_saved_lsn = self.latest_lsn;
     }
@@ -14696,7 +14696,7 @@ impl LogManager {
         log_file: &str,
         log_page: &mut WalPage,
     ) -> BlockId {
-        let block_id = file_manager.append(log_file.to_string());
+        let block_id = file_manager.append_wal(log_file.to_string());
         log_page.reset();
         file_manager.write_wal_block(&block_id, log_page.bytes());
         block_id
@@ -14806,6 +14806,7 @@ pub struct BatchReadReq {
 pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
     fn length(&self, filename: String) -> usize;
+    fn wal_length(&self, filename: String) -> usize;
     fn read(&self, block_id: &BlockId, page: &mut Page);
     fn write(&self, block_id: &BlockId, page: &Page);
     fn read_wal_block(&self, block_id: &BlockId, buf: &mut [u8]);
@@ -14821,7 +14822,9 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
         }
     }
     fn append(&self, filename: String) -> BlockId;
+    fn append_wal(&self, filename: String) -> BlockId;
     fn sync(&self, filename: &str);
+    fn sync_wal(&self, filename: &str);
     fn sync_directory(&self);
     fn enable_io_stats(&self) {}
     fn disable_io_stats(&self) {}
@@ -14836,7 +14839,7 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Classifies a database file as WAL or data for I/O-mode routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FileClass {
     Wal,
     Data,
@@ -14881,7 +14884,6 @@ impl OpenFile {
     }
 
     /// Write exactly one page to the file at `offset`.
-    /// Uses the thread-local aligned buffer when the mode is `Direct`.
     fn write_page_at(&self, offset: u64, data: &[u8]) {
         debug_assert_eq!(data.len(), crate::page::PAGE_SIZE_BYTES as usize);
         match self.mode {
@@ -14897,15 +14899,6 @@ impl OpenFile {
                 unreachable!("Direct I/O is only supported on Linux")
             }
         }
-    }
-}
-
-/// Classify a filename as WAL or data.
-fn classify_file(filename: &str) -> FileClass {
-    if filename == SimpleDB::LOG_FILE {
-        FileClass::Wal
-    } else {
-        FileClass::Data
     }
 }
 
@@ -15025,7 +15018,7 @@ impl IoBatchCounters {
 struct FileManager {
     db_directory: PathBuf,
     /// Read-locked for lookup (common path); write-locked only on first open of a file.
-    open_files: RwLock<HashMap<String, Arc<OpenFile>>>,
+    open_files: RwLock<HashMap<(String, FileClass), Arc<OpenFile>>>,
     directory_fd: File,
     io_stats_enabled: AtomicBool,
     io_batch_counters: IoBatchCounters,
@@ -15074,9 +15067,9 @@ impl FileManager {
     /// Return a handle to the `OpenFile` for `filename`, opening it on first access.
     /// Common path (file already open): takes a shared read lock, no blocking between readers.
     /// Slow path (first access): upgrades to write lock to insert the new entry.
-    fn get_open_file(&self, filename: &str) -> Arc<OpenFile> {
+    fn get_open_file(&self, filename: &str, class: FileClass) -> Arc<OpenFile> {
         let full_path = self.db_directory.join(filename);
-        let key = full_path.to_string_lossy().into_owned();
+        let key = (full_path.to_string_lossy().into_owned(), class);
 
         // Fast path: file already open — shared read lock, multiple threads proceed concurrently.
         {
@@ -15090,7 +15083,6 @@ impl FileManager {
         let mut map = self.open_files.write().unwrap();
         // Re-check after acquiring write lock (another thread may have inserted between the two locks).
         Arc::clone(map.entry(key).or_insert_with(|| {
-            let class = classify_file(filename);
             Arc::new(open_with_mode(&full_path, class).expect("Failed to open file"))
         }))
     }
@@ -15098,7 +15090,7 @@ impl FileManager {
     #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
     fn read_page_sync(&self, block_id: &BlockId, page: &mut Page) {
         let offset = block_offset(block_id.block_num);
-        let of = self.get_open_file(&block_id.filename);
+        let of = self.get_open_file(&block_id.filename, FileClass::Data);
         *page = Page::from_bytes(of.read_page_at(offset));
     }
 
@@ -15200,13 +15192,20 @@ impl FileManager {
         }
     }
 }
+
 impl FileSystemInterface for FileManager {
     fn block_size(&self) -> usize {
         crate::page::PAGE_SIZE_BYTES as usize
     }
 
     fn length(&self, filename: String) -> usize {
-        let of = self.get_open_file(&filename);
+        let of = self.get_open_file(&filename, FileClass::Data);
+        let metadata = of.file.metadata().unwrap();
+        (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+    }
+
+    fn wal_length(&self, filename: String) -> usize {
+        let of = self.get_open_file(&filename, FileClass::Wal);
         let metadata = of.file.metadata().unwrap();
         (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
     }
@@ -15222,7 +15221,7 @@ impl FileSystemInterface for FileManager {
 
     fn write(&self, block_id: &BlockId, page: &Page) {
         let offset = block_offset(block_id.block_num);
-        let of = self.get_open_file(&block_id.filename);
+        let of = self.get_open_file(&block_id.filename, FileClass::Data);
         of.write_page_at(offset, page.bytes());
     }
 
@@ -15232,12 +15231,9 @@ impl FileSystemInterface for FileManager {
             crate::page::PAGE_SIZE_BYTES as usize,
             "raw read buffer must be PAGE_SIZE_BYTES"
         );
-        let reqs = [BatchReadReq {
-            block_id: block_id.clone(),
-        }];
-        let mut pages = [Page::new()];
-        self.read_batch(&reqs, &mut pages);
-        buf.copy_from_slice(pages[0].bytes());
+        let offset = block_offset(block_id.block_num);
+        let of = self.get_open_file(&block_id.filename, FileClass::Wal);
+        buf.copy_from_slice(&of.read_page_at(offset));
     }
 
     fn write_wal_block(&self, block_id: &BlockId, buf: &[u8]) {
@@ -15247,7 +15243,7 @@ impl FileSystemInterface for FileManager {
             "raw write buffer must be PAGE_SIZE_BYTES"
         );
         let offset = block_offset(block_id.block_num);
-        let of = self.get_open_file(&block_id.filename);
+        let of = self.get_open_file(&block_id.filename, FileClass::Wal);
         of.write_page_at(offset, buf);
     }
 
@@ -15271,7 +15267,7 @@ impl FileSystemInterface for FileManager {
             let mut direct_offsets: Vec<u64> = Vec::new();
 
             for (idx, req) in reqs.iter().enumerate() {
-                let of = self.get_open_file(&req.block_id.filename);
+                let of = self.get_open_file(&req.block_id.filename, FileClass::Data);
                 match of.mode {
                     IoMode::Buffered => {
                         let offset = block_offset(req.block_id.block_num);
@@ -15313,7 +15309,21 @@ impl FileSystemInterface for FileManager {
     /// Holds `append_mu` across the length-query → write-at sequence to prevent
     /// two concurrent appenders writing to the same offset.
     fn append(&self, filename: String) -> BlockId {
-        let of = self.get_open_file(&filename);
+        let of = self.get_open_file(&filename, FileClass::Data);
+        let _guard = of.append_mu.lock().unwrap();
+        let new_blk_num = {
+            let metadata = of.file.metadata().unwrap();
+            (metadata.len() as usize) / (crate::page::PAGE_SIZE_BYTES as usize)
+        };
+        let block_id = BlockId::new(filename, new_blk_num);
+        let zeros = Page::new();
+        let offset = block_offset(new_blk_num);
+        of.write_page_at(offset, zeros.bytes());
+        block_id
+    }
+
+    fn append_wal(&self, filename: String) -> BlockId {
+        let of = self.get_open_file(&filename, FileClass::Wal);
         let _guard = of.append_mu.lock().unwrap();
         let new_blk_num = {
             let metadata = of.file.metadata().unwrap();
@@ -15327,7 +15337,12 @@ impl FileSystemInterface for FileManager {
     }
 
     fn sync(&self, filename: &str) {
-        let of = self.get_open_file(filename);
+        let of = self.get_open_file(filename, FileClass::Data);
+        of.file.sync_all().unwrap();
+    }
+
+    fn sync_wal(&self, filename: &str) {
+        let of = self.get_open_file(filename, FileClass::Wal);
         of.file.sync_all().unwrap();
     }
 
@@ -15471,6 +15486,10 @@ mod mock_file_manager {
                 .map_or(0, |file| file.blocks.len())
         }
 
+        fn wal_length(&self, filename: String) -> usize {
+            self.length(filename)
+        }
+
         fn read(&self, block_id: &BlockId, page: &mut Page) {
             let mut inner = self.inner.lock().unwrap();
             if inner.crashed {
@@ -15575,6 +15594,10 @@ mod mock_file_manager {
             BlockId::new(filename, block_num)
         }
 
+        fn append_wal(&self, filename: String) -> BlockId {
+            self.append(filename)
+        }
+
         fn sync(&self, filename: &str) {
             let mut inner = self.inner.lock().unwrap();
             if inner.crashed {
@@ -15587,6 +15610,10 @@ mod mock_file_manager {
                 }
                 file.file_synced = true;
             }
+        }
+
+        fn sync_wal(&self, filename: &str) {
+            self.sync(filename)
         }
 
         fn sync_directory(&self) {
@@ -15607,11 +15634,13 @@ mod file_manager_tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    use crate::IoMode;
     #[cfg(feature = "direct-io")]
     use crate::DIRECT_IO_FALLBACK_COUNT;
-    use crate::{classify_file, test_utils::TestDir, FileClass, FileManager, FileSystemInterface};
     #[cfg(feature = "direct-io")]
     use crate::{direct_io_fallback_count, Page, PAGE_SIZE_BYTES};
+    use crate::{test_utils::TestDir, FileClass, FileManager, FileSystemInterface};
 
     #[cfg(feature = "direct-io")]
     static COUNTER_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -15641,7 +15670,7 @@ mod file_manager_tests {
             .open_files
             .read()
             .unwrap()
-            .contains_key(&full_path_str));
+            .contains_key(&(full_path_str, FileClass::Data)));
     }
 
     #[test]
@@ -15660,12 +15689,6 @@ mod file_manager_tests {
         assert_eq!(file_manager.length(filename), 2);
     }
 
-    #[test]
-    fn test_classify_file_routes_wal_and_data() {
-        assert_eq!(classify_file("simpledb.log"), FileClass::Wal);
-        assert_eq!(classify_file("table.tbl"), FileClass::Data);
-    }
-
     #[cfg(all(feature = "direct-io", target_os = "linux"))]
     #[test]
     fn test_direct_io_mode_round_trip_write_then_read() {
@@ -15677,11 +15700,27 @@ mod file_manager_tests {
         for (idx, b) in write_page.bytes_mut().iter_mut().enumerate() {
             *b = (idx % 251) as u8;
         }
-        file_manager.write_wal_block(&block_id, write_page.bytes());
+        file_manager.write(&block_id, &write_page);
 
-        let mut read_buf = [0u8; PAGE_SIZE_BYTES as usize];
-        file_manager.read_wal_block(&block_id, &mut read_buf);
-        assert_eq!(read_buf, write_page.bytes());
+        let mut read_page = Page::new();
+        file_manager.read(&block_id, &mut read_page);
+        assert_eq!(read_page.bytes(), write_page.bytes());
+    }
+
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    #[test]
+    fn test_custom_wal_filename_stays_buffered() {
+        let (_temp_dir, file_manager) = setup();
+        let filename = "custom.log".to_string();
+        let block_id = file_manager.append_wal(filename.clone());
+        let buf = vec![7u8; PAGE_SIZE_BYTES as usize];
+
+        file_manager.write_wal_block(&block_id, &buf);
+
+        let full_path = file_manager.db_directory.join(&filename);
+        let key = (full_path.to_string_lossy().to_string(), FileClass::Wal);
+        let open_files = file_manager.open_files.read().unwrap();
+        assert_eq!(open_files.get(&key).unwrap().mode, IoMode::Buffered);
     }
 
     #[cfg(feature = "direct-io")]
