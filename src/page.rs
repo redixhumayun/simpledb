@@ -957,12 +957,10 @@ impl<'a> LinePtrBytes<'a> {
         Self { bytes }
     }
 
-    fn read(&self, index: usize) -> Vec<u8> {
+    fn read(&self, index: usize) -> &[u8] {
         let start = index * Self::LINE_PTR_BYTES;
         let end = start + Self::LINE_PTR_BYTES;
-        let mut dest = vec![0u8; Self::LINE_PTR_BYTES];
-        dest.copy_from_slice(&self.bytes[start..end]);
-        dest
+        &self.bytes[start..end]
     }
 
     fn as_slice(&self) -> &'a [u8] {
@@ -1074,7 +1072,7 @@ impl<'a> LinePtrArray<'a> {
             self.bytes.as_slice().len(),
             self.capacity * LinePtrBytes::LINE_PTR_BYTES
         );
-        LinePtr::from_bytes(&self.bytes.read(index))
+        LinePtr::from_bytes(self.bytes.read(index))
     }
 }
 
