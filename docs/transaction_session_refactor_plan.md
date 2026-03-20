@@ -1,6 +1,8 @@
 # Transaction Session Refactor Plan
 
-Tracking issue: [#63](https://github.com/redixhumayun/simpledb/issues/63)
+Tracking issue: [#98](https://github.com/redixhumayun/simpledb/issues/98)
+
+Related umbrella issue: [#63](https://github.com/redixhumayun/simpledb/issues/63)
 
 ## Goal
 

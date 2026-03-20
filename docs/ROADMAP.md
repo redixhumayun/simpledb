@@ -2,7 +2,8 @@
 
 ### Transactions
 1. [Implement deadlock detection strategy](https://github.com/redixhumayun/simpledb/issues/6) - Add wait-for or wait-die strategy
-2. [Enforce transaction guard lifetimes via session API](https://github.com/redixhumayun/simpledb/issues/63) - Introduce transaction sessions backed by RwLock to make guard scoping compile-time enforced and eliminate commit/flush deadlocks
+2. [Implement staged transaction/session refactor plan](https://github.com/redixhumayun/simpledb/issues/98) - Execute the phased transaction/session ownership plan without coupling it to planner/executor boundary changes
+3. [Enforce transaction guard lifetimes via session API](https://github.com/redixhumayun/simpledb/issues/63) - Umbrella issue for the long-term session-based transaction model and compile-time guard lifetime enforcement
 
 ### Storage
 1. [Expand type system with additional data types and NULL support](https://github.com/redixhumayun/simpledb/issues/33) - Add 7 new types (boolean, bigint, float, decimal, date, timestamp, blob) with NULL bitmap
