@@ -23,8 +23,9 @@
 ### Query Engine & CLI
 1. [Add EXPLAIN command for query plan visualization](https://github.com/redixhumayun/simpledb/issues/19) - Show query execution plans for educational insight
 2. [Implement cost-based query optimizer](https://github.com/redixhumayun/simpledb/issues/20) - Replace heuristic optimizer with statistics-driven cost-based optimization
-3. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
-4. [Hash Join Optimization From DuckDB](https://github.com/redixhumayun/simpledb/issues/34) - Implement hash join operator with DuckDB-style optimizations for equi-join queries
+3. [Decouple planning from execution by binding transactions at open-time](https://github.com/redixhumayun/simpledb/issues/96) - Keep plans metadata-only and pass runtime transaction/session context into execution rather than planner-owned objects
+4. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
+5. [Hash Join Optimization From DuckDB](https://github.com/redixhumayun/simpledb/issues/34) - Implement hash join operator with DuckDB-style optimizations for equi-join queries
 
 ### Performance & Benchmarking
 1. [Tracking: Performance Alignment Plan](https://github.com/redixhumayun/simpledb/issues/46) - Stabilize benchmarking infrastructure, add instrumentation for latency/queue metrics, implement admission control and background maintenance

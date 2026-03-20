@@ -16,6 +16,14 @@ Tracking Issue: [#63](https://github.com/redixhumayun/simpledb/issues/63)
 
 ## Proposed Architecture
 
+### Layers To Focus On
+- Page guards, typed page views, heap iterators
+- Txn-local bookkeeping (Buffer list, conccurrency manager, recovery manager)
+- Transaction core (TransactionInner, session/handle API, lifecycle)
+
+### Related Follow-up
+- If this refactor pushes plan objects and scan construction to require explicit runtime session binding, track that broader planner/executor boundary work under [#96](https://github.com/redixhumayun/simpledb/issues/96) instead of expanding #63 indefinitely.
+
 ### TransactionHandle + Sessions
 ```rust
 pub struct TransactionHandle(Arc<RwLock<TransactionInner>>);
