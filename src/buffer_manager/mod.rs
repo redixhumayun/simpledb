@@ -363,8 +363,23 @@ impl LatchTableGuard {
         Self { latch }
     }
 
+    fn try_new(latch_shards: &LatchShards, block_id: &BlockId, shard_index: usize) -> Option<Self> {
+        let latch = {
+            let mut guard = latch_shards[shard_index].try_lock().ok()?;
+            let block_latch_ptr = guard
+                .entry(block_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            Arc::clone(block_latch_ptr)
+        };
+        Some(Self { latch })
+    }
+
     fn lock<'a>(&'a self) -> MutexGuard<'a, ()> {
         self.latch.lock().unwrap()
+    }
+
+    fn try_lock<'a>(&'a self) -> Option<MutexGuard<'a, ()>> {
+        self.latch.try_lock().ok()
     }
 }
 
@@ -617,11 +632,19 @@ impl BufferManager {
     /// eviction, or blocking waits.
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
         let shard_index = self.shard_index(block_id);
-        let latch_table_guard = LatchTableGuard::new(&self.latch_shards, block_id, shard_index);
-        let _block_latch = latch_table_guard.lock();
+        let Some(latch_table_guard) =
+            LatchTableGuard::try_new(&self.latch_shards, block_id, shard_index)
+        else {
+            return FastPinOutcome::Contended;
+        };
+        let Some(_block_latch) = latch_table_guard.try_lock() else {
+            return FastPinOutcome::Contended;
+        };
 
         let frame_ptr = {
-            let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
+            let Some(mut resident_guard) = self.resident_shards[shard_index].try_lock().ok() else {
+                return FastPinOutcome::Contended;
+            };
             match resident_guard.get(block_id) {
                 Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
                     Some(frame_ptr) => Some(frame_ptr),
@@ -648,10 +671,9 @@ impl BufferManager {
                 .as_ref()
                 .is_some_and(|current| current == block_id)
             {
-                self.resident_shards[shard_index]
-                    .lock()
-                    .unwrap()
-                    .remove(block_id);
+                if let Ok(mut resident_guard) = self.resident_shards[shard_index].try_lock() {
+                    resident_guard.remove(block_id);
+                }
                 return FastPinOutcome::NotResident;
             }
             let was_unpinned = meta_guard.pin();
