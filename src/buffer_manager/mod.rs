@@ -33,6 +33,20 @@ use crate::{
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 use crate::intrusive_dll::IntrusiveNode;
 
+/// Result of a resident-only fast pin attempt.
+///
+/// Fast pin is used by restart-oriented B-tree traversal code that must distinguish
+/// between a page being absent from the buffer pool and the fast path encountering
+/// lock contention.
+pub enum FastPinOutcome<T> {
+    /// Fast pin succeeded and produced the requested value.
+    Ready(T),
+    /// The page is not currently resident and must be pinned through the slow path.
+    NotResident,
+    /// The page may be resident, but the fast path would have to wait on an internal lock.
+    Contended,
+}
+
 #[derive(Debug)]
 pub struct FrameMeta {
     pub(crate) block_id: Option<BlockId>,
@@ -363,8 +377,23 @@ impl LatchTableGuard {
         Self { latch }
     }
 
+    fn try_new(latch_shards: &LatchShards, block_id: &BlockId, shard_index: usize) -> Option<Self> {
+        let latch = {
+            let mut guard = latch_shards[shard_index].try_lock().ok()?;
+            let block_latch_ptr = guard
+                .entry(block_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            Arc::clone(block_latch_ptr)
+        };
+        Some(Self { latch })
+    }
+
     fn lock<'a>(&'a self) -> MutexGuard<'a, ()> {
         self.latch.lock().unwrap()
+    }
+
+    fn try_lock<'a>(&'a self) -> Option<MutexGuard<'a, ()>> {
+        self.latch.try_lock().ok()
     }
 }
 
@@ -615,38 +644,51 @@ impl BufferManager {
     ///
     /// This is resident-only and never performs replacement policy bookkeeping,
     /// eviction, or blocking waits.
-    pub fn pin_fast(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
+    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
         let shard_index = self.shard_index(block_id);
-        let latch_table_guard = LatchTableGuard::new(&self.latch_shards, block_id, shard_index);
-        let _block_latch = latch_table_guard.lock();
+        let Some(latch_table_guard) =
+            LatchTableGuard::try_new(&self.latch_shards, block_id, shard_index)
+        else {
+            return FastPinOutcome::Contended;
+        };
+        let Some(_block_latch) = latch_table_guard.try_lock() else {
+            return FastPinOutcome::Contended;
+        };
 
         let frame_ptr = {
-            let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
+            let Some(mut resident_guard) = self.resident_shards[shard_index].try_lock().ok() else {
+                return FastPinOutcome::Contended;
+            };
             match resident_guard.get(block_id) {
                 Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
                     Some(frame_ptr) => Some(frame_ptr),
                     None => {
                         resident_guard.remove(block_id);
-                        return None;
+                        return FastPinOutcome::NotResident;
                     }
                 },
                 None => None,
             }
-        }?;
+        };
+
+        let Some(frame_ptr) = frame_ptr else {
+            return FastPinOutcome::NotResident;
+        };
 
         {
             // Use try_lock to avoid blocking while page latches are held
-            let mut meta_guard = frame_ptr.try_lock_meta()?;
+            let Some(mut meta_guard) = frame_ptr.try_lock_meta() else {
+                return FastPinOutcome::Contended;
+            };
             if !meta_guard
                 .block_id
                 .as_ref()
                 .is_some_and(|current| current == block_id)
             {
-                self.resident_shards[shard_index]
-                    .lock()
-                    .unwrap()
-                    .remove(block_id);
-                return None;
+                if let Ok(mut resident_guard) = self.resident_shards[shard_index].try_lock() {
+                    resident_guard.remove(block_id);
+                }
+                return FastPinOutcome::NotResident;
             }
             let was_unpinned = meta_guard.pin();
             if was_unpinned {
@@ -654,7 +696,7 @@ impl BufferManager {
             }
         }
 
-        Some(frame_ptr)
+        FastPinOutcome::Ready(frame_ptr)
     }
 
     /// Full pin path with immediate replacement policy updates and eviction.

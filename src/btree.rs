@@ -280,6 +280,7 @@ enum WriteState {
     Start,
     DescendFast,
     NeedSlowPin(BlockId),
+    RetryFast,
     AcquireSplitGate,
     DescendUnderSplitGate,
     NeedSlowPinUnderSplitGate(BlockId),
@@ -296,6 +297,7 @@ enum ReadState {
     RetryFromRoot,
     DescendFast,
     NeedSlowPin(BlockId),
+    RetryFast,
     Ready { cursor: traversal::ScanCursor },
 }
 
@@ -854,12 +856,14 @@ impl BTreeIndex {
                         traversal::ReadTraverseOutcome::NeedSlowPin(block) => {
                             ReadState::NeedSlowPin(block)
                         }
+                        traversal::ReadTraverseOutcome::Retry => ReadState::RetryFast,
                     }
                 }
                 ReadState::NeedSlowPin(block) => {
                     txn.pin_read_guard(&block)?;
                     ReadState::RetryFromRoot
                 }
+                ReadState::RetryFast => ReadState::RetryFromRoot,
                 ReadState::Ready { cursor } => {
                     self.read_cursor = Some(cursor);
                     return Ok(());
@@ -903,6 +907,7 @@ impl BTreeIndex {
                 WriteState::NeedSlowPin(_) => {
                     unreachable!("begin_write consumes non-escalated slow-pin retries")
                 }
+                WriteState::RetryFast => WriteState::DescendFast,
                 WriteState::AcquireSplitGate => {
                     self.scan_gate_guard = None;
                     #[cfg(test)]
@@ -952,6 +957,10 @@ impl BTreeIndex {
                                     );
                                     WriteState::NeedSlowPinUnderSplitGate(block)
                                 }
+                                traversal::WriteTraverseOutcome::Retry => {
+                                    split_gate_guard.take();
+                                    WriteState::AcquireSplitGate
+                                }
                             }
                         }
                     }
@@ -985,6 +994,10 @@ impl BTreeIndex {
                             }
                             traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
                                 WriteState::NeedSlowPinUnderSplitGate(block)
+                            }
+                            traversal::WriteTraverseOutcome::Retry => {
+                                split_gate_guard.take();
+                                WriteState::AcquireSplitGate
                             }
                         }
                     }
@@ -1026,12 +1039,14 @@ impl BTreeIndex {
                         traversal::WriteTraverseOutcome::NeedSlowPin(block) => {
                             WriteState::NeedSlowPin(block)
                         }
+                        traversal::WriteTraverseOutcome::Retry => WriteState::RetryFast,
                     }
                 }
                 WriteState::NeedSlowPin(block) => {
                     txn.pin_write_guard(&block)?;
                     WriteState::DescendFast
                 }
+                WriteState::RetryFast => WriteState::DescendFast,
                 WriteState::AcquireSplitGate
                 | WriteState::DescendUnderSplitGate
                 | WriteState::NeedSlowPinUnderSplitGate(_)
@@ -1275,12 +1290,13 @@ mod traversal {
 
     use crate::{
         page::{BTreeInternalPageViewMut, PageWriteGuard},
-        BlockId, Constant, Layout, SimpleDBResult, Transaction, RID,
+        BlockId, Constant, FastPinOutcome, Layout, SimpleDBResult, Transaction, RID,
     };
 
     pub(super) enum ReadTraverseOutcome {
         Ready(ReadCursor),
         NeedSlowPin(BlockId),
+        Retry,
     }
 
     pub(super) struct ReadCursor {
@@ -1473,6 +1489,7 @@ mod traversal {
     pub(super) enum WriteTraverseOutcome<'a> {
         Ready(WriteCtx<'a>),
         NeedSlowPin(BlockId),
+        Retry,
     }
 
     /// Choose the child pointer to follow from one internal page.
@@ -1549,10 +1566,15 @@ mod traversal {
             };
 
             let next_block = BlockId::new(file_name.to_string(), rsib);
-            let Some(next_guard) = txn.pin_read_guard_fast(&next_block)? else {
-                return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
+            let next_view = match txn.pin_read_guard_fast(&next_block)? {
+                FastPinOutcome::Ready(next_guard) => {
+                    next_guard.into_btree_leaf_page_view(leaf_layout)?
+                }
+                FastPinOutcome::NotResident => {
+                    return Ok(ReadTraverseOutcome::NeedSlowPin(next_block));
+                }
+                FastPinOutcome::Contended => return Ok(ReadTraverseOutcome::Retry),
             };
-            let next_view = next_guard.into_btree_leaf_page_view(leaf_layout)?;
             current_block = next_block;
             current_view = next_view;
         }
@@ -1571,8 +1593,11 @@ mod traversal {
         search_key: &Constant,
     ) -> SimpleDBResult<ReadTraverseOutcome> {
         let guard = match txn.pin_read_guard_fast(root_block)? {
-            Some(g) => g,
-            None => return Ok(ReadTraverseOutcome::NeedSlowPin(root_block.clone())),
+            FastPinOutcome::Ready(g) => g,
+            FastPinOutcome::NotResident => {
+                return Ok(ReadTraverseOutcome::NeedSlowPin(root_block.clone()));
+            }
+            FastPinOutcome::Contended => return Ok(ReadTraverseOutcome::Retry),
         };
         let mut current_view = guard.into_btree_internal_page_view(internal_layout)?;
 
@@ -1602,8 +1627,11 @@ mod traversal {
             }
 
             let child_guard = match txn.pin_read_guard_fast(&child_block)? {
-                Some(g) => g,
-                None => return Ok(ReadTraverseOutcome::NeedSlowPin(child_block)),
+                FastPinOutcome::Ready(g) => g,
+                FastPinOutcome::NotResident => {
+                    return Ok(ReadTraverseOutcome::NeedSlowPin(child_block));
+                }
+                FastPinOutcome::Contended => return Ok(ReadTraverseOutcome::Retry),
             };
             let child_view = child_guard.into_btree_internal_page_view(internal_layout)?;
             current_view = child_view;
@@ -1639,8 +1667,11 @@ mod traversal {
         search_key: &Constant,
     ) -> SimpleDBResult<WriteTraverseOutcome<'a>> {
         let root_guard = match txn.pin_write_guard_fast(root_block)? {
-            Some(g) => g,
-            None => return Ok(WriteTraverseOutcome::NeedSlowPin(root_block.clone())),
+            FastPinOutcome::Ready(g) => g,
+            FastPinOutcome::NotResident => {
+                return Ok(WriteTraverseOutcome::NeedSlowPin(root_block.clone()));
+            }
+            FastPinOutcome::Contended => return Ok(WriteTraverseOutcome::Retry),
         };
         let root_view = root_guard.into_btree_internal_page_view_mut(internal_layout)?;
         let root_level = root_view.btree_level();
@@ -1664,10 +1695,14 @@ mod traversal {
 
             if level == 0 {
                 let leaf_guard = match txn.pin_write_guard_fast(&child_block)? {
-                    Some(g) => g,
-                    None => {
+                    FastPinOutcome::Ready(g) => g,
+                    FastPinOutcome::NotResident => {
                         ancestor_views.clear();
                         return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                    }
+                    FastPinOutcome::Contended => {
+                        ancestor_views.clear();
+                        return Ok(WriteTraverseOutcome::Retry);
                     }
                 };
                 ancestor_views.push((current_block, current_view));
@@ -1680,10 +1715,14 @@ mod traversal {
             }
 
             let child_guard = match txn.pin_write_guard_fast(&child_block)? {
-                Some(g) => g,
-                None => {
+                FastPinOutcome::Ready(g) => g,
+                FastPinOutcome::NotResident => {
                     ancestor_views.clear();
                     return Ok(WriteTraverseOutcome::NeedSlowPin(child_block));
+                }
+                FastPinOutcome::Contended => {
+                    ancestor_views.clear();
+                    return Ok(WriteTraverseOutcome::Retry);
                 }
             };
             let child_view = child_guard.into_btree_internal_page_view_mut(internal_layout)?;
@@ -2264,6 +2303,7 @@ mod btree_index_tests {
                         .pin_read_guard(&block)
                         .expect("slow pin for restart");
                 }
+                traversal::ReadTraverseOutcome::Retry => {}
             }
         }
     }
