@@ -32,7 +32,7 @@ use std::{
 };
 
 use crate::{
-    BlockId, BufferFrame, BufferHandle, Constant, FieldType, Layout, LogRecord, Lsn,
+    BlockId, BufferFrame, BufferHandle, BufferManager, Constant, FieldType, Layout, LogRecord, Lsn,
     SimpleDBResult, RID,
 };
 
@@ -2702,11 +2702,13 @@ impl<'a> PageReadGuard<'a> {
 /// Write guard providing exclusive access to a pinned page.
 ///
 /// Holds a buffer handle, frame reference, and write lock on the page data.
-/// Automatically unpins when dropped.
+/// Automatically publishes dirty metadata and unpins when dropped.
 pub struct PageWriteGuard<'a> {
-    page: RwLockWriteGuard<'a, PageBytes>,
-    _frame: Arc<BufferFrame>,
+    page: Option<RwLockWriteGuard<'a, PageBytes>>,
+    frame: Arc<BufferFrame>,
     handle: BufferHandle,
+    buffer_manager: Arc<BufferManager>,
+    pending_modified: Cell<Option<(usize, usize)>>,
     log_manager: Arc<Mutex<LogManager>>,
 }
 
@@ -2716,22 +2718,31 @@ impl<'a> PageWriteGuard<'a> {
         handle: BufferHandle,
         frame: Arc<BufferFrame>,
         page: RwLockWriteGuard<'a, PageBytes>,
+        buffer_manager: Arc<BufferManager>,
         log_manager: Arc<Mutex<LogManager>>,
     ) -> Self {
         Self {
-            page,
-            _frame: frame,
+            page: Some(page),
+            frame,
             handle,
+            buffer_manager,
+            pending_modified: Cell::new(None),
             log_manager,
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.page.bytes()
+        self.page
+            .as_ref()
+            .expect("PageWriteGuard page lock already released")
+            .bytes()
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
-        self.page.bytes_mut()
+        self.page
+            .as_mut()
+            .expect("PageWriteGuard page lock already released")
+            .bytes_mut()
     }
 
     /// Returns the block ID of the pinned page.
@@ -2748,9 +2759,13 @@ impl<'a> PageWriteGuard<'a> {
         Arc::clone(&self.log_manager)
     }
 
-    /// Marks the page as modified for WAL.
+    /// Records dirty metadata for this write guard.
+    ///
+    /// The final frame metadata publish happens in [`Drop`] after the page lock
+    /// has been released, preserving the current `meta -> page` lock ordering
+    /// used by buffer-manager flush paths.
     pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
-        self.handle.mark_modified(txn_id, lsn);
+        self.pending_modified.set(Some((txn_id, lsn)));
     }
 
     /// Formats the page as an empty heap page.
@@ -2899,7 +2914,18 @@ impl Deref for PageWriteGuard<'_> {
     type Target = PageBytes;
 
     fn deref(&self) -> &Self::Target {
-        &self.page
+        self.page
+            .as_ref()
+            .expect("PageWriteGuard page lock already released")
+    }
+}
+
+impl Drop for PageWriteGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.page.take());
+        if let Some((txn_id, lsn)) = self.pending_modified.take() {
+            self.buffer_manager.mark_modified(&self.frame, txn_id, lsn);
+        }
     }
 }
 
