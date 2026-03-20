@@ -197,3 +197,11 @@ Start with phase 1 only:
 - do not change transaction semantics yet
 
 That is the smallest step that makes later execution/storage cleanup plausible.
+
+## References
+
+- PostgreSQL planner/optimizer overview: <https://www.postgresql.org/docs/current/planner-optimizer.html>
+- PostgreSQL executor overview: <https://www.postgresql.org/docs/current/executor.html>
+- DuckDB internals overview: <https://duckdb.org/docs/stable/internals/overview.html>
+- Goetz Graefe, "Volcano - An Extensible and Parallel Query Evaluation System" (1994)
+- Goetz Graefe, "The Cascades Framework for Query Optimization" (1995)
