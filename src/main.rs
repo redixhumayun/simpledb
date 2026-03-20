@@ -9569,12 +9569,6 @@ pub struct BufferHandle {
     pending_modified: Cell<Option<(usize, usize)>>,
 }
 
-pub enum FastPinOutcome<T> {
-    Ready(T),
-    NotResident,
-    Contended,
-}
-
 impl BufferHandle {
     pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
         txn.pin_internal(&block_id);
@@ -14248,7 +14242,7 @@ mod buffer_list_tests {
 }
 
 // Re-export buffer manager types from the buffer_manager module
-pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FrameMeta};
+pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FastPinOutcome, FrameMeta};
 
 #[cfg(test)]
 mod buffer_manager_tests {

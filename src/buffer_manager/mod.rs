@@ -27,11 +27,25 @@ use crate::{
     page::PageType,
     page::{BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
     replacement::PolicyState,
-    BatchReadReq, BlockId, FastPinOutcome, LogManager, Lsn, Page, SharedFS,
+    BatchReadReq, BlockId, LogManager, Lsn, Page, SharedFS,
 };
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 use crate::intrusive_dll::IntrusiveNode;
+
+/// Result of a resident-only fast pin attempt.
+///
+/// Fast pin is used by restart-oriented B-tree traversal code that must distinguish
+/// between a page being absent from the buffer pool and the fast path encountering
+/// lock contention.
+pub enum FastPinOutcome<T> {
+    /// Fast pin succeeded and produced the requested value.
+    Ready(T),
+    /// The page is not currently resident and must be pinned through the slow path.
+    NotResident,
+    /// The page may be resident, but the fast path would have to wait on an internal lock.
+    Contended,
+}
 
 #[derive(Debug)]
 pub struct FrameMeta {
