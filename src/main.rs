@@ -9569,6 +9569,12 @@ pub struct BufferHandle {
     pending_modified: Cell<Option<(usize, usize)>>,
 }
 
+pub enum FastPinOutcome<T> {
+    Ready(T),
+    NotResident,
+    Contended,
+}
+
 impl BufferHandle {
     pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
         txn.pin_internal(&block_id);
@@ -9768,13 +9774,15 @@ impl Transaction {
         Ok(self.make_write_guard_from_frame(handle, frame))
     }
 
-    /// Fast resident-only read pin. Returns `None` when the page is not already resident.
+    /// Fast resident-only read pin.
     pub fn pin_read_guard_fast(
         self: &Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<Option<PageReadGuard<'_>>> {
-        if !self.pin_internal_fast(block_id) {
-            return Ok(None);
+    ) -> SimpleDBResult<FastPinOutcome<PageReadGuard<'_>>> {
+        match self.pin_internal_fast(block_id) {
+            FastPinOutcome::Ready(()) => {}
+            FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
+            FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
@@ -9782,16 +9790,20 @@ impl Transaction {
             pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        Ok(Some(self.make_read_guard_from_frame(handle, frame)))
+        Ok(FastPinOutcome::Ready(
+            self.make_read_guard_from_frame(handle, frame),
+        ))
     }
 
-    /// Fast resident-only write pin. Returns `None` when the page is not already resident.
+    /// Fast resident-only write pin.
     pub fn pin_write_guard_fast(
         self: &Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<Option<PageWriteGuard<'_>>> {
-        if !self.pin_internal_fast(block_id) {
-            return Ok(None);
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'_>>> {
+        match self.pin_internal_fast(block_id) {
+            FastPinOutcome::Ready(()) => {}
+            FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
+            FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
@@ -9799,7 +9811,9 @@ impl Transaction {
             pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
-        Ok(Some(self.make_write_guard_from_frame(handle, frame)))
+        Ok(FastPinOutcome::Ready(
+            self.make_write_guard_from_frame(handle, frame),
+        ))
     }
 
     pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
@@ -9904,7 +9918,7 @@ impl Transaction {
         self.buffer_list.pin(block_id);
     }
 
-    fn pin_internal_fast(&self, block_id: &BlockId) -> bool {
+    fn pin_internal_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
         self.buffer_list.pin_fast(block_id)
     }
 
@@ -14088,16 +14102,18 @@ impl BufferList {
     }
 
     /// Fast resident-only pin.
-    fn pin_fast(&self, block_id: &BlockId) -> bool {
-        let Some(buffer) = self.buffer_manager.pin_fast(block_id) else {
-            return false;
+    fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
+        let buffer = match self.buffer_manager.pin_fast(block_id) {
+            FastPinOutcome::Ready(buffer) => buffer,
+            FastPinOutcome::NotResident => return FastPinOutcome::NotResident,
+            FastPinOutcome::Contended => return FastPinOutcome::Contended,
         };
         self.buffers
             .borrow_mut()
             .entry(block_id.clone())
             .and_modify(|v| v.count += 1)
             .or_insert(HashMapValue { buffer, count: 1 });
-        true
+        FastPinOutcome::Ready(())
     }
 
     fn mark_modified(&self, block_id: &BlockId, txn_num: usize, lsn: usize) {

@@ -27,7 +27,7 @@ use crate::{
     page::PageType,
     page::{BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
     replacement::PolicyState,
-    BatchReadReq, BlockId, LogManager, Lsn, Page, SharedFS,
+    BatchReadReq, BlockId, FastPinOutcome, LogManager, Lsn, Page, SharedFS,
 };
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
@@ -615,7 +615,7 @@ impl BufferManager {
     ///
     /// This is resident-only and never performs replacement policy bookkeeping,
     /// eviction, or blocking waits.
-    pub fn pin_fast(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
+    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
         let shard_index = self.shard_index(block_id);
         let latch_table_guard = LatchTableGuard::new(&self.latch_shards, block_id, shard_index);
         let _block_latch = latch_table_guard.lock();
@@ -627,16 +627,22 @@ impl BufferManager {
                     Some(frame_ptr) => Some(frame_ptr),
                     None => {
                         resident_guard.remove(block_id);
-                        return None;
+                        return FastPinOutcome::NotResident;
                     }
                 },
                 None => None,
             }
-        }?;
+        };
+
+        let Some(frame_ptr) = frame_ptr else {
+            return FastPinOutcome::NotResident;
+        };
 
         {
             // Use try_lock to avoid blocking while page latches are held
-            let mut meta_guard = frame_ptr.try_lock_meta()?;
+            let Some(mut meta_guard) = frame_ptr.try_lock_meta() else {
+                return FastPinOutcome::Contended;
+            };
             if !meta_guard
                 .block_id
                 .as_ref()
@@ -646,7 +652,7 @@ impl BufferManager {
                     .lock()
                     .unwrap()
                     .remove(block_id);
-                return None;
+                return FastPinOutcome::NotResident;
             }
             let was_unpinned = meta_guard.pin();
             if was_unpinned {
@@ -654,7 +660,7 @@ impl BufferManager {
             }
         }
 
-        Some(frame_ptr)
+        FastPinOutcome::Ready(frame_ptr)
     }
 
     /// Full pin path with immediate replacement policy updates and eviction.
