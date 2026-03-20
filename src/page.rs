@@ -2644,8 +2644,11 @@ impl WalPage {
 /// Holds a buffer handle, frame reference, and read lock on the page data.
 /// Automatically unpins when dropped.
 pub struct PageReadGuard<'a> {
+    /// Shared lock over the page bytes.
     page: RwLockReadGuard<'a, PageBytes>,
+    /// Strong reference keeping the frame alive for the guard lifetime.
     frame: Arc<BufferFrame>,
+    /// RAII pin owner dropped after the page lock so unpin happens last.
     handle: BufferHandle,
 }
 
@@ -2704,11 +2707,17 @@ impl<'a> PageReadGuard<'a> {
 /// Holds a buffer handle, frame reference, and write lock on the page data.
 /// Automatically publishes dirty metadata and unpins when dropped.
 pub struct PageWriteGuard<'a> {
+    /// Exclusive page lock wrapped in `Option` so `Drop` can release it first.
     page: Option<RwLockWriteGuard<'a, PageBytes>>,
+    /// Strong reference keeping the frame alive through dirty publication.
     frame: Arc<BufferFrame>,
+    /// RAII pin owner dropped after dirty publication so unpin happens last.
     handle: BufferHandle,
+    /// Buffer manager entry point for publishing dirty frame metadata in `Drop`.
     buffer_manager: Arc<BufferManager>,
+    /// Final `(txn_id, lsn)` published after the page lock has been released.
     pending_modified: Cell<Option<(usize, usize)>>,
+    /// Log manager used by helpers that emit WAL before mutating the page.
     log_manager: Arc<Mutex<LogManager>>,
 }
 
