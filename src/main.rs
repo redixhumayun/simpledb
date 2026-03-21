@@ -9559,24 +9559,21 @@ impl Schema {
     }
 }
 
-/// A handle representing a pinned buffer
-/// The buffer is automatically unpinned when the handle is dropped
+/// A handle representing one transaction-local pin on a block.
 ///
-/// This uses RAII semantics to ensure that manual unpinning is not required which will reduce programmer error as well
+/// The handle is the RAII owner of the pin: cloning it adds another pin for the
+/// same block, and dropping it releases exactly one pin.
 pub struct BufferHandle {
+    /// The pinned block this handle is responsible for unpinning on drop.
     block_id: BlockId,
+    /// Shared transaction used only for pin bookkeeping.
     txn: Arc<Transaction>,
-    pending_modified: Cell<Option<(usize, usize)>>,
 }
 
 impl BufferHandle {
     pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
         txn.pin_internal(&block_id);
-        BufferHandle {
-            block_id,
-            txn,
-            pending_modified: Cell::new(None),
-        }
+        BufferHandle { block_id, txn }
     }
 
     pub fn block_id(&self) -> &BlockId {
@@ -9586,10 +9583,6 @@ impl BufferHandle {
     pub fn txn_id(&self) -> usize {
         self.txn.id()
     }
-
-    pub fn mark_modified(&self, txn_id: usize, lsn: usize) {
-        self.pending_modified.set(Some((txn_id, lsn)));
-    }
 }
 
 impl Clone for BufferHandle {
@@ -9598,18 +9591,12 @@ impl Clone for BufferHandle {
         Self {
             block_id: self.block_id.clone(),
             txn: Arc::clone(&self.txn),
-            // A clone represents a distinct pin handle; it does not inherit pending
-            // dirty state from the source handle.
-            pending_modified: Cell::new(None),
         }
     }
 }
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
-        if let Some((txn_id, lsn)) = self.pending_modified.get() {
-            self.txn.set_modified_internal(&self.block_id, txn_id, lsn);
-        }
         self.txn.unpin_internal(&self.block_id);
     }
 }
@@ -9746,8 +9733,9 @@ impl Transaction {
         let raw = Arc::into_raw(Arc::clone(&frame));
         let page = unsafe { (*raw).write_page() };
         let frame_for_guard = unsafe { Arc::from_raw(raw) };
+        let buffer_manager = Arc::clone(&self.buffer_manager);
         let log_manager = Arc::clone(&self.log_manager);
-        PageWriteGuard::new(handle, frame_for_guard, page, log_manager)
+        PageWriteGuard::new(handle, frame_for_guard, page, buffer_manager, log_manager)
     }
 
     pub fn pin_read_guard(
@@ -9781,7 +9769,6 @@ impl Transaction {
         let handle = BufferHandle {
             block_id: block_id.clone(),
             txn: Arc::clone(self),
-            pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
@@ -9802,7 +9789,6 @@ impl Transaction {
         let handle = BufferHandle {
             block_id: block_id.clone(),
             txn: Arc::clone(self),
-            pending_modified: Cell::new(None),
         };
         let frame = self.buffer_list.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
@@ -9919,10 +9905,6 @@ impl Transaction {
     /// Unpin this [`BlockId`] since it is no longer needed by this transaction
     fn unpin_internal(&self, block_id: &BlockId) {
         self.buffer_list.unpin(block_id);
-    }
-
-    fn set_modified_internal(&self, block_id: &BlockId, txn_num: usize, lsn: usize) {
-        self.buffer_list.mark_modified(block_id, txn_num, lsn);
     }
 
     /// Get the available buffers for this transaction
@@ -14108,21 +14090,6 @@ impl BufferList {
             .and_modify(|v| v.count += 1)
             .or_insert(HashMapValue { buffer, count: 1 });
         FastPinOutcome::Ready(())
-    }
-
-    fn mark_modified(&self, block_id: &BlockId, txn_num: usize, lsn: usize) {
-        if self.txn_committed.get() {
-            return;
-        }
-        let frame = Arc::clone(
-            &self
-                .buffers
-                .borrow()
-                .get(block_id)
-                .expect("mark_modified called for non-pinned block")
-                .buffer,
-        );
-        self.buffer_manager.mark_modified(&frame, txn_num, lsn);
     }
 
     /// Unpin the buffer associated with the provided [`BlockId`]

@@ -2,7 +2,7 @@
 
 ### Transactions
 1. [Implement deadlock detection strategy](https://github.com/redixhumayun/simpledb/issues/6) - Add wait-for or wait-die strategy
-2. [Enforce transaction guard lifetimes via session API](https://github.com/redixhumayun/simpledb/issues/63) - Introduce transaction sessions backed by RwLock to make guard scoping compile-time enforced and eliminate commit/flush deadlocks
+2. [Enforce transaction guard lifetimes via session API](https://github.com/redixhumayun/simpledb/issues/63) - Umbrella issue for the long-term session-based transaction model and compile-time guard lifetime enforcement
 
 ### Storage
 1. [Expand type system with additional data types and NULL support](https://github.com/redixhumayun/simpledb/issues/33) - Add 7 new types (boolean, bigint, float, decimal, date, timestamp, blob) with NULL bitmap
@@ -23,8 +23,9 @@
 ### Query Engine & CLI
 1. [Add EXPLAIN command for query plan visualization](https://github.com/redixhumayun/simpledb/issues/19) - Show query execution plans for educational insight
 2. [Implement cost-based query optimizer](https://github.com/redixhumayun/simpledb/issues/20) - Replace heuristic optimizer with statistics-driven cost-based optimization
-3. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
-4. [Hash Join Optimization From DuckDB](https://github.com/redixhumayun/simpledb/issues/34) - Implement hash join operator with DuckDB-style optimizations for equi-join queries
+3. [Decouple planning from execution by binding transactions at open-time](https://github.com/redixhumayun/simpledb/issues/96) - Keep plans metadata-only and pass runtime transaction/session context into execution rather than planner-owned objects
+4. [Implement intra-query parallelism for parallel table scans](https://github.com/redixhumayun/simpledb/issues/32) - Enable single queries to leverage multiple CPU cores through parallel table scans
+5. [Hash Join Optimization From DuckDB](https://github.com/redixhumayun/simpledb/issues/34) - Implement hash join operator with DuckDB-style optimizations for equi-join queries
 
 ### Performance & Benchmarking
 1. [Tracking: Performance Alignment Plan](https://github.com/redixhumayun/simpledb/issues/46) - Stabilize benchmarking infrastructure, add instrumentation for latency/queue metrics, implement admission control and background maintenance
