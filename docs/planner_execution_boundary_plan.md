@@ -150,66 +150,68 @@ Exit criteria:
 - executor capabilities are split in a way that fits the current operators ✅
 - planner/executor boundary work can target the new execution interfaces, not the legacy ones ✅
 
-### Phase 2: introduce explicit execution context
+### Phase 2: introduce explicit execution context ✅ DONE
 
 - Add a documented `ExecutionContext` type.
 - Initially allow it to wrap the current runtime authority (`Arc<Transaction>`) so behavior stays stable.
 - Add context-taking execution entry points against the new executor traits.
 
-Suggested minimal shape:
+Implemented shape:
 
 ```rust
 pub struct ExecutionContext {
     txn: Arc<Transaction>,
 }
+impl ExecutionContext {
+    pub fn new(txn: Arc<Transaction>) -> Self { Self { txn } }
+    pub fn txn(&self) -> &Arc<Transaction> { &self.txn }
+}
 ```
 
-Why this phase matters:
-
-- it separates planner-owned data from execution-owned data without forcing session lifetimes yet
-- it creates the seam that later transaction/session work can plug into
-
 Exit criteria:
 
-- a runtime context type exists
-- new execution entry points can take it explicitly
+- a runtime context type exists ✅
+- new execution entry points can take it explicitly ✅
 
-### Phase 3: migrate leaf storage/execution objects first
+### Phase 3: migrate leaf storage/execution objects first ✅ DONE
 
 - Change table-backed planning so planning does not need to retain a live transaction.
-- Move transaction binding into context-taking open paths such as `open(...)` / `open_table(...)`.
-- Migrate `TableScan`, `RecordPage`, and index/table access constructors so they are created from runtime context, not planner-owned transaction fields.
+- Move transaction binding into context-taking open paths.
+- `TableScan`/`RecordPage` still internally store `Arc<Transaction>` (per the plan); the win is the planner no longer owns it.
 
-Important point:
+Implementation notes:
 
-- phase 3 still allows `TableScan` / `RecordPage` to internally store `Arc<Transaction>` if that keeps churn manageable
-- the key win is that the planner no longer owns that runtime state
-
-Exit criteria:
-
-- `TablePlan` is metadata-only
-- `TableScan`/`RecordPage` are constructed from execution context
-
-### Phase 4: migrate wrapper scans/operators
-
-- Update `SelectPlan`, `ProjectPlan`, `ProductPlan`, and other operator plans to open children using explicit runtime context.
-- Keep wrapper execution objects owning child scans, not planner-time transaction state.
-- Preserve current semantics and operator ordering.
+- `TablePlan` is now metadata-only (`table_name`, `layout`, `stat_info`, `table_id` — no `txn`)
+- `TablePlan::open_table_scan(&self, ctx)` creates `TableScan` from `ctx.txn()`
+- `MaterializePlan` stores `block_size: usize` (stable config value captured at construction) instead of `txn`
+- `SortPlan` drops `txn`; `split_into_runs`, `merge`, `do_merge_iters` take `&ExecutionContext`
+- Design decisions in `docs/decisions/phase2_5_execution_context.md`
 
 Exit criteria:
 
-- all major plan types open through explicit runtime context
-- no planner-owned operator requires broad transaction state
+- `TablePlan` is metadata-only ✅
+- `TableScan`/`RecordPage` are constructed from execution context ✅
 
-### Phase 5: retire context-free `open()`
+### Phase 4: migrate wrapper scans/operators ✅ DONE
 
-- Remove or deprecate context-free planner open entry points.
-- Make the explicit execution context path the only supported runtime entry.
-- Update planner tests, CLI entry points, and helper APIs.
+- `SelectPlan`, `ProjectPlan`, `ProductPlan`, `MergeJoinPlan`, `MultiBufferProductPlan`, `IndexSelectPlan`, `IndexJoinPlan` all open children via `ctx`.
+- `MergeJoinPlan` and `MultiBufferProductPlan` drop their `txn` fields.
+- `TablePlanner` drops its `txn` field.
 
 Exit criteria:
 
-- the plan/execution boundary is explicit everywhere
+- all major plan types open through explicit runtime context ✅
+- no planner-owned operator requires broad transaction state ✅
+
+### Phase 5: retire context-free `open()` ✅ DONE
+
+- Context-free `Plan::open()` removed entirely.
+- `Plan::open(&self, ctx: &ExecutionContext) -> Box<dyn Scan>` is the only execution entry.
+- All call sites (tests, CLI, benchmarks, mutation planners) updated.
+
+Exit criteria:
+
+- the plan/execution boundary is explicit everywhere ✅
 
 ### Phase 6: evaluate follow-on transaction/session integration
 
