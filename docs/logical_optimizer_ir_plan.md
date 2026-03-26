@@ -13,6 +13,8 @@ Introduce a logical query representation that is optimizer-friendly in Rust:
 
 This is intentionally narrower than a full optimizer rewrite. The focus is the logical layer only.
 
+However, the logical/physical planning boundary must be implemented first. The logical IR work should not begin until query meaning and physical implementation choice are separated in code.
+
 ## Why this exists
 
 Today the codebase does not have a clean logical/physical split.
@@ -47,30 +49,20 @@ This plan does not require, initially:
 
 ## Design direction
 
-The logical layer should follow the shape suggested in the blog post:
+The logical layer should move toward the shape suggested in the blog post:
 
-- one framework-owned wrapper node with uniform `children`
-- one logical node-kind enum
-- one logical attribute payload enum / struct family
+- logical planning returns a logical IR, not executable plans
+- logical optimization rewrites that IR
+- physical planning lowers that IR into executable plan structs
 
-Conceptually:
+The exact in-memory shape of `LogicalPlan` does not need to be frozen yet. The boundary matters more than the final logical-node representation.
 
-```rust
-pub struct LogicalNode {
-    kind: LogicalNodeKind,
-    children: Vec<Arc<LogicalNode>>,
-    data: LogicalNodeData,
-}
+For the first implementation, it is acceptable for `LogicalPlan` to be a single enum with embedded children and schema. If later memo/rule work needs a framework-owned wrapper shape with uniform `children`, we can evolve the logical representation then.
 
-pub enum LogicalNodeKind {
-    Scan,
-    Filter,
-    Project,
-    Join,
-}
-```
+But that only works if the logical layer has a real contract to target. So the first implementation step is not the wrapper node itself; it is the boundary between:
 
-The exact naming is not important. The important point is that the optimizer manipulates one uniform tree shape instead of a large family of typed plan structs.
+- logical query representation and logical rewrites
+- physical operator selection and executable plan construction
 
 ## Why use the wrapper shape only for logical plans
 
@@ -85,7 +77,7 @@ The current physical layer does not need that yet. Physical plans can stay as ty
 
 So the intended split is:
 
-- logical layer: optimizer-friendly wrapper representation
+- logical layer: optimizer-friendly logical IR
 - physical layer: typed plan / executor representation
 
 ## Current logical concepts already present in the codebase
@@ -115,37 +107,40 @@ Those belong in physical planning / lowering.
 
 ## Suggested logical node shape for this codebase
 
-Start small. The logical IR only needs to model operators we already have query semantics for.
+Start small. The logical IR only needs to model operators we already have query semantics for. For the first implementation, a single enum is enough.
 
 ```rust
-pub enum LogicalNodeKind {
-    TableScan,
-    Filter,
-    Project,
-    Join,
-}
-
-pub enum LogicalNodeData {
-    None,
-    TableScan { table: String },
-    Filter { predicate: Predicate },
-    Project { fields: Vec<String> },
-    Join { predicate: Predicate },
-}
-
-pub struct LogicalNode {
-    pub kind: LogicalNodeKind,
-    pub children: Vec<Arc<LogicalNode>>,
-    pub data: LogicalNodeData,
-    pub schema: Schema,
+pub enum LogicalPlan {
+    TableScan {
+        table: String,
+        schema: Schema,
+    },
+    Filter {
+        input: Arc<LogicalPlan>,
+        predicate: Predicate,
+        schema: Schema,
+    },
+    Project {
+        input: Arc<LogicalPlan>,
+        fields: Vec<String>,
+        schema: Schema,
+    },
+    Join {
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        predicate: Predicate,
+        schema: Schema,
+    },
 }
 ```
 
 Notes:
 
 - storing `schema` directly is fine for the first step; it avoids repeated recomputation
+- separate `LogicalNodeKind` / `LogicalNodeData` and `LogicalProps` types are not required yet
 - logical `Join` should represent relational join meaning, not a particular implementation
 - an inner join with no extracted join predicate can still exist as `Join { predicate: Predicate::empty() }`
+- if later memo/rule work wants the blog post's wrapper-style representation, this enum can be migrated then
 
 ## Mapping from current planner to the new logical IR
 
@@ -172,6 +167,52 @@ Target shape:
 5. execute physical plan with `ExecutionContext`
 
 The key change is that steps 2-3 do not create executable plan structs.
+
+## Required boundary before logical IR work
+
+Before introducing the logical wrapper representation, implement a minimal boundary in code:
+
+- one stage produces a logical query representation only
+- a later stage lowers that logical representation into the current physical `Plan` family
+- physical operators like `IndexSelectPlan`, `IndexJoinPlan`, `SortPlan`, `MergeJoinPlan`, `MaterializePlan`, and `MultiBufferProductPlan` are forbidden from being created during logical planning
+
+This is required because otherwise the new logical IR will immediately become a cosmetic wrapper around the current mixed planner.
+
+The API surface to lock first should be:
+
+```rust
+pub trait LogicalPlanner {
+    fn build(
+        &self,
+        query: QueryData,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<LogicalPlan>;
+}
+
+pub trait LogicalOptimizer {
+    fn optimize(
+        &self,
+        plan: LogicalPlan,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<LogicalPlan>;
+}
+
+pub trait PhysicalPlanner {
+    fn lower(
+        &self,
+        logical: &LogicalPlan,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Arc<dyn Plan>>;
+}
+```
+
+The exact trait names are not important. The important points are:
+
+- logical planning no longer returns `Arc<dyn Plan>` directly
+- logical optimization consumes and produces `LogicalPlan`
+- physical planning is the first stage allowed to produce executable `Plan` nodes
+
+This doc intentionally does not lock down catalog helper traits, context objects, or ownership details beyond this seam.
 
 ## Heuristics to move into logical space first
 
@@ -208,18 +249,41 @@ Exit criteria:
 
 - logical/physical split is documented
 
-### Phase 1: add logical IR types
+### Phase 1: implement the logical/physical boundary
 
-- add `LogicalNode`, `LogicalNodeKind`, and `LogicalNodeData`
-- keep the initial logical operator set intentionally small: table scan, filter, project, join
-- add helper constructors for readability
-- add generic child access / rebuild helpers on the wrapper node
+- introduce separate logical-planning and physical-lowering stages in code
+- stop returning physical `Plan` trait objects directly from the logical-planning stage
+- make physical operator selection an explicit follow-on step
+- keep the first logical representation minimal if necessary, but enforce the stage boundary first
+
+Minimum success criteria for this phase:
+
+- there is a code path that constructs query meaning before physical operator choice
+- physical nodes are created only in lowering, not in logical planning
+- `HeuristicQueryPlanner` / `BasicQueryPlanner` stop mixing logical reasoning and physical node construction in one pass
+
+Important point:
+
+- this phase must be completed before introducing the wrapper-style logical optimizer IR
+- otherwise the new logical representation will inherit the same mixed-layer problems as the current planner
+
+Exit criteria:
+
+- logical and physical planning are separate implemented stages
+- the boundary exists in code, not just in documentation
+
+### Phase 2: add logical IR types
+
+- add `LogicalPlan` with a small initial operator set: table scan, filter, project, join
+- embed `schema` directly in the logical variants for now
+- do not over-design the logical representation before the boundary is stable
+- keep open the option of later migrating this enum to a wrapper-style representation if memo/rule work needs it
 
 Exit criteria:
 
 - logical trees can be constructed without using `Arc<dyn Plan>`
 
-### Phase 2: build initial logical plans from `QueryData`
+### Phase 3: build initial logical plans from `QueryData`
 
 - replace `BasicQueryPlanner`'s direct construction of physical/mixed plans with logical IR construction
 - construct table scans first
@@ -230,7 +294,7 @@ Exit criteria:
 
 - SQL query planning can produce a logical tree without choosing physical operators
 
-### Phase 3: move current heuristic rewrites onto logical IR
+### Phase 4: move current heuristic rewrites onto logical IR
 
 - migrate predicate extraction and pushdown logic from `TablePlanner`
 - migrate the current left-deep join heuristic from `HeuristicQueryPlanner`
@@ -240,7 +304,7 @@ Exit criteria:
 
 - current heuristic planner works over logical IR instead of `Arc<dyn Plan>`
 
-### Phase 4: add physical lowering
+### Phase 5: add physical lowering
 
 - introduce a lowering stage from logical IR to the current physical plan family
 - choose access paths and join implementations here
@@ -256,7 +320,7 @@ Exit criteria:
 
 - logical planning and physical selection are distinct steps
 
-### Phase 5: prepare for memo / DP work
+### Phase 6: prepare for memo / DP work
 
 - add stable logical-node hashing / equality conventions
 - make logical attributes explicit enough for memo keys
@@ -300,13 +364,14 @@ Focus additional tests on:
 
 ## Immediate next step
 
-Start with phase 1 only:
+Start with phase 1 only, and complete it before any logical IR work:
 
-- add the logical wrapper node and its enums
-- add constructors for table scan / filter / project / join
-- do not change the physical layer yet
+- define separate logical-planning, logical-optimization, and physical-lowering interfaces
+- make logical planning stop returning `Arc<dyn Plan>` directly
+- forbid physical operator construction during the logical-planning stage
+- keep the physical plan family as-is for now
 
-That creates the minimum optimizer-friendly seam without forcing a full planner rewrite in one step.
+That is the minimum step that prevents the future logical IR from collapsing back into the current mixed-layer planner.
 
 ## References
 
