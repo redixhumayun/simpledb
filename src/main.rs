@@ -190,8 +190,9 @@ impl SimpleDB {
 pub struct MultiBufferProductPlan {
     lhs: Arc<MaterializePlan>,
     rhs: Arc<dyn Plan>,
-    txn: Arc<Transaction>,
     schema: Schema,
+    block_size: usize,
+    available_buffs: usize,
 }
 
 impl MultiBufferProductPlan {
@@ -200,21 +201,28 @@ impl MultiBufferProductPlan {
         rhs: Arc<dyn Plan>,
         txn: Arc<Transaction>,
     ) -> SimpleDBResult<Self> {
+        let block_size = txn.block_size();
+        let available_buffs = txn.available_buffs();
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
         let lhs = Arc::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
         Ok(Self {
-            txn,
             lhs,
             rhs,
             schema,
+            block_size,
+            available_buffs,
         })
     }
 
-    pub fn create_temp_table(&self, plan: &Arc<dyn Plan>) -> SimpleDBResult<TempTable> {
-        let temp_table = TempTable::new(Arc::clone(&self.txn), plan.schema());
-        let mut source_scan = plan.open();
+    pub fn create_temp_table(
+        &self,
+        ctx: &ExecutionContext,
+        plan: &Arc<dyn Plan>,
+    ) -> SimpleDBResult<TempTable> {
+        let temp_table = TempTable::new(Arc::clone(ctx.txn()), plan.schema());
+        let mut source_scan = plan.open(ctx);
         let mut table_scan = temp_table.open();
         while let Some(result) = source_scan.next() {
             result?;
@@ -231,11 +239,11 @@ impl MultiBufferProductPlan {
 }
 
 impl Plan for MultiBufferProductPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let table_scan = self.lhs.open_table_scan();
-        let scan_2 = self.create_temp_table(&self.rhs).unwrap();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let table_scan = self.lhs.open_table_scan(ctx);
+        let scan_2 = self.create_temp_table(ctx, &self.rhs).unwrap();
         let scan = MultiBufferProductScan::new(
-            Arc::clone(&self.txn),
+            Arc::clone(ctx.txn()),
             table_scan,
             &scan_2.table_name,
             scan_2.layout,
@@ -244,12 +252,12 @@ impl Plan for MultiBufferProductPlan {
     }
 
     fn blocks_accessed(&self) -> usize {
-        let available_buffs = self.txn.available_buffs();
+        let available_buffs = self.available_buffs;
         //  TODO: This is copied over from [MaterializePlan::blocks_accessed] because there is no way
         //  to pass ownership to MaterializePlan right now of self.rhs
         let num_blocks = {
             let layout = Layout::new(self.rhs.schema());
-            let records_per_block = self.txn.block_size() / layout.max_encoded_size();
+            let records_per_block = self.block_size / layout.max_encoded_size();
             self.rhs.records_output() / records_per_block
         };
         let num_chunks = num_blocks / available_buffs;
@@ -283,7 +291,7 @@ impl Plan for MultiBufferProductPlan {
 mod multi_buffer_product_plan_tests {
     use std::sync::Arc;
 
-    use crate::{MultiBufferProductPlan, Plan, SimpleDB, TablePlan, Transaction};
+    use crate::{ExecutionContext, MultiBufferProductPlan, Plan, SimpleDB, TablePlan, Transaction};
 
     fn setup_emp_dept(db: &SimpleDB, txn: Arc<Transaction>) {
         db.planner
@@ -345,7 +353,8 @@ mod multi_buffer_product_plan_tests {
         insert_dept(&db, Arc::clone(&txn), 30);
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let scan = mbp.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let scan = mbp.open(&ctx);
 
         let mut count = 0;
         for res in scan {
@@ -363,7 +372,8 @@ mod multi_buffer_product_plan_tests {
         // no inserts
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let scan = mbp.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let scan = mbp.open(&ctx);
 
         let mut count = 0;
         for res in scan {
@@ -382,7 +392,8 @@ mod multi_buffer_product_plan_tests {
         insert_dept(&db, Arc::clone(&txn), 30);
 
         let mbp = build_plan(&db, Arc::clone(&txn));
-        let mut scan = mbp.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = mbp.open(&ctx);
 
         // consume a few
         scan.next();
@@ -1160,19 +1171,13 @@ pub struct MergeJoinPlan {
     plan_2: Arc<SortPlan>,
     field_name_1: String,
     field_name_2: String,
-    txn: Arc<Transaction>,
     schema: Schema,
 }
 
 impl MergeJoinPlan {
-    pub fn txn(&self) -> &Arc<Transaction> {
-        &self.txn
-    }
-
     pub fn new(
         plan_1: Arc<dyn Plan>,
         plan_2: Arc<SortPlan>,
-        txn: Arc<Transaction>,
         field_name_1: String,
         field_name_2: String,
     ) -> Result<Self, Box<dyn Error>> {
@@ -1184,16 +1189,15 @@ impl MergeJoinPlan {
             plan_2,
             field_name_1,
             field_name_2,
-            txn,
             schema,
         })
     }
 }
 
 impl Plan for MergeJoinPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let scan_1 = self.plan_1.open();
-        let sort_scan_2 = self.plan_2.open_sort_scan();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let scan_1 = self.plan_1.open(ctx);
+        let sort_scan_2 = self.plan_2.open_sort_scan(ctx);
         let scan = MergeJoinScan::new(
             scan_1,
             sort_scan_2,
@@ -1247,7 +1251,7 @@ impl Plan for MergeJoinPlan {
 mod merge_join_plan_tests {
     use std::sync::Arc;
 
-    use crate::{MergeJoinPlan, Plan, SimpleDB, SortPlan, TablePlan};
+    use crate::{ExecutionContext, MergeJoinPlan, Plan, SimpleDB, SortPlan, TablePlan};
 
     #[test]
     fn test_merge_join_plan_with_real_tables() {
@@ -1306,14 +1310,14 @@ mod merge_join_plan_tests {
         let merge_join_plan = MergeJoinPlan::new(
             sort_plan1,
             sort_plan2,
-            Arc::clone(&txn),
             "id".to_string(),
             "depid".to_string(),
         )
         .unwrap();
 
         // Open the plan and test
-        let mut scan = merge_join_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = merge_join_plan.open(&ctx);
 
         let mut results = Vec::new();
         while let Some(result) = scan.next() {
@@ -1920,18 +1924,20 @@ mod merge_join_scan_tests {
 
 pub struct SortPlan {
     source_plan: Arc<dyn Plan>,
-    txn: Arc<Transaction>,
     schema: Schema,
     record_comparator: RecordComparator,
 }
 
 impl SortPlan {
-    pub fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>, field_list: Vec<String>) -> Self {
+    pub fn new(
+        source_plan: Arc<dyn Plan>,
+        _txn: Arc<Transaction>,
+        field_list: Vec<String>,
+    ) -> Self {
         let schema = source_plan.schema();
         let record_comparator = RecordComparator::new(field_list);
         Self {
             source_plan,
-            txn,
             schema,
             record_comparator,
         }
@@ -1954,11 +1960,12 @@ impl SortPlan {
 
     pub fn split_into_runs(
         &self,
+        ctx: &ExecutionContext,
         mut source_scan: Box<dyn Scan>,
     ) -> Result<Vec<TempTable>, Box<dyn Error>> {
         let mut temp_tables: Vec<TempTable> = Vec::new();
         source_scan.before_first()?;
-        let current_temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let current_temp_table = TempTable::new(Arc::clone(ctx.txn()), self.source_plan.schema());
         let mut current_scan = current_temp_table.open();
         temp_tables.push(current_temp_table);
 
@@ -1980,7 +1987,7 @@ impl SortPlan {
                         Ok(ordering) => match ordering {
                             Ordering::Greater => {
                                 let new_temp_table = TempTable::new(
-                                    Arc::clone(&self.txn),
+                                    Arc::clone(ctx.txn()),
                                     self.source_plan.schema(),
                                 );
                                 current_scan = new_temp_table.open();
@@ -2005,6 +2012,7 @@ impl SortPlan {
 
     pub fn do_merge_iters(
         &self,
+        ctx: &ExecutionContext,
         mut temp_tables: Vec<TempTable>,
     ) -> Result<Vec<TempTable>, Box<dyn Error>> {
         if temp_tables.len() <= 2 {
@@ -2013,7 +2021,7 @@ impl SortPlan {
         while temp_tables.len() > 2 {
             let temp_table_1 = temp_tables.remove(0);
             let temp_table_2 = temp_tables.remove(0);
-            let sorted_temp_table = self.merge(temp_table_1, temp_table_2)?;
+            let sorted_temp_table = self.merge(ctx, temp_table_1, temp_table_2)?;
             temp_tables.push(sorted_temp_table);
         }
         Ok(temp_tables)
@@ -2021,12 +2029,13 @@ impl SortPlan {
 
     pub fn merge(
         &self,
+        ctx: &ExecutionContext,
         table_1: TempTable,
         table_2: TempTable,
     ) -> Result<TempTable, Box<dyn Error>> {
         let mut scan_1 = Some(table_1.open());
         let mut scan_2 = Some(table_2.open());
-        let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let temp_table = TempTable::new(Arc::clone(ctx.txn()), self.source_plan.schema());
         let mut current_scan = temp_table.open();
 
         enum MergeState {
@@ -2163,17 +2172,17 @@ impl SortPlan {
 }
 
 impl SortPlan {
-    pub fn open_sort_scan(&self) -> SortScan {
-        let source_scan = self.source_plan.open();
-        let runs = self.split_into_runs(source_scan).unwrap();
-        let merged_runs = self.do_merge_iters(runs).unwrap();
+    pub fn open_sort_scan(&self, ctx: &ExecutionContext) -> SortScan {
+        let source_scan = self.source_plan.open(ctx);
+        let runs = self.split_into_runs(ctx, source_scan).unwrap();
+        let merged_runs = self.do_merge_iters(ctx, runs).unwrap();
         SortScan::new(merged_runs, self.record_comparator.clone())
     }
 }
 
 impl Plan for SortPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        Box::new(self.open_sort_scan())
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        Box::new(self.open_sort_scan(ctx))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -2215,7 +2224,7 @@ impl Plan for SortPlan {
 
 #[cfg(test)]
 mod sort_plan_tests {
-    use crate::{Plan, SimpleDB, SortPlan, TablePlan};
+    use crate::{ExecutionContext, Plan, SimpleDB, SortPlan, TablePlan};
     use std::sync::Arc;
 
     #[test]
@@ -2247,7 +2256,8 @@ mod sort_plan_tests {
         let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
 
         // Open the sort scan
-        let mut sort_scan = sort_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut sort_scan = sort_plan.open(&ctx);
 
         // Verify records come back in sorted order
         let mut prev_id = None;
@@ -2301,7 +2311,8 @@ mod sort_plan_tests {
         let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["grade".to_string()]);
 
         // Open the sort scan
-        let mut sort_scan = sort_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut sort_scan = sort_plan.open(&ctx);
 
         // Verify records come back in sorted order
         let mut prev_grade = None;
@@ -2373,7 +2384,8 @@ mod sort_plan_tests {
         );
 
         // Open the sort scan
-        let mut sort_scan = sort_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut sort_scan = sort_plan.open(&ctx);
 
         // Verify records come back in sorted order
         let mut prev_dept = None;
@@ -2419,7 +2431,8 @@ mod sort_plan_tests {
         let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
 
         // Open the sort scan
-        let sort_scan = sort_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let sort_scan = sort_plan.open(&ctx);
 
         // Verify no records are returned
         let mut count = 0;
@@ -2812,20 +2825,24 @@ impl RecordComparator {
 
 pub struct MaterializePlan {
     source_plan: Arc<dyn Plan>,
-    txn: Arc<Transaction>,
+    block_size: usize,
 }
 
 impl MaterializePlan {
     pub fn new(source_plan: Arc<dyn Plan>, txn: Arc<Transaction>) -> Self {
-        Self { source_plan, txn }
+        let block_size = txn.block_size();
+        Self {
+            source_plan,
+            block_size,
+        }
     }
 }
 
 impl MaterializePlan {
-    pub fn open_table_scan(&self) -> TableScan {
-        let mut source_scan = self.source_plan.open();
+    pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
+        let mut source_scan = self.source_plan.open(ctx);
         println!("The schema retrieved {:?}", self.source_plan.schema());
-        let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
+        let temp_table = TempTable::new(Arc::clone(ctx.txn()), self.source_plan.schema());
         let mut temp_table_scan = temp_table.open();
         while let Some(result) = source_scan.next() {
             if result.is_err() {
@@ -2846,13 +2863,13 @@ impl MaterializePlan {
 }
 
 impl Plan for MaterializePlan {
-    fn open(&self) -> Box<dyn Scan> {
-        Box::new(self.open_table_scan())
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        Box::new(self.open_table_scan(ctx))
     }
 
     fn blocks_accessed(&self) -> usize {
         let layout = Layout::new(self.source_plan.schema());
-        let rpb = self.txn.block_size() / layout.max_encoded_size();
+        let rpb = self.block_size / layout.max_encoded_size();
         self.source_plan.records_output() / rpb
     }
 
@@ -2886,7 +2903,7 @@ impl Plan for MaterializePlan {
 
 #[cfg(test)]
 mod materialize_plan_tests {
-    use crate::{MaterializePlan, Plan, Scan, SimpleDB, TablePlan};
+    use crate::{ExecutionContext, MaterializePlan, Plan, Scan, SimpleDB, TablePlan};
     use std::sync::Arc;
 
     #[test]
@@ -2925,7 +2942,8 @@ mod materialize_plan_tests {
         let materialize_plan = MaterializePlan::new(Arc::new(table_plan), Arc::clone(&txn));
 
         // Open the materialized scan
-        let mut materialized_scan = materialize_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut materialized_scan = materialize_plan.open(&ctx);
 
         // Verify all records were materialized correctly
         let mut count = 0;
@@ -2987,7 +3005,8 @@ mod materialize_plan_tests {
         let materialize_plan = MaterializePlan::new(source_plan, Arc::clone(&txn));
 
         // Open the materialized scan
-        let materialized_scan = materialize_plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let materialized_scan = materialize_plan.open(&ctx);
 
         // Verify no records exist
         let mut count = 0;
@@ -3097,7 +3116,7 @@ impl Planner {
 mod planner_tests {
     use std::sync::Arc;
 
-    use crate::{Constant, Index, Scan, SimpleDB, TableCursor, TablePlan};
+    use crate::{Constant, ExecutionContext, Index, Scan, SimpleDB, TableCursor, TablePlan};
 
     #[test]
     fn test_planner_single_table() {
@@ -3120,7 +3139,8 @@ mod planner_tests {
         dbg!("reading records back");
         let sql = "select B from T1 where A>10".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut retrieved_count = 0;
         while let Some(_) = scan.next() {
             scan.get_string("b").unwrap();
@@ -3164,7 +3184,8 @@ mod planner_tests {
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
         plan.print_plan_internal(0);
         dbg!("Reading records in join");
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
             let lhs = scan.get_string("b").unwrap();
@@ -3197,7 +3218,8 @@ mod planner_tests {
         dbg!("Reading all the records back");
         let sql = "select A, B from t1".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
             scan.get_int("a").unwrap();
@@ -3212,7 +3234,8 @@ mod planner_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         let sql = "select A, B from t1".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
             let a = scan.get_int("a").unwrap();
@@ -3247,7 +3270,8 @@ mod planner_tests {
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
         let sql = "select A, B from t1 where A < 100".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
             scan.get_int("a").unwrap();
@@ -3299,7 +3323,8 @@ mod planner_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         );
-        let mut table_scan = table_plan.open_table_scan();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut table_scan = table_plan.open_table_scan(&ctx);
 
         // Open the index
         let mut index = major_index.open();
@@ -3379,7 +3404,8 @@ mod planner_tests {
         // Verify the updates through a query
         let sql = "select sname, sid from student_alt".to_string();
         let plan = db.planner.create_query_plan(sql, Arc::clone(&txn)).unwrap();
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
 
         let mut results = Vec::new();
         while let Some(_) = scan.next() {
@@ -3414,12 +3440,13 @@ mod planner_tests {
         let mut found = false;
         while index.next() {
             let rid = index.get_data_rid();
+            let ctx = ExecutionContext::new(Arc::clone(&txn));
             let mut table_scan = TablePlan::new(
                 "student_alt",
                 Arc::clone(&txn),
                 Arc::clone(&db.metadata_manager),
             )
-            .open_table_scan();
+            .open_table_scan(&ctx);
             table_scan.move_to_rid(rid).unwrap();
             if table_scan.get_string("sname").unwrap() == "sam" {
                 found = true;
@@ -3490,7 +3517,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
             }
         }
         txn.lock_in_order(lock_requests)?;
-        let mut scan = plan.open_table_scan();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open_table_scan(&ctx);
         scan.insert_values(&values)?;
         let rid = scan.get_rid()?;
         for (field, value) in data.fields.iter().zip(data.values.iter()) {
@@ -3522,7 +3550,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
         }];
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
-        let mut scan = table_plan.open_table_scan();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = table_plan.open_table_scan(&ctx);
         let mut rows_deleted = 0;
 
         while let Some(result) = scan.next() {
@@ -3561,7 +3590,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
         }];
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
-        let mut scan = table_plan.open_table_scan();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = table_plan.open_table_scan(&ctx);
         let mut update_count = 0;
 
         while let Some(result) = scan.next() {
@@ -3635,7 +3665,11 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: InsertData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let plan = TablePlan::new(&data.table_name, txn, Arc::clone(&self.metadata_manager));
+        let plan = TablePlan::new(
+            &data.table_name,
+            Arc::clone(&txn),
+            Arc::clone(&self.metadata_manager),
+        );
         let schema = plan.schema();
         let field_map: std::collections::HashMap<&str, Constant> = data
             .fields
@@ -3655,7 +3689,8 @@ impl UpdatePlanner for BasicUpdatePlanner {
                 })
             })
             .collect();
-        let mut scan = plan.open_table_scan();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open_table_scan(&ctx);
         scan.insert_values(&values)?;
         Ok(1)
     }
@@ -3671,7 +3706,8 @@ impl UpdatePlanner for BasicUpdatePlanner {
             Arc::clone(&self.metadata_manager),
         );
         let predicate = data.predicate;
-        let mut scan = table_plan.open_table_scan();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = table_plan.open_table_scan(&ctx);
         let mut rows_deleted = 0;
         while let Some(result) = scan.next() {
             result?;
@@ -3694,7 +3730,8 @@ impl UpdatePlanner for BasicUpdatePlanner {
             Arc::clone(&self.metadata_manager),
         );
         let predicate = data.predicate;
-        let mut scan = table_plan.open_table_scan();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = table_plan.open_table_scan(&ctx);
         let mut update_count = 0;
         while let Some(result) = scan.next() {
             result?;
@@ -3783,7 +3820,6 @@ pub trait UpdatePlanner {
 pub struct TablePlanner {
     table_name: String,
     predicate: Predicate,
-    txn: Arc<Transaction>,
     metadata_manager: Arc<MetadataManager>,
     schema: Schema,
     indexes: HashMap<String, IndexInfo>,
@@ -3814,7 +3850,6 @@ impl TablePlanner {
         Self {
             table_name,
             predicate,
-            txn: Arc::clone(&txn),
             metadata_manager,
             schema: plan.schema(),
             indexes,
@@ -3834,7 +3869,11 @@ impl TablePlanner {
     /// Check if the [Predicate] will allow joining these two tables. If not, return [None]
     /// If possible, construct an [IndexJoinPlan]. If predicate does not apply, return [ProductPlan]
     /// with a join predicate on top
-    fn make_join_plan(&self, other_plan: &Arc<dyn Plan>) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
+    fn make_join_plan(
+        &self,
+        other_plan: &Arc<dyn Plan>,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
         let mut unioned_schema = Schema::new();
         unioned_schema.add_all_from_schema(&self.schema)?;
         unioned_schema.add_all_from_schema(&other_plan.schema())?;
@@ -3849,18 +3888,24 @@ impl TablePlanner {
         let plan = self
             .make_index_join_plan(Arc::clone(&self.plan), Arc::clone(other_plan))?
             .map(Ok)
-            .unwrap_or_else(|| self.make_product_join_plan(Arc::clone(other_plan)))?;
+            .unwrap_or_else(|| {
+                self.make_product_join_plan(Arc::clone(other_plan), Arc::clone(&txn))
+            })?;
         Ok(Some(plan))
     }
 
     /// Construct a [MultiBufferProductPlan] with the provided plan
-    fn make_product_plan(&self, other_plan: Arc<dyn Plan>) -> SimpleDBResult<Arc<dyn Plan>> {
+    fn make_product_plan(
+        &self,
+        other_plan: Arc<dyn Plan>,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
         let plan_as_dyn: Arc<dyn Plan> = self.plan.clone();
         let filtered_plan = self.add_select_predicate(plan_as_dyn);
         Ok(Arc::new(MultiBufferProductPlan::new(
             other_plan,
             filtered_plan,
-            Arc::clone(&self.txn),
+            txn,
         )?))
     }
 
@@ -3897,8 +3942,12 @@ impl TablePlanner {
     /// This function constructs a [MultiBufferProductPlan] and then adds two plans on top
     /// 1. [SelectPlan] with [Predicate] filtering for this table
     /// 2. [SelectPlan] with [Predicate] filtering for the cross-table join condition
-    fn make_product_join_plan(&self, other_plan: Arc<dyn Plan>) -> SimpleDBResult<Arc<dyn Plan>> {
-        self.make_product_plan(Arc::clone(&other_plan))
+    fn make_product_join_plan(
+        &self,
+        other_plan: Arc<dyn Plan>,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
+        self.make_product_plan(Arc::clone(&other_plan), txn)
             .and_then(|p| self.add_join_predicate(p, &other_plan))
     }
 
@@ -3997,11 +4046,11 @@ impl HeuristicQueryPlanner {
 
         //  Find the lowest cost join plan, and failing that find the lowest cost product plan and failing that just error out
         while !self.table_planners.is_empty() {
-            match self.get_lowest_join_plan(&current_plan) {
+            match self.get_lowest_join_plan(&current_plan, Arc::clone(&txn)) {
                 Ok(new_plan) => {
                     current_plan = new_plan;
                 }
-                Err(e) => match self.get_lowest_product_plan(current_plan) {
+                Err(e) => match self.get_lowest_product_plan(current_plan, Arc::clone(&txn)) {
                     Ok(new_plan) => {
                         current_plan = new_plan;
                     }
@@ -4036,12 +4085,13 @@ impl HeuristicQueryPlanner {
     pub fn get_lowest_join_plan(
         &mut self,
         current_plan: &Arc<dyn Plan>,
+        txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
         let candidates: Vec<(usize, Arc<dyn Plan>)> = self
             .table_planners
             .iter()
             .enumerate()
-            .map(|(idx, tp)| Ok((idx, tp.make_join_plan(current_plan)?)))
+            .map(|(idx, tp)| Ok((idx, tp.make_join_plan(current_plan, Arc::clone(&txn))?)))
             .collect::<SimpleDBResult<Vec<_>>>()?
             .into_iter()
             .filter_map(|(idx, opt)| opt.map(|p| (idx, p)))
@@ -4059,13 +4109,14 @@ impl HeuristicQueryPlanner {
     pub fn get_lowest_product_plan(
         &mut self,
         current_plan: Arc<dyn Plan>,
+        txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
         let (idx, plan) = self
             .table_planners
             .iter()
             .enumerate()
             .map(|(idx, tp)| {
-                tp.make_product_plan(Arc::clone(&current_plan))
+                tp.make_product_plan(Arc::clone(&current_plan), Arc::clone(&txn))
                     .map(|p| (idx, p))
             })
             .collect::<SimpleDBResult<Vec<_>>>()?
@@ -4165,8 +4216,11 @@ mod basic_query_planner_tests {
         sql: &str,
         fields: &[&str],
     ) -> Vec<Vec<Constant>> {
-        let plan = planner.create_query_plan(sql.to_string(), txn).unwrap();
-        let mut scan = plan.open();
+        let plan = planner
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open(&ctx);
         let mut out = Vec::new();
         scan.before_first().unwrap();
         while let Some(Ok(())) = scan.next() {
@@ -4346,8 +4400,11 @@ mod heuristic_equivalence_tests {
         sql: &str,
         fields: &[&str],
     ) -> Vec<Vec<Constant>> {
-        let plan = planner.create_query_plan(sql.to_string(), txn).unwrap();
-        let mut scan = plan.open();
+        let plan = planner
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open(&ctx);
         let mut out = Vec::new();
         scan.before_first().unwrap();
         while let Some(Ok(())) = scan.next() {
@@ -4613,9 +4670,9 @@ impl ProductPlan {
 }
 
 impl Plan for ProductPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let scan_1 = self.plan_1.open();
-        let scan_2 = self.plan_2.open();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let scan_1 = self.plan_1.open(ctx);
+        let scan_2 = self.plan_2.open(ctx);
         Box::new(ProductScan::new(scan_1, scan_2))
     }
 
@@ -4688,8 +4745,8 @@ impl ProjectPlan {
 }
 
 impl Plan for ProjectPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let scan = self.plan.open();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let scan = self.plan.open(ctx);
         Box::new(ProjectScan::new(scan, self.schema.fields.clone()))
     }
 
@@ -4734,8 +4791,8 @@ impl IndexSelectPlan {
 }
 
 impl Plan for IndexSelectPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let scan = self.plan.open_table_scan();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let scan = self.plan.open_table_scan(ctx);
         Box::new(IndexSelectScan::new(
             scan,
             self.ii.open(),
@@ -4784,8 +4841,8 @@ impl SelectPlan {
 }
 
 impl Plan for SelectPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        Box::new(SelectScan::new(self.plan.open(), self.predicate.clone()))
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        Box::new(SelectScan::new(self.plan.open(ctx), self.predicate.clone()))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -4827,7 +4884,6 @@ impl Plan for SelectPlan {
 
 pub struct TablePlan {
     table_name: String,
-    txn: Arc<Transaction>,
     layout: Layout,
     stat_info: StatInfo,
     table_id: u32,
@@ -4847,7 +4903,6 @@ impl TablePlan {
             .unwrap_or(u32::MAX);
         Self {
             table_name: table_name.to_string(),
-            txn,
             layout,
             stat_info,
             table_id,
@@ -4860,9 +4915,9 @@ impl TablePlan {
 }
 
 impl TablePlan {
-    pub fn open_table_scan(&self) -> TableScan {
+    pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
         TableScan::new(
-            Arc::clone(&self.txn),
+            Arc::clone(ctx.txn()),
             self.layout.clone(),
             &self.table_name,
             self.table_id,
@@ -4872,8 +4927,8 @@ impl TablePlan {
 }
 
 impl Plan for TablePlan {
-    fn open(&self) -> Box<dyn Scan> {
-        Box::new(self.open_table_scan())
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        Box::new(self.open_table_scan(ctx))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -4903,8 +4958,22 @@ impl Plan for TablePlan {
     }
 }
 
+pub struct ExecutionContext {
+    txn: Arc<Transaction>,
+}
+
+impl ExecutionContext {
+    pub fn new(txn: Arc<Transaction>) -> Self {
+        Self { txn }
+    }
+
+    pub fn txn(&self) -> &Arc<Transaction> {
+        &self.txn
+    }
+}
+
 pub trait Plan {
-    fn open(&self) -> Box<dyn Scan>;
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan>;
     fn blocks_accessed(&self) -> usize;
     fn records_output(&self) -> usize;
     fn distinct_values(&self, field_name: &str) -> usize;
@@ -4919,7 +4988,9 @@ pub trait Plan {
 mod plan_test_single_table {
     use std::sync::Arc;
 
-    use crate::{Plan, Predicate, ProjectPlan, SelectPlan, SimpleDB, TablePlan, Term};
+    use crate::{
+        ExecutionContext, Plan, Predicate, ProjectPlan, SelectPlan, SimpleDB, TablePlan, Term,
+    };
 
     fn print_stats<T>(plan: &T, type_of_plan: &str)
     where
@@ -4939,7 +5010,12 @@ mod plan_test_single_table {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
 
         //  the table plan
-        let table = TablePlan::new("student", db.new_tx(), Arc::clone(&db.metadata_manager));
+        let txn = db.new_tx();
+        let table = TablePlan::new(
+            "student",
+            Arc::clone(&txn),
+            Arc::clone(&db.metadata_manager),
+        );
         print_stats(&table, "table");
 
         //  the select plan
@@ -4962,7 +5038,8 @@ mod plan_test_single_table {
         //  This will never run in the test, but that's okay for now. This test is mostly a sanity check to see that things compose together
         if let Ok(project) = project {
             // open the plan and initiate the scan now
-            let mut scan = project.open();
+            let ctx = ExecutionContext::new(Arc::clone(&txn));
+            let mut scan = project.open(&ctx);
             while let Some(_) = scan.next() {
                 println!(
                     "sid {}, sname {}, majorid {}, gradyear {}",
@@ -5393,9 +5470,9 @@ impl IndexJoinPlan {
 }
 
 impl Plan for IndexJoinPlan {
-    fn open(&self) -> Box<dyn Scan> {
-        let lhs = self.plan_1.open();
-        let scan = self.plan_2.open_table_scan();
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        let lhs = self.plan_1.open(ctx);
+        let scan = self.plan_2.open_table_scan(ctx);
         let idx = self.index_info.open();
         Box::new(IndexJoinScan::new(lhs, idx, scan, self.join_field.clone()))
     }
@@ -5453,7 +5530,7 @@ impl Plan for IndexJoinPlan {
 mod index_join_plan_tests {
     use std::sync::Arc;
 
-    use crate::{IndexJoinPlan, Plan, SimpleDB, TablePlan};
+    use crate::{ExecutionContext, IndexJoinPlan, Plan, SimpleDB, TablePlan};
 
     #[test]
     fn test_index_join_plan_with_real_tables() {
@@ -5524,7 +5601,8 @@ mod index_join_plan_tests {
         let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "id".to_string()).unwrap();
 
         // Execute
-        let mut scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
         let mut results = Vec::new();
         while let Some(res) = scan.next() {
             assert!(res.is_ok());
@@ -5599,7 +5677,8 @@ mod index_join_plan_tests {
             .expect("expected index on t2.c");
 
         let plan = IndexJoinPlan::new(lhs, rhs, idx_info, "a".to_string()).unwrap();
-        let scan = plan.open();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let scan = plan.open(&ctx);
         let mut count = 0;
         for res in scan {
             assert!(res.is_ok());

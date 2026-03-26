@@ -1,7 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use clap::Parser;
-use simpledb::{BTreeIndex, Constant, FieldType, SimpleDB, Transaction};
+use simpledb::{BTreeIndex, Constant, ExecutionContext, FieldType, SimpleDB, Transaction};
 use std::error::Error;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -282,8 +282,11 @@ fn execute_query(
     sql: &str,
     txn: Arc<Transaction>,
 ) -> Result<String, Box<dyn Error>> {
-    let plan = db.planner.create_query_plan(sql.to_string(), txn)?;
-    let mut scan = plan.open();
+    let plan = db
+        .planner
+        .create_query_plan(sql.to_string(), Arc::clone(&txn))?;
+    let ctx = ExecutionContext::new(txn);
+    let mut scan = plan.open(&ctx);
 
     let mut result = String::new();
     let mut row_count = 0;

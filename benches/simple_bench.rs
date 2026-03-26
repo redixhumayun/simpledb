@@ -2,8 +2,8 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use simpledb::{
-    BTreeIndex, Constant, Index, Layout, LockError, Scan, SimpleDB, SplitGate, TableCursor,
-    TableScan, Transaction, RID,
+    BTreeIndex, Constant, ExecutionContext, Index, Layout, LockError, Scan, SimpleDB, SplitGate,
+    TableCursor, TableScan, Transaction, RID,
 };
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -307,7 +307,8 @@ fn bench_select(c: &mut Criterion) {
                 )
                 .unwrap();
             {
-                let mut scan = plan.open();
+                let ctx = ExecutionContext::new(Arc::clone(&txn));
+                let mut scan = plan.open(&ctx);
                 let _ = scan.by_ref().count();
             }
             txn.commit().unwrap();
@@ -322,7 +323,8 @@ fn bench_select(c: &mut Criterion) {
                 .create_query_plan("SELECT * FROM bench_table".to_string(), Arc::clone(&txn))
                 .unwrap();
             {
-                let mut scan = plan.open();
+                let ctx = ExecutionContext::new(Arc::clone(&txn));
+                let mut scan = plan.open(&ctx);
                 let _count = scan.by_ref().count();
             }
             txn.commit().unwrap();
