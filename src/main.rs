@@ -188,7 +188,7 @@ impl SimpleDB {
 }
 
 pub struct MultiBufferProductPlan {
-    lhs: Arc<dyn Plan>,
+    lhs: Arc<MaterializePlan>,
     rhs: Arc<dyn Plan>,
     txn: Arc<Transaction>,
     schema: Schema,
@@ -231,11 +231,8 @@ impl MultiBufferProductPlan {
 }
 
 impl Plan for MultiBufferProductPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
-        let scan_1 = self.lhs.open();
-        let table_scan: TableScan = *(scan_1 as Box<dyn Any>)
-            .downcast()
-            .expect("Failed to downcast to TableScan");
+    fn open(&self) -> Box<dyn Scan> {
+        let table_scan = self.lhs.open_table_scan();
         let scan_2 = self.create_temp_table(&self.rhs).unwrap();
         let scan = MultiBufferProductScan::new(
             Arc::clone(&self.txn),
@@ -546,39 +543,6 @@ where
 
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
         self.product_scan.as_ref().unwrap().has_field(field_name)
-    }
-}
-
-impl<S1> UpdateScan for MultiBufferProductScan<S1>
-where
-    S1: UpdateScan + Clone + 'static,
-{
-    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        unimplemented!()
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        unimplemented!()
     }
 }
 
@@ -948,36 +912,6 @@ impl Iterator for ChunkScan {
     }
 }
 
-impl UpdateScan for ChunkScan {
-    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        unimplemented!()
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-}
-
 #[cfg(test)]
 mod chunk_scan_tests {
     use super::*;
@@ -1223,7 +1157,7 @@ pub fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
 
 pub struct MergeJoinPlan {
     plan_1: Arc<dyn Plan>,
-    plan_2: Arc<dyn Plan>,
+    plan_2: Arc<SortPlan>,
     field_name_1: String,
     field_name_2: String,
     txn: Arc<Transaction>,
@@ -1237,7 +1171,7 @@ impl MergeJoinPlan {
 
     pub fn new(
         plan_1: Arc<dyn Plan>,
-        plan_2: Arc<dyn Plan>,
+        plan_2: Arc<SortPlan>,
         txn: Arc<Transaction>,
         field_name_1: String,
         field_name_2: String,
@@ -1257,12 +1191,9 @@ impl MergeJoinPlan {
 }
 
 impl Plan for MergeJoinPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+    fn open(&self) -> Box<dyn Scan> {
         let scan_1 = self.plan_1.open();
-        let scan_2 = self.plan_2.open();
-        let sort_scan_2: SortScan = *(scan_2 as Box<dyn Any>)
-            .downcast()
-            .expect("Failed to downcast");
+        let sort_scan_2 = self.plan_2.open_sort_scan();
         let scan = MergeJoinScan::new(
             scan_1,
             sort_scan_2,
@@ -1567,38 +1498,6 @@ where
     }
 }
 
-impl<S> UpdateScan for MergeJoinScan<S>
-where
-    S: Scan + 'static,
-{
-    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        unimplemented!()
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        unimplemented!()
-    }
-}
 #[cfg(test)]
 mod merge_join_scan_tests {
 
@@ -1606,7 +1505,7 @@ mod merge_join_scan_tests {
 
     use crate::{
         Constant, Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan,
-        TempTable, UpdateScan,
+        TableCursor, TempTable,
     };
 
     #[test]
@@ -2041,7 +1940,7 @@ impl SortPlan {
     fn copy<Source, Dest>(&self, source: &Source, destination: &mut Dest) -> SimpleDBResult<()>
     where
         Source: Scan,
-        Dest: UpdateScan,
+        Dest: TableCursor,
     {
         let values: Vec<Constant> = self
             .schema
@@ -2055,7 +1954,7 @@ impl SortPlan {
 
     pub fn split_into_runs(
         &self,
-        mut source_scan: Box<dyn UpdateScan>,
+        mut source_scan: Box<dyn Scan>,
     ) -> Result<Vec<TempTable>, Box<dyn Error>> {
         let mut temp_tables: Vec<TempTable> = Vec::new();
         source_scan.before_first()?;
@@ -2263,12 +2162,18 @@ impl SortPlan {
     }
 }
 
-impl Plan for SortPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+impl SortPlan {
+    pub fn open_sort_scan(&self) -> SortScan {
         let source_scan = self.source_plan.open();
         let runs = self.split_into_runs(source_scan).unwrap();
         let merged_runs = self.do_merge_iters(runs).unwrap();
-        Box::new(SortScan::new(merged_runs, self.record_comparator.clone()))
+        SortScan::new(merged_runs, self.record_comparator.clone())
+    }
+}
+
+impl Plan for SortPlan {
+    fn open(&self) -> Box<dyn Scan> {
+        Box::new(self.open_sort_scan())
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -2737,42 +2642,13 @@ impl Scan for SortScan {
     }
 }
 
-impl UpdateScan for SortScan {
-    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
-        todo!()
-    }
-
-    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
-        todo!()
-    }
-
-    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
-        todo!()
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        todo!()
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        todo!()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        todo!()
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        todo!()
-    }
-}
-
 #[cfg(test)]
 mod sort_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Constant, Layout, RecordComparator, Scan, Schema, SimpleDB, SortScan, TempTable, UpdateScan,
+        Constant, Layout, RecordComparator, Scan, Schema, SimpleDB, SortScan, TableCursor,
+        TempTable,
     };
 
     #[test]
@@ -2945,8 +2821,8 @@ impl MaterializePlan {
     }
 }
 
-impl Plan for MaterializePlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+impl MaterializePlan {
+    pub fn open_table_scan(&self) -> TableScan {
         let mut source_scan = self.source_plan.open();
         println!("The schema retrieved {:?}", self.source_plan.schema());
         let temp_table = TempTable::new(Arc::clone(&self.txn), self.source_plan.schema());
@@ -2965,7 +2841,13 @@ impl Plan for MaterializePlan {
             temp_table_scan.insert_values(&values).unwrap();
         }
         temp_table_scan.before_first().unwrap();
-        Box::new(temp_table_scan)
+        temp_table_scan
+    }
+}
+
+impl Plan for MaterializePlan {
+    fn open(&self) -> Box<dyn Scan> {
+        Box::new(self.open_table_scan())
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -3215,7 +3097,7 @@ impl Planner {
 mod planner_tests {
     use std::sync::Arc;
 
-    use crate::{Constant, Index, Plan, SimpleDB, TablePlan};
+    use crate::{Constant, Index, Scan, SimpleDB, TableCursor, TablePlan};
 
     #[test]
     fn test_planner_single_table() {
@@ -3417,7 +3299,7 @@ mod planner_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         );
-        let mut table_scan = table_plan.open();
+        let mut table_scan = table_plan.open_table_scan();
 
         // Open the index
         let mut index = major_index.open();
@@ -3537,7 +3419,7 @@ mod planner_tests {
                 Arc::clone(&txn),
                 Arc::clone(&db.metadata_manager),
             )
-            .open();
+            .open_table_scan();
             table_scan.move_to_rid(rid).unwrap();
             if table_scan.get_string("sname").unwrap() == "sam" {
                 found = true;
@@ -3608,7 +3490,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
             }
         }
         txn.lock_in_order(lock_requests)?;
-        let mut scan = plan.open();
+        let mut scan = plan.open_table_scan();
         scan.insert_values(&values)?;
         let rid = scan.get_rid()?;
         for (field, value) in data.fields.iter().zip(data.values.iter()) {
@@ -3640,19 +3522,20 @@ impl UpdatePlanner for IndexUpdatePlanner {
         }];
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
-        let plan = Arc::new(table_plan);
-        let plan = SelectPlan::new(plan, predicate);
-        let mut scan = plan.open();
+        let mut scan = table_plan.open_table_scan();
         let mut rows_deleted = 0;
 
-        while let Some(_) = scan.next() {
-            let rid = scan.get_rid()?;
-            for field in indexes.keys() {
-                let mut index = indexes.get(field).unwrap().open();
-                index.delete(&scan.get_value(field)?, &rid);
+        while let Some(result) = scan.next() {
+            result?;
+            if predicate.is_satisfied(&scan)? {
+                let rid = scan.get_rid()?;
+                for field in indexes.keys() {
+                    let mut index = indexes.get(field).unwrap().open();
+                    index.delete(&scan.get_value(field)?, &rid);
+                }
+                scan.delete()?;
+                rows_deleted += 1;
             }
-            scan.delete()?;
-            rows_deleted += 1;
         }
 
         Ok(rows_deleted)
@@ -3678,21 +3561,22 @@ impl UpdatePlanner for IndexUpdatePlanner {
         }];
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
-        let plan = Arc::new(table_plan);
-        let plan = SelectPlan::new(plan, predicate);
-        let mut scan = plan.open();
+        let mut scan = table_plan.open_table_scan();
         let mut update_count = 0;
 
-        while let Some(_) = scan.next() {
-            let old_value = scan.get_value(&data.field_name)?;
-            let new_value = data.new_value.evaluate(&scan)?;
-            scan.set_value(&data.field_name, new_value.clone())?;
-            if let Some(ii) = indexes.get(&data.field_name) {
-                let mut index = ii.open();
-                index.delete(&old_value, &scan.get_rid()?);
-                index.insert(&new_value, &scan.get_rid()?);
+        while let Some(result) = scan.next() {
+            result?;
+            if predicate.is_satisfied(&scan)? {
+                let old_value = scan.get_value(&data.field_name)?;
+                let new_value = data.new_value.evaluate(&scan)?;
+                scan.set_value(&data.field_name, new_value.clone())?;
+                if let Some(ii) = indexes.get(&data.field_name) {
+                    let mut index = ii.open();
+                    index.delete(&old_value, &scan.get_rid()?);
+                    index.insert(&new_value, &scan.get_rid()?);
+                }
+                update_count += 1;
             }
-            update_count += 1;
         }
         Ok(update_count)
     }
@@ -3771,7 +3655,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
                 })
             })
             .collect();
-        let mut scan = plan.open();
+        let mut scan = plan.open_table_scan();
         scan.insert_values(&values)?;
         Ok(1)
     }
@@ -3781,17 +3665,20 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: DeleteData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let plan = Arc::new(TablePlan::new(
+        let table_plan = TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
-        ));
-        let plan = SelectPlan::new(plan, data.predicate);
-        let mut scan = plan.open();
+        );
+        let predicate = data.predicate;
+        let mut scan = table_plan.open_table_scan();
         let mut rows_deleted = 0;
-        while let Some(_) = scan.next() {
-            scan.delete()?;
-            rows_deleted += 1;
+        while let Some(result) = scan.next() {
+            result?;
+            if predicate.is_satisfied(&scan)? {
+                scan.delete()?;
+                rows_deleted += 1;
+            }
         }
         Ok(rows_deleted)
     }
@@ -3801,18 +3688,21 @@ impl UpdatePlanner for BasicUpdatePlanner {
         data: ModifyData,
         txn: Arc<Transaction>,
     ) -> Result<usize, Box<dyn Error>> {
-        let plan = Arc::new(TablePlan::new(
+        let table_plan = TablePlan::new(
             &data.table_name,
             Arc::clone(&txn),
             Arc::clone(&self.metadata_manager),
-        ));
-        let plan = SelectPlan::new(plan, data.predicate);
-        let mut scan = plan.open();
+        );
+        let predicate = data.predicate;
+        let mut scan = table_plan.open_table_scan();
         let mut update_count = 0;
-        while let Some(_) = scan.next() {
-            let value = data.new_value.evaluate(&scan)?;
-            scan.set_value(&data.field_name, value)?;
-            update_count += 1;
+        while let Some(result) = scan.next() {
+            result?;
+            if predicate.is_satisfied(&scan)? {
+                let value = data.new_value.evaluate(&scan)?;
+                scan.set_value(&data.field_name, value)?;
+                update_count += 1;
+            }
         }
         Ok(update_count)
     }
@@ -3897,7 +3787,7 @@ pub struct TablePlanner {
     metadata_manager: Arc<MetadataManager>,
     schema: Schema,
     indexes: HashMap<String, IndexInfo>,
-    plan: Arc<dyn Plan>,
+    plan: Arc<TablePlan>,
 }
 
 impl TablePlanner {
@@ -3965,7 +3855,8 @@ impl TablePlanner {
 
     /// Construct a [MultiBufferProductPlan] with the provided plan
     fn make_product_plan(&self, other_plan: Arc<dyn Plan>) -> SimpleDBResult<Arc<dyn Plan>> {
-        let filtered_plan = self.add_select_predicate(Arc::clone(&self.plan));
+        let plan_as_dyn: Arc<dyn Plan> = self.plan.clone();
+        let filtered_plan = self.add_select_predicate(plan_as_dyn);
         Ok(Arc::new(MultiBufferProductPlan::new(
             other_plan,
             filtered_plan,
@@ -3980,7 +3871,7 @@ impl TablePlanner {
     /// 3. The other plan's schema must also contain the field
     fn make_index_join_plan(
         &self,
-        plan: Arc<dyn Plan>,
+        plan: Arc<TablePlan>,
         other_plan: Arc<dyn Plan>,
     ) -> SimpleDBResult<Option<Arc<dyn Plan>>> {
         let plan_schema = &self.schema;
@@ -4015,7 +3906,7 @@ impl TablePlanner {
     /// and is part of the predicate in the form F=c, construct an [IndexSelectPlan]
     /// Using the first index is a pedgagogical simplification
     /// TODO: Fix this to use the most selective index and to use more than one index
-    fn make_index_select_plan(&self, plan: Arc<dyn Plan>) -> Arc<dyn Plan> {
+    fn make_index_select_plan(&self, plan: Arc<TablePlan>) -> Arc<dyn Plan> {
         for field in self.indexes.keys() {
             if let Some(bounds) = self.predicate.bounded_index_search_bounds(field) {
                 return Arc::new(IndexSelectPlan::new(
@@ -4722,7 +4613,7 @@ impl ProductPlan {
 }
 
 impl Plan for ProductPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+    fn open(&self) -> Box<dyn Scan> {
         let scan_1 = self.plan_1.open();
         let scan_2 = self.plan_2.open();
         Box::new(ProductScan::new(scan_1, scan_2))
@@ -4797,7 +4688,7 @@ impl ProjectPlan {
 }
 
 impl Plan for ProjectPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+    fn open(&self) -> Box<dyn Scan> {
         let scan = self.plan.open();
         Box::new(ProjectScan::new(scan, self.schema.fields.clone()))
     }
@@ -4831,23 +4722,20 @@ impl Plan for ProjectPlan {
 }
 
 pub struct IndexSelectPlan {
-    plan: Arc<dyn Plan>,
+    plan: Arc<TablePlan>,
     ii: IndexInfo,
     bounds: IndexSearchBounds,
 }
 
 impl IndexSelectPlan {
-    fn new(plan: Arc<dyn Plan>, ii: IndexInfo, bounds: IndexSearchBounds) -> Self {
+    fn new(plan: Arc<TablePlan>, ii: IndexInfo, bounds: IndexSearchBounds) -> Self {
         Self { plan, ii, bounds }
     }
 }
 
 impl Plan for IndexSelectPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
-        let scan = self.plan.open();
-        let scan: TableScan = *(scan as Box<dyn Any>)
-            .downcast()
-            .expect("Failed to downcast to TableScan");
+    fn open(&self) -> Box<dyn Scan> {
+        let scan = self.plan.open_table_scan();
         Box::new(IndexSelectScan::new(
             scan,
             self.ii.open(),
@@ -4896,7 +4784,7 @@ impl SelectPlan {
 }
 
 impl Plan for SelectPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+    fn open(&self) -> Box<dyn Scan> {
         Box::new(SelectScan::new(self.plan.open(), self.predicate.clone()))
     }
 
@@ -4937,7 +4825,7 @@ impl Plan for SelectPlan {
     }
 }
 
-struct TablePlan {
+pub struct TablePlan {
     table_name: String,
     txn: Arc<Transaction>,
     layout: Layout,
@@ -4971,17 +4859,21 @@ impl TablePlan {
     }
 }
 
-impl Plan for TablePlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
-        Box::new(
-            TableScan::new(
-                Arc::clone(&self.txn),
-                self.layout.clone(),
-                &self.table_name,
-                self.table_id,
-            )
-            .unwrap(),
+impl TablePlan {
+    pub fn open_table_scan(&self) -> TableScan {
+        TableScan::new(
+            Arc::clone(&self.txn),
+            self.layout.clone(),
+            &self.table_name,
+            self.table_id,
         )
+        .unwrap()
+    }
+}
+
+impl Plan for TablePlan {
+    fn open(&self) -> Box<dyn Scan> {
+        Box::new(self.open_table_scan())
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -5012,7 +4904,7 @@ impl Plan for TablePlan {
 }
 
 pub trait Plan {
-    fn open(&self) -> Box<dyn UpdateScan>;
+    fn open(&self) -> Box<dyn Scan>;
     fn blocks_accessed(&self) -> usize;
     fn records_output(&self) -> usize;
     fn distinct_values(&self, field_name: &str) -> usize;
@@ -5106,7 +4998,7 @@ impl Scan for Box<dyn Scan> {
     }
 }
 
-impl Scan for Box<dyn UpdateScan> {
+impl Scan for Box<dyn TableCursor> {
     fn before_first(&mut self) -> SimpleDBResult<()> {
         (**self).before_first()
     }
@@ -5128,7 +5020,7 @@ impl Scan for Box<dyn UpdateScan> {
     }
 }
 
-impl UpdateScan for Box<dyn UpdateScan> {
+impl TableCursor for Box<dyn TableCursor> {
     fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         (**self).set_int(field_name, value)
     }
@@ -5262,61 +5154,9 @@ where
     }
 }
 
-impl<S1, S2> UpdateScan for ProductScan<S1, S2>
-where
-    S1: UpdateScan + 'static,
-    S2: UpdateScan + 'static,
-{
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        if self.s1.has_field(field_name)? {
-            return self.s1.set_int(field_name, value);
-        }
-        if self.s2.has_field(field_name)? {
-            return self.s2.set_int(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in ProductScan").into())
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        if self.s1.has_field(field_name)? {
-            return self.s1.set_string(field_name, value);
-        }
-        if self.s2.has_field(field_name)? {
-            return self.s2.set_string(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in ProductScan").into())
-    }
-
-    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
-        if self.s1.has_field(field_name)? {
-            return self.s1.set_value(field_name, value);
-        }
-        if self.s2.has_field(field_name)? {
-            return self.s2.set_value(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in ProductScan").into())
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        panic!("Insert not supported in ProductScan");
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        panic!("Delete not supported in ProductScan");
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        panic!("Get RID not supported in ProductScan");
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        panic!("Move to RID not supported in ProductScan");
-    }
-}
-
 #[cfg(test)]
 mod product_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use std::sync::Arc;
 
     use crate::{
@@ -5441,39 +5281,6 @@ where
     }
 }
 
-impl<S> UpdateScan for ProjectScan<S>
-where
-    S: UpdateScan + 'static,
-{
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        self.scan.set_int(field_name, value)
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        self.scan.set_string(field_name, value)
-    }
-
-    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
-        self.scan.set_value(field_name, value)
-    }
-
-    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
-        self.scan.insert_values(values)
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        self.scan.delete()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        self.scan.get_rid()
-    }
-
-    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
-        self.scan.move_to_rid(rid)
-    }
-}
-
 impl<S> Drop for ProjectScan<S>
 where
     S: Scan,
@@ -5485,7 +5292,7 @@ where
 
 #[cfg(test)]
 mod project_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use std::sync::Arc;
 
     use crate::{
@@ -5559,7 +5366,7 @@ mod project_scan_tests {
 
 pub struct IndexJoinPlan {
     plan_1: Arc<dyn Plan>,
-    plan_2: Arc<dyn Plan>,
+    plan_2: Arc<TablePlan>,
     index_info: IndexInfo,
     schema: Schema,
     join_field: String,
@@ -5568,7 +5375,7 @@ pub struct IndexJoinPlan {
 impl IndexJoinPlan {
     pub fn new(
         plan_1: Arc<dyn Plan>,
-        plan_2: Arc<dyn Plan>,
+        plan_2: Arc<TablePlan>,
         index_info: IndexInfo,
         join_field: String,
     ) -> Result<Self, Box<dyn Error>> {
@@ -5586,12 +5393,9 @@ impl IndexJoinPlan {
 }
 
 impl Plan for IndexJoinPlan {
-    fn open(&self) -> Box<dyn UpdateScan> {
+    fn open(&self) -> Box<dyn Scan> {
         let lhs = self.plan_1.open();
-        let scan = self.plan_2.open();
-        let scan: TableScan = *(scan as Box<dyn Any>)
-            .downcast()
-            .expect("Failed to downcast to TableScan in IndexJoinPlan");
+        let scan = self.plan_2.open_table_scan();
         let idx = self.index_info.open();
         Box::new(IndexJoinScan::new(lhs, idx, scan, self.join_field.clone()))
     }
@@ -5959,61 +5763,9 @@ where
     }
 }
 
-impl<S, I> UpdateScan for IndexJoinScan<S, I>
-where
-    S: UpdateScan + 'static,
-    I: Index + 'static,
-{
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        if self.lhs.has_field(field_name)? {
-            return self.lhs.set_int(field_name, value);
-        }
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.set_int(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in IndexJoinScan").into())
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        if self.lhs.has_field(field_name)? {
-            return self.lhs.set_string(field_name, value);
-        }
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.set_string(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in IndexJoinScan").into())
-    }
-
-    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
-        if self.lhs.has_field(field_name)? {
-            return self.lhs.set_value(field_name, value);
-        }
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.set_value(field_name, value);
-        }
-        Err(format!("Field {field_name} not found in IndexJoinScan").into())
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        panic!("Insert not supported in IndexJoinScan");
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        panic!("Delete not supported in IndexJoinScan");
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        panic!("Get RID not supported in IndexJoinScan");
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        panic!("Move to RID not supported in IndexJoinScan");
-    }
-}
-
 #[cfg(test)]
 mod index_join_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use std::sync::Arc;
 
     use crate::{
@@ -6186,42 +5938,9 @@ where
     }
 }
 
-impl<I> UpdateScan for IndexSelectScan<I>
-where
-    I: Index + 'static,
-{
-    fn set_int(&self, _field_name: &str, _value: i32) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-
-    fn set_string(&self, _field_name: &str, _value: String) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-
-    fn set_value(&self, _field_name: &str, _value: Constant) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-
-    fn insert_values(&mut self, _values: &[Constant]) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        unreachable!()
-    }
-
-    fn move_to_rid(&mut self, _rid: RID) -> SimpleDBResult<()> {
-        unreachable!()
-    }
-}
-
 #[cfg(test)]
 mod index_select_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use std::sync::Arc;
 
     use crate::{
@@ -6368,42 +6087,9 @@ where
     }
 }
 
-impl<S> UpdateScan for SelectScan<S>
-where
-    S: UpdateScan + 'static,
-{
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        self.scan.set_int(field_name, value)
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        self.scan.set_string(field_name, value)
-    }
-
-    fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
-        self.scan.set_value(field_name, value)
-    }
-
-    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
-        self.scan.insert_values(values)
-    }
-
-    fn delete(&mut self) -> SimpleDBResult<()> {
-        self.scan.delete()
-    }
-
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        self.scan.get_rid()
-    }
-
-    fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
-        self.scan.move_to_rid(rid)
-    }
-}
-
 #[cfg(test)]
 mod select_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use std::sync::Arc;
 
     use crate::{
@@ -7475,7 +7161,7 @@ impl MetadataManager {
 
 #[cfg(test)]
 mod metadata_manager_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
     use crate::{
         test_utils::generate_random_number, Constant, FieldType, MetadataManager, Schema, SimpleDB,
         TableScan, Transaction,
@@ -8717,7 +8403,7 @@ impl Scan for TableScan {
     }
 }
 
-impl UpdateScan for TableScan {
+impl TableCursor for TableScan {
     fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.record_page.as_ref().unwrap().set_int(
             *self.current_slot.as_ref().unwrap(),
@@ -8800,7 +8486,7 @@ impl UpdateScan for TableScan {
     }
 }
 
-pub trait UpdateScan: Scan + Any {
+pub trait TableCursor: Scan + Any {
     fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()>;
     fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()>;
     fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()>;
@@ -8821,7 +8507,7 @@ pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
 
 #[cfg(test)]
 mod table_scan_tests {
-    use super::UpdateScan;
+    use super::TableCursor;
 
     use crate::{
         test_utils::generate_random_number, Constant, Layout, Scan, Schema, SimpleDB, TableScan,
