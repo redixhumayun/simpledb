@@ -108,7 +108,7 @@ Early phases do **not** require `ExecutionContext` to borrow transaction session
 
 ## Phase plan
 
-### Phase 0: lock the boundary
+### Phase 0: lock the boundary ✅ DONE
 
 - Document that plan objects should stop gaining new runtime fields.
 - Treat `Arc<Transaction>` in planner-owned objects as debt, not a permanent pattern.
@@ -116,9 +116,9 @@ Early phases do **not** require `ExecutionContext` to borrow transaction session
 
 Exit criteria:
 
-- boundary documented
+- boundary documented ✅
 
-### Phase 1: replace universal `Scan` / `UpdateScan` boundary
+### Phase 1: replace universal `Scan` / `UpdateScan` boundary ✅ DONE
 
 - Introduce executor traits that match the current operator set instead of forcing every node through `UpdateScan`.
 - Make row-producing operators the default execution abstraction.
@@ -128,21 +128,27 @@ Exit criteria:
 
 Minimum success criteria for this phase:
 
-- read-only operators no longer implement fake update methods
-- `Plan::open()` no longer requires returning `Box<dyn UpdateScan>` for all nodes
-- update/delete paths use a narrower table-row mutation interface
-- plans stop downcasting generic scan trait objects just to recover concrete capabilities
+- read-only operators no longer implement fake update methods ✅
+- `Plan::open()` no longer requires returning `Box<dyn UpdateScan>` for all nodes ✅
+- update/delete paths use a narrower table-row mutation interface ✅
+- plans stop downcasting generic scan trait objects just to recover concrete capabilities ✅
 
-Important point:
+Implementation notes:
 
-- this phase should be completed before introducing a new planner/execution boundary API
-- otherwise we risk cementing the old executor abstraction into the new boundary
+- `UpdateScan` replaced by `TableCursor: Scan + Any` (only `TableScan` implements it)
+- `Plan::open()` now returns `Box<dyn Scan>`
+- Removed fake `UpdateScan` impls from 9 read-only scan types
+- `MergeJoinPlan` stores `plan_2: Arc<SortPlan>` directly; `SortPlan::open_sort_scan()` added
+- `MultiBufferProductPlan` stores `lhs: Arc<MaterializePlan>`; `MaterializePlan::open_table_scan()` added
+- `IndexSelectPlan` and `IndexJoinPlan` store `Arc<TablePlan>`; `TablePlan::open_table_scan()` added
+- Mutation planners apply predicates inline against `TableScan` (no more `SelectPlan` wrapping for mutations)
+- Design decisions recorded in `docs/decisions/phase1_executor_capability_split.md`
 
 Exit criteria:
 
-- no universal `UpdateScan`-style boundary remains
-- executor capabilities are split in a way that fits the current operators
-- planner/executor boundary work can target the new execution interfaces, not the legacy ones
+- no universal `UpdateScan`-style boundary remains ✅
+- executor capabilities are split in a way that fits the current operators ✅
+- planner/executor boundary work can target the new execution interfaces, not the legacy ones ✅
 
 ### Phase 2: introduce explicit execution context
 
