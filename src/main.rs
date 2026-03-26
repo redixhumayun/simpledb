@@ -2169,9 +2169,7 @@ impl SortPlan {
         //  Close the scans
         Ok(temp_table)
     }
-}
 
-impl SortPlan {
     pub fn open_sort_scan(&self, ctx: &ExecutionContext) -> SortScan {
         let source_scan = self.source_plan.open(ctx);
         let runs = self.split_into_runs(ctx, source_scan).unwrap();
@@ -2836,9 +2834,7 @@ impl MaterializePlan {
             block_size,
         }
     }
-}
 
-impl MaterializePlan {
     pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
         let mut source_scan = self.source_plan.open(ctx);
         println!("The schema retrieved {:?}", self.source_plan.schema());
