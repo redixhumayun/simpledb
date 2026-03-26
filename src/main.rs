@@ -4912,9 +4912,7 @@ impl TablePlan {
     fn table_id(&self) -> u32 {
         self.table_id
     }
-}
 
-impl TablePlan {
     pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
         TableScan::new(
             Arc::clone(ctx.txn()),
