@@ -2834,7 +2834,6 @@ impl MaterializePlan {
             block_size,
         }
     }
-
 }
 
 impl TableSource for MaterializePlan {
@@ -3115,7 +3114,9 @@ impl Planner {
 mod planner_tests {
     use std::sync::Arc;
 
-    use crate::{Constant, ExecutionContext, Index, Scan, SimpleDB, TableCursor, TablePlan, TableSource};
+    use crate::{
+        Constant, ExecutionContext, Index, Scan, SimpleDB, TableCursor, TablePlan, TableSource,
+    };
 
     #[test]
     fn test_planner_single_table() {
