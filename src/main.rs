@@ -116,7 +116,7 @@ impl SimpleDB {
             Arc::clone(&lock_table),
         ));
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
-        let query_planner = BasicQueryPlanner::new(Arc::clone(&metadata_manager));
+        let query_planner = PipelineQueryPlanner::new(Arc::clone(&metadata_manager));
         let _update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
         let index_update_planner = IndexUpdatePlanner::new(Arc::clone(&metadata_manager));
         let planner = Arc::new(Planner::new(
@@ -4139,7 +4139,7 @@ impl QueryPlanner for HeuristicQueryPlanner {
     }
 }
 
-struct BasicQueryPlanner {
+pub struct BasicQueryPlanner {
     metadata_manager: Arc<MetadataManager>,
 }
 
@@ -4385,7 +4385,7 @@ mod heuristic_equivalence_tests {
 
     fn heuristic_planner(db: &SimpleDB) -> Planner {
         Planner::new(
-            Box::new(HeuristicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(PipelineQueryPlanner::new(Arc::clone(&db.metadata_manager))),
             Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
         )
     }
@@ -4553,7 +4553,7 @@ mod heuristic_efficiency_tests {
 
     fn heuristic_planner(db: &SimpleDB) -> Planner {
         Planner::new(
-            Box::new(HeuristicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(PipelineQueryPlanner::new(Arc::clone(&db.metadata_manager))),
             Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
         )
     }
@@ -4650,7 +4650,630 @@ pub trait QueryPlanner {
     ) -> SimpleDBResult<Arc<dyn Plan>>;
 }
 
-struct ProductPlan {
+// ============================================================================
+// Logical IR: plan representation, optimizer boundary, and pipeline
+// ============================================================================
+
+/// Pure logical query tree. No physical implementation choices are embedded.
+///
+/// Each variant stores `schema` and pre-computed cost estimates
+/// (`records_output`, `blocks_accessed`) derived from catalog statistics at
+/// build time. Storing them avoids repeated recomputation during optimization.
+pub enum LogicalPlan {
+    TableScan {
+        table: String,
+        schema: Schema,
+        records_output: usize,
+        blocks_accessed: usize,
+    },
+    Filter {
+        input: Arc<LogicalPlan>,
+        predicate: Predicate,
+        schema: Schema,
+        records_output: usize,
+        blocks_accessed: usize,
+    },
+    Project {
+        input: Arc<LogicalPlan>,
+        fields: Vec<String>,
+        schema: Schema,
+    },
+    Join {
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        /// Empty predicate represents a cross-join.
+        predicate: Predicate,
+        schema: Schema,
+        records_output: usize,
+        blocks_accessed: usize,
+    },
+}
+
+impl LogicalPlan {
+    pub fn records_output(&self) -> usize {
+        match self {
+            LogicalPlan::TableScan { records_output, .. } => *records_output,
+            LogicalPlan::Filter { records_output, .. } => *records_output,
+            LogicalPlan::Project { input, .. } => input.records_output(),
+            LogicalPlan::Join { records_output, .. } => *records_output,
+        }
+    }
+
+    pub fn blocks_accessed(&self) -> usize {
+        match self {
+            LogicalPlan::TableScan {
+                blocks_accessed, ..
+            } => *blocks_accessed,
+            LogicalPlan::Filter {
+                blocks_accessed, ..
+            } => *blocks_accessed,
+            LogicalPlan::Project { input, .. } => input.blocks_accessed(),
+            LogicalPlan::Join {
+                blocks_accessed, ..
+            } => *blocks_accessed,
+        }
+    }
+
+    pub fn schema(&self) -> &Schema {
+        match self {
+            LogicalPlan::TableScan { schema, .. } => schema,
+            LogicalPlan::Filter { schema, .. } => schema,
+            LogicalPlan::Project { schema, .. } => schema,
+            LogicalPlan::Join { schema, .. } => schema,
+        }
+    }
+
+    /// Field-agnostic distinct-value estimate, matching `StatInfo::distinct_values`.
+    pub fn distinct_values(&self, field_name: &str) -> usize {
+        match self {
+            LogicalPlan::TableScan { records_output, .. } => 1 + records_output / 3,
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => {
+                if predicate.equates_with_constant(field_name).is_some() {
+                    1
+                } else if let Some(other_field) = predicate.equates_with_field(field_name) {
+                    std::cmp::min(
+                        input.distinct_values(field_name),
+                        input.distinct_values(&other_field),
+                    )
+                } else {
+                    input.distinct_values(field_name)
+                }
+            }
+            LogicalPlan::Project { input, .. } => input.distinct_values(field_name),
+            LogicalPlan::Join { left, right, .. } => {
+                if left.schema().fields.contains(&field_name.to_string()) {
+                    left.distinct_values(field_name)
+                } else {
+                    right.distinct_values(field_name)
+                }
+            }
+        }
+    }
+
+    /// Build a `Filter` node. Computes `records_output` using predicate selectivity.
+    pub fn make_filter(input: Arc<LogicalPlan>, predicate: Predicate) -> Self {
+        let schema = input.schema().clone();
+        let blocks_accessed = input.blocks_accessed();
+        let reduction = predicate.reduction_factor_fn(|field| input.distinct_values(field));
+        let records_output = std::cmp::max(1, input.records_output() / reduction);
+        LogicalPlan::Filter {
+            input,
+            predicate,
+            schema,
+            records_output,
+            blocks_accessed,
+        }
+    }
+
+    /// Build a `Join` node. Computes schema and cost estimates from both inputs.
+    pub fn make_join(
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        predicate: Predicate,
+    ) -> SimpleDBResult<Self> {
+        let mut schema = Schema::new();
+        schema.add_all_from_schema(left.schema())?;
+        schema.add_all_from_schema(right.schema())?;
+
+        let base_records = left.records_output().saturating_mul(right.records_output());
+        let reduction = if predicate.is_empty() {
+            1
+        } else {
+            let left_ref = &left;
+            let right_ref = &right;
+            predicate.reduction_factor_fn(|field| {
+                if left_ref.schema().fields.contains(&field.to_string()) {
+                    left_ref.distinct_values(field)
+                } else {
+                    right_ref.distinct_values(field)
+                }
+            })
+        };
+        let records_output = std::cmp::max(1, base_records / reduction);
+        // Simple nested-loop cost estimate: scan right once per block of left.
+        let blocks_accessed = left.blocks_accessed().saturating_add(
+            left.records_output()
+                .saturating_mul(right.blocks_accessed()),
+        );
+        Ok(LogicalPlan::Join {
+            left,
+            right,
+            predicate,
+            schema,
+            records_output,
+            blocks_accessed,
+        })
+    }
+}
+
+/// Produces a `LogicalPlan` from parsed `QueryData`. Does not make physical choices.
+pub trait LogicalPlanner {
+    fn build(&self, query: QueryData, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan>;
+}
+
+/// Rewrites a `LogicalPlan` without introducing physical operators.
+pub trait LogicalOptimizer {
+    fn optimize(&self, plan: LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan>;
+}
+
+/// Lowers a `LogicalPlan` into an executable physical `Plan` tree.
+pub trait PhysicalPlanner {
+    fn lower(&self, logical: &LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<Arc<dyn Plan>>;
+}
+
+// ----------------------------------------------------------------------------
+// BasicLogicalPlanner — naive translation of QueryData into LogicalPlan
+// ----------------------------------------------------------------------------
+
+struct BasicLogicalPlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl BasicLogicalPlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
+}
+
+impl LogicalPlanner for BasicLogicalPlanner {
+    /// Produces a flat logical tree:
+    ///   Project(Filter(Join(Join(TableScan(t1), TableScan(t2)), TableScan(t3)), pred), fields)
+    ///
+    /// No join reordering or predicate pushdown — that is left to the optimizer.
+    fn build(&self, query: QueryData, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan> {
+        // 1. Build a TableScan for each table in the query.
+        let mut scans: Vec<Arc<LogicalPlan>> = query
+            .tables
+            .iter()
+            .map(|table| {
+                let layout = self.metadata_manager.get_layout(table, Arc::clone(&txn));
+                let stat_info =
+                    self.metadata_manager
+                        .get_stat_info(table, layout.clone(), Arc::clone(&txn));
+                Arc::new(LogicalPlan::TableScan {
+                    table: table.clone(),
+                    schema: layout.schema.clone(),
+                    records_output: stat_info.num_records,
+                    blocks_accessed: stat_info.num_blocks,
+                })
+            })
+            .collect();
+
+        // 2. Cross-join all tables left-to-right.
+        let mut tree = scans.remove(0);
+        for scan in scans {
+            tree = Arc::new(LogicalPlan::make_join(tree, scan, Predicate::new(vec![]))?);
+        }
+
+        // 3. Apply WHERE predicate as a Filter node (if non-empty).
+        let mut plan = if !query.predicate.is_empty() {
+            Arc::new(LogicalPlan::make_filter(tree, query.predicate))
+        } else {
+            tree
+        };
+
+        // 4. Apply projection.
+        let expanded_fields: Vec<String> = if query.fields.contains(&"*".to_string()) {
+            plan.schema().fields.clone()
+        } else {
+            query.fields.clone()
+        };
+        let mut proj_schema = Schema::new();
+        for field in &expanded_fields {
+            proj_schema.add_from_schema(field, plan.schema())?;
+        }
+        plan = Arc::new(LogicalPlan::Project {
+            input: plan,
+            fields: expanded_fields,
+            schema: proj_schema,
+        });
+
+        Ok(Arc::try_unwrap(plan).unwrap_or_else(|arc| (*arc).clone()))
+    }
+}
+
+// Need Clone on LogicalPlan for Arc::try_unwrap fallback above.
+impl Clone for LogicalPlan {
+    fn clone(&self) -> Self {
+        match self {
+            LogicalPlan::TableScan {
+                table,
+                schema,
+                records_output,
+                blocks_accessed,
+            } => LogicalPlan::TableScan {
+                table: table.clone(),
+                schema: schema.clone(),
+                records_output: *records_output,
+                blocks_accessed: *blocks_accessed,
+            },
+            LogicalPlan::Filter {
+                input,
+                predicate,
+                schema,
+                records_output,
+                blocks_accessed,
+            } => LogicalPlan::Filter {
+                input: Arc::clone(input),
+                predicate: predicate.clone(),
+                schema: schema.clone(),
+                records_output: *records_output,
+                blocks_accessed: *blocks_accessed,
+            },
+            LogicalPlan::Project {
+                input,
+                fields,
+                schema,
+            } => LogicalPlan::Project {
+                input: Arc::clone(input),
+                fields: fields.clone(),
+                schema: schema.clone(),
+            },
+            LogicalPlan::Join {
+                left,
+                right,
+                predicate,
+                schema,
+                records_output,
+                blocks_accessed,
+            } => LogicalPlan::Join {
+                left: Arc::clone(left),
+                right: Arc::clone(right),
+                predicate: predicate.clone(),
+                schema: schema.clone(),
+                records_output: *records_output,
+                blocks_accessed: *blocks_accessed,
+            },
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// HeuristicLogicalOptimizer — predicate pushdown and left-deep join ordering
+// ----------------------------------------------------------------------------
+
+struct HeuristicLogicalOptimizer;
+
+impl HeuristicLogicalOptimizer {
+    fn new() -> Self {
+        Self
+    }
+
+    /// Recursively collect all `TableScan` leaves from a join tree, consuming the tree.
+    fn collect_scans(plan: Arc<LogicalPlan>) -> Vec<Arc<LogicalPlan>> {
+        match plan.as_ref() {
+            LogicalPlan::TableScan { .. } => vec![plan],
+            LogicalPlan::Join { left, right, .. } => {
+                let mut scans = Self::collect_scans(Arc::clone(left));
+                scans.extend(Self::collect_scans(Arc::clone(right)));
+                scans
+            }
+            _ => vec![plan], // Filter/Project at top-level: treat as opaque leaf
+        }
+    }
+
+    /// Find and remove the element at `idx` from `remaining`.
+    fn take(remaining: &mut Vec<Arc<LogicalPlan>>, idx: usize) -> Arc<LogicalPlan> {
+        remaining.remove(idx)
+    }
+
+    /// Pick the scan from `remaining` whose join with `current` has a join predicate
+    /// and produces the fewest rows. Falls back to the cheapest cross-join if none qualify.
+    fn pick_next(
+        current: &Arc<LogicalPlan>,
+        remaining: &mut Vec<Arc<LogicalPlan>>,
+        global_pred: &Predicate,
+    ) -> SimpleDBResult<Arc<LogicalPlan>> {
+        // Try joins with a predicate first.
+        let mut best_join: Option<(usize, Arc<LogicalPlan>)> = None;
+        for (idx, scan) in remaining.iter().enumerate() {
+            let mut unioned = Schema::new();
+            unioned.add_all_from_schema(current.schema())?;
+            unioned.add_all_from_schema(scan.schema())?;
+            let join_pred =
+                global_pred.sub_predicate_for_join(current.schema(), scan.schema(), &unioned);
+            if join_pred.is_empty() {
+                continue;
+            }
+            let candidate = Arc::new(LogicalPlan::make_join(
+                Arc::clone(current),
+                Arc::clone(scan),
+                join_pred,
+            )?);
+            match &best_join {
+                None => best_join = Some((idx, candidate)),
+                Some((_, best)) if candidate.records_output() < best.records_output() => {
+                    best_join = Some((idx, candidate));
+                }
+                _ => {}
+            }
+        }
+        if let Some((idx, join_node)) = best_join {
+            remaining.remove(idx);
+            return Ok(join_node);
+        }
+
+        // No join predicate: cross-join with the cheapest remaining scan.
+        let (idx, _) = remaining
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.records_output())
+            .ok_or("no remaining tables to join")?;
+        let scan = Self::take(remaining, idx);
+        Ok(Arc::new(LogicalPlan::make_join(
+            Arc::clone(current),
+            scan,
+            Predicate::new(vec![]),
+        )?))
+    }
+}
+
+impl LogicalOptimizer for HeuristicLogicalOptimizer {
+    /// Apply predicate pushdown and left-deep join ordering.
+    ///
+    /// The input is the flat tree from `BasicLogicalPlanner`. This optimizer:
+    /// 1. Extracts the global `Filter` predicate and all `TableScan` leaves.
+    /// 2. Pushes per-table sub-predicates down onto each `TableScan`.
+    /// 3. Builds an optimal left-deep join tree (smallest-output first).
+    /// 4. Adds per-join predicates as `Join.predicate`.
+    /// 5. Re-wraps with `Project`.
+    fn optimize(&self, plan: LogicalPlan, _txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan> {
+        // Unwrap the outer Project.
+        let (proj_fields, proj_schema, inner) = match plan {
+            LogicalPlan::Project {
+                fields,
+                schema,
+                input,
+            } => (fields, schema, input),
+            other => return Ok(other), // nothing to optimize
+        };
+
+        // Peel off a top-level Filter to get the global predicate.
+        let (global_pred, join_tree) = match inner.as_ref() {
+            LogicalPlan::Filter {
+                predicate, input, ..
+            } => (predicate.clone(), Arc::clone(input)),
+            _ => (Predicate::new(vec![]), inner),
+        };
+
+        // Collect all TableScan leaves from the join tree.
+        let raw_scans = HeuristicLogicalOptimizer::collect_scans(join_tree);
+
+        // Push per-table predicates down onto each scan.
+        let mut filtered_scans: Vec<Arc<LogicalPlan>> = raw_scans
+            .into_iter()
+            .map(|scan| {
+                let per_table_pred = global_pred.sub_predicate_for_select(scan.schema());
+                if per_table_pred.is_empty() {
+                    scan
+                } else {
+                    Arc::new(LogicalPlan::make_filter(scan, per_table_pred))
+                }
+            })
+            .collect();
+
+        // Heuristic 5a: start with the filtered scan producing fewest rows.
+        let start_idx = filtered_scans
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.records_output())
+            .map(|(i, _)| i)
+            .ok_or("no tables in query")?;
+        let mut current = HeuristicLogicalOptimizer::take(&mut filtered_scans, start_idx);
+
+        // Heuristic 4: repeatedly join with the best next table.
+        while !filtered_scans.is_empty() {
+            current =
+                HeuristicLogicalOptimizer::pick_next(&current, &mut filtered_scans, &global_pred)?;
+        }
+
+        // Re-wrap with Project using the original fields and schema.
+        Ok(LogicalPlan::Project {
+            input: current,
+            fields: proj_fields,
+            schema: proj_schema,
+        })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DefaultPhysicalPlanner — lowers LogicalPlan to physical Plan nodes
+// ----------------------------------------------------------------------------
+
+struct DefaultPhysicalPlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl DefaultPhysicalPlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
+
+    /// If `plan` is a `TableScan` or `Filter(TableScan, ...)`, return the table name
+    /// and the filter predicate (empty if plain TableScan).
+    fn extract_inner_table(plan: &LogicalPlan) -> Option<(&str, Predicate)> {
+        match plan {
+            LogicalPlan::TableScan { table, .. } => Some((table.as_str(), Predicate::new(vec![]))),
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => match input.as_ref() {
+                LogicalPlan::TableScan { table, .. } => Some((table.as_str(), predicate.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl PhysicalPlanner for DefaultPhysicalPlanner {
+    fn lower(&self, logical: &LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<Arc<dyn Plan>> {
+        match logical {
+            LogicalPlan::TableScan { table, .. } => {
+                let plan =
+                    TablePlan::new(table, Arc::clone(&txn), Arc::clone(&self.metadata_manager));
+                Ok(Arc::new(plan))
+            }
+
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => {
+                // Check if the inner input is a TableScan so we can consider IndexSelectPlan.
+                if let LogicalPlan::TableScan { table, .. } = input.as_ref() {
+                    let table_plan = Arc::new(TablePlan::new(
+                        table,
+                        Arc::clone(&txn),
+                        Arc::clone(&self.metadata_manager),
+                    ));
+                    let indexes = self
+                        .metadata_manager
+                        .get_index_info(table, Arc::clone(&txn));
+                    for (field, ii) in &indexes {
+                        if let Some(bounds) = predicate.bounded_index_search_bounds(field) {
+                            let index_plan: Arc<dyn Plan> = Arc::new(IndexSelectPlan::new(
+                                Arc::clone(&table_plan) as Arc<dyn TableSource>,
+                                ii.clone(),
+                                bounds,
+                            ));
+                            // Wrap with the full filter predicate so any non-index terms are applied.
+                            return Ok(Arc::new(SelectPlan::new(index_plan, predicate.clone())));
+                        }
+                    }
+                    // No index: plain SelectPlan over TablePlan.
+                    return Ok(Arc::new(SelectPlan::new(
+                        Arc::clone(&table_plan) as Arc<dyn Plan>,
+                        predicate.clone(),
+                    )));
+                }
+                // General case: lower input, then filter.
+                let lowered = self.lower(input, Arc::clone(&txn))?;
+                Ok(Arc::new(SelectPlan::new(lowered, predicate.clone())))
+            }
+
+            LogicalPlan::Project { input, fields, .. } => {
+                let lowered = self.lower(input, Arc::clone(&txn))?;
+                let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                Ok(Arc::new(ProjectPlan::new(lowered, field_refs)?))
+            }
+
+            LogicalPlan::Join {
+                left,
+                right,
+                predicate,
+                ..
+            } => {
+                // Check whether the right (inner) side is a bare TableScan or a
+                // Filter(TableScan) so we can use IndexJoinPlan.
+                if let Some((inner_table, inner_filter)) = Self::extract_inner_table(right.as_ref())
+                {
+                    let indexes = self
+                        .metadata_manager
+                        .get_index_info(inner_table, Arc::clone(&txn));
+                    for (field, ii) in &indexes {
+                        if let Some(outer_field) = predicate.equates_with_field(field) {
+                            if left.schema().fields.contains(&outer_field) {
+                                let outer = self.lower(left, Arc::clone(&txn))?;
+                                let inner_tp = Arc::new(TablePlan::new(
+                                    inner_table,
+                                    Arc::clone(&txn),
+                                    Arc::clone(&self.metadata_manager),
+                                ));
+                                let mut plan: Arc<dyn Plan> = Arc::new(IndexJoinPlan::new(
+                                    outer,
+                                    Arc::clone(&inner_tp) as Arc<dyn TableSource>,
+                                    ii.clone(),
+                                    outer_field,
+                                )?);
+                                // Apply any per-table filter on the inner side.
+                                if !inner_filter.is_empty() {
+                                    plan = Arc::new(SelectPlan::new(plan, inner_filter.clone()));
+                                }
+                                // Apply the full join predicate — mirrors old add_join_predicate.
+                                // The index handles the equi-join field; remaining terms (e.g.
+                                // cross-table range predicates) still need a SelectPlan wrapper.
+                                if !predicate.is_empty() {
+                                    plan = Arc::new(SelectPlan::new(plan, predicate.clone()));
+                                }
+                                return Ok(plan);
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to MultiBufferProductPlan.
+                let lowered_left = self.lower(left, Arc::clone(&txn))?;
+                let lowered_right = self.lower(right, Arc::clone(&txn))?;
+                let mut plan: Arc<dyn Plan> = Arc::new(MultiBufferProductPlan::new(
+                    lowered_left,
+                    lowered_right,
+                    Arc::clone(&txn),
+                )?);
+                if !predicate.is_empty() {
+                    plan = Arc::new(SelectPlan::new(plan, predicate.clone()));
+                }
+                Ok(plan)
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// PipelineQueryPlanner — chains logical planner + optimizer + physical planner
+// ----------------------------------------------------------------------------
+
+/// Implements the logical/physical split mandated by the optimizer plan:
+///
+///   1. `BasicLogicalPlanner`        builds a `LogicalPlan` from `QueryData`
+///   2. `HeuristicLogicalOptimizer`  rewrites the tree (predicate pushdown, join ordering)
+///   3. `DefaultPhysicalPlanner`     lowers the tree to executable `Plan` nodes
+struct PipelineQueryPlanner {
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl PipelineQueryPlanner {
+    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
+        Self { metadata_manager }
+    }
+}
+
+impl QueryPlanner for PipelineQueryPlanner {
+    fn create_plan(
+        &self,
+        query_data: QueryData,
+        txn: Arc<Transaction>,
+    ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let logical_planner = BasicLogicalPlanner::new(Arc::clone(&self.metadata_manager));
+        let optimizer = HeuristicLogicalOptimizer::new();
+        let physical_planner = DefaultPhysicalPlanner::new(Arc::clone(&self.metadata_manager));
+
+        let logical = logical_planner.build(query_data, Arc::clone(&txn))?;
+        let optimized = optimizer.optimize(logical, Arc::clone(&txn))?;
+        physical_planner.lower(&optimized, txn)
+    }
+}
+
+pub struct ProductPlan {
     plan_1: Arc<dyn Plan>,
     plan_2: Arc<dyn Plan>,
     schema: Schema,
@@ -6478,6 +7101,32 @@ impl Predicate {
         }
     }
 
+    /// Generic version of `reduction_factor` that calls distinct_values via a closure.
+    /// Used by the logical planner to estimate selectivity without a physical `Plan`.
+    fn reduction_factor_fn<F>(&self, f: F) -> usize
+    where
+        F: Fn(&str) -> usize,
+    {
+        Self::evaluate_reduction_factor_fn(&self.root, &f)
+    }
+
+    fn evaluate_reduction_factor_fn<F>(node: &PredicateNode, f: &F) -> usize
+    where
+        F: Fn(&str) -> usize,
+    {
+        match node {
+            PredicateNode::Empty => 1,
+            PredicateNode::Term(term) => term.reduction_factor_fn(f),
+            PredicateNode::Composite { op: _, operands } => {
+                let mut factor = 1usize;
+                for operand in operands {
+                    factor = factor.saturating_mul(Self::evaluate_reduction_factor_fn(operand, f));
+                }
+                factor
+            }
+        }
+    }
+
     fn equates_with_constant(&self, field_name: &str) -> Option<Constant> {
         Predicate::evaluate_equates_with_constant(&self.root, field_name)
     }
@@ -6933,6 +7582,29 @@ impl Term {
             return 1;
         }
 
+        usize::MAX
+    }
+
+    /// Generic version of `reduction_factor` that calls distinct_values via a closure.
+    /// Used by the logical planner to estimate selectivity without a physical `Plan`.
+    fn reduction_factor_fn<F>(&self, f: &F) -> usize
+    where
+        F: Fn(&str) -> usize,
+    {
+        if self.lhs.is_field_name() && self.rhs.is_field_name() {
+            let lhs_field = self.lhs.get_field_name().unwrap();
+            let rhs_field = self.rhs.get_field_name().unwrap();
+            return std::cmp::max(f(lhs_field), f(rhs_field));
+        }
+        if self.lhs.is_field_name() {
+            return f(self.lhs.get_field_name().unwrap());
+        }
+        if self.rhs.is_field_name() {
+            return f(self.rhs.get_field_name().unwrap());
+        }
+        if self.lhs.get_constant_value().unwrap() == self.rhs.get_constant_value().unwrap() {
+            return 1;
+        }
         usize::MAX
     }
 
