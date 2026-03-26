@@ -188,7 +188,7 @@ impl SimpleDB {
 }
 
 pub struct MultiBufferProductPlan {
-    lhs: Arc<MaterializePlan>,
+    lhs: Arc<dyn TableSource>,
     rhs: Arc<dyn Plan>,
     schema: Schema,
     block_size: usize,
@@ -206,7 +206,7 @@ impl MultiBufferProductPlan {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
-        let lhs = Arc::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
+        let lhs: Arc<dyn TableSource> = Arc::new(MaterializePlan::new(lhs, Arc::clone(&txn)));
         Ok(Self {
             lhs,
             rhs,
@@ -2835,7 +2835,10 @@ impl MaterializePlan {
         }
     }
 
-    pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
+}
+
+impl TableSource for MaterializePlan {
+    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
         let mut source_scan = self.source_plan.open(ctx);
         println!("The schema retrieved {:?}", self.source_plan.schema());
         let temp_table = TempTable::new(Arc::clone(ctx.txn()), self.source_plan.schema());
@@ -3112,7 +3115,7 @@ impl Planner {
 mod planner_tests {
     use std::sync::Arc;
 
-    use crate::{Constant, ExecutionContext, Index, Scan, SimpleDB, TableCursor, TablePlan};
+    use crate::{Constant, ExecutionContext, Index, Scan, SimpleDB, TableCursor, TablePlan, TableSource};
 
     #[test]
     fn test_planner_single_table() {
@@ -4775,13 +4778,13 @@ impl Plan for ProjectPlan {
 }
 
 pub struct IndexSelectPlan {
-    plan: Arc<TablePlan>,
+    plan: Arc<dyn TableSource>,
     ii: IndexInfo,
     bounds: IndexSearchBounds,
 }
 
 impl IndexSelectPlan {
-    fn new(plan: Arc<TablePlan>, ii: IndexInfo, bounds: IndexSearchBounds) -> Self {
+    fn new(plan: Arc<dyn TableSource>, ii: IndexInfo, bounds: IndexSearchBounds) -> Self {
         Self { plan, ii, bounds }
     }
 }
@@ -4908,8 +4911,10 @@ impl TablePlan {
     fn table_id(&self) -> u32 {
         self.table_id
     }
+}
 
-    pub fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
+impl TableSource for TablePlan {
+    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
         TableScan::new(
             Arc::clone(ctx.txn()),
             self.layout.clone(),
@@ -4976,6 +4981,15 @@ pub trait Plan {
         self.print_plan_internal(indent);
     }
     fn print_plan_internal(&self, indent: usize);
+}
+
+/// A plan node that can be opened as a table-backed cursor.
+/// Only table-producing nodes implement this — `TablePlan` (base table) and
+/// `MaterializePlan` (temp table). Parent operators that need direct row-location
+/// access (`IndexSelectPlan`, `IndexJoinPlan`, `MultiBufferProductPlan`) store
+/// `Arc<dyn TableSource>` instead of concrete plan types.
+pub trait TableSource: Plan {
+    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan;
 }
 
 #[cfg(test)]
@@ -5437,7 +5451,7 @@ mod project_scan_tests {
 
 pub struct IndexJoinPlan {
     plan_1: Arc<dyn Plan>,
-    plan_2: Arc<TablePlan>,
+    plan_2: Arc<dyn TableSource>,
     index_info: IndexInfo,
     schema: Schema,
     join_field: String,
@@ -5446,7 +5460,7 @@ pub struct IndexJoinPlan {
 impl IndexJoinPlan {
     pub fn new(
         plan_1: Arc<dyn Plan>,
-        plan_2: Arc<TablePlan>,
+        plan_2: Arc<dyn TableSource>,
         index_info: IndexInfo,
         join_field: String,
     ) -> Result<Self, Box<dyn Error>> {

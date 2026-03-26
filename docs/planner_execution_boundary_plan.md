@@ -213,6 +213,19 @@ Exit criteria:
 
 - the plan/execution boundary is explicit everywhere ✅
 
+### Phase 5.5: introduce `TableSource` trait ✅ DONE
+
+- Introduced `pub trait TableSource: Plan` with `open_table_scan(&self, ctx) -> TableScan`.
+- `TablePlan` and `MaterializePlan` implement it; `open_table_scan` moved from inherent `impl` blocks to trait impls.
+- `IndexSelectPlan`, `IndexJoinPlan`, `MultiBufferProductPlan` now store `Arc<dyn TableSource>` instead of `Arc<TablePlan>` / `Arc<MaterializePlan>`.
+- `TablePlanner` private helpers still take `Arc<TablePlan>` (always concrete); coercion to `Arc<dyn TableSource>` happens at call sites.
+- `SortPlan::open_sort_scan()` stays as a concrete method — `MergeJoinPlan` still needs `SortScan` directly for `save_position`/`restore_position`.
+
+Exit criteria:
+
+- `Arc<TablePlan>` and `Arc<MaterializePlan>` no longer appear as field types in parent plan structs ✅
+- `Plan` methods remain callable on `Arc<dyn TableSource>` via supertrait dispatch ✅
+
 ### Phase 6: evaluate follow-on transaction/session integration
 
 - Revisit issue [#63](https://github.com/redixhumayun/simpledb/issues/63) after the planner/executor boundary is clean.
