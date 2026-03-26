@@ -2,8 +2,8 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use simpledb::{
-    BTreeIndex, Constant, Index, Layout, LockError, Scan, SimpleDB, SplitGate, TableScan,
-    Transaction, UpdateScan, RID,
+    BTreeIndex, Constant, Index, Layout, LockError, Scan, SimpleDB, SplitGate, TableCursor,
+    TableScan, Transaction, RID,
 };
 use std::sync::Arc;
 use std::sync::Barrier;
