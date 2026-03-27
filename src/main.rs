@@ -1490,8 +1490,8 @@ mod merge_join_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Constant, Layout, MarkRestoreScan, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB,
-        SortScan, TableCursor, TempTable,
+        Constant, Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan,
+        TableCursor, TempTable,
     };
 
     #[test]
