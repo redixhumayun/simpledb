@@ -69,6 +69,10 @@ harness = false
 
 See the full project roadmap in [docs/ROADMAP.md](docs/ROADMAP.md).
 
+### Query Engine Architecture
+
+See [docs/architecture/query_engine.md](docs/architecture/query_engine.md) for the authoritative overview of the query engine structure and layer boundaries.
+
 ### WAL Documentation
 
-See [docs/WAL.md](docs/WAL.md) for WAL architecture, recovery model, invariants, tradeoffs, and current gaps.
+See [docs/architecture/WAL.md](docs/architecture/WAL.md) for WAL architecture, recovery model, invariants, tradeoffs, and current gaps.
