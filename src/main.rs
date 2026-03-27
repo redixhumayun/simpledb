@@ -1294,17 +1294,9 @@ mod merge_join_plan_tests {
         ));
 
         // Create sort plans
-        let sort_plan1 = Arc::new(SortPlan::new(
-            plan1,
-            Arc::clone(&txn),
-            vec!["id".to_string()],
-        ));
+        let sort_plan1 = Arc::new(SortPlan::new(plan1, vec!["id".to_string()]));
 
-        let sort_plan2 = Arc::new(SortPlan::new(
-            plan2,
-            Arc::clone(&txn),
-            vec!["depid".to_string()],
-        ));
+        let sort_plan2 = Arc::new(SortPlan::new(plan2, vec!["depid".to_string()]));
 
         // Create merge join plan
         let merge_join_plan = MergeJoinPlan::new(
@@ -1929,11 +1921,7 @@ pub struct SortPlan {
 }
 
 impl SortPlan {
-    pub fn new(
-        source_plan: Arc<dyn Plan>,
-        _txn: Arc<Transaction>,
-        field_list: Vec<String>,
-    ) -> Self {
+    pub fn new(source_plan: Arc<dyn Plan>, field_list: Vec<String>) -> Self {
         let schema = source_plan.schema();
         let record_comparator = RecordComparator::new(field_list);
         Self {
@@ -2251,7 +2239,7 @@ mod sort_plan_tests {
         ));
 
         // Create sort plan sorting by id
-        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
+        let sort_plan = SortPlan::new(table_plan, vec!["id".to_string()]);
 
         // Open the sort scan
         let ctx = ExecutionContext::new(Arc::clone(&txn));
@@ -2306,7 +2294,7 @@ mod sort_plan_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["grade".to_string()]);
+        let sort_plan = SortPlan::new(table_plan, vec!["grade".to_string()]);
 
         // Open the sort scan
         let ctx = ExecutionContext::new(Arc::clone(&txn));
@@ -2375,11 +2363,7 @@ mod sort_plan_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let sort_plan = SortPlan::new(
-            table_plan,
-            Arc::clone(&txn),
-            vec!["dept".to_string(), "salary".to_string()],
-        );
+        let sort_plan = SortPlan::new(table_plan, vec!["dept".to_string(), "salary".to_string()]);
 
         // Open the sort scan
         let ctx = ExecutionContext::new(Arc::clone(&txn));
@@ -2426,7 +2410,7 @@ mod sort_plan_tests {
             Arc::clone(&txn),
             Arc::clone(&db.metadata_manager),
         ));
-        let sort_plan = SortPlan::new(table_plan, Arc::clone(&txn), vec!["id".to_string()]);
+        let sort_plan = SortPlan::new(table_plan, vec!["id".to_string()]);
 
         // Open the sort scan
         let ctx = ExecutionContext::new(Arc::clone(&txn));
