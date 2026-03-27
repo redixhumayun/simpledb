@@ -1297,7 +1297,6 @@ mod merge_join_plan_tests {
 
         // Create sort plans
         let sort_plan1 = Arc::new(SortPlan::new(plan1, vec!["id".to_string()]));
-
         let sort_plan2 = Arc::new(SortPlan::new(plan2, vec!["depid".to_string()]));
 
         // Create merge join plan
