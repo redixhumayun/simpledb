@@ -4,7 +4,7 @@
 
 Introduce a formal logical/physical split in the query planner:
 
-- `LogicalPlan` enum (`TableScan`, `Filter`, `Project`, `Join`) as a pure relational IR
+- wrapper-style `LogicalPlan` IR (`kind`, `children`, `data`, `props`) with logical node kinds `TableScan`, `Filter`, `Project`, `Join`
 - `LogicalPlanner`, `LogicalOptimizer`, `PhysicalPlanner` boundary traits
 - `PipelineQueryPlanner` chains all three stages and replaces `BasicQueryPlanner` as the default in `SimpleDB`
 
@@ -16,7 +16,7 @@ This made rule-based logical rewrites, memoization, and DP join ordering impract
 
 ## What changed
 
-- `LogicalPlan` enum with pre-computed cost stats (records_output, blocks_accessed, distinct_values) derived from catalog data at build time.
+- wrapper-style `LogicalPlan` with pre-computed cost stats (`records_output`, `blocks_accessed`, `distinct_values`) in `props`, derived from catalog data at build time.
 - `BasicLogicalPlanner`: naive `QueryData → LogicalPlan` translation (cross-join tree + Filter + Project).
 - `HeuristicLogicalOptimizer`: predicate pushdown and left-deep join ordering over `LogicalPlan` nodes only — no physical plan objects.
 - `DefaultPhysicalPlanner`: recursive `LogicalPlan → Arc<dyn Plan>` lowering. Physical choices (IndexSelectPlan, IndexJoinPlan, MultiBufferProductPlan) are made only here.
@@ -29,6 +29,14 @@ This made rule-based logical rewrites, memoization, and DP join ordering impract
 - Physical plan node types (`TablePlan`, `SelectPlan`, `ProjectPlan`, `IndexSelectPlan`, `IndexJoinPlan`, `MultiBufferProductPlan`, etc.) are unchanged.
 - Execution semantics, scan iterators, transaction handling are unchanged.
 - The heuristics themselves (join ordering, predicate pushdown, index selection) produce identical results — they are restructured, not changed.
+
+## Why the logical IR uses the wrapper shape now
+
+The current heuristics could have worked with a simpler typed logical enum. We still chose the wrapper shape now because:
+
+- the logical/physical boundary is already in place, so this is the cheapest time to change logical IR
+- future rule/memo/DP work benefits from uniform child traversal and reconstruction
+- delaying the wrapper shape would likely force another logical-IR migration once more optimizer logic accumulates
 
 ## Phase 6 (not yet done)
 

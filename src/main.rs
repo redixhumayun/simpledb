@@ -4659,77 +4659,180 @@ pub trait QueryPlanner {
 /// Each variant stores `schema` and pre-computed cost estimates
 /// (`records_output`, `blocks_accessed`) derived from catalog statistics at
 /// build time. Storing them avoids repeated recomputation during optimization.
-pub enum LogicalPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalPlanKind {
+    TableScan,
+    Filter,
+    Project,
+    Join,
+}
+
+#[derive(Debug, Clone)]
+pub enum LogicalPlanData {
     TableScan {
+        table: String,
+    },
+    Filter {
+        predicate: Predicate,
+    },
+    Project {
+        fields: Vec<String>,
+    },
+    /// Empty predicate represents a cross-join.
+    Join {
+        predicate: Predicate,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LogicalPlanProps {
+    schema: Schema,
+    records_output: usize,
+    blocks_accessed: usize,
+}
+
+/// Optimizer-facing logical IR.
+///
+/// We intentionally keep the logical layer in a wrapper-node shape (`kind`,
+/// `children`, `data`, `props`) instead of a large typed enum tree because the
+/// optimizer wants uniform structural operations: inspect children, rebuild
+/// nodes, and later memoize / match rewrite patterns. The physical layer stays
+/// typed and executor-focused; only the logical layer pays this abstraction.
+///
+/// Inspired by: https://www.skyzh.dev/blog/2025-02-06-optimizer-lesson-01/
+#[derive(Debug, Clone)]
+pub struct LogicalPlan {
+    kind: LogicalPlanKind,
+    children: Vec<Arc<LogicalPlan>>,
+    data: LogicalPlanData,
+    props: LogicalPlanProps,
+}
+
+impl LogicalPlan {
+    fn new(
+        kind: LogicalPlanKind,
+        children: Vec<Arc<LogicalPlan>>,
+        data: LogicalPlanData,
+        props: LogicalPlanProps,
+    ) -> Self {
+        Self {
+            kind,
+            children,
+            data,
+            props,
+        }
+    }
+
+    pub fn make_table_scan(
         table: String,
         schema: Schema,
         records_output: usize,
         blocks_accessed: usize,
-    },
-    Filter {
-        input: Arc<LogicalPlan>,
-        predicate: Predicate,
-        schema: Schema,
-        records_output: usize,
-        blocks_accessed: usize,
-    },
-    Project {
-        input: Arc<LogicalPlan>,
-        fields: Vec<String>,
-        schema: Schema,
-    },
-    Join {
-        left: Arc<LogicalPlan>,
-        right: Arc<LogicalPlan>,
-        /// Empty predicate represents a cross-join.
-        predicate: Predicate,
-        schema: Schema,
-        records_output: usize,
-        blocks_accessed: usize,
-    },
-}
+    ) -> Self {
+        Self::new(
+            LogicalPlanKind::TableScan,
+            vec![],
+            LogicalPlanData::TableScan { table },
+            LogicalPlanProps {
+                schema,
+                records_output,
+                blocks_accessed,
+            },
+        )
+    }
 
-impl LogicalPlan {
-    pub fn records_output(&self) -> usize {
-        match self {
-            LogicalPlan::TableScan { records_output, .. } => *records_output,
-            LogicalPlan::Filter { records_output, .. } => *records_output,
-            LogicalPlan::Project { input, .. } => input.records_output(),
-            LogicalPlan::Join { records_output, .. } => *records_output,
+    pub fn make_project(input: Arc<LogicalPlan>, fields: Vec<String>, schema: Schema) -> Self {
+        let records_output = input.records_output();
+        let blocks_accessed = input.blocks_accessed();
+        Self::new(
+            LogicalPlanKind::Project,
+            vec![input],
+            LogicalPlanData::Project { fields },
+            LogicalPlanProps {
+                schema,
+                records_output,
+                blocks_accessed,
+            },
+        )
+    }
+
+    pub fn kind(&self) -> LogicalPlanKind {
+        self.kind
+    }
+
+    pub fn children(&self) -> &[Arc<LogicalPlan>] {
+        &self.children
+    }
+
+    pub fn data(&self) -> &LogicalPlanData {
+        &self.data
+    }
+
+    pub fn input(&self) -> Option<&Arc<LogicalPlan>> {
+        match self.kind {
+            LogicalPlanKind::Filter | LogicalPlanKind::Project => self.children.first(),
+            _ => None,
         }
+    }
+
+    pub fn left(&self) -> Option<&Arc<LogicalPlan>> {
+        match self.kind {
+            LogicalPlanKind::Join => self.children.first(),
+            _ => None,
+        }
+    }
+
+    pub fn right(&self) -> Option<&Arc<LogicalPlan>> {
+        match self.kind {
+            LogicalPlanKind::Join => self.children.get(1),
+            _ => None,
+        }
+    }
+
+    pub fn table_name(&self) -> Option<&str> {
+        match &self.data {
+            LogicalPlanData::TableScan { table } => Some(table.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn predicate(&self) -> Option<&Predicate> {
+        match &self.data {
+            LogicalPlanData::Filter { predicate } | LogicalPlanData::Join { predicate } => {
+                Some(predicate)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn project_fields(&self) -> Option<&[String]> {
+        match &self.data {
+            LogicalPlanData::Project { fields } => Some(fields.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn records_output(&self) -> usize {
+        self.props.records_output
     }
 
     pub fn blocks_accessed(&self) -> usize {
-        match self {
-            LogicalPlan::TableScan {
-                blocks_accessed, ..
-            } => *blocks_accessed,
-            LogicalPlan::Filter {
-                blocks_accessed, ..
-            } => *blocks_accessed,
-            LogicalPlan::Project { input, .. } => input.blocks_accessed(),
-            LogicalPlan::Join {
-                blocks_accessed, ..
-            } => *blocks_accessed,
-        }
+        self.props.blocks_accessed
     }
 
     pub fn schema(&self) -> &Schema {
-        match self {
-            LogicalPlan::TableScan { schema, .. } => schema,
-            LogicalPlan::Filter { schema, .. } => schema,
-            LogicalPlan::Project { schema, .. } => schema,
-            LogicalPlan::Join { schema, .. } => schema,
-        }
+        &self.props.schema
     }
 
     /// Field-agnostic distinct-value estimate, matching `StatInfo::distinct_values`.
     pub fn distinct_values(&self, field_name: &str) -> usize {
-        match self {
-            LogicalPlan::TableScan { records_output, .. } => 1 + records_output / 3,
-            LogicalPlan::Filter {
-                input, predicate, ..
-            } => {
+        match self.kind() {
+            LogicalPlanKind::TableScan => 1 + self.records_output() / 3,
+            LogicalPlanKind::Filter => {
+                let predicate = self
+                    .predicate()
+                    .expect("filter nodes must have a predicate");
+                let input = self.input().expect("filter nodes must have one child");
                 if predicate.equates_with_constant(field_name).is_some() {
                     1
                 } else if let Some(other_field) = predicate.equates_with_field(field_name) {
@@ -4741,8 +4844,13 @@ impl LogicalPlan {
                     input.distinct_values(field_name)
                 }
             }
-            LogicalPlan::Project { input, .. } => input.distinct_values(field_name),
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlanKind::Project => self
+                .input()
+                .expect("project nodes must have one child")
+                .distinct_values(field_name),
+            LogicalPlanKind::Join => {
+                let left = self.left().expect("join nodes must have a left child");
+                let right = self.right().expect("join nodes must have a right child");
                 if left.schema().fields.contains(&field_name.to_string()) {
                     left.distinct_values(field_name)
                 } else {
@@ -4758,13 +4866,16 @@ impl LogicalPlan {
         let blocks_accessed = input.blocks_accessed();
         let reduction = predicate.reduction_factor_fn(|field| input.distinct_values(field));
         let records_output = std::cmp::max(1, input.records_output() / reduction);
-        LogicalPlan::Filter {
-            input,
-            predicate,
-            schema,
-            records_output,
-            blocks_accessed,
-        }
+        Self::new(
+            LogicalPlanKind::Filter,
+            vec![input],
+            LogicalPlanData::Filter { predicate },
+            LogicalPlanProps {
+                schema,
+                records_output,
+                blocks_accessed,
+            },
+        )
     }
 
     /// Build a `Join` node. Computes schema and cost estimates from both inputs.
@@ -4797,14 +4908,16 @@ impl LogicalPlan {
             left.records_output()
                 .saturating_mul(right.blocks_accessed()),
         );
-        Ok(LogicalPlan::Join {
-            left,
-            right,
-            predicate,
-            schema,
-            records_output,
-            blocks_accessed,
-        })
+        Ok(Self::new(
+            LogicalPlanKind::Join,
+            vec![left, right],
+            LogicalPlanData::Join { predicate },
+            LogicalPlanProps {
+                schema,
+                records_output,
+                blocks_accessed,
+            },
+        ))
     }
 }
 
@@ -4852,12 +4965,12 @@ impl LogicalPlanner for BasicLogicalPlanner {
                 let stat_info =
                     self.metadata_manager
                         .get_stat_info(table, layout.clone(), Arc::clone(&txn));
-                Arc::new(LogicalPlan::TableScan {
-                    table: table.clone(),
-                    schema: layout.schema.clone(),
-                    records_output: stat_info.num_records,
-                    blocks_accessed: stat_info.num_blocks,
-                })
+                Arc::new(LogicalPlan::make_table_scan(
+                    table.clone(),
+                    layout.schema.clone(),
+                    stat_info.num_records,
+                    stat_info.num_blocks,
+                ))
             })
             .collect();
 
@@ -4884,69 +4997,13 @@ impl LogicalPlanner for BasicLogicalPlanner {
         for field in &expanded_fields {
             proj_schema.add_from_schema(field, plan.schema())?;
         }
-        plan = Arc::new(LogicalPlan::Project {
-            input: plan,
-            fields: expanded_fields,
-            schema: proj_schema,
-        });
+        plan = Arc::new(LogicalPlan::make_project(
+            plan,
+            expanded_fields,
+            proj_schema,
+        ));
 
         Ok(Arc::try_unwrap(plan).unwrap_or_else(|arc| (*arc).clone()))
-    }
-}
-
-// Need Clone on LogicalPlan for Arc::try_unwrap fallback above.
-impl Clone for LogicalPlan {
-    fn clone(&self) -> Self {
-        match self {
-            LogicalPlan::TableScan {
-                table,
-                schema,
-                records_output,
-                blocks_accessed,
-            } => LogicalPlan::TableScan {
-                table: table.clone(),
-                schema: schema.clone(),
-                records_output: *records_output,
-                blocks_accessed: *blocks_accessed,
-            },
-            LogicalPlan::Filter {
-                input,
-                predicate,
-                schema,
-                records_output,
-                blocks_accessed,
-            } => LogicalPlan::Filter {
-                input: Arc::clone(input),
-                predicate: predicate.clone(),
-                schema: schema.clone(),
-                records_output: *records_output,
-                blocks_accessed: *blocks_accessed,
-            },
-            LogicalPlan::Project {
-                input,
-                fields,
-                schema,
-            } => LogicalPlan::Project {
-                input: Arc::clone(input),
-                fields: fields.clone(),
-                schema: schema.clone(),
-            },
-            LogicalPlan::Join {
-                left,
-                right,
-                predicate,
-                schema,
-                records_output,
-                blocks_accessed,
-            } => LogicalPlan::Join {
-                left: Arc::clone(left),
-                right: Arc::clone(right),
-                predicate: predicate.clone(),
-                schema: schema.clone(),
-                records_output: *records_output,
-                blocks_accessed: *blocks_accessed,
-            },
-        }
     }
 }
 
@@ -4963,11 +5020,11 @@ impl HeuristicLogicalOptimizer {
 
     /// Recursively collect all `TableScan` leaves from a join tree, consuming the tree.
     fn collect_scans(plan: Arc<LogicalPlan>) -> Vec<Arc<LogicalPlan>> {
-        match plan.as_ref() {
-            LogicalPlan::TableScan { .. } => vec![plan],
-            LogicalPlan::Join { left, right, .. } => {
-                let mut scans = Self::collect_scans(Arc::clone(left));
-                scans.extend(Self::collect_scans(Arc::clone(right)));
+        match plan.kind() {
+            LogicalPlanKind::TableScan => vec![plan],
+            LogicalPlanKind::Join => {
+                let mut scans = Self::collect_scans(Arc::clone(plan.left().unwrap()));
+                scans.extend(Self::collect_scans(Arc::clone(plan.right().unwrap())));
                 scans
             }
             _ => vec![plan], // Filter/Project at top-level: treat as opaque leaf
@@ -5041,21 +5098,21 @@ impl LogicalOptimizer for HeuristicLogicalOptimizer {
     /// 5. Re-wraps with `Project`.
     fn optimize(&self, plan: LogicalPlan, _txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan> {
         // Unwrap the outer Project.
-        let (proj_fields, proj_schema, inner) = match plan {
-            LogicalPlan::Project {
-                fields,
-                schema,
-                input,
-            } => (fields, schema, input),
-            other => return Ok(other), // nothing to optimize
-        };
+        if plan.kind() != LogicalPlanKind::Project {
+            return Ok(plan);
+        }
+        let proj_fields = plan.project_fields().unwrap().to_vec();
+        let proj_schema = plan.schema().clone();
+        let inner = Arc::clone(plan.input().unwrap());
 
         // Peel off a top-level Filter to get the global predicate.
-        let (global_pred, join_tree) = match inner.as_ref() {
-            LogicalPlan::Filter {
-                predicate, input, ..
-            } => (predicate.clone(), Arc::clone(input)),
-            _ => (Predicate::new(vec![]), inner),
+        let (global_pred, join_tree) = if inner.kind() == LogicalPlanKind::Filter {
+            (
+                inner.predicate().unwrap().clone(),
+                Arc::clone(inner.input().unwrap()),
+            )
+        } else {
+            (Predicate::new(vec![]), inner)
         };
 
         // Collect all TableScan leaves from the join tree.
@@ -5090,11 +5147,7 @@ impl LogicalOptimizer for HeuristicLogicalOptimizer {
         }
 
         // Re-wrap with Project using the original fields and schema.
-        Ok(LogicalPlan::Project {
-            input: current,
-            fields: proj_fields,
-            schema: proj_schema,
-        })
+        Ok(LogicalPlan::make_project(current, proj_fields, proj_schema))
     }
 }
 
@@ -5114,14 +5167,21 @@ impl DefaultPhysicalPlanner {
     /// If `plan` is a `TableScan` or `Filter(TableScan, ...)`, return the table name
     /// and the filter predicate (empty if plain TableScan).
     fn extract_inner_table(plan: &LogicalPlan) -> Option<(&str, Predicate)> {
-        match plan {
-            LogicalPlan::TableScan { table, .. } => Some((table.as_str(), Predicate::new(vec![]))),
-            LogicalPlan::Filter {
-                input, predicate, ..
-            } => match input.as_ref() {
-                LogicalPlan::TableScan { table, .. } => Some((table.as_str(), predicate.clone())),
-                _ => None,
-            },
+        match plan.kind() {
+            LogicalPlanKind::TableScan => {
+                Some((plan.table_name().unwrap(), Predicate::new(vec![])))
+            }
+            LogicalPlanKind::Filter => {
+                let input = plan.input().unwrap();
+                if input.kind() == LogicalPlanKind::TableScan {
+                    Some((
+                        input.table_name().unwrap(),
+                        plan.predicate().unwrap().clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -5129,18 +5189,20 @@ impl DefaultPhysicalPlanner {
 
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     fn lower(&self, logical: &LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<Arc<dyn Plan>> {
-        match logical {
-            LogicalPlan::TableScan { table, .. } => {
+        match logical.kind() {
+            LogicalPlanKind::TableScan => {
+                let table = logical.table_name().unwrap();
                 let plan =
                     TablePlan::new(table, Arc::clone(&txn), Arc::clone(&self.metadata_manager));
                 Ok(Arc::new(plan))
             }
 
-            LogicalPlan::Filter {
-                input, predicate, ..
-            } => {
+            LogicalPlanKind::Filter => {
+                let input = logical.input().unwrap();
+                let predicate = logical.predicate().unwrap();
                 // Check if the inner input is a TableScan so we can consider IndexSelectPlan.
-                if let LogicalPlan::TableScan { table, .. } = input.as_ref() {
+                if input.kind() == LogicalPlanKind::TableScan {
+                    let table = input.table_name().unwrap();
                     let table_plan = Arc::new(TablePlan::new(
                         table,
                         Arc::clone(&txn),
@@ -5171,18 +5233,18 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 Ok(Arc::new(SelectPlan::new(lowered, predicate.clone())))
             }
 
-            LogicalPlan::Project { input, fields, .. } => {
+            LogicalPlanKind::Project => {
+                let input = logical.input().unwrap();
+                let fields = logical.project_fields().unwrap();
                 let lowered = self.lower(input, Arc::clone(&txn))?;
                 let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                 Ok(Arc::new(ProjectPlan::new(lowered, field_refs)?))
             }
 
-            LogicalPlan::Join {
-                left,
-                right,
-                predicate,
-                ..
-            } => {
+            LogicalPlanKind::Join => {
+                let left = logical.left().unwrap();
+                let right = logical.right().unwrap();
+                let predicate = logical.predicate().unwrap();
                 // Check whether the right (inner) side is a bare TableScan or a
                 // Filter(TableScan) so we can use IndexJoinPlan.
                 if let Some((inner_table, inner_filter)) = Self::extract_inner_table(right.as_ref())

@@ -49,15 +49,13 @@ This plan does not require, initially:
 
 ## Design direction
 
-The logical layer should move toward the shape suggested in the blog post:
+The logical layer should now use the shape suggested in the blog post:
 
 - logical planning returns a logical IR, not executable plans
 - logical optimization rewrites that IR
 - physical planning lowers that IR into executable plan structs
 
-The exact in-memory shape of `LogicalPlan` does not need to be frozen yet. The boundary matters more than the final logical-node representation.
-
-For the first implementation, it is acceptable for `LogicalPlan` to be a single enum with embedded children and schema. If later memo/rule work needs a framework-owned wrapper shape with uniform `children`, we can evolve the logical representation then.
+The boundary still matters more than the fine details, but we now intentionally choose the optimizer-friendly wrapper shape early so later rule/memo work does not require another logical-IR migration.
 
 But that only works if the logical layer has a real contract to target. So the first implementation step is not the wrapper node itself; it is the boundary between:
 
@@ -107,40 +105,49 @@ Those belong in physical planning / lowering.
 
 ## Suggested logical node shape for this codebase
 
-Start small. The logical IR only needs to model operators we already have query semantics for. For the first implementation, a single enum is enough.
+Start small. The logical IR only needs to model operators we already have query semantics for, but it should already use a framework-owned wrapper shape.
 
 ```rust
-pub enum LogicalPlan {
-    TableScan {
-        table: String,
-        schema: Schema,
-    },
-    Filter {
-        input: Arc<LogicalPlan>,
-        predicate: Predicate,
-        schema: Schema,
-    },
-    Project {
-        input: Arc<LogicalPlan>,
-        fields: Vec<String>,
-        schema: Schema,
-    },
-    Join {
-        left: Arc<LogicalPlan>,
-        right: Arc<LogicalPlan>,
-        predicate: Predicate,
-        schema: Schema,
-    },
+pub enum LogicalPlanKind {
+    TableScan,
+    Filter,
+    Project,
+    Join,
+}
+
+pub enum LogicalPlanData {
+    TableScan { table: String },
+    Filter { predicate: Predicate },
+    Project { fields: Vec<String> },
+    Join { predicate: Predicate },
+}
+
+pub struct LogicalPlanProps {
+    schema: Schema,
+    records_output: usize,
+    blocks_accessed: usize,
+}
+
+pub struct LogicalPlan {
+    kind: LogicalPlanKind,
+    children: Vec<Arc<LogicalPlan>>,
+    data: LogicalPlanData,
+    props: LogicalPlanProps,
 }
 ```
 
 Notes:
 
-- storing `schema` directly is fine for the first step; it avoids repeated recomputation
-- separate `LogicalNodeKind` / `LogicalNodeData` and `LogicalProps` types are not required yet
+- `children` is the key part of the shape; it gives rewrites and future memo code one uniform way to traverse and rebuild nodes
+- `LogicalPlanProps` is a convenient place for derived metadata already needed by the current heuristics
 - logical `Join` should represent relational join meaning, not a particular implementation
 - an inner join with no extracted join predicate can still exist as `Join { predicate: Predicate::empty() }`
-- if later memo/rule work wants the blog post's wrapper-style representation, this enum can be migrated then
+
+Why choose this shape now:
+
+- the boundary already exists, so changing logical IR now is cheap
+- current heuristics do not require the wrapper, but future optimizer work will benefit from it
+- adopting it now avoids a second logical-layer refactor after more rewrite logic accumulates
 
 ## Mapping from current planner to the new logical IR
 
@@ -274,10 +281,10 @@ Exit criteria:
 
 ### Phase 2: add logical IR types
 
-- add `LogicalPlan` with a small initial operator set: table scan, filter, project, join
-- embed `schema` directly in the logical variants for now
-- do not over-design the logical representation before the boundary is stable
-- keep open the option of later migrating this enum to a wrapper-style representation if memo/rule work needs it
+- add wrapper-style logical IR types: `LogicalPlanKind`, `LogicalPlanData`, `LogicalPlanProps`, `LogicalPlan`
+- keep the initial operator set intentionally small: table scan, filter, project, join
+- add helper constructors and child-access helpers for readability
+- store currently needed derived metadata in `LogicalPlanProps`
 
 Exit criteria:
 
