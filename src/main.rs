@@ -4907,30 +4907,28 @@ impl LogicalPlan {
 
 /// Produces a `LogicalPlan` from parsed `QueryData`. Does not make physical choices.
 pub trait LogicalPlanner {
-    fn build(&self, query: QueryData, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan>;
+    fn build(&self, query: QueryData, ctx: &PlanningContext) -> SimpleDBResult<LogicalPlan>;
 }
 
 /// Rewrites a `LogicalPlan` without introducing physical operators.
 pub trait LogicalOptimizer {
-    fn optimize(&self, plan: LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan>;
+    fn optimize(&self, plan: LogicalPlan, ctx: &PlanningContext) -> SimpleDBResult<LogicalPlan>;
 }
 
 /// Lowers a `LogicalPlan` into an executable physical `Plan` tree.
 pub trait PhysicalPlanner {
-    fn lower(&self, logical: &LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<Arc<dyn Plan>>;
+    fn lower(&self, logical: &LogicalPlan, ctx: &PlanningContext) -> SimpleDBResult<Arc<dyn Plan>>;
 }
 
 // ----------------------------------------------------------------------------
 // BasicLogicalPlanner — naive translation of QueryData into LogicalPlan
 // ----------------------------------------------------------------------------
 
-struct BasicLogicalPlanner {
-    metadata_manager: Arc<MetadataManager>,
-}
+struct BasicLogicalPlanner;
 
 impl BasicLogicalPlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
-        Self { metadata_manager }
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -4939,16 +4937,20 @@ impl LogicalPlanner for BasicLogicalPlanner {
     ///   Project(Filter(Join(Join(TableScan(t1), TableScan(t2)), TableScan(t3)), pred), fields)
     ///
     /// No join reordering or predicate pushdown — that is left to the optimizer.
-    fn build(&self, query: QueryData, txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan> {
+    fn build(&self, query: QueryData, ctx: &PlanningContext) -> SimpleDBResult<LogicalPlan> {
         // 1. Build a TableScan for each table in the query.
         let mut scans: Vec<Arc<LogicalPlan>> = query
             .tables
             .iter()
             .map(|table| {
-                let layout = self.metadata_manager.get_layout(table, Arc::clone(&txn));
-                let stat_info =
-                    self.metadata_manager
-                        .get_stat_info(table, layout.clone(), Arc::clone(&txn));
+                let layout = ctx
+                    .metadata_manager()
+                    .get_layout(table, Arc::clone(ctx.txn()));
+                let stat_info = ctx.metadata_manager().get_stat_info(
+                    table,
+                    layout.clone(),
+                    Arc::clone(ctx.txn()),
+                );
                 Arc::new(LogicalPlan::make_table_scan(
                     table.clone(),
                     layout.schema.clone(),
@@ -5080,7 +5082,7 @@ impl LogicalOptimizer for HeuristicLogicalOptimizer {
     /// 3. Builds an optimal left-deep join tree (smallest-output first).
     /// 4. Adds per-join predicates as `Join.predicate`.
     /// 5. Re-wraps with `Project`.
-    fn optimize(&self, plan: LogicalPlan, _txn: Arc<Transaction>) -> SimpleDBResult<LogicalPlan> {
+    fn optimize(&self, plan: LogicalPlan, _ctx: &PlanningContext) -> SimpleDBResult<LogicalPlan> {
         // Unwrap the outer Project.
         if plan.kind() != LogicalPlanKind::Project {
             return Ok(plan);
@@ -5139,13 +5141,11 @@ impl LogicalOptimizer for HeuristicLogicalOptimizer {
 // DefaultPhysicalPlanner — lowers LogicalPlan to physical Plan nodes
 // ----------------------------------------------------------------------------
 
-struct DefaultPhysicalPlanner {
-    metadata_manager: Arc<MetadataManager>,
-}
+struct DefaultPhysicalPlanner;
 
 impl DefaultPhysicalPlanner {
-    fn new(metadata_manager: Arc<MetadataManager>) -> Self {
-        Self { metadata_manager }
+    fn new() -> Self {
+        Self
     }
 
     /// If `plan` is a `TableScan` or `Filter(TableScan, ...)`, return the table name
@@ -5172,12 +5172,15 @@ impl DefaultPhysicalPlanner {
 }
 
 impl PhysicalPlanner for DefaultPhysicalPlanner {
-    fn lower(&self, logical: &LogicalPlan, txn: Arc<Transaction>) -> SimpleDBResult<Arc<dyn Plan>> {
+    fn lower(&self, logical: &LogicalPlan, ctx: &PlanningContext) -> SimpleDBResult<Arc<dyn Plan>> {
         match logical.kind() {
             LogicalPlanKind::TableScan => {
                 let table = logical.table_name().unwrap();
-                let plan =
-                    TablePlan::new(table, Arc::clone(&txn), Arc::clone(&self.metadata_manager));
+                let plan = TablePlan::new(
+                    table,
+                    Arc::clone(ctx.txn()),
+                    Arc::clone(ctx.metadata_manager()),
+                );
                 Ok(Arc::new(plan))
             }
 
@@ -5189,12 +5192,12 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     let table = input.table_name().unwrap();
                     let table_plan = Arc::new(TablePlan::new(
                         table,
-                        Arc::clone(&txn),
-                        Arc::clone(&self.metadata_manager),
+                        Arc::clone(ctx.txn()),
+                        Arc::clone(ctx.metadata_manager()),
                     ));
-                    let indexes = self
-                        .metadata_manager
-                        .get_index_info(table, Arc::clone(&txn));
+                    let indexes = ctx
+                        .metadata_manager()
+                        .get_index_info(table, Arc::clone(ctx.txn()));
                     for (field, ii) in &indexes {
                         if let Some(bounds) = predicate.bounded_index_search_bounds(field) {
                             let index_plan: Arc<dyn Plan> = Arc::new(IndexSelectPlan::new(
@@ -5213,14 +5216,14 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                     )));
                 }
                 // General case: lower input, then filter.
-                let lowered = self.lower(input, Arc::clone(&txn))?;
+                let lowered = self.lower(input, ctx)?;
                 Ok(Arc::new(SelectPlan::new(lowered, predicate.clone())))
             }
 
             LogicalPlanKind::Project => {
                 let input = logical.input().unwrap();
                 let fields = logical.project_fields().unwrap();
-                let lowered = self.lower(input, Arc::clone(&txn))?;
+                let lowered = self.lower(input, ctx)?;
                 let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                 Ok(Arc::new(ProjectPlan::new(lowered, field_refs)?))
             }
@@ -5233,17 +5236,17 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 // Filter(TableScan) so we can use IndexJoinPlan.
                 if let Some((inner_table, inner_filter)) = Self::extract_inner_table(right.as_ref())
                 {
-                    let indexes = self
-                        .metadata_manager
-                        .get_index_info(inner_table, Arc::clone(&txn));
+                    let indexes = ctx
+                        .metadata_manager()
+                        .get_index_info(inner_table, Arc::clone(ctx.txn()));
                     for (field, ii) in &indexes {
                         if let Some(outer_field) = predicate.equates_with_field(field) {
                             if left.schema().fields.contains(&outer_field) {
-                                let outer = self.lower(left, Arc::clone(&txn))?;
+                                let outer = self.lower(left, ctx)?;
                                 let inner_tp = Arc::new(TablePlan::new(
                                     inner_table,
-                                    Arc::clone(&txn),
-                                    Arc::clone(&self.metadata_manager),
+                                    Arc::clone(ctx.txn()),
+                                    Arc::clone(ctx.metadata_manager()),
                                 ));
                                 let mut plan: Arc<dyn Plan> = Arc::new(IndexJoinPlan::new(
                                     outer,
@@ -5268,12 +5271,12 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 }
 
                 // Fall back to MultiBufferProductPlan.
-                let lowered_left = self.lower(left, Arc::clone(&txn))?;
-                let lowered_right = self.lower(right, Arc::clone(&txn))?;
+                let lowered_left = self.lower(left, ctx)?;
+                let lowered_right = self.lower(right, ctx)?;
                 let mut plan: Arc<dyn Plan> = Arc::new(MultiBufferProductPlan::new(
                     lowered_left,
                     lowered_right,
-                    Arc::clone(&txn),
+                    Arc::clone(ctx.txn()),
                 )?);
                 if !predicate.is_empty() {
                     plan = Arc::new(SelectPlan::new(plan, predicate.clone()));
@@ -5309,13 +5312,10 @@ impl QueryPlanner for PipelineQueryPlanner {
         query_data: QueryData,
         txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
-        let logical_planner = BasicLogicalPlanner::new(Arc::clone(&self.metadata_manager));
-        let optimizer = HeuristicLogicalOptimizer::new();
-        let physical_planner = DefaultPhysicalPlanner::new(Arc::clone(&self.metadata_manager));
-
-        let logical = logical_planner.build(query_data, Arc::clone(&txn))?;
-        let optimized = optimizer.optimize(logical, Arc::clone(&txn))?;
-        physical_planner.lower(&optimized, txn)
+        let ctx = PlanningContext::new(txn, Arc::clone(&self.metadata_manager));
+        let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
+        let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
+        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
     }
 }
 
@@ -5624,6 +5624,35 @@ impl Plan for TablePlan {
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{}├─ Schema: {:?}", prefix, self.schema().fields);
         println!("{prefix}╰─");
+    }
+}
+
+/// Planning-time inputs: catalog metadata and the transaction used to read it.
+///
+/// Separates the role of planning (reading schemas, stats, index metadata) from
+/// execution (opening scans, taking locks, writing temp tables). Planning code
+/// takes `&PlanningContext` rather than raw `Arc<Transaction>` so that its
+/// dependencies are explicit and it cannot accidentally perform execution-time
+/// operations.
+pub struct PlanningContext {
+    txn: Arc<Transaction>,
+    metadata_manager: Arc<MetadataManager>,
+}
+
+impl PlanningContext {
+    pub fn new(txn: Arc<Transaction>, metadata_manager: Arc<MetadataManager>) -> Self {
+        Self {
+            txn,
+            metadata_manager,
+        }
+    }
+
+    pub fn txn(&self) -> &Arc<Transaction> {
+        &self.txn
+    }
+
+    pub fn metadata_manager(&self) -> &Arc<MetadataManager> {
+        &self.metadata_manager
     }
 }
 
