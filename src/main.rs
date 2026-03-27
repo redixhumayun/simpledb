@@ -220,7 +220,7 @@ impl MultiBufferProductExecutor {
 }
 
 pub struct MultiBufferProductPlan {
-    lhs: Arc<MaterializePlan>,
+    lhs: Arc<dyn TempTableSource>,
     rhs: Arc<dyn Plan>,
     schema: Schema,
     block_size: usize,
@@ -238,7 +238,7 @@ impl MultiBufferProductPlan {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
-        let lhs = Arc::new(MaterializePlan::new(lhs, ctx));
+        let lhs: Arc<dyn TempTableSource> = Arc::new(MaterializePlan::new(lhs, ctx));
         Ok(Self {
             lhs,
             rhs,
@@ -2906,8 +2906,8 @@ impl MaterializePlan {
     }
 }
 
-impl MaterializePlan {
-    pub fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable {
+impl TempTableSource for MaterializePlan {
+    fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable {
         MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute_to_temp(ctx)
     }
 }
@@ -5739,10 +5739,18 @@ pub trait Plan {
     fn print_plan_internal(&self, indent: usize);
 }
 
+/// A plan node that can materialize its output into a `TempTable`.
+/// `MaterializePlan` implements this. `MultiBufferProductPlan` stores
+/// `Arc<dyn TempTableSource>` to express that it needs a materializable LHS
+/// without depending on the concrete `MaterializePlan` type.
+pub trait TempTableSource: Plan {
+    fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable;
+}
+
 /// A plan node that can be opened as a table-backed cursor.
 /// Only table-producing nodes implement this — `TablePlan` (base table) and
 /// `MaterializePlan` (temp table). Parent operators that need direct row-location
-/// access (`IndexSelectPlan`, `IndexJoinPlan`, `MultiBufferProductPlan`) store
+/// access (`IndexSelectPlan`, `IndexJoinPlan`) store
 /// `Arc<dyn TableSource>` instead of concrete plan types.
 pub trait TableSource: Plan {
     fn open_table_cursor(&self, ctx: &ExecutionContext) -> Box<dyn TableCursor>;
