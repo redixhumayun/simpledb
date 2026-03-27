@@ -233,8 +233,8 @@ impl MultiBufferProductPlan {
         rhs: Arc<dyn Plan>,
         ctx: &PlanningContext,
     ) -> SimpleDBResult<Self> {
-        let block_size = ctx.txn().block_size();
-        let available_buffs = ctx.txn().available_buffs();
+        let block_size = ctx.block_size();
+        let available_buffs = ctx.available_buffs();
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
@@ -2862,7 +2862,7 @@ pub struct MaterializePlan {
 
 impl MaterializePlan {
     pub fn new(source_plan: Arc<dyn Plan>, ctx: &PlanningContext) -> Self {
-        let block_size = ctx.txn().block_size();
+        let block_size = ctx.block_size();
         Self {
             source_plan,
             block_size,
@@ -3819,7 +3819,6 @@ pub trait UpdatePlanner {
 pub struct TablePlanner {
     table_name: String,
     predicate: Predicate,
-    metadata_manager: Arc<MetadataManager>,
     schema: Schema,
     indexes: HashMap<String, IndexInfo>,
     plan: Arc<TablePlan>,
@@ -3830,19 +3829,12 @@ impl TablePlanner {
         &self.table_name
     }
 
-    pub fn metadata_manager(&self) -> &Arc<MetadataManager> {
-        &self.metadata_manager
-    }
-
     pub fn new(table_name: String, predicate: Predicate, ctx: &PlanningContext) -> Self {
         let plan = Arc::new(TablePlan::new(table_name.as_str(), ctx));
-        let indexes = ctx
-            .metadata_manager()
-            .get_index_info(&table_name, Arc::clone(ctx.txn()));
+        let indexes = ctx.index_info(&table_name);
         Self {
             table_name,
             predicate,
-            metadata_manager: Arc::clone(ctx.metadata_manager()),
             schema: plan.schema(),
             indexes,
             plan,
@@ -4943,14 +4935,8 @@ impl LogicalPlanner for BasicLogicalPlanner {
             .tables
             .iter()
             .map(|table| {
-                let layout = ctx
-                    .metadata_manager()
-                    .get_layout(table, Arc::clone(ctx.txn()));
-                let stat_info = ctx.metadata_manager().get_stat_info(
-                    table,
-                    layout.clone(),
-                    Arc::clone(ctx.txn()),
-                );
+                let layout = ctx.layout(table);
+                let stat_info = ctx.stat_info(table, layout.clone());
                 Arc::new(LogicalPlan::make_table_scan(
                     table.clone(),
                     layout.schema.clone(),
@@ -5187,9 +5173,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 if input.kind() == LogicalPlanKind::TableScan {
                     let table = input.table_name().unwrap();
                     let table_plan = Arc::new(TablePlan::new(table, ctx));
-                    let indexes = ctx
-                        .metadata_manager()
-                        .get_index_info(table, Arc::clone(ctx.txn()));
+                    let indexes = ctx.index_info(table);
                     for (field, ii) in &indexes {
                         if let Some(bounds) = predicate.bounded_index_search_bounds(field) {
                             let index_plan: Arc<dyn Plan> = Arc::new(IndexSelectPlan::new(
@@ -5228,9 +5212,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 // Filter(TableScan) so we can use IndexJoinPlan.
                 if let Some((inner_table, inner_filter)) = Self::extract_inner_table(right.as_ref())
                 {
-                    let indexes = ctx
-                        .metadata_manager()
-                        .get_index_info(inner_table, Arc::clone(ctx.txn()));
+                    let indexes = ctx.index_info(inner_table);
                     for (field, ii) in &indexes {
                         if let Some(outer_field) = predicate.equates_with_field(field) {
                             if left.schema().fields.contains(&outer_field) {
@@ -5548,16 +5530,9 @@ pub struct TablePlan {
 
 impl TablePlan {
     pub fn new(table_name: &str, ctx: &PlanningContext) -> Self {
-        let layout = ctx
-            .metadata_manager()
-            .get_layout(table_name, Arc::clone(ctx.txn()));
-        let stat_info =
-            ctx.metadata_manager()
-                .get_stat_info(table_name, layout.clone(), Arc::clone(ctx.txn()));
-        let table_id = ctx
-            .metadata_manager()
-            .get_table_id(table_name, Arc::clone(ctx.txn()))
-            .unwrap_or(u32::MAX);
+        let layout = ctx.layout(table_name);
+        let stat_info = ctx.stat_info(table_name, layout.clone());
+        let table_id = ctx.table_id(table_name).unwrap_or(u32::MAX);
         Self {
             table_name: table_name.to_string(),
             layout,
@@ -5622,6 +5597,11 @@ impl Plan for TablePlan {
 /// takes `&PlanningContext` rather than raw `Arc<Transaction>` so that its
 /// dependencies are explicit and it cannot accidentally perform execution-time
 /// operations.
+///
+/// Planner code accesses catalog and configuration data through the specific
+/// accessor methods below. The underlying transaction and metadata manager are
+/// intentionally not exposed — their implementation can later evolve (e.g. to
+/// cached or snapshot-backed reads) without changing any planner call sites.
 pub struct PlanningContext {
     txn: Arc<Transaction>,
     metadata_manager: Arc<MetadataManager>,
@@ -5635,12 +5615,33 @@ impl PlanningContext {
         }
     }
 
-    pub fn txn(&self) -> &Arc<Transaction> {
-        &self.txn
+    pub fn layout(&self, table_name: &str) -> Layout {
+        self.metadata_manager
+            .get_layout(table_name, Arc::clone(&self.txn))
     }
 
-    pub fn metadata_manager(&self) -> &Arc<MetadataManager> {
-        &self.metadata_manager
+    pub fn stat_info(&self, table_name: &str, layout: Layout) -> StatInfo {
+        self.metadata_manager
+            .get_stat_info(table_name, layout, Arc::clone(&self.txn))
+    }
+
+    pub fn table_id(&self, table_name: &str) -> Option<u32> {
+        self.metadata_manager
+            .get_table_id(table_name, Arc::clone(&self.txn))
+            .ok()
+    }
+
+    pub fn index_info(&self, table_name: &str) -> HashMap<String, IndexInfo> {
+        self.metadata_manager
+            .get_index_info(table_name, Arc::clone(&self.txn))
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.txn.block_size()
+    }
+
+    pub fn available_buffs(&self) -> usize {
+        self.txn.available_buffs()
     }
 }
 
