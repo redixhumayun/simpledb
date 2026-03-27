@@ -192,22 +192,26 @@ impl SimpleDB {
 /// Lives entirely below `Plan::open` — it is created inside
 /// `MultiBufferProductPlan::open` and never appears in the physical plan layer.
 struct MultiBufferProductExecutor {
+    lhs: Arc<dyn Plan>,
     rhs: Arc<dyn Plan>,
 }
 
 impl MultiBufferProductExecutor {
-    fn new(rhs: Arc<dyn Plan>) -> Self {
-        Self { rhs }
+    fn new(lhs: Arc<dyn Plan>, rhs: Arc<dyn Plan>) -> Self {
+        Self { lhs, rhs }
     }
 
-    fn create_temp_table(&self, ctx: &ExecutionContext) -> SimpleDBResult<TempTable> {
-        let temp_table = TempTable::new(Arc::clone(ctx.txn()), self.rhs.schema());
-        let mut source_scan = self.rhs.open(ctx);
+    fn materialize_plan(
+        &self,
+        plan: &Arc<dyn Plan>,
+        ctx: &ExecutionContext,
+    ) -> SimpleDBResult<TempTable> {
+        let temp_table = TempTable::new(Arc::clone(ctx.txn()), plan.schema());
+        let mut source_scan = plan.open(ctx);
         let mut table_scan = temp_table.open();
         while let Some(result) = source_scan.next() {
             result?;
-            let values: Vec<Constant> = self
-                .rhs
+            let values: Vec<Constant> = plan
                 .schema()
                 .fields
                 .iter()
@@ -217,14 +221,23 @@ impl MultiBufferProductExecutor {
         }
         Ok(temp_table)
     }
+
+    fn materialize_lhs(&self, ctx: &ExecutionContext) -> SimpleDBResult<TempTable> {
+        self.materialize_plan(&self.lhs, ctx)
+    }
+
+    fn materialize_rhs(&self, ctx: &ExecutionContext) -> SimpleDBResult<TempTable> {
+        self.materialize_plan(&self.rhs, ctx)
+    }
 }
 
 pub struct MultiBufferProductPlan {
-    lhs: Arc<dyn TempTableSource>,
+    lhs: Arc<dyn Plan>,
     rhs: Arc<dyn Plan>,
     schema: Schema,
     block_size: usize,
     available_buffs: usize,
+    lhs_materialized_blocks: usize,
 }
 
 impl MultiBufferProductPlan {
@@ -238,22 +251,24 @@ impl MultiBufferProductPlan {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
-        let lhs: Arc<dyn TempTableSource> = Arc::new(MaterializePlan::new(lhs, ctx));
+        let lhs_materialized_blocks = MaterializePlan::new(Arc::clone(&lhs), ctx).blocks_accessed();
         Ok(Self {
             lhs,
             rhs,
             schema,
             block_size,
             available_buffs,
+            lhs_materialized_blocks,
         })
     }
 }
 
 impl Plan for MultiBufferProductPlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
-        let lhs_temp = self.lhs.execute_to_temp(ctx);
-        let executor = MultiBufferProductExecutor::new(Arc::clone(&self.rhs));
-        let rhs_temp = executor.create_temp_table(ctx).unwrap();
+        let executor =
+            MultiBufferProductExecutor::new(Arc::clone(&self.lhs), Arc::clone(&self.rhs));
+        let lhs_temp = executor.materialize_lhs(ctx).unwrap();
+        let rhs_temp = executor.materialize_rhs(ctx).unwrap();
         let scan = MultiBufferProductScan::new(
             Arc::clone(ctx.txn()),
             lhs_temp,
@@ -273,7 +288,7 @@ impl Plan for MultiBufferProductPlan {
             self.rhs.records_output() / records_per_block
         };
         let num_chunks = num_blocks / available_buffs;
-        self.rhs.blocks_accessed() + (self.lhs.blocks_accessed() * num_chunks)
+        self.rhs.blocks_accessed() + (self.lhs_materialized_blocks * num_chunks)
     }
 
     fn records_output(&self) -> usize {
@@ -2903,12 +2918,6 @@ impl MaterializePlan {
             source_plan,
             block_size,
         }
-    }
-}
-
-impl TempTableSource for MaterializePlan {
-    fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable {
-        MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute_to_temp(ctx)
     }
 }
 
@@ -5737,14 +5746,6 @@ pub trait Plan {
         self.print_plan_internal(indent);
     }
     fn print_plan_internal(&self, indent: usize);
-}
-
-/// A plan node that can materialize its output into a `TempTable`.
-/// `MaterializePlan` implements this. `MultiBufferProductPlan` stores
-/// `Arc<dyn TempTableSource>` to express that it needs a materializable LHS
-/// without depending on the concrete `MaterializePlan` type.
-pub trait TempTableSource: Plan {
-    fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable;
 }
 
 /// A plan node that can be opened as a table-backed cursor.
