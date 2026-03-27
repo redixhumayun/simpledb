@@ -1182,10 +1182,13 @@ pub fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
     k
 }
 
-/// A plan node that can produce a mark/restore-capable sorted scan.
-/// Only `SortPlan` implements this. `MergeJoinPlan` stores `Arc<dyn SortedSource>`
-/// instead of the concrete `SortPlan` to express that it only needs the
-/// mark/restore-capable sorted execution capability.
+/// A plan node that produces a sorted, mark/restore-capable scan.
+///
+/// `MergeJoinPlan` stores `Arc<dyn SortedSource>` rather than `Arc<SortPlan>`
+/// because what it actually needs is sorted input with the ability to save and
+/// restore a position — not any particular sort implementation. Only `SortPlan`
+/// implements this today, but the boundary keeps the plan layer honest about its
+/// true dependency.
 pub trait SortedSource: Plan {
     fn open_mark_restore(&self, ctx: &ExecutionContext) -> Box<dyn MarkRestoreScan>;
 }
@@ -3844,6 +3847,12 @@ impl UpdatePlanner for BasicUpdatePlanner {
     }
 }
 
+/// Executes DML and DDL statements against the catalog and storage layer.
+///
+/// The two implementations (`BasicUpdatePlanner` and `IndexUpdatePlanner`) differ
+/// in whether they maintain secondary index entries alongside heap mutations.
+/// `Planner` dispatches to one via dynamic dispatch so callers are unaware of
+/// which strategy is in use.
 pub trait UpdatePlanner {
     fn execute_insert(
         &self,
@@ -4681,6 +4690,11 @@ mod heuristic_efficiency_tests {
     }
 }
 
+/// Turns a parsed SELECT query into an executable physical plan.
+///
+/// Implementations choose join order, access paths (table scan vs. index), and
+/// physical operators. `Planner` holds one via a `Box<dyn QueryPlanner>` so the
+/// optimizer strategy can be swapped without changing call sites.
 pub trait QueryPlanner {
     fn create_plan(
         &self,
@@ -5736,10 +5750,23 @@ impl ExecutionContext {
     }
 }
 
+/// A node in the physical query plan tree.
+///
+/// Plans are pure descriptors — they carry cost estimates and schema information
+/// but perform no I/O themselves. Execution begins only when `open` is called,
+/// which returns a pull-based `Scan` iterator that drives actual data movement.
+///
+/// Cost methods (`blocks_accessed`, `records_output`, `distinct_values`) are used
+/// by the query optimizer to compare candidate plans before execution.
 pub trait Plan {
+    /// Open this plan node and return an iterator over its output rows.
+    /// All I/O, locking, and temp-table creation happen here, not at plan construction time.
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan>;
+    /// Estimated number of block reads required to execute this plan.
     fn blocks_accessed(&self) -> usize;
+    /// Estimated number of output records.
     fn records_output(&self) -> usize;
+    /// Estimated number of distinct values for the given field across output records.
     fn distinct_values(&self, field_name: &str) -> usize;
     fn schema(&self) -> Schema;
     fn print_plan(&self, indent: usize) {
@@ -5748,11 +5775,13 @@ pub trait Plan {
     fn print_plan_internal(&self, indent: usize);
 }
 
-/// A plan node that can be opened as a table-backed cursor.
-/// Only table-producing nodes implement this — `TablePlan` (base table) and
-/// `MaterializePlan` (temp table). Parent operators that need direct row-location
-/// access (`IndexSelectPlan`, `IndexJoinPlan`) store
-/// `Arc<dyn TableSource>` instead of concrete plan types.
+/// A plan node that can be opened as a mutable, row-positioned cursor.
+///
+/// Extends `Plan` for nodes whose output is a real heap table — `TablePlan` (a
+/// base table) and `MaterializePlan` (a materialized temp table). Callers that
+/// need to mutate rows or navigate by `RID` (`IndexSelectPlan`, `IndexJoinPlan`)
+/// store `Arc<dyn TableSource>` so they depend only on the capability, not on
+/// the concrete scan type.
 pub trait TableSource: Plan {
     fn open_table_cursor(&self, ctx: &ExecutionContext) -> Box<dyn TableCursor>;
 }
@@ -9332,22 +9361,49 @@ impl TableCursor for TableScan {
     }
 }
 
+/// A `Scan` that can save and restore its current position.
+///
+/// Required by merge join: when two sorted streams share a join key value across
+/// multiple rows, the right-side scan must be able to restart from the beginning
+/// of that group for each new left-side row. `SortScan` implements this;
+/// `MergeJoinScan` holds a `Box<dyn MarkRestoreScan>` rather than a concrete
+/// `SortScan` to express only the capability it needs.
 pub trait MarkRestoreScan: Scan {
+    /// Record the current scan position so it can be restored later.
     fn save_position(&mut self) -> SimpleDBResult<()>;
+    /// Return to the position recorded by the most recent `save_position` call.
     fn restore_position(&mut self) -> SimpleDBResult<()>;
 }
 
+/// A `Scan` with row-mutation and direct-positioning capabilities.
+///
+/// Used wherever a caller needs to do more than read — inserting, deleting,
+/// updating, or jumping directly to a known `RID` (e.g. after an index lookup).
+/// DML planners and index-backed scan nodes hold `Box<dyn TableCursor>` rather
+/// than a concrete `TableScan` so the physical layer is not over-specified.
 pub trait TableCursor: Scan + Any {
     fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()>;
     /// Insert a new record with the given values (in schema field order).
     fn insert_row(&mut self, values: &[Constant]) -> SimpleDBResult<()>;
     fn delete(&mut self) -> SimpleDBResult<()>;
+    /// Return the `RID` of the record at the current cursor position.
     fn rid(&self) -> Result<RID, Box<dyn Error>>;
+    /// Move directly to the record identified by `rid`, bypassing sequential iteration.
     fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()>;
 }
 
+/// Pull-based row iterator for the query execution engine.
+///
+/// All plan nodes produce a `Scan` when opened. Callers drive execution by
+/// calling the `Iterator::next` (inherited) in a loop; each `Ok(())` means the
+/// cursor has advanced to a new row whose fields can be read via `get_value`.
+///
+/// `before_first` resets the scan to before the first record, allowing a second
+/// pass without reopening the underlying storage.
 pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
+    /// Reset the cursor to before the first record.
     fn before_first(&mut self) -> SimpleDBResult<()>;
+    /// Read the value of `field_name` at the current cursor position.
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
 }
