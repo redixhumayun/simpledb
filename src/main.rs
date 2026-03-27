@@ -220,7 +220,7 @@ impl MultiBufferProductExecutor {
 }
 
 pub struct MultiBufferProductPlan {
-    lhs: Arc<dyn TableSource>,
+    lhs: Arc<MaterializePlan>,
     rhs: Arc<dyn Plan>,
     schema: Schema,
     block_size: usize,
@@ -238,7 +238,7 @@ impl MultiBufferProductPlan {
         let mut schema = Schema::new();
         schema.add_all_from_schema(&lhs.schema())?;
         schema.add_all_from_schema(&rhs.schema())?;
-        let lhs: Arc<dyn TableSource> = Arc::new(MaterializePlan::new(lhs, ctx));
+        let lhs = Arc::new(MaterializePlan::new(lhs, ctx));
         Ok(Self {
             lhs,
             rhs,
@@ -251,14 +251,14 @@ impl MultiBufferProductPlan {
 
 impl Plan for MultiBufferProductPlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
-        let table_scan = self.lhs.open_table_scan(ctx);
+        let lhs_temp = self.lhs.execute_to_temp(ctx);
         let executor = MultiBufferProductExecutor::new(Arc::clone(&self.rhs));
-        let temp_table = executor.create_temp_table(ctx).unwrap();
+        let rhs_temp = executor.create_temp_table(ctx).unwrap();
         let scan = MultiBufferProductScan::new(
             Arc::clone(ctx.txn()),
-            table_scan,
-            &temp_table.table_name,
-            temp_table.layout,
+            lhs_temp,
+            &rhs_temp.table_name,
+            rhs_temp.layout,
         );
         Box::new(scan)
     }
@@ -433,14 +433,11 @@ mod multi_buffer_product_plan_tests {
     }
 }
 
-pub struct MultiBufferProductScan<S1>
-where
-    S1: Scan + Clone,
-{
+pub struct MultiBufferProductScan {
     txn: Arc<Transaction>,
-    s1: S1,
+    lhs_temp: TempTable,
     s2: Option<ChunkScan>,
-    product_scan: Option<ProductScan<S1, ChunkScan>>,
+    product_scan: Option<ProductScan<TableScan, ChunkScan>>,
     chunk_size: usize,
     table_name: String,
     file_name: String,
@@ -448,11 +445,13 @@ where
     next_start_block_num: usize,
 }
 
-impl<S1> MultiBufferProductScan<S1>
-where
-    S1: Scan + Clone,
-{
-    pub fn new(txn: Arc<Transaction>, s1: S1, table_name: &str, layout: Layout) -> Self {
+impl MultiBufferProductScan {
+    pub fn new(
+        txn: Arc<Transaction>,
+        lhs_temp: TempTable,
+        table_name: &str,
+        layout: Layout,
+    ) -> Self {
         debug!("Creating multi buffer product scan for {}.tbl", table_name);
         let file_name = format!("{table_name}.tbl");
         let available_buffers = txn.available_buffs();
@@ -465,7 +464,7 @@ where
 
         let mut scan = MultiBufferProductScan {
             txn,
-            s1,
+            lhs_temp,
             s2: None,
             product_scan: None,
             chunk_size,
@@ -492,7 +491,7 @@ where
         self.product_scan.take();
         self.s2.take();
 
-        self.s1.before_first().unwrap();
+        let lhs_scan = self.lhs_temp.open();
         let chunk_scan = ChunkScan::new(
             Arc::clone(&self.txn),
             self.layout.clone(),
@@ -502,7 +501,7 @@ where
         );
         self.s2 = Some(chunk_scan);
         self.product_scan = Some(ProductScan::new(
-            self.s1.clone(),
+            lhs_scan,
             self.s2.as_ref().unwrap().clone(),
         ));
         self.next_start_block_num = new_last_block_num + 1;
@@ -510,10 +509,7 @@ where
     }
 }
 
-impl<S1> Iterator for MultiBufferProductScan<S1>
-where
-    S1: Scan + Clone,
-{
+impl Iterator for MultiBufferProductScan {
     type Item = SimpleDBResult<()>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -538,10 +534,7 @@ where
     }
 }
 
-impl<S1> Scan for MultiBufferProductScan<S1>
-where
-    S1: Scan + Clone,
-{
+impl Scan for MultiBufferProductScan {
     fn before_first(&mut self) -> SimpleDBResult<()> {
         self.next_start_block_num = 0;
         self.load_next_set_of_chunks();
@@ -617,9 +610,19 @@ mod multi_buffer_product_scan_tests {
         drop(emp_scan);
         drop(dept_scan);
 
-        // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
-        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+        // Create MultiBufferProductScan using a TempTable for the LHS
+        let emp_temp = TempTable::new(Arc::clone(&txn), emp_layout.schema.clone());
+        {
+            let mut src = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+            let mut dst = emp_temp.open();
+            while let Some(r) = src.next() {
+                r?;
+                let emp_id = src.get_value("emp_id")?;
+                let name = src.get_value("name")?;
+                dst.insert_row(&[emp_id, name])?;
+            }
+        }
+        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_temp, "dept", dept_layout);
 
         // Count total combinations (should be 500 * 3000 = 1,500,000)
         let mut count = 0;
@@ -641,9 +644,9 @@ mod multi_buffer_product_scan_tests {
         let txn = db.new_tx();
         let (emp_layout, dept_layout) = create_test_tables(&db, Arc::clone(&txn));
 
-        // Create empty scans
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
-        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+        // Create empty LHS TempTable
+        let emp_temp = TempTable::new(Arc::clone(&txn), emp_layout.schema.clone());
+        let mbp_scan = MultiBufferProductScan::new(Arc::clone(&txn), emp_temp, "dept", dept_layout);
 
         let mut count = 0;
         for result in mbp_scan {
@@ -669,10 +672,20 @@ mod multi_buffer_product_scan_tests {
         drop(emp_scan);
         drop(dept_scan);
 
-        // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
+        // Create MultiBufferProductScan using a TempTable for the LHS
+        let emp_temp = TempTable::new(Arc::clone(&txn), emp_layout.schema.clone());
+        {
+            let mut src = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+            let mut dst = emp_temp.open();
+            while let Some(r) = src.next() {
+                r?;
+                let emp_id = src.get_value("emp_id")?;
+                let name = src.get_value("name")?;
+                dst.insert_row(&[emp_id, name])?;
+            }
+        }
         let mut mbp_scan =
-            MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+            MultiBufferProductScan::new(Arc::clone(&txn), emp_temp, "dept", dept_layout);
 
         // Test first combination
         if let Some(result) = mbp_scan.next() {
@@ -705,10 +718,20 @@ mod multi_buffer_product_scan_tests {
         drop(emp_scan);
         drop(dept_scan);
 
-        // Create MultiBufferProductScan
-        let emp_scan = TableScan::new(Arc::clone(&txn), emp_layout, "emp", 1).unwrap();
+        // Create MultiBufferProductScan using a TempTable for the LHS
+        let emp_temp = TempTable::new(Arc::clone(&txn), emp_layout.schema.clone());
+        {
+            let mut src = TableScan::new(Arc::clone(&txn), emp_layout.clone(), "emp", 1).unwrap();
+            let mut dst = emp_temp.open();
+            while let Some(r) = src.next() {
+                r?;
+                let emp_id = src.get_value("emp_id")?;
+                let name = src.get_value("name")?;
+                dst.insert_row(&[emp_id, name])?;
+            }
+        }
         let mut mbp_scan =
-            MultiBufferProductScan::new(Arc::clone(&txn), emp_scan, "dept", dept_layout);
+            MultiBufferProductScan::new(Arc::clone(&txn), emp_temp, "dept", dept_layout);
 
         // Read some records
         mbp_scan.next();
@@ -1144,9 +1167,17 @@ pub fn best_factor(available_buffers: usize, num_of_blocks: usize) -> usize {
     k
 }
 
+/// A plan node that can produce a mark/restore-capable sorted scan.
+/// Only `SortPlan` implements this. `MergeJoinPlan` stores `Arc<dyn SortedSource>`
+/// instead of the concrete `SortPlan` to express that it only needs the
+/// mark/restore-capable sorted execution capability.
+pub trait SortedSource: Plan {
+    fn open_mark_restore(&self, ctx: &ExecutionContext) -> Box<dyn MarkRestoreScan>;
+}
+
 pub struct MergeJoinPlan {
     plan_1: Arc<dyn Plan>,
-    plan_2: Arc<SortPlan>,
+    plan_2: Arc<dyn SortedSource>,
     field_name_1: String,
     field_name_2: String,
     schema: Schema,
@@ -1155,7 +1186,7 @@ pub struct MergeJoinPlan {
 impl MergeJoinPlan {
     pub fn new(
         plan_1: Arc<dyn Plan>,
-        plan_2: Arc<SortPlan>,
+        plan_2: Arc<dyn SortedSource>,
         field_name_1: String,
         field_name_2: String,
     ) -> Result<Self, Box<dyn Error>> {
@@ -1175,10 +1206,10 @@ impl MergeJoinPlan {
 impl Plan for MergeJoinPlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
         let scan_1 = self.plan_1.open(ctx);
-        let sort_scan_2 = self.plan_2.open_sort_scan(ctx);
+        let scan_2 = self.plan_2.open_mark_restore(ctx);
         let scan = MergeJoinScan::new(
             scan_1,
-            sort_scan_2,
+            scan_2,
             self.field_name_1.clone(),
             self.field_name_2.clone(),
         );
@@ -1230,7 +1261,8 @@ mod merge_join_plan_tests {
     use std::sync::Arc;
 
     use crate::{
-        ExecutionContext, MergeJoinPlan, Plan, PlanningContext, SimpleDB, SortPlan, TablePlan,
+        ExecutionContext, MergeJoinPlan, Plan, PlanningContext, SimpleDB, SortPlan, SortedSource,
+        TablePlan,
     };
 
     #[test]
@@ -1272,7 +1304,7 @@ mod merge_join_plan_tests {
         // Create merge join plan
         let merge_join_plan = MergeJoinPlan::new(
             sort_plan1,
-            sort_plan2,
+            sort_plan2 as Arc<dyn SortedSource>,
             "id".to_string(),
             "depid".to_string(),
         )
@@ -1316,7 +1348,7 @@ where
     S: Scan,
 {
     scan_1: S,
-    scan_2: SortScan,
+    scan_2: Box<dyn MarkRestoreScan>,
     field_name_1: String,
     field_name_2: String,
     scan_state: MergeJoinScanState,
@@ -1331,7 +1363,12 @@ where
         self.at_new_group
     }
 
-    pub fn new(scan_1: S, scan_2: SortScan, field_name_1: String, field_name_2: String) -> Self {
+    pub fn new(
+        scan_1: S,
+        scan_2: Box<dyn MarkRestoreScan>,
+        field_name_1: String,
+        field_name_2: String,
+    ) -> Self {
         Self {
             scan_1,
             scan_2,
@@ -1453,8 +1490,8 @@ mod merge_join_scan_tests {
     use std::sync::Arc;
 
     use crate::{
-        Constant, Layout, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB, SortScan,
-        TableCursor, TempTable,
+        Constant, Layout, MarkRestoreScan, MergeJoinScan, RecordComparator, Scan, Schema, SimpleDB,
+        SortScan, TableCursor, TempTable,
     };
 
     #[test]
@@ -1503,8 +1540,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let mut merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join
         let mut join_count = 0;
@@ -1581,8 +1622,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join - should find no matches
         let mut join_count = 0;
@@ -1641,8 +1686,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let mut merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join - should find 2*3=6 matches for id=5
         let mut join_count = 0;
@@ -1682,8 +1731,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join - should find no matches
         let mut join_count = 0;
@@ -1728,8 +1781,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join - should find no matches
         let mut join_count = 0;
@@ -1785,8 +1842,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let mut merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // Test the join - should find exactly one match
         let mut join_count = 0;
@@ -1855,8 +1916,12 @@ mod merge_join_scan_tests {
         let sort_scan2 = SortScan::new(vec![temp_table2], record_comparator2);
 
         // Create MergeJoinScan
-        let mut merge_join_scan =
-            MergeJoinScan::new(sort_scan1, sort_scan2, "id".to_string(), "id".to_string());
+        let mut merge_join_scan = MergeJoinScan::new(
+            sort_scan1,
+            Box::new(sort_scan2),
+            "id".to_string(),
+            "id".to_string(),
+        );
 
         // First read all records
         let mut first_pass_count = 0;
@@ -2157,6 +2222,12 @@ impl SortPlan {
         let source_scan = self.source_plan.open(ctx);
         let executor = SortExecutor::new(self.schema.clone(), self.record_comparator.clone());
         executor.execute(ctx, source_scan).unwrap()
+    }
+}
+
+impl SortedSource for SortPlan {
+    fn open_mark_restore(&self, ctx: &ExecutionContext) -> Box<dyn MarkRestoreScan> {
+        Box::new(self.open_sort_scan(ctx))
     }
 }
 
@@ -2599,6 +2670,16 @@ impl Scan for SortScan {
     }
 }
 
+impl MarkRestoreScan for SortScan {
+    fn save_position(&mut self) -> SimpleDBResult<()> {
+        SortScan::save_position(self)
+    }
+
+    fn restore_position(&mut self) -> SimpleDBResult<()> {
+        SortScan::restore_position(self)
+    }
+}
+
 #[cfg(test)]
 mod sort_scan_tests {
     use std::sync::Arc;
@@ -2770,7 +2851,7 @@ impl RecordComparator {
 /// Owns the runtime materialization of a source plan into a temporary table.
 ///
 /// Lives entirely below `Plan::open` — it is created inside
-/// `MaterializePlan::open_table_scan` and never appears in the physical plan layer.
+/// `MaterializePlan::open_table_cursor` and never appears in the physical plan layer.
 struct MaterializeExecutor {
     source_plan: Arc<dyn Plan>,
 }
@@ -2780,7 +2861,7 @@ impl MaterializeExecutor {
         Self { source_plan }
     }
 
-    fn execute(&self, ctx: &ExecutionContext) -> TableScan {
+    fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable {
         let mut source_scan = self.source_plan.open(ctx);
         println!("The schema retrieved {:?}", self.source_plan.schema());
         let temp_table = TempTable::new(Arc::clone(ctx.txn()), self.source_plan.schema());
@@ -2798,8 +2879,15 @@ impl MaterializeExecutor {
                 .collect();
             temp_table_scan.insert_row(&values).unwrap();
         }
-        temp_table_scan.before_first().unwrap();
-        temp_table_scan
+        drop(temp_table_scan);
+        temp_table
+    }
+
+    fn execute(&self, ctx: &ExecutionContext) -> TableScan {
+        let temp_table = self.execute_to_temp(ctx);
+        let mut scan = temp_table.open();
+        scan.before_first().unwrap();
+        scan
     }
 }
 
@@ -2818,15 +2906,21 @@ impl MaterializePlan {
     }
 }
 
+impl MaterializePlan {
+    pub fn execute_to_temp(&self, ctx: &ExecutionContext) -> TempTable {
+        MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute_to_temp(ctx)
+    }
+}
+
 impl TableSource for MaterializePlan {
-    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
-        MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute(ctx)
+    fn open_table_cursor(&self, ctx: &ExecutionContext) -> Box<dyn TableCursor> {
+        Box::new(MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute(ctx))
     }
 }
 
 impl Plan for MaterializePlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
-        Box::new(self.open_table_scan(ctx))
+        Box::new(MaterializeExecutor::new(Arc::clone(&self.source_plan)).execute(ctx))
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -3297,7 +3391,7 @@ mod planner_tests {
         let planning_ctx = PlanningContext::new(Arc::clone(&txn), Arc::clone(&db.metadata_manager));
         let table_plan = TablePlan::new("student", &planning_ctx);
         let ctx = ExecutionContext::new(Arc::clone(&txn));
-        let mut table_scan = table_plan.open_table_scan(&ctx);
+        let mut table_scan = table_plan.open_table_cursor(&ctx);
 
         // Open the index
         let mut index = major_index.open();
@@ -3416,7 +3510,8 @@ mod planner_tests {
             let planning_ctx =
                 PlanningContext::new(Arc::clone(&txn), Arc::clone(&db.metadata_manager));
             let ctx = ExecutionContext::new(Arc::clone(&txn));
-            let mut table_scan = TablePlan::new("student_alt", &planning_ctx).open_table_scan(&ctx);
+            let mut table_scan =
+                TablePlan::new("student_alt", &planning_ctx).open_table_cursor(&ctx);
             table_scan.move_to_rid(rid).unwrap();
             if table_scan.get_value("sname").unwrap().as_str().to_string() == "sam" {
                 found = true;
@@ -3486,7 +3581,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         }
         txn.lock_in_order(lock_requests)?;
         let ctx = ExecutionContext::new(Arc::clone(&txn));
-        let mut scan = plan.open_table_scan(&ctx);
+        let mut scan = plan.open_table_cursor(&ctx);
         scan.insert_row(&values)?;
         let rid = scan.rid()?;
         for (field, value) in data.fields.iter().zip(data.values.iter()) {
@@ -3517,7 +3612,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
         let ctx = ExecutionContext::new(Arc::clone(&txn));
-        let mut scan = table_plan.open_table_scan(&ctx);
+        let mut scan = table_plan.open_table_cursor(&ctx);
         let mut rows_deleted = 0;
 
         while let Some(result) = scan.next() {
@@ -3555,7 +3650,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         lock_requests.extend(predicate.index_lock_requests(&indexes, IndexLockMode::X));
         txn.lock_in_order(lock_requests)?;
         let ctx = ExecutionContext::new(Arc::clone(&txn));
-        let mut scan = table_plan.open_table_scan(&ctx);
+        let mut scan = table_plan.open_table_cursor(&ctx);
         let mut update_count = 0;
 
         while let Some(result) = scan.next() {
@@ -3652,7 +3747,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
             })
             .collect();
         let ctx = ExecutionContext::new(txn);
-        let mut scan = plan.open_table_scan(&ctx);
+        let mut scan = plan.open_table_cursor(&ctx);
         scan.insert_row(&values)?;
         Ok(1)
     }
@@ -3667,7 +3762,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let table_plan = TablePlan::new(&data.table_name, &planning_ctx);
         let predicate = data.predicate;
         let ctx = ExecutionContext::new(txn);
-        let mut scan = table_plan.open_table_scan(&ctx);
+        let mut scan = table_plan.open_table_cursor(&ctx);
         let mut rows_deleted = 0;
         while let Some(result) = scan.next() {
             result?;
@@ -3689,7 +3784,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
         let table_plan = TablePlan::new(&data.table_name, &planning_ctx);
         let predicate = data.predicate;
         let ctx = ExecutionContext::new(txn);
-        let mut scan = table_plan.open_table_scan(&ctx);
+        let mut scan = table_plan.open_table_cursor(&ctx);
         let mut update_count = 0;
         while let Some(result) = scan.next() {
             result?;
@@ -5390,9 +5485,13 @@ impl IndexSelectPlan {
 
 impl Plan for IndexSelectPlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
-        let scan = self.plan.open_table_scan(ctx);
+        let scan = self.plan.open_table_cursor(ctx);
+        let txn = Arc::clone(ctx.txn());
+        let table_id = self.ii.indexed_table_id();
         Box::new(IndexSelectScan::new(
             scan,
+            txn,
+            table_id,
             self.ii.open(),
             self.bounds.clone(),
         ))
@@ -5506,20 +5605,30 @@ impl TablePlan {
 }
 
 impl TableSource for TablePlan {
-    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan {
-        TableScan::new(
-            Arc::clone(ctx.txn()),
-            self.layout.clone(),
-            &self.table_name,
-            self.table_id,
+    fn open_table_cursor(&self, ctx: &ExecutionContext) -> Box<dyn TableCursor> {
+        Box::new(
+            TableScan::new(
+                Arc::clone(ctx.txn()),
+                self.layout.clone(),
+                &self.table_name,
+                self.table_id,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 }
 
 impl Plan for TablePlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
-        Box::new(self.open_table_scan(ctx))
+        Box::new(
+            TableScan::new(
+                Arc::clone(ctx.txn()),
+                self.layout.clone(),
+                &self.table_name,
+                self.table_id,
+            )
+            .unwrap(),
+        )
     }
 
     fn blocks_accessed(&self) -> usize {
@@ -5636,7 +5745,7 @@ pub trait Plan {
 /// access (`IndexSelectPlan`, `IndexJoinPlan`, `MultiBufferProductPlan`) store
 /// `Arc<dyn TableSource>` instead of concrete plan types.
 pub trait TableSource: Plan {
-    fn open_table_scan(&self, ctx: &ExecutionContext) -> TableScan;
+    fn open_table_cursor(&self, ctx: &ExecutionContext) -> Box<dyn TableCursor>;
 }
 
 #[cfg(test)]
@@ -5753,6 +5862,30 @@ impl TableCursor for Box<dyn TableCursor> {
 
     fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
         (**self).move_to_rid(rid)
+    }
+}
+
+impl Scan for Box<dyn MarkRestoreScan> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
+        (**self).before_first()
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        (**self).get_value(field_name)
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        (**self).has_field(field_name)
+    }
+}
+
+impl MarkRestoreScan for Box<dyn MarkRestoreScan> {
+    fn save_position(&mut self) -> SimpleDBResult<()> {
+        (**self).save_position()
+    }
+
+    fn restore_position(&mut self) -> SimpleDBResult<()> {
+        (**self).restore_position()
     }
 }
 
@@ -6067,7 +6200,7 @@ impl IndexJoinPlan {
 impl Plan for IndexJoinPlan {
     fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
         let lhs = self.plan_1.open(ctx);
-        let scan = self.plan_2.open_table_scan(ctx);
+        let scan = self.plan_2.open_table_cursor(ctx);
         let idx = self.index_info.open();
         Box::new(IndexJoinScan::new(lhs, idx, scan, self.join_field.clone()))
     }
@@ -6282,7 +6415,7 @@ where
     I: Index,
 {
     lhs: S,
-    rhs: TableScan,
+    rhs: Box<dyn TableCursor>,
     index: I,
     join_field: String,
     state: IndexJoinScanState,
@@ -6293,7 +6426,7 @@ where
     S: Scan,
     I: Index,
 {
-    pub fn new(lhs: S, index: I, rhs: TableScan, join_field: String) -> Self {
+    pub fn new(lhs: S, index: I, rhs: Box<dyn TableCursor>, join_field: String) -> Self {
         Self {
             lhs,
             rhs,
@@ -6346,7 +6479,7 @@ where
                 IndexJoinScanState::Probe => {
                     if self.index.next() {
                         let rid = self.index.get_data_rid();
-                        self.rhs.move_to_row_id(rid);
+                        self.rhs.move_to_rid(rid).unwrap();
                         return Some(Ok(()));
                     } else {
                         self.state = IndexJoinScanState::Advance;
@@ -6472,7 +6605,8 @@ mod index_join_scan_tests {
         {
             let mut join_count = 0;
             let scan1 = TableScan::new(Arc::clone(&txn), layout1.clone(), "T1", 1).unwrap();
-            let scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
+            let scan2: Box<dyn TableCursor> =
+                Box::new(TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap());
             let index = index_info.open();
 
             let mut index_join_scan = IndexJoinScan::new(scan1, index, scan2, "A".to_string());
@@ -6504,7 +6638,9 @@ pub struct IndexSelectScan<I>
 where
     I: Index,
 {
-    scan: TableScan,
+    scan: Box<dyn TableCursor>,
+    txn: Arc<Transaction>,
+    table_id: u32,
     index: I,
     bounds: IndexSearchBounds,
 }
@@ -6513,9 +6649,17 @@ impl<I> IndexSelectScan<I>
 where
     I: Index,
 {
-    fn new(scan: TableScan, index: I, bounds: IndexSearchBounds) -> Self {
+    fn new(
+        scan: Box<dyn TableCursor>,
+        txn: Arc<Transaction>,
+        table_id: u32,
+        index: I,
+        bounds: IndexSearchBounds,
+    ) -> Self {
         Self {
             scan,
+            txn,
+            table_id,
             index,
             bounds,
         }
@@ -6532,7 +6676,7 @@ where
         let result = self.index.next();
         if result {
             let rid = self.index.get_data_rid();
-            self.scan.move_to_row_id(rid);
+            self.scan.move_to_rid(rid).unwrap();
             return Some(Ok(()));
         }
         None
@@ -6544,12 +6688,10 @@ where
     I: Index,
 {
     fn before_first(&mut self) -> SimpleDBResult<()> {
-        self.scan
-            .txn
-            .lock_in_order(vec![OrderedLockRequest::Table {
-                table_id: self.scan.table_id,
-                mode: TableLockMode::IS,
-            }])?;
+        self.txn.lock_in_order(vec![OrderedLockRequest::Table {
+            table_id: self.table_id,
+            mode: TableLockMode::IS,
+        }])?;
         match &self.bounds {
             IndexSearchBounds::Key(value) => {
                 self.index.before_first(value);
@@ -6639,11 +6781,18 @@ mod index_select_scan_tests {
         //  read block via index
         {
             let mut selection_count = 0;
-            let scan = TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap();
+            let scan: Box<dyn TableCursor> =
+                Box::new(TableScan::new(Arc::clone(&txn), layout.clone(), "T", 1).unwrap());
             let value = Constant::Int(10);
             let index = index_info.open();
-            let mut index_select_scan =
-                IndexSelectScan::new(scan, index, IndexSearchBounds::Key(value));
+            let table_id = index_info.indexed_table_id();
+            let mut index_select_scan = IndexSelectScan::new(
+                scan,
+                Arc::clone(&txn),
+                table_id,
+                index,
+                IndexSearchBounds::Key(value),
+            );
             index_select_scan.before_first().unwrap();
             while let Some(Ok(())) = index_select_scan.next() {
                 assert_eq!(index_select_scan.get_value("A").unwrap().as_int(), 10);
@@ -9172,6 +9321,11 @@ impl TableCursor for TableScan {
         self.current_slot = Some(rid.slot);
         Ok(())
     }
+}
+
+pub trait MarkRestoreScan: Scan {
+    fn save_position(&mut self) -> SimpleDBResult<()>;
+    fn restore_position(&mut self) -> SimpleDBResult<()>;
 }
 
 pub trait TableCursor: Scan + Any {
