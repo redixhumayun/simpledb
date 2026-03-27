@@ -213,7 +213,7 @@ impl MultiBufferProductExecutor {
                 .iter()
                 .map(|f| source_scan.get_value(f))
                 .collect::<Result<Vec<_>, _>>()?;
-            table_scan.insert_values(&values)?;
+            table_scan.insert_row(&values)?;
         }
         Ok(temp_table)
     }
@@ -548,14 +548,6 @@ where
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        self.product_scan.as_ref().unwrap().get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        self.product_scan.as_ref().unwrap().get_string(field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         self.product_scan.as_ref().unwrap().get_value(field_name)
     }
@@ -597,13 +589,12 @@ mod multi_buffer_product_scan_tests {
     ) -> SimpleDBResult<()> {
         // Insert employee records
         for i in 0..emp_size {
-            emp_scan
-                .insert_values(&[Constant::Int(i as i32), Constant::String(format!("emp{i}"))])?;
+            emp_scan.insert_row(&[Constant::Int(i as i32), Constant::String(format!("emp{i}"))])?;
         }
 
         // Insert department records
         for i in 0..dept_size {
-            dept_scan.insert_values(&[
+            dept_scan.insert_row(&[
                 Constant::Int(i as i32),
                 Constant::String(format!("dept{i}")),
             ])?;
@@ -686,10 +677,10 @@ mod multi_buffer_product_scan_tests {
         // Test first combination
         if let Some(result) = mbp_scan.next() {
             result?;
-            let emp_id = mbp_scan.get_int("emp_id")?;
-            let name = mbp_scan.get_string("name")?;
-            let dept_id = mbp_scan.get_int("dept_id")?;
-            let dept_name = mbp_scan.get_string("dept_name")?;
+            let emp_id = mbp_scan.get_value("emp_id")?.as_int();
+            let name = mbp_scan.get_value("name")?.as_str().to_string();
+            let dept_id = mbp_scan.get_value("dept_id")?.as_int();
+            let dept_name = mbp_scan.get_value("dept_name")?.as_str().to_string();
 
             assert_eq!(emp_id, 0, "First employee ID should be 0");
             assert_eq!(name, "emp0", "First employee name should be emp0");
@@ -854,44 +845,23 @@ impl Scan for ChunkScan {
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        let record_page = &self.buffer_list[self.current_record_page.ok_or_else(|| {
-            format!(
-                "No record page number in ChunkScan set when calling get_int for {}",
-                self.table_name
-            )
-        })?];
-        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No current slot set in ChunkScan when calling get_int for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        record_page.get_int(slot, field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        let record_page = &self.buffer_list[self.current_record_page.ok_or_else(|| {
-            format!(
-                "No record page number set in ChunkScan when calling get_string for {}",
-                self.table_name
-            )
-        })?];
-        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No current slot set in ChunkScan when calling get_string for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        record_page.get_string(slot, field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        let record_page = &self.buffer_list[self.current_record_page.ok_or_else(|| {
+            format!(
+                "No record page number in ChunkScan set when calling get_value for {}",
+                self.table_name
+            )
+        })?];
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set in ChunkScan when calling get_value for {}",
+                self.table_name
+            )
+            .into()
+        })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(record_page.get_int(slot, field_name)?)),
+            FieldType::String => Ok(Constant::String(record_page.get_string(slot, field_name)?)),
         }
     }
 
@@ -948,7 +918,7 @@ mod chunk_scan_tests {
 
     fn insert_test_records(table_scan: &mut TableScan, count: usize) -> SimpleDBResult<()> {
         for i in 0..count {
-            table_scan.insert_values(&[
+            table_scan.insert_row(&[
                 Constant::Int(i as i32),
                 Constant::String(format!("name{i}")),
             ])?;
@@ -982,8 +952,8 @@ mod chunk_scan_tests {
 
         while let Some(result) = chunk_scan.next() {
             result?;
-            let id = chunk_scan.get_int("id")?;
-            let name = chunk_scan.get_string("name")?;
+            let id = chunk_scan.get_value("id")?.as_int();
+            let name = chunk_scan.get_value("name")?.as_str().to_string();
 
             assert!(id > last_id, "Records should be read in order");
             assert_eq!(name, format!("name{id}"));
@@ -1022,8 +992,8 @@ mod chunk_scan_tests {
 
         while let Some(result) = chunk_scan.next() {
             result?;
-            let id = chunk_scan.get_int("id")?;
-            let name = chunk_scan.get_string("name")?;
+            let id = chunk_scan.get_value("id")?.as_int();
+            let name = chunk_scan.get_value("name")?.as_str().to_string();
 
             assert!(id > last_id, "Records should be read in order");
             assert_eq!(name, format!("name{id}"));
@@ -1061,7 +1031,7 @@ mod chunk_scan_tests {
         let mut records = Vec::new();
         while let Some(result) = chunk_scan.next() {
             result?;
-            let id = chunk_scan.get_int("id")?;
+            let id = chunk_scan.get_value("id")?.as_int();
             records.push(id);
         }
 
@@ -1126,7 +1096,7 @@ mod chunk_scan_tests {
         let mut ids = Vec::new();
         while let Some(result) = chunk_scan.next() {
             result?;
-            ids.push(chunk_scan.get_int("id")?);
+            ids.push(chunk_scan.get_value("id")?.as_int());
         }
         assert_eq!(ids.len(), 5, "Should read all records after before_first");
         assert_eq!(
@@ -1315,9 +1285,9 @@ mod merge_join_plan_tests {
         let mut results = Vec::new();
         while let Some(result) = scan.next() {
             assert!(result.is_ok());
-            let id = scan.get_int("id").unwrap();
-            let name = scan.get_string("name").unwrap();
-            let dept = scan.get_string("deptname").unwrap();
+            let id = scan.get_value("id").unwrap().as_int();
+            let name = scan.get_value("name").unwrap().as_str().to_string();
+            let dept = scan.get_value("deptname").unwrap().as_str().to_string();
             results.push((id, name, dept));
         }
 
@@ -1460,24 +1430,6 @@ where
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if self.scan_1.has_field(field_name)? {
-            return self.scan_1.get_int(field_name);
-        } else if self.scan_2.has_field(field_name)? {
-            return self.scan_2.get_int(field_name);
-        }
-        Err(format!("Field {field_name} not found").into())
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if self.scan_1.has_field(field_name)? {
-            return self.scan_1.get_string(field_name);
-        } else if self.scan_2.has_field(field_name)? {
-            return self.scan_2.get_string(field_name);
-        }
-        Err(format!("Field {field_name} not found").into())
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         if self.scan_1.has_field(field_name)? {
             return self.scan_1.get_value(field_name);
@@ -1530,7 +1482,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 2, 3, 5, 7] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -1539,7 +1491,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [2, 3, 5, 7, 9] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
                     .unwrap();
             }
         }
@@ -1561,9 +1513,17 @@ mod merge_join_scan_tests {
 
         while let Some(result) = merge_join_scan.next() {
             assert!(result.is_ok(), "Join should succeed");
-            let id1 = merge_join_scan.get_int("id").unwrap();
-            let name = merge_join_scan.get_string("name").unwrap();
-            let dept = merge_join_scan.get_string("dept").unwrap();
+            let id1 = merge_join_scan.get_value("id").unwrap().as_int();
+            let name = merge_join_scan
+                .get_value("name")
+                .unwrap()
+                .as_str()
+                .to_string();
+            let dept = merge_join_scan
+                .get_value("dept")
+                .unwrap()
+                .as_str()
+                .to_string();
 
             assert_eq!(format!("name{id1}"), name);
             assert_eq!(format!("dept{id1}"), dept);
@@ -1601,7 +1561,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5, 7, 9] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -1609,7 +1569,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [2, 4, 6, 8, 10] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
                     .unwrap();
             }
         }
@@ -1660,7 +1620,7 @@ mod merge_join_scan_tests {
             let mut scan = temp_table1.open();
             // Insert id=5 twice
             for i in [1, 3, 5, 5, 7] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -1669,7 +1629,7 @@ mod merge_join_scan_tests {
             let mut scan = temp_table2.open();
             // Insert id=5 three times
             for i in [2, 5, 5, 5, 8] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
                     .unwrap();
             }
         }
@@ -1688,7 +1648,7 @@ mod merge_join_scan_tests {
         let mut join_count = 0;
         while let Some(result) = merge_join_scan.next() {
             assert!(result.is_ok());
-            let id = merge_join_scan.get_int("id").unwrap();
+            let id = merge_join_scan.get_value("id").unwrap().as_int();
             assert_eq!(id, 5, "Only id=5 should match");
             join_count += 1;
         }
@@ -1757,7 +1717,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in 1..5 {
-                scan.insert_values(&[Constant::Int(i)]).unwrap();
+                scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -1805,7 +1765,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5, 7] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -1813,7 +1773,7 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [5, 8, 10] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("dept{i}"))])
                     .unwrap();
             }
         }
@@ -1832,9 +1792,17 @@ mod merge_join_scan_tests {
         let mut join_count = 0;
         while let Some(result) = merge_join_scan.next() {
             assert!(result.is_ok());
-            let id = merge_join_scan.get_int("id").unwrap();
-            let name = merge_join_scan.get_string("name").unwrap();
-            let dept = merge_join_scan.get_string("dept").unwrap();
+            let id = merge_join_scan.get_value("id").unwrap().as_int();
+            let name = merge_join_scan
+                .get_value("name")
+                .unwrap()
+                .as_str()
+                .to_string();
+            let dept = merge_join_scan
+                .get_value("dept")
+                .unwrap()
+                .as_str()
+                .to_string();
 
             assert_eq!(id, 5);
             assert_eq!(name, "name5");
@@ -1869,14 +1837,14 @@ mod merge_join_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in 1..4 {
-                scan.insert_values(&[Constant::Int(i)]).unwrap();
+                scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
 
         {
             let mut scan = temp_table2.open();
             for i in 1..4 {
-                scan.insert_values(&[Constant::Int(i)]).unwrap();
+                scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -1944,7 +1912,7 @@ impl SortExecutor {
             .iter()
             .map(|f| source.get_value(f))
             .collect::<Result<Vec<_>, _>>()?;
-        destination.insert_values(&values)?;
+        destination.insert_row(&values)?;
         Ok(())
     }
 
@@ -2274,7 +2242,7 @@ mod sort_plan_tests {
 
         while let Some(result) = sort_scan.next() {
             assert!(result.is_ok());
-            let curr_id = sort_scan.get_int("id").unwrap();
+            let curr_id = sort_scan.get_value("id").unwrap().as_int();
 
             if let Some(prev) = prev_id {
                 assert!(curr_id > prev, "Records should be in ascending order");
@@ -2327,7 +2295,7 @@ mod sort_plan_tests {
 
         while let Some(result) = sort_scan.next() {
             assert!(result.is_ok());
-            let curr_grade = sort_scan.get_int("grade").unwrap();
+            let curr_grade = sort_scan.get_value("grade").unwrap().as_int();
 
             if let Some(prev) = prev_grade {
                 assert!(curr_grade >= prev, "Records should be in ascending order");
@@ -2393,8 +2361,8 @@ mod sort_plan_tests {
 
         while let Some(result) = sort_scan.next() {
             assert!(result.is_ok());
-            let curr_dept = sort_scan.get_int("dept").unwrap();
-            let curr_salary = sort_scan.get_int("salary").unwrap();
+            let curr_dept = sort_scan.get_value("dept").unwrap().as_int();
+            let curr_salary = sort_scan.get_value("salary").unwrap().as_int();
 
             if let (Some(pd), Some(ps)) = (prev_dept, prev_salary) {
                 assert!(
@@ -2500,8 +2468,8 @@ impl SortScan {
     }
 
     pub fn save_position(&mut self) -> SimpleDBResult<()> {
-        let rid_1 = self.s1.get_rid()?;
-        let rid_2 = self.s2.as_ref().map(|s| s.get_rid()).transpose()?;
+        let rid_1 = self.s1.rid()?;
+        let rid_2 = self.s2.as_ref().map(|s| s.rid()).transpose()?;
         self.saved_rids[0] = Some(rid_1);
         self.saved_rids[1] = rid_2;
         Ok(())
@@ -2610,26 +2578,6 @@ impl Scan for SortScan {
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        match self.current_scan {
-            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_int(field_name),
-            SortScanState::OnSecond | SortScanState::OnlySecond => {
-                self.s2.as_ref().unwrap().get_int(field_name)
-            }
-            _ => Err("No current record".into()),
-        }
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        match self.current_scan {
-            SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_string(field_name),
-            SortScanState::OnSecond | SortScanState::OnlySecond => {
-                self.s2.as_ref().unwrap().get_string(field_name)
-            }
-            _ => Err("No current record".into()),
-        }
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         match self.current_scan {
             SortScanState::OnFirst | SortScanState::OnlyFirst => self.s1.get_value(field_name),
@@ -2680,7 +2628,7 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table1.open();
             for i in [1, 3, 5] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -2689,7 +2637,7 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table2.open();
             for i in [2, 4, 6] {
-                scan.insert_values(&[Constant::Int(i), Constant::String(format!("name{i}"))])
+                scan.insert_row(&[Constant::Int(i), Constant::String(format!("name{i}"))])
                     .unwrap();
             }
         }
@@ -2706,7 +2654,7 @@ mod sort_scan_tests {
 
         while let Some(result) = sort_scan.next() {
             assert!(result.is_ok());
-            let curr_id = sort_scan.get_int("id").unwrap();
+            let curr_id = sort_scan.get_value("id").unwrap().as_int();
 
             if let Some(prev) = prev_id {
                 assert!(
@@ -2739,7 +2687,7 @@ mod sort_scan_tests {
         {
             let mut scan = temp_table.open();
             for i in [1, 2, 3, 4, 5] {
-                scan.insert_values(&[Constant::Int(i)]).unwrap();
+                scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
 
@@ -2751,7 +2699,7 @@ mod sort_scan_tests {
 
         while let Some(result) = sort_scan.next() {
             assert!(result.is_ok());
-            let curr_id = sort_scan.get_int("id").unwrap();
+            let curr_id = sort_scan.get_value("id").unwrap().as_int();
 
             if let Some(prev) = prev_id {
                 assert!(curr_id > prev);
@@ -2848,7 +2796,7 @@ impl MaterializeExecutor {
                 .iter()
                 .map(|f| source_scan.get_value(f).unwrap())
                 .collect();
-            temp_table_scan.insert_values(&values).unwrap();
+            temp_table_scan.insert_row(&values).unwrap();
         }
         temp_table_scan.before_first().unwrap();
         temp_table_scan
@@ -2962,8 +2910,12 @@ mod materialize_plan_tests {
         let mut count = 0;
         while let Some(result) = materialized_scan.next() {
             assert!(result.is_ok());
-            let a_val = materialized_scan.get_int("a").unwrap();
-            let b_val = materialized_scan.get_string("b").unwrap();
+            let a_val = materialized_scan.get_value("a").unwrap().as_int();
+            let b_val = materialized_scan
+                .get_value("b")
+                .unwrap()
+                .as_str()
+                .to_string();
 
             // Verify against original data
             assert_eq!(b_val, test_data[count].1);
@@ -2982,8 +2934,12 @@ mod materialize_plan_tests {
         let mut count = 0;
         while let Some(result) = materialized_scan.next() {
             assert!(result.is_ok());
-            let a_val = materialized_scan.get_int("a").unwrap();
-            let b_val = materialized_scan.get_string("b").unwrap();
+            let a_val = materialized_scan.get_value("a").unwrap().as_int();
+            let b_val = materialized_scan
+                .get_value("b")
+                .unwrap()
+                .as_str()
+                .to_string();
 
             // Verify against original data
             assert_eq!(b_val, test_data[count].1);
@@ -3160,7 +3116,7 @@ mod planner_tests {
         let mut scan = plan.open(&ctx);
         let mut retrieved_count = 0;
         while let Some(_) = scan.next() {
-            scan.get_string("b").unwrap();
+            scan.get_value("b").unwrap().as_str().to_string();
             retrieved_count += 1;
         }
         assert_eq!(retrieved_count, 189);
@@ -3205,8 +3161,8 @@ mod planner_tests {
         let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
-            let lhs = scan.get_string("b").unwrap();
-            let rhs = scan.get_string("d").unwrap();
+            let lhs = scan.get_value("b").unwrap().as_str().to_string();
+            let rhs = scan.get_value("d").unwrap().as_str().to_string();
             assert_eq!(lhs, rhs);
             read_count += 1;
         }
@@ -3239,8 +3195,8 @@ mod planner_tests {
         let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
-            scan.get_int("a").unwrap();
-            scan.get_string("b").unwrap();
+            scan.get_value("a").unwrap().as_int();
+            scan.get_value("b").unwrap().as_str().to_string();
             read_count += 1;
         }
         assert_eq!(read_count, count);
@@ -3255,8 +3211,8 @@ mod planner_tests {
         let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
-            let a = scan.get_int("a").unwrap();
-            scan.get_string("b").unwrap();
+            let a = scan.get_value("a").unwrap().as_int();
+            scan.get_value("b").unwrap().as_str().to_string();
             assert!(a >= 100);
             read_count += 1;
         }
@@ -3291,8 +3247,11 @@ mod planner_tests {
         let mut scan = plan.open(&ctx);
         let mut read_count = 0;
         while let Some(_) = scan.next() {
-            scan.get_int("a").unwrap();
-            assert_eq!(scan.get_string("b").unwrap(), "modified");
+            scan.get_value("a").unwrap().as_int();
+            assert_eq!(
+                scan.get_value("b").unwrap().as_str().to_string(),
+                "modified"
+            );
             read_count += 1;
         }
         assert_eq!(read_count, 100);
@@ -3351,7 +3310,7 @@ mod planner_tests {
         while index.next() {
             let rid = index.get_data_rid();
             table_scan.move_to_rid(rid).unwrap();
-            found_students.push(table_scan.get_string("sname").unwrap());
+            found_students.push(table_scan.get_value("sname").unwrap().as_str().to_string());
         }
 
         assert_eq!(found_students.len(), 3);
@@ -3423,8 +3382,8 @@ mod planner_tests {
 
         let mut results = Vec::new();
         while let Some(_) = scan.next() {
-            let name = scan.get_string("sname").unwrap();
-            let id = scan.get_int("sid").unwrap();
+            let name = scan.get_value("sname").unwrap().as_str().to_string();
+            let id = scan.get_value("sid").unwrap().as_int();
             results.push((name, id));
         }
 
@@ -3459,7 +3418,7 @@ mod planner_tests {
             let ctx = ExecutionContext::new(Arc::clone(&txn));
             let mut table_scan = TablePlan::new("student_alt", &planning_ctx).open_table_scan(&ctx);
             table_scan.move_to_rid(rid).unwrap();
-            if table_scan.get_string("sname").unwrap() == "sam" {
+            if table_scan.get_value("sname").unwrap().as_str().to_string() == "sam" {
                 found = true;
                 break;
             }
@@ -3528,8 +3487,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
         txn.lock_in_order(lock_requests)?;
         let ctx = ExecutionContext::new(Arc::clone(&txn));
         let mut scan = plan.open_table_scan(&ctx);
-        scan.insert_values(&values)?;
-        let rid = scan.get_rid()?;
+        scan.insert_row(&values)?;
+        let rid = scan.rid()?;
         for (field, value) in data.fields.iter().zip(data.values.iter()) {
             if let Some(ii) = indexes.get(field) {
                 let mut index = ii.open();
@@ -3564,7 +3523,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
         while let Some(result) = scan.next() {
             result?;
             if predicate.is_satisfied(&scan)? {
-                let rid = scan.get_rid()?;
+                let rid = scan.rid()?;
                 for field in indexes.keys() {
                     let mut index = indexes.get(field).unwrap().open();
                     index.delete(&scan.get_value(field)?, &rid);
@@ -3607,8 +3566,8 @@ impl UpdatePlanner for IndexUpdatePlanner {
                 scan.set_value(&data.field_name, new_value.clone())?;
                 if let Some(ii) = indexes.get(&data.field_name) {
                     let mut index = ii.open();
-                    index.delete(&old_value, &scan.get_rid()?);
-                    index.insert(&new_value, &scan.get_rid()?);
+                    index.delete(&old_value, &scan.rid()?);
+                    index.insert(&new_value, &scan.rid()?);
                 }
                 update_count += 1;
             }
@@ -3694,7 +3653,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
             .collect();
         let ctx = ExecutionContext::new(txn);
         let mut scan = plan.open_table_scan(&ctx);
-        scan.insert_values(&values)?;
+        scan.insert_row(&values)?;
         Ok(1)
     }
 
@@ -5737,10 +5696,10 @@ mod plan_test_single_table {
             while let Some(_) = scan.next() {
                 println!(
                     "sid {}, sname {}, majorid {}, gradyear {}",
-                    scan.get_int("sid").unwrap(),
-                    scan.get_string("sname").unwrap(),
-                    scan.get_int("majorid").unwrap(),
-                    scan.get_int("gradyear").unwrap()
+                    scan.get_value("sid").unwrap().as_int(),
+                    scan.get_value("sname").unwrap().as_str().to_string(),
+                    scan.get_value("majorid").unwrap().as_int(),
+                    scan.get_value("gradyear").unwrap().as_int()
                 );
             }
         }
@@ -5750,14 +5709,6 @@ mod plan_test_single_table {
 impl Scan for Box<dyn Scan> {
     fn before_first(&mut self) -> SimpleDBResult<()> {
         (**self).before_first()
-    }
-
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        (**self).get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        (**self).get_string(field_name)
     }
 
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
@@ -5774,14 +5725,6 @@ impl Scan for Box<dyn TableCursor> {
         (**self).before_first()
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        (**self).get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        (**self).get_string(field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         (**self).get_value(field_name)
     }
@@ -5792,28 +5735,20 @@ impl Scan for Box<dyn TableCursor> {
 }
 
 impl TableCursor for Box<dyn TableCursor> {
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        (**self).set_int(field_name, value)
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        (**self).set_string(field_name, value)
-    }
-
     fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         (**self).set_value(field_name, value)
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
-        (**self).insert_values(values)
+    fn insert_row(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
+        (**self).insert_row(values)
     }
 
     fn delete(&mut self) -> SimpleDBResult<()> {
         (**self).delete()
     }
 
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
-        (**self).get_rid()
+    fn rid(&self) -> Result<RID, Box<dyn Error>> {
+        (**self).rid()
     }
 
     fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()> {
@@ -5884,26 +5819,6 @@ where
         self.s2.before_first()
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if self.s1.has_field(field_name)? {
-            return self.s1.get_int(field_name);
-        }
-        if self.s2.has_field(field_name)? {
-            return self.s2.get_int(field_name);
-        }
-        Err(format!("Field {field_name} not found in ProductScan").into())
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if self.s1.has_field(field_name)? {
-            return self.s1.get_string(field_name);
-        }
-        if self.s2.has_field(field_name)? {
-            return self.s2.get_string(field_name);
-        }
-        Err(format!("Field {field_name} not found in ProductScan").into())
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         if self.s1.has_field(field_name)? {
             return self.s1.get_value(field_name);
@@ -5954,10 +5869,10 @@ mod product_scan_tests {
             let mut scan2 = TableScan::new(Arc::clone(&txn), layout2.clone(), "T2", 2).unwrap();
             for i in 0..50 {
                 scan1
-                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .insert_row(&[Constant::Int(i), Constant::String(format!("string{i}"))])
                     .unwrap();
                 scan2
-                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .insert_row(&[Constant::Int(i), Constant::String(format!("string{i}"))])
                     .unwrap();
             }
         }
@@ -5977,8 +5892,8 @@ mod product_scan_tests {
                 ProjectScan::new(select_scan, vec!["B".to_string(), "D".to_string()]);
             // project_scan.before_first().unwrap();
             while let Some(_) = project_scan.next() {
-                let lhs = project_scan.get_string("B").unwrap();
-                let rhs = project_scan.get_string("D").unwrap();
+                let lhs = project_scan.get_value("B").unwrap().as_str().to_string();
+                let rhs = project_scan.get_value("D").unwrap().as_str().to_string();
                 assert_eq!(lhs, rhs);
             }
         }
@@ -6022,20 +5937,6 @@ impl<S> Scan for ProjectScan<S>
 where
     S: Scan,
 {
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if !self.has_field(field_name)? {
-            return Err(format!("Field {field_name} not found in ProjectScan").into());
-        }
-        self.scan.get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if !self.has_field(field_name)? {
-            return Err(format!("Field {field_name} not found in ProjectScan").into());
-        }
-        self.scan.get_string(field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         if !self.has_field(field_name)? {
             return Err(format!("Field {field_name} not found in ProjectScan").into());
@@ -6088,7 +5989,7 @@ mod project_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert_values(&[
+                    scan.insert_row(&[
                         Constant::Int(10),
                         Constant::String(format!("string{}", 10)),
                     ])
@@ -6099,7 +6000,7 @@ mod project_scan_tests {
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert_values(&[
+                scan.insert_row(&[
                     Constant::Int(number.try_into().unwrap()),
                     Constant::String(format!("string{number}")),
                 ])
@@ -6122,9 +6023,9 @@ mod project_scan_tests {
             let select_scan = SelectScan::new(scan, predicate);
             let mut projection_scan = ProjectScan::new(select_scan, vec!["B".to_string()]);
             while let Some(_) = projection_scan.next() {
-                assert_eq!(projection_scan.get_int("A").unwrap(), 10);
+                assert_eq!(projection_scan.get_value("A").unwrap().as_int(), 10);
                 assert_eq!(
-                    projection_scan.get_string("B").unwrap(),
+                    projection_scan.get_value("B").unwrap().as_str().to_string(),
                     format!("string{}", 10)
                 );
                 projected_count += 1;
@@ -6293,9 +6194,9 @@ mod index_join_plan_tests {
         let mut results = Vec::new();
         while let Some(res) = scan.next() {
             assert!(res.is_ok());
-            let id = scan.get_int("id").unwrap();
-            let name = scan.get_string("name").unwrap();
-            let dept = scan.get_string("deptname").unwrap();
+            let id = scan.get_value("id").unwrap().as_int();
+            let name = scan.get_value("name").unwrap().as_str().to_string();
+            let dept = scan.get_value("deptname").unwrap().as_str().to_string();
             results.push((id, name, dept));
         }
 
@@ -6481,26 +6382,6 @@ where
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        if self.lhs.has_field(field_name)? {
-            return self.lhs.get_int(field_name);
-        }
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.get_int(field_name);
-        }
-        Err(format!("Field {field_name} not found in IndexJoinScan").into())
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        if self.lhs.has_field(field_name)? {
-            return self.lhs.get_string(field_name);
-        }
-        if self.rhs.has_field(field_name)? {
-            return self.rhs.get_string(field_name);
-        }
-        Err(format!("Field {field_name} not found in IndexJoinScan").into())
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         if self.lhs.has_field(field_name)? {
             return self.lhs.get_value(field_name);
@@ -6570,17 +6451,17 @@ mod index_join_scan_tests {
             for i in 0..50 {
                 // Insert into first table
                 scan1
-                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .insert_row(&[Constant::Int(i), Constant::String(format!("string{i}"))])
                     .unwrap();
 
                 // Insert into second table with matching values
                 scan2
-                    .insert_values(&[Constant::Int(i), Constant::String(format!("string{i}"))])
+                    .insert_row(&[Constant::Int(i), Constant::String(format!("string{i}"))])
                     .unwrap();
 
                 // Create index entry
                 let mut index = index_info.open();
-                index.insert(&Constant::Int(i), &scan2.get_rid().unwrap());
+                index.insert(&Constant::Int(i), &scan2.rid().unwrap());
 
                 inserted_count += 1;
             }
@@ -6599,13 +6480,13 @@ mod index_join_scan_tests {
 
             while let Some(Ok(())) = index_join_scan.next() {
                 // Verify join condition A = C
-                let a_val = index_join_scan.get_int("A").unwrap();
-                let c_val = index_join_scan.get_int("C").unwrap();
+                let a_val = index_join_scan.get_value("A").unwrap().as_int();
+                let c_val = index_join_scan.get_value("C").unwrap().as_int();
                 assert_eq!(a_val, c_val);
 
                 // Verify corresponding strings match
-                let b_val = index_join_scan.get_string("B").unwrap();
-                let d_val = index_join_scan.get_string("D").unwrap();
+                let b_val = index_join_scan.get_value("B").unwrap().as_str().to_string();
+                let d_val = index_join_scan.get_value("D").unwrap().as_str().to_string();
                 assert_eq!(b_val, d_val);
 
                 join_count += 1;
@@ -6680,14 +6561,6 @@ where
         Ok(())
     }
 
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        self.scan.get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        self.scan.get_string(field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         self.scan.get_value(field_name)
     }
@@ -6733,21 +6606,21 @@ mod index_select_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert_values(&[
+                    scan.insert_row(&[
                         Constant::Int(10),
                         Constant::String(format!("string{}", 10)),
                     ])
                     .unwrap();
                     dbg!("Inserting the index entry when value is 10");
                     let mut index = index_info.open();
-                    index.insert(&Constant::Int(10), &scan.get_rid().unwrap());
+                    index.insert(&Constant::Int(10), &scan.rid().unwrap());
                     inserted_count += 1;
                     continue;
                 }
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {} into table", number);
-                scan.insert_values(&[
+                scan.insert_row(&[
                     Constant::Int(number.try_into().unwrap()),
                     Constant::String(format!("string{number}")),
                 ])
@@ -6756,7 +6629,7 @@ mod index_select_scan_tests {
                 let mut index = index_info.open();
                 index.insert(
                     &Constant::Int(number.try_into().unwrap()),
-                    &scan.get_rid().unwrap(),
+                    &scan.rid().unwrap(),
                 );
                 inserted_count += 1;
             }
@@ -6773,7 +6646,7 @@ mod index_select_scan_tests {
                 IndexSelectScan::new(scan, index, IndexSearchBounds::Key(value));
             index_select_scan.before_first().unwrap();
             while let Some(Ok(())) = index_select_scan.next() {
-                assert_eq!(index_select_scan.get_int("A").unwrap(), 10);
+                assert_eq!(index_select_scan.get_value("A").unwrap().as_int(), 10);
                 selection_count += 1;
             }
             assert_eq!(selection_count, 5);
@@ -6825,14 +6698,6 @@ impl<S> Scan for SelectScan<S>
 where
     S: Scan,
 {
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        self.scan.get_int(field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        self.scan.get_string(field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
         self.scan.get_value(field_name)
     }
@@ -6873,7 +6738,7 @@ mod select_scan_tests {
             for i in 0..50 {
                 if i % 10 == 0 {
                     dbg!("Inserting number {}", 10);
-                    scan.insert_values(&[
+                    scan.insert_row(&[
                         Constant::Int(10),
                         Constant::String(format!("string{}", 10)),
                     ])
@@ -6884,7 +6749,7 @@ mod select_scan_tests {
 
                 let number = (generate_random_number() % 9) + 1; //  generate number in the range of 1-9
                 dbg!("Inserting number {}", number);
-                scan.insert_values(&[
+                scan.insert_row(&[
                     Constant::Int(number.try_into().unwrap()),
                     Constant::String(format!("string{number}")),
                 ])
@@ -6907,7 +6772,7 @@ mod select_scan_tests {
             let mut select_scan = SelectScan::new(scan, predicate);
             while let Some(result) = select_scan.next() {
                 assert!(result.is_ok());
-                assert!(select_scan.get_int("A").unwrap() == 10);
+                assert!(select_scan.get_value("A").unwrap().as_int() == 10);
                 selection_count += 1;
             }
             assert_eq!(selection_count, 5);
@@ -8029,7 +7894,7 @@ mod metadata_manager_tests {
             for _ in 0..50 {
                 let n = (generate_random_number() % 50) + 1;
                 table_scan
-                    .insert_values(&[Constant::Int(n as i32), Constant::String(format!("rec{n}"))])
+                    .insert_row(&[Constant::Int(n as i32), Constant::String(format!("rec{n}"))])
                     .unwrap();
             }
 
@@ -8103,7 +7968,7 @@ mod metadata_manager_tests {
                 TableScan::new(Arc::clone(&setup_txn), layout.clone(), table_name, table_id)
                     .unwrap();
             for i in 0..20 {
-                table_scan.insert_values(&[Constant::Int(i)]).unwrap();
+                table_scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
         setup_txn.commit().unwrap();
@@ -8219,7 +8084,7 @@ impl IndexManager {
         )
         .unwrap();
         table_scan
-            .insert_values(&[
+            .insert_row(&[
                 Constant::String(index_name.to_string()),
                 Constant::String(table_name.to_string()),
                 Constant::String(field_name.to_string()),
@@ -8245,9 +8110,17 @@ impl IndexManager {
         )
         .unwrap();
         while table_scan.next().is_some() {
-            if table_scan.get_string(Self::TABLE_COL_NAME).unwrap() == table_name {
-                let field_name = table_scan.get_string(Self::TABLE_FIELD_NAME).unwrap();
-                let index_name = table_scan.get_string(Self::INDEX_COL_NAME).unwrap();
+            if table_scan.get_value(Self::TABLE_COL_NAME).unwrap().as_str() == table_name {
+                let field_name = table_scan
+                    .get_value(Self::TABLE_FIELD_NAME)
+                    .unwrap()
+                    .as_str()
+                    .to_string();
+                let index_name = table_scan
+                    .get_value(Self::INDEX_COL_NAME)
+                    .unwrap()
+                    .as_str()
+                    .to_string();
                 let layout = self.table_manager.get_layout(table_name, Arc::clone(&txn));
                 let stat_info =
                     self.stat_manager
@@ -8468,8 +8341,11 @@ impl Index for HashIndex {
 
     fn get_data_rid(&self) -> RID {
         let table_scan = self.table_scan.as_ref().unwrap();
-        let block_num = table_scan.get_int(IndexInfo::BLOCK_NUM_FIELD).unwrap();
-        let id = table_scan.get_int(IndexInfo::ID_FIELD).unwrap();
+        let block_num = table_scan
+            .get_value(IndexInfo::BLOCK_NUM_FIELD)
+            .unwrap()
+            .as_int();
+        let id = table_scan.get_value(IndexInfo::ID_FIELD).unwrap().as_int();
         RID {
             block_num: block_num as usize,
             slot: id as usize,
@@ -8480,7 +8356,7 @@ impl Index for HashIndex {
         self.before_first(data_val);
         let table_scan = self.table_scan.as_mut().unwrap();
         table_scan
-            .insert_values(&[
+            .insert_row(&[
                 Constant::Int(data_rid.block_num as i32),
                 Constant::Int(data_rid.slot as i32),
                 data_val.clone(),
@@ -8589,8 +8465,15 @@ impl StatManager {
         )
         .unwrap();
         while table_scan.next().is_some() {
-            let table_name = table_scan.get_string(TableManager::TABLE_NAME_COL).unwrap();
-            let table_id = table_scan.get_int(TableManager::TABLE_ID_COL).unwrap_or(-1) as u32;
+            let table_name = table_scan
+                .get_value(TableManager::TABLE_NAME_COL)
+                .unwrap()
+                .as_str()
+                .to_string();
+            let table_id = table_scan
+                .get_value(TableManager::TABLE_ID_COL)
+                .map(|v| v.as_int())
+                .unwrap_or(-1) as u32;
             let layout = self.table_manager.get_layout(&table_name, Arc::clone(&txn));
             let table_stats =
                 self.calculate_table_stats(&table_name, layout, table_id, Arc::clone(&txn));
@@ -8675,7 +8558,7 @@ impl ViewManager {
         )
         .unwrap();
         table_scan
-            .insert_values(&[
+            .insert_row(&[
                 Constant::String(view_name.to_string()),
                 Constant::String(view_def.to_string()),
             ])
@@ -8695,8 +8578,14 @@ impl ViewManager {
         )
         .unwrap();
         while let Some(_) = table_scan.next() {
-            if view_name == table_scan.get_string(Self::VIEW_NAME_COL).unwrap() {
-                return Some(table_scan.get_string(Self::VIEW_DEF_COL).unwrap());
+            if view_name == table_scan.get_value(Self::VIEW_NAME_COL).unwrap().as_str() {
+                return Some(
+                    table_scan
+                        .get_value(Self::VIEW_DEF_COL)
+                        .unwrap()
+                        .as_str()
+                        .to_string(),
+                );
             }
         }
         None
@@ -8759,7 +8648,10 @@ impl TableManager {
             let mut max_id = -1i32;
             while let Some(result) = scan.next() {
                 result.expect("failed to scan table catalog for max table_id");
-                let id = scan.get_int(Self::TABLE_ID_COL).unwrap_or(-1);
+                let id = scan
+                    .get_value(Self::TABLE_ID_COL)
+                    .map(|v| v.as_int())
+                    .unwrap_or(-1);
                 if id > max_id {
                     max_id = id;
                 }
@@ -8804,7 +8696,7 @@ impl TableManager {
             )
             .unwrap();
             table_scan
-                .insert_values(&[
+                .insert_row(&[
                     Constant::String(table_name.to_string()),
                     Constant::Int(layout.max_encoded_size() as i32),
                     Constant::Int(table_id),
@@ -8824,7 +8716,7 @@ impl TableManager {
             for field in &schema.fields {
                 let field_info = schema.info.get(field).unwrap();
                 table_scan
-                    .insert_values(&[
+                    .insert_row(&[
                         Constant::String(table_name.to_string()),
                         Constant::String(field.to_string()),
                         Constant::Int(field_info.field_type as i32),
@@ -8850,12 +8742,26 @@ impl TableManager {
             let mut schema = Schema::new();
             while let Some(result) = table_scan.next() {
                 result.expect("failed to advance table scan in get_layout");
-                let scanned_table = table_scan.get_string(Self::TABLE_NAME_COL).unwrap();
+                let scanned_table = table_scan
+                    .get_value(Self::TABLE_NAME_COL)
+                    .unwrap()
+                    .as_str()
+                    .to_string();
                 if table_name == scanned_table {
-                    let field_name = table_scan.get_string(Self::FIELD_NAME_COL).unwrap();
-                    let field_type: FieldType =
-                        table_scan.get_int(Self::FIELD_TYPE_COL).unwrap().into();
-                    let field_length = table_scan.get_int(Self::FIELD_LENGTH_COL).unwrap() as usize;
+                    let field_name = table_scan
+                        .get_value(Self::FIELD_NAME_COL)
+                        .unwrap()
+                        .as_str()
+                        .to_string();
+                    let field_type: FieldType = table_scan
+                        .get_value(Self::FIELD_TYPE_COL)
+                        .unwrap()
+                        .as_int()
+                        .into();
+                    let field_length = table_scan
+                        .get_value(Self::FIELD_LENGTH_COL)
+                        .unwrap()
+                        .as_int() as usize;
                     schema.add_field(&field_name, field_type, field_length);
                 }
             }
@@ -8874,9 +8780,12 @@ impl TableManager {
         )?;
         while let Some(result) = table_scan.next() {
             result?;
-            let scanned_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
+            let scanned_name = table_scan
+                .get_value(Self::TABLE_NAME_COL)?
+                .as_str()
+                .to_string();
             if scanned_name == table_name {
-                let id = table_scan.get_int(Self::TABLE_ID_COL)? as u32;
+                let id = table_scan.get_value(Self::TABLE_ID_COL)?.as_int() as u32;
                 return Ok(id);
             }
         }
@@ -8895,7 +8804,10 @@ impl TableManager {
         let mut tables = Vec::new();
         while let Some(result) = table_scan.next() {
             result?;
-            let table_name = table_scan.get_string(Self::TABLE_NAME_COL)?;
+            let table_name = table_scan
+                .get_value(Self::TABLE_NAME_COL)?
+                .as_str()
+                .to_string();
             // Skip internal catalog tables
             if table_name != Self::TABLE_CAT_TABLE_NAME && table_name != Self::FIELD_CAT_TABLE_NAME
             {
@@ -9158,46 +9070,24 @@ impl Iterator for TableScan {
 }
 
 impl Scan for TableScan {
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>> {
-        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No record page set when calling get_int for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No current slot set when calling get_int for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        page.get_int(slot, field_name)
-    }
-
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>> {
-        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No record page set when calling get_string for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
-            format!(
-                "No current slot set when calling get_string for {}",
-                self.table_name
-            )
-            .into()
-        })?;
-        page.get_string(slot, field_name)
-    }
-
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        let page = self.record_page.as_ref().ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No record page set when calling get_value for {}",
+                self.table_name
+            )
+            .into()
+        })?;
+        let slot = self.current_slot.ok_or_else(|| -> Box<dyn Error> {
+            format!(
+                "No current slot set when calling get_value for {}",
+                self.table_name
+            )
+            .into()
+        })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::Int => Ok(Constant::Int(self.get_int(field_name)?)),
-            FieldType::String => Ok(Constant::String(self.get_string(field_name)?)),
+            FieldType::Int => Ok(Constant::Int(page.get_int(slot, field_name)?)),
+            FieldType::String => Ok(Constant::String(page.get_string(slot, field_name)?)),
         }
     }
 
@@ -9212,39 +9102,29 @@ impl Scan for TableScan {
 }
 
 impl TableCursor for TableScan {
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()> {
-        self.record_page.as_ref().unwrap().set_int(
-            *self.current_slot.as_ref().unwrap(),
-            field_name,
-            value,
-        )?;
-        Ok(())
-    }
-
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()> {
-        self.record_page.as_ref().unwrap().set_string(
-            *self.current_slot.as_ref().unwrap(),
-            field_name,
-            &value,
-        )?;
-        Ok(())
-    }
-
     fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()> {
         match self.layout.schema.info.get(field_name).unwrap().field_type {
-            FieldType::Int => self.set_int(field_name, value.as_int())?,
-            FieldType::String => self.set_string(field_name, value.as_str().to_string())?,
+            FieldType::Int => self.record_page.as_ref().unwrap().set_int(
+                *self.current_slot.as_ref().unwrap(),
+                field_name,
+                value.as_int(),
+            )?,
+            FieldType::String => self.record_page.as_ref().unwrap().set_string(
+                *self.current_slot.as_ref().unwrap(),
+                field_name,
+                value.as_str(),
+            )?,
         }
         Ok(())
     }
 
-    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
+    fn insert_row(&mut self, values: &[Constant]) -> SimpleDBResult<()> {
         let mut iterations = 0;
         loop {
             iterations += 1;
             assert!(
                 iterations <= 10000,
-                "Table scan insert_values failed for {iterations} iterations"
+                "Table scan insert_row failed for {iterations} iterations"
             );
             match self.record_page.as_ref().unwrap().insert_values(values) {
                 Ok(slot) => {
@@ -9274,7 +9154,7 @@ impl TableCursor for TableScan {
         Ok(())
     }
 
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>> {
+    fn rid(&self) -> Result<RID, Box<dyn Error>> {
         Ok(RID::new(
             self.record_page.as_ref().unwrap().block_id.block_num,
             *self.current_slot.as_ref().unwrap(),
@@ -9295,20 +9175,16 @@ impl TableCursor for TableScan {
 }
 
 pub trait TableCursor: Scan + Any {
-    fn set_int(&self, field_name: &str, value: i32) -> SimpleDBResult<()>;
-    fn set_string(&self, field_name: &str, value: String) -> SimpleDBResult<()>;
     fn set_value(&self, field_name: &str, value: Constant) -> SimpleDBResult<()>;
     /// Insert a new record with the given values (in schema field order).
-    fn insert_values(&mut self, values: &[Constant]) -> SimpleDBResult<()>;
+    fn insert_row(&mut self, values: &[Constant]) -> SimpleDBResult<()>;
     fn delete(&mut self) -> SimpleDBResult<()>;
-    fn get_rid(&self) -> Result<RID, Box<dyn Error>>;
+    fn rid(&self) -> Result<RID, Box<dyn Error>>;
     fn move_to_rid(&mut self, rid: RID) -> SimpleDBResult<()>;
 }
 
 pub trait Scan: Iterator<Item = Result<(), Box<dyn Error>>> {
     fn before_first(&mut self) -> SimpleDBResult<()>;
-    fn get_int(&self, field_name: &str) -> Result<i32, Box<dyn Error>>;
-    fn get_string(&self, field_name: &str) -> Result<String, Box<dyn Error>>;
     fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>>;
     fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>>;
 }
@@ -9343,7 +9219,7 @@ mod table_scan_tests {
         let n: usize = 15;
         let mut ts = TableScan::new(txn, layout, "redirect_test", 1).unwrap();
         for i in 0..n {
-            ts.insert_values(&[Constant::Int(i as i32), Constant::String("a".to_string())])
+            ts.insert_row(&[Constant::Int(i as i32), Constant::String("a".to_string())])
                 .unwrap();
         }
 
@@ -9353,8 +9229,9 @@ mod table_scan_tests {
         ts.move_to_start();
         let mut updated = 0usize;
         while ts.next().is_some() {
-            let name = ts.get_string("name").unwrap();
-            ts.set_string("name", name + "xxxxx").unwrap();
+            let name = ts.get_value("name").unwrap().as_str().to_string();
+            ts.set_value("name", Constant::String(name + "xxxxx"))
+                .unwrap();
             updated += 1;
         }
         assert_eq!(updated, n, "each row must be updated exactly once");
@@ -9362,7 +9239,7 @@ mod table_scan_tests {
         // Verify every row has exactly one append ("axxxxx"), not two ("axxxxxxxxxx").
         ts.move_to_start();
         while ts.next().is_some() {
-            let name = ts.get_string("name").unwrap();
+            let name = ts.get_value("name").unwrap().as_str().to_string();
             assert_eq!(name, "axxxxx", "row double-processed: got {:?}", name);
         }
     }
@@ -9383,7 +9260,7 @@ mod table_scan_tests {
         for _ in 0..100 {
             let number = (generate_random_number() % 100) + 1;
             table_scan
-                .insert_values(&[
+                .insert_row(&[
                     Constant::Int(number as i32),
                     Constant::String(format!("rec{number}")),
                 ])
@@ -9401,7 +9278,7 @@ mod table_scan_tests {
         let mut deleted_count = 0;
         table_scan.move_to_start();
         while let Some(_) = table_scan.next() {
-            let number = table_scan.get_int("A").unwrap();
+            let number = table_scan.get_value("A").unwrap().as_int();
             dbg!(format!("The number retrieved {}", number));
             if number < 25 {
                 deleted_count += 1;
@@ -9414,8 +9291,8 @@ mod table_scan_tests {
         let mut remaining_count = 0;
         table_scan.move_to_start();
         while let Some(_) = table_scan.next() {
-            table_scan.get_int("A").unwrap();
-            table_scan.get_string("B").unwrap();
+            table_scan.get_value("A").unwrap().as_int();
+            table_scan.get_value("B").unwrap().as_str().to_string();
             remaining_count += 1;
         }
         dbg!(format!("Found {} remaining records", remaining_count));
@@ -9430,14 +9307,14 @@ pub enum Constant {
 }
 
 impl Constant {
-    fn as_int(&self) -> i32 {
+    pub fn as_int(&self) -> i32 {
         match self {
             Constant::Int(value) => *value,
             _ => panic!("Expected an integer constant"),
         }
     }
 
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
             Constant::String(value) => value,
             _ => panic!("Expected a string constant"),
