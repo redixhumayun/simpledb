@@ -10193,18 +10193,22 @@ impl Drop for BufferHandle {
     }
 }
 
-trait TransactionOperations {
+trait RecoveryWriteContext {
     fn txn_id(&self) -> usize;
     fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>>;
 }
 
-impl TransactionOperations for Arc<Transaction> {
+struct TransactionRecoveryContext<'a> {
+    txn: &'a Arc<Transaction>,
+}
+
+impl RecoveryWriteContext for TransactionRecoveryContext<'_> {
     fn txn_id(&self) -> usize {
-        self.id()
+        self.txn.id()
     }
 
     fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
-        Transaction::pin_write_guard(self, block_id)
+        self.txn.pin_write_guard(block_id)
     }
 }
 
@@ -10332,7 +10336,8 @@ impl Transaction {
     /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
     /// It will also handle meta operations like unpinning buffers
     pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
-        self.recovery_manager.rollback(self).unwrap();
+        let recovery_ctx = TransactionRecoveryContext { txn: self };
+        self.recovery_manager.rollback(&recovery_ctx).unwrap();
         self.concurrency_manager.release()?;
         self.pin_state.unpin_all();
         Ok(())
@@ -10340,7 +10345,8 @@ impl Transaction {
 
     /// Recover the database on start-up or after a crash
     pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
-        self.recovery_manager.recover(self).unwrap();
+        let recovery_ctx = TransactionRecoveryContext { txn: self };
+        self.recovery_manager.recover(&recovery_ctx).unwrap();
         self.concurrency_manager.release()?;
         self.pin_state.unpin_all();
         Ok(())
@@ -12236,7 +12242,7 @@ impl RecoveryManager {
     /// Iterate over the WAL records in reverse order and undo any modifications done for this [`Transaction`]
     /// Flush all data associated with this transaction
     /// Create, write and flush a [`LogRecord::Checkpoint`] record
-    fn rollback(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn rollback(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
         for (_, log) in log_iter {
@@ -12261,7 +12267,7 @@ impl RecoveryManager {
     /// Recover the database from the last [`LogRecord::Checkpoint`]
     /// Find all the incomplete transactions and undo their operations
     /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
-    fn recover(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn recover(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
         let log_iter = self.log_manager.lock().unwrap().iterator();
         let mut finished_txns: Vec<usize> = Vec::new();
@@ -13777,7 +13783,7 @@ impl LogRecord {
 
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
-    fn undo(&self, txn: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn undo(&self, txn: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         match self {
             LogRecord::Start(_) => Ok(()),    //  no-op
             LogRecord::Commit(_) => Ok(()),   //  no-op
@@ -14205,7 +14211,7 @@ impl LogRecord {
     /// Rollback path intentionally does not use this check.
     fn should_undo_during_recovery(
         &self,
-        txn: &dyn TransactionOperations,
+        txn: &dyn RecoveryWriteContext,
         record_lsn: Lsn,
     ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
