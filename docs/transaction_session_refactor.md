@@ -3,131 +3,209 @@
 Tracking Issues: [#63](https://github.com/redixhumayun/simpledb/issues/63), [#98](https://github.com/redixhumayun/simpledb/issues/98)
 
 ## Motivation
-- `transaction_tests::test_transaction_multi_threaded_single_reader_single_writer` now deadlocks because `PageWriteGuard` holds `RwLockWriteGuard<Page>` across `Transaction::commit`, and `RecoveryManager::commit -> BufferManager::flush_all` tries to grab the same write lock again.
-- Root cause: the `Transaction` API exposes everything through `Arc<Transaction>` and `&self`, so Rust cannot prevent overlapping lifetimes between guard objects and `commit/rollback`. Guard discipline is entirely manual; forgetting to scope a guard leads to hangs.
-- We also paid for widespread interior mutability (`RefCell`, `Cell`, `Arc<Mutex<_>>`) solely because methods only take shared references. This obscures ownership, complicates reasoning about aliasing, and forces runtime checks instead of compile-time guarantees.
-- Enforcing RAII guard scoping via the type system eliminates this deadlock class, simplifies Transaction internals, and sets the stage for future intra-query parallelism without reintroducing `set_int/get_int` style helper APIs.
 
-## Current Design (Problems)
-- Callers clone `Arc<Transaction>` into threads and invoke `pin_read_guard` / `pin_write_guard` / `commit` directly on `&Arc<Transaction>`.
-- `BufferHandle` stores its own `Arc<Transaction>` to call `pin_internal/unpin_internal` in `Drop`, so buffer pins live even after `Transaction` methods return.
-- Nothing prevents a write guard from living longer than mutation scopes; tests currently hold guards through `commit`.
-- `BufferList.buffers`, `ConcurrencyManager.locks`, and similar fields rely on `RefCell`/`Cell` to mutate behind `&self`, adding runtime borrow checks and making aliasing implicit.
+- The current `Transaction` API is centered on `Arc<Transaction>` plus `&self` methods. That means Rust cannot prevent a caller from holding a page guard and then calling `commit`/`rollback` on the same transaction.
+- The concrete hazard is write-side: a live `PageWriteGuard` can hold a page write latch while `Transaction::commit -> RecoveryManager::commit -> BufferManager::flush_all` tries to take that write latch again.
+- Lower layers currently retain a broad backward edge to full transaction authority: `BufferHandle` stores `Arc<Transaction>`, and page guards / iterators own that handle for RAII unpin.
+- We want compile-time protection for the dangerous write-side overlap without forcing the entire executor onto session-borrowed read lifetimes.
 
-## Proposed Architecture
+## What Changed In Our Understanding
 
-### Layers To Focus On
-- Page guards, typed page views, heap iterators
-- Txn-local bookkeeping (Buffer list, conccurrency manager, recovery manager)
-- Transaction core (TransactionInner, session/handle API, lifecycle)
+The earlier version of this doc assumed we could make read and write sessions symmetric:
 
-### Related Follow-up
-- The planner/executor boundary work from [#96](https://github.com/redixhumayun/simpledb/issues/96) is now in place, so this refactor can focus on transaction/runtime ownership without simultaneously redesigning logical and physical planning.
-- The concrete staged implementation tracker for this work is [#98](https://github.com/redixhumayun/simpledb/issues/98).
+- `read_session()` would expose only immutable access
+- `write_session()` would expose mutable access
+- txn-local bookkeeping like `BufferList` could become plain unsynchronized state
 
-### TransactionHandle + Sessions
+That does not fit the current engine.
+
+Read paths are not purely read-only at the transaction layer:
+
+- `pin_read_guard` mutates txn-local pin bookkeeping
+- `BufferHandle::drop` mutates it again during unpin
+- `HeapIterator` can keep a pin alive across many executor calls
+- one transaction can have multiple active read-side objects at once (`TableScan`, `ChunkScan`, `SortScan`, B-tree cursors, joins)
+
+If read sessions borrowed immutable txn state and read guards / iterators also borrowed that session, executor lifetimes would spread through `Scan`, `Plan::open`, and most physical operators. That is likely too invasive and not clearly a performance win.
+
+## Revised Goal
+
+The refactor should target these outcomes:
+
+1. Make `commit` / `rollback` illegal while a write guard derived from the same transaction session is alive.
+2. Remove the backward edge from lower layers to full `Transaction` authority.
+3. Keep the read path shareable and compatible with the current executor shape, even if that means keeping synchronized pin bookkeeping.
+4. Avoid a coarse design where every read pin pays both an outer transaction lock and an inner buffer-list lock.
+
+## Revised Architecture
+
+### Split Transaction Authority
+
+Use a stable outer handle plus split internal state:
+
 ```rust
-pub struct TransactionHandle(Arc<RwLock<TransactionInner>>);
-
-impl TransactionHandle {
-    pub fn read_session(&self) -> TransactionReadSession<'_> {
-        TransactionReadSession { guard: self.0.read().unwrap() }
-    }
-
-    pub fn write_session(&self) -> TransactionWriteSession<'_> {
-        TransactionWriteSession { guard: self.0.write().unwrap() }
-    }
+pub struct TransactionHandle {
+    read_state: Arc<TxnReadState>,
+    write_state: Arc<Mutex<TxnWriteState>>,
 }
 
 pub struct TransactionReadSession<'a> {
-    guard: RwLockReadGuard<'a, TransactionInner>,
+    txn: &'a TransactionHandle,
 }
 
 pub struct TransactionWriteSession<'a> {
-    guard: RwLockWriteGuard<'a, TransactionInner>,
+    txn: &'a TransactionHandle,
+    guard: MutexGuard<'a, TxnWriteState>,
 }
 ```
-- Read sessions expose purely `&TransactionInner` APIs (pin read guard, catalog ops) and can coexist across threads.
-- Write sessions expose `&'a mut TransactionInner` so mutation helpers require exclusive borrows, enforced by Rust.
 
-### Guard APIs require `&mut self`
+The important split is semantic, not cosmetic:
+
+- `TxnReadState` owns shared read-pin state and other read-side capabilities that must outlive a single method call.
+- `TxnWriteState` owns lifecycle-sensitive write authority: commit, rollback, recovery, lock release, and write-only txn bookkeeping.
+
+### Read Path: Shared State, Synchronized Pins
+
+Read sessions may borrow the transaction immutably, but read pinning still needs synchronized shared state.
+
 ```rust
-impl TransactionInner {
-    pub fn pin_write_guard<'a>(&'a mut self, block: &BlockId) -> PageWriteGuard<'a> {
-        self.concurrency_manager.xlock(block)?;
-        let handle = BufferHandle::new(self, block.clone());
-        PageWriteGuard::new(handle, ...)
+struct TxnReadState {
+    pin_state: Arc<PinState>,
+    buffer_manager: Arc<BufferManager>,
+    file_manager: SharedFS,
+    log_manager: Arc<Mutex<LogManager>>,
+    tx_id: TransactionID,
+}
+
+struct PinState {
+    buffer_list: Mutex<BufferList>,
+}
+```
+
+Read-side guard ownership should point only at pin state, not at the whole transaction:
+
+```rust
+pub struct BufferHandle {
+    block_id: BlockId,
+    pin_state: Arc<PinState>,
+    tx_id: TransactionID,
+}
+```
+
+This keeps current executor behavior workable:
+
+- multiple scans can stay open in one transaction
+- `HeapIterator` can keep a page pinned across many `next()` calls
+- lower layers no longer need `Arc<Transaction>`
+
+### Write Path: Borrowed Session, Compile-Time Exclusion
+
+Write operations go through an exclusive session.
+
+```rust
+impl TransactionHandle {
+    pub fn read_session(&self) -> TransactionReadSession<'_> {
+        TransactionReadSession { txn: self }
     }
 
-    pub fn commit(&mut self) -> Result<()> {
-        self.recovery_manager.commit();
-        self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
-        Ok(())
+    pub fn write_session(&self) -> TransactionWriteSession<'_> {
+        TransactionWriteSession {
+            txn: self,
+            guard: self.write_state.lock().unwrap(),
+        }
+    }
+}
+
+impl TransactionWriteSession<'_> {
+    pub fn pin_write_guard<'a>(&'a mut self, block: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        // write pin path
+        unimplemented!()
+    }
+
+    pub fn commit(self) -> SimpleDBResult<()> {
+        // flush, release locks, unpin all
+        unimplemented!()
     }
 }
 ```
-- Because `pin_write_guard` borrows `&mut self`, the compiler will not allow `commit(&mut self)` (or consumption of the write session) while any guard derived from that mutable borrow is alive.
-- `BufferHandle` now stores `&'a mut TransactionInner` instead of `Arc<Transaction>`, so dropping the handle automatically releases the mutable borrow when it unpins.
 
-### Guard Lifetimes enforce RAII
+The critical property is that `pin_write_guard` borrows `&mut self`. That makes this illegal:
+
 ```rust
-let tx = Arc::new(TransactionHandle::new(...));
-let writer = tx.clone();
-std::thread::spawn(move || {
-    let mut session = writer.write_session();
-    {
-        let mut page = session.pin_write_guard(&block);
-        page.set_value(80, Constant::Int(1));
-        page.mark_modified(session.txn_id(), Lsn::MAX);
-    } // guard drops, mutable borrow released
-    session.commit().unwrap(); // now allowed
-});
+let mut ws = txn.write_session();
+let page = ws.pin_write_guard(&block)?;
+ws.commit()?; // does not compile while `page` is alive
 ```
-- Attempting to call `session.commit()` while `page` is still alive fails to compile, removing the previously silent deadlock path.
 
-### Simplifying TransactionInner state
-With exclusive access guaranteed:
-- Replace `BufferList.buffers: RefCell<HashMap<...>>` with a plain `HashMap`; tracking pins no longer needs runtime borrow checks.
-- `ConcurrencyManager.locks` can drop `RefCell` and use `HashMap` directly.
-- `BufferHandle` avoids cloning `Arc<Transaction>` and no longer risks use-after-free of transaction internals.
-- Shared subsystems (`BufferManager`, `FileManager`, `LogManager`) keep their own synchronization because they are cross-transaction resources.
+This is the main safety win. It addresses the concrete deadlock-producing misuse without forcing the read path into the same lifetime model.
 
-### Parallelism Story
-- Read-heavy workloads: multiple threads call `read_session()` simultaneously and pin pages without blocking each other.
-- Writers: still serialize on the write session (matching strict 2PL requirements), but guard scoping ensures flushing can never deadlock.
-- Future intra-query parallelism splits execution work into read sessions; write sessions remain short-lived for mutation phases.
+### Intentional Asymmetry
 
-### Why this is easier to do now
+The API should be asymmetric.
 
-The query engine now has a much cleaner separation between:
+That is acceptable because the engine is already asymmetric in reality:
 
-- logical planning
-- physical planning
-- runtime execution
+- write guards are the primary commit/deadlock hazard
+- reads need to remain shareable and long-lived inside scans / iterators
+- writes need exclusive lifecycle authority
 
-That means this refactor can primarily target:
+Trying to force full symmetry between read and write sessions leads to significantly worse executor lifetimes and likely extra synchronization with little payoff.
 
-- `TransactionHandle` / `TransactionInner`
-- page guards and buffer handles
-- execution-time storage / scan code
+## What This Refactor Does Not Promise
 
-instead of also having to untangle planner-owned transaction state at the same time.
+- It does not remove all interior mutability from transaction-local state.
+- It does not give a compile-time error for `commit()` while a read guard or `HeapIterator` is alive, unless the executor is radically reshaped around borrowed read sessions.
+- It does not make read sessions purely immutable in the sense of “no txn-local mutation happens”; read pin bookkeeping is still mutation.
+- It does not use transaction locking as database concurrency control. Inter-transaction concurrency still comes from the lock table, page latches, buffer manager, and WAL synchronization.
+
+## Backward Edge Policy
+
+The goal is not “no backward edge at all”. The goal is “no broad backward edge to full transaction authority”.
+
+Acceptable:
+
+- `PageReadGuard` / `PageWriteGuard` / `HeapIterator` own a narrow handle to pin state for RAII unpin
+- recovery code receives a narrow write capability that can pin pages and mark them dirty
+
+Not acceptable:
+
+- lower layers storing `Arc<Transaction>` and thereby retaining access to broad transaction methods
+
+In other words, a narrow upward pointer for RAII ownership is fine. A broad upward pointer to the whole transaction object is what we want to eliminate.
+
+## Recovery Implication
+
+Rollback and recovery still need explicit write authority.
+
+Today WAL undo uses a transaction-facing interface that can repeatedly:
+
+- pin a page for write
+- mutate it
+- mark it dirty
+
+The new design still needs that capability, but it should be expressed as a narrow write/recovery authority, not as “recovery can call arbitrary methods on `Arc<Transaction>`”.
+
+This is another reason the refactor should split broad transaction authority into narrower capabilities.
 
 ## Migration Plan
-1. Introduce `TransactionHandle`, `TransactionInner`, and session types while keeping existing API behind feature flag or adapter.
-2. Update guard constructors to require `&mut TransactionInner` and propagate lifetimes through `BufferHandle`, `PageReadGuard`, `PageWriteGuard`.
-3. Refactor execution/storage call sites to obtain sessions before pinning/committing; thread the new runtime authority through execution paths.
-4. Refactor tests and examples to use explicit sessions and guard-scoping idioms.
-5. Remove interior-mutability wrappers (`RefCell`, `Cell`) that become redundant once exclusive borrows exist.
-6. Delete legacy `Transaction` methods that take `Arc<Self>` directly and update docs/examples.
 
-## Open Questions
-- Should `read_session()` allow pinning multiple blocks simultaneously, or do we expose a finer-grained borrow (e.g., `PageReadCursor`) to reduce lock hold time?
-- Do we need a `try_write_session()` to avoid blocking intra-query parallel operators, or is blocking acceptable under strict 2PL?
-- How do we stage the migration without breaking existing public API consumers? (Option: keep `Arc<Transaction>` facade that internally acquires sessions.)
+1. Introduce `TransactionHandle`, `TxnReadState`, and `TxnWriteState` without changing executor call sites yet.
+2. Replace `BufferHandle -> Arc<Transaction>` with `BufferHandle -> Arc<PinState>`.
+3. Keep read pin/unpin on synchronized shared pin state so existing scans and iterators continue to work.
+4. Introduce `TransactionWriteSession` and move `pin_write_guard`, `commit`, `rollback`, and recovery-sensitive write operations onto it.
+5. Update write-side call sites to acquire a write session explicitly before pinning writable pages or finishing the transaction.
+6. Replace the current rollback/recovery callback surface with a narrower write capability.
+7. Remove legacy `Arc<Transaction>` write-entry APIs once callers have migrated.
+
+## Non-Goals For This Phase
+
+- Reworking the executor around session-borrowed read lifetimes
+- Making `Plan::open` / `Scan` / `TableCursor` lifetime-parameterized
+- Removing synchronized txn-local pin bookkeeping from the read path
+- Redesigning logical/physical planner boundaries
 
 ## References
-- Deadlock surfaced in `transaction_tests::test_transaction_multi_threaded_single_reader_single_writer` after guard/view migration.
-- Related roadmap items: Intra-query parallelism (#32), Read/Write handle design (#29).
-- Prerequisite architecture cleanup: [#96](https://github.com/redixhumayun/simpledb/issues/96)
+
+- Related roadmap item: [#98](https://github.com/redixhumayun/simpledb/issues/98)
+- Original motivating bug: [#63](https://github.com/redixhumayun/simpledb/issues/63)
+- Related architecture cleanup: [#96](https://github.com/redixhumayun/simpledb/issues/96)

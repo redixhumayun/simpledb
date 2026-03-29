@@ -10155,14 +10155,17 @@ impl Schema {
 pub struct BufferHandle {
     /// The pinned block this handle is responsible for unpinning on drop.
     block_id: BlockId,
-    /// Shared transaction used only for pin bookkeeping.
-    txn: Arc<Transaction>,
+    /// Narrow shared state used only for transaction-local pin bookkeeping.
+    pin_state: Arc<PinState>,
 }
 
 impl BufferHandle {
-    pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
-        txn.pin_internal(&block_id);
-        BufferHandle { block_id, txn }
+    fn new(block_id: BlockId, pin_state: Arc<PinState>) -> Self {
+        pin_state.pin(&block_id);
+        BufferHandle {
+            block_id,
+            pin_state,
+        }
     }
 
     pub fn block_id(&self) -> &BlockId {
@@ -10170,23 +10173,23 @@ impl BufferHandle {
     }
 
     pub fn txn_id(&self) -> usize {
-        self.txn.id()
+        self.pin_state.txn_id() as usize
     }
 }
 
 impl Clone for BufferHandle {
     fn clone(&self) -> Self {
-        self.txn.pin_internal(&self.block_id);
+        self.pin_state.pin(&self.block_id);
         Self {
             block_id: self.block_id.clone(),
-            txn: Arc::clone(&self.txn),
+            pin_state: Arc::clone(&self.pin_state),
         }
     }
 }
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
-        self.txn.unpin_internal(&self.block_id);
+        self.pin_state.unpin(&self.block_id);
     }
 }
 
@@ -10222,13 +10225,58 @@ impl TxIdGenerator {
 
 static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
+#[derive(Debug)]
+struct PinState {
+    tx_id: TransactionID,
+    buffer_list: BufferList,
+}
+
+impl PinState {
+    fn new(tx_id: TransactionID, buffer_manager: Arc<BufferManager>) -> Self {
+        Self {
+            tx_id,
+            buffer_list: BufferList::new(buffer_manager),
+        }
+    }
+
+    fn txn_id(&self) -> TransactionID {
+        self.tx_id
+    }
+
+    fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
+        self.buffer_list.get_buffer(block_id)
+    }
+
+    fn pin(&self, block_id: &BlockId) {
+        self.buffer_list.pin(block_id);
+    }
+
+    fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
+        self.buffer_list.pin_fast(block_id)
+    }
+
+    fn unpin(&self, block_id: &BlockId) {
+        self.buffer_list.unpin(block_id);
+    }
+
+    fn unpin_all(&self) {
+        self.buffer_list.unpin_all();
+    }
+
+    #[cfg(test)]
+    fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
+        self.buffer_list
+            .assert_pin_invariant(block_id, expected_handles);
+    }
+}
+
 pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<BufferManager>,
     recovery_manager: RecoveryManager,
     concurrency_manager: ConcurrencyManager,
-    buffer_list: BufferList,
+    pin_state: Arc<PinState>,
     tx_id: TransactionID,
 }
 
@@ -10261,7 +10309,7 @@ impl Transaction {
                 Arc::clone(&log_manager),
                 Arc::clone(&buffer_manager),
             ),
-            buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
+            pin_state: Arc::new(PinState::new(tx_id, Arc::clone(&buffer_manager))),
             buffer_manager,
             log_manager,
             concurrency_manager: ConcurrencyManager::new(tx_id, lock_table),
@@ -10276,7 +10324,7 @@ impl Transaction {
     pub fn commit(&self) -> SimpleDBResult<()> {
         self.recovery_manager.commit()?;
         self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
+        self.pin_state.unpin_all();
         Ok(())
     }
 
@@ -10286,7 +10334,7 @@ impl Transaction {
     pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
         self.recovery_manager.rollback(self).unwrap();
         self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
+        self.pin_state.unpin_all();
         Ok(())
     }
 
@@ -10294,13 +10342,13 @@ impl Transaction {
     pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
         self.recovery_manager.recover(self).unwrap();
         self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
+        self.pin_state.unpin_all();
         Ok(())
     }
 
     /// The pin method which will return a [`BufferHandle`] for RAII semantics
     fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
-        BufferHandle::new(block_id.clone(), Arc::clone(self))
+        BufferHandle::new(block_id.clone(), Arc::clone(&self.pin_state))
     }
 
     fn make_read_guard_from_frame<'a>(
@@ -10332,7 +10380,7 @@ impl Transaction {
         block_id: &BlockId,
     ) -> SimpleDBResult<PageReadGuard<'_>> {
         let handle = self.pin(block_id);
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(self.make_read_guard_from_frame(handle, frame))
     }
 
@@ -10341,7 +10389,7 @@ impl Transaction {
         block_id: &BlockId,
     ) -> SimpleDBResult<PageWriteGuard<'_>> {
         let handle = self.pin(block_id);
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(self.make_write_guard_from_frame(handle, frame))
     }
 
@@ -10350,16 +10398,16 @@ impl Transaction {
         self: &Arc<Self>,
         block_id: &BlockId,
     ) -> SimpleDBResult<FastPinOutcome<PageReadGuard<'_>>> {
-        match self.pin_internal_fast(block_id) {
+        match self.pin_state.pin_fast(block_id) {
             FastPinOutcome::Ready(()) => {}
             FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
             FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
-            txn: Arc::clone(self),
+            pin_state: Arc::clone(&self.pin_state),
         };
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
             self.make_read_guard_from_frame(handle, frame),
         ))
@@ -10370,16 +10418,16 @@ impl Transaction {
         self: &Arc<Self>,
         block_id: &BlockId,
     ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'_>>> {
-        match self.pin_internal_fast(block_id) {
+        match self.pin_state.pin_fast(block_id) {
             FastPinOutcome::Ready(()) => {}
             FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
             FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
-            txn: Arc::clone(self),
+            pin_state: Arc::clone(&self.pin_state),
         };
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
             self.make_write_guard_from_frame(handle, frame),
         ))
@@ -10478,22 +10526,6 @@ impl Transaction {
             }
         }
         Ok(())
-    }
-
-    /// Pin this [`BlockId`] to be used in this transaction
-    /// This should not be used anywhere outside of the following modules - [`Transaction`], [`RecoveryManager`]
-    /// It does not provide RAII semantics. Requires an explicit call to [`Transaction::unpin_internal`] after
-    fn pin_internal(&self, block_id: &BlockId) {
-        self.buffer_list.pin(block_id);
-    }
-
-    fn pin_internal_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
-        self.buffer_list.pin_fast(block_id)
-    }
-
-    /// Unpin this [`BlockId`] since it is no longer needed by this transaction
-    fn unpin_internal(&self, block_id: &BlockId) {
-        self.buffer_list.unpin(block_id);
     }
 
     /// Get the available buffers for this transaction
@@ -11056,17 +11088,17 @@ mod transaction_tests {
         let block_id = txn.append("test");
 
         {
-            let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+            let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
             // Verify pin count = 1
-            let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+            let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
             assert_eq!(buffer.pin_count(), 1);
 
-            txn.buffer_list.assert_pin_invariant(&block_id, 1);
+            txn.pin_state.assert_pin_invariant(&block_id, 1);
         }
 
         // After handle is dropped, buffer should be unpinned
-        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+        assert!(txn.pin_state.get_buffer(&block_id).is_none());
 
         db.buffer_manager.assert_buffer_count_invariant();
     }
@@ -11080,30 +11112,30 @@ mod transaction_tests {
         //  append a correctly formatted page to the file
         txn.append("test");
 
-        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+        txn.pin_state.assert_pin_invariant(&block_id, 1);
 
         let handle2 = handle1.clone();
 
         // Both handles should keep block pinned - pin count should be 2
-        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 2);
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 2);
+        txn.pin_state.assert_pin_invariant(&block_id, 2);
 
         drop(handle1);
 
         // After dropping one handle, pin count should be 1
-        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 1);
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+        txn.pin_state.assert_pin_invariant(&block_id, 1);
 
         drop(handle2);
 
         // After dropping both handles, buffer should be unpinned
-        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+        assert!(txn.pin_state.get_buffer(&block_id).is_none());
 
         db.buffer_manager.assert_buffer_count_invariant();
     }
@@ -11114,7 +11146,7 @@ mod transaction_tests {
         let txn = db.new_tx();
         let block_id = txn.append("test");
 
-        let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
         txn.commit().unwrap();
 
@@ -11130,7 +11162,7 @@ mod transaction_tests {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
         let block_id = txn.append("test");
-        let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
         // Commit unpins everything and sets committed flag
         txn.commit().unwrap();
@@ -11152,7 +11184,7 @@ mod transaction_tests {
         let txn = db.new_tx();
         let block_id = txn.append("test");
 
-        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
         let handle2 = handle1.clone();
         let handle3 = handle2.clone();
 
