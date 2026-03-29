@@ -2255,11 +2255,10 @@ impl Plan for SortPlan {
     }
 
     fn blocks_accessed(&self) -> usize {
-        //  TODO: This is incorrect, it should be using MaterializePlan::blocks_accessed()
-        //  however, that requires clone on the Plan trait
-        // let materialize_plan =
-        //     MaterializePlan::new((*self.source_plan).clone(), Arc::clone(&self.txn));
-        // materialize_plan.blocks_accessed()
+        //  TODO: This is incorrect — sort materializes its input, so the cost
+        //  should mirror MaterializePlan::blocks_accessed (records_output / records_per_block).
+        //  Fixing it requires SortPlan to store block_size, which means accepting
+        //  a &PlanningContext in SortPlan::new.
         self.source_plan.blocks_accessed()
     }
 
