@@ -2780,7 +2780,7 @@ mod btree_index_tests {
             let committed_root_block = idx.root_block.block_num as u32;
             let committed_tree_height = idx.tree_height;
             let index_file_name = idx.index_file_name.clone();
-            t1.commit().unwrap();
+            t1.write_session().commit().unwrap();
 
             // Transaction 2: force many uncommitted splits/cascades.
             let t2 = db.new_tx();
@@ -2808,7 +2808,7 @@ mod btree_index_tests {
         // Recover in fresh DB process view.
         let db = SimpleDB::new(&dir, 8, false, 5000);
         let recovery_tx = db.new_tx();
-        recovery_tx.recover().unwrap();
+        recovery_tx.write_session().recover().unwrap();
 
         let verify_tx = db.new_tx();
         let mut verify_index = BTreeIndex::new(
@@ -2867,7 +2867,7 @@ mod btree_index_tests {
         let baseline_root_block = baseline_idx.root_block.block_num as u32;
         let baseline_tree_height = baseline_idx.tree_height;
         let index_file_name = baseline_idx.index_file_name.clone();
-        t1.commit().unwrap();
+        t1.write_session().commit().unwrap();
 
         // Transaction 2: uncommitted heavy insert workload causing split cascades.
         let t2 = db.new_tx();
@@ -2888,7 +2888,7 @@ mod btree_index_tests {
             blocks_after > blocks_before,
             "expected uncommitted inserts to allocate split pages"
         );
-        t2.rollback().unwrap();
+        t2.write_session().rollback().unwrap();
 
         // Transaction 3: verify logical state restored to baseline.
         let t3 = db.new_tx();
@@ -2977,7 +2977,7 @@ mod btree_index_tests {
             for k in 0..PRELOAD {
                 idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
             }
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3023,7 +3023,7 @@ mod btree_index_tests {
                     if !idx.next() {
                         all_found = false;
                     }
-                    txn.commit().unwrap();
+                    txn.write_session().commit().unwrap();
                 }
                 all_found
             }));
@@ -3061,7 +3061,7 @@ mod btree_index_tests {
                 Arc::clone(&split_gate),
             )
             .unwrap();
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3103,7 +3103,7 @@ mod btree_index_tests {
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
-                    txn.commit().unwrap();
+                    txn.write_session().commit().unwrap();
                 }
             }));
         }
@@ -3136,7 +3136,7 @@ mod btree_index_tests {
             );
         }
         super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
-        val_txn.commit().unwrap();
+        val_txn.write_session().commit().unwrap();
     }
 
     /// 4 writer threads insert interleaved keys (thread i: i, i+4, i+8, …) to force
@@ -3165,7 +3165,7 @@ mod btree_index_tests {
                 Arc::clone(&split_gate),
             )
             .unwrap();
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3208,7 +3208,7 @@ mod btree_index_tests {
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
-                    txn.commit().unwrap();
+                    txn.write_session().commit().unwrap();
                 }
             }));
         }
@@ -3237,7 +3237,7 @@ mod btree_index_tests {
             assert!(val_idx.next(), "key {k} missing after split stress");
         }
         super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
-        val_txn.commit().unwrap();
+        val_txn.write_session().commit().unwrap();
     }
 
     /// 1 writer thread inserts new keys while 3 reader threads lookup pre-committed keys.
@@ -3274,7 +3274,7 @@ mod btree_index_tests {
             for k in 0..PRELOAD {
                 idx.insert(&Constant::Int(k), &RID::new(1, k as usize));
             }
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3319,7 +3319,7 @@ mod btree_index_tests {
                     )
                     .unwrap();
                     idx.insert(&Constant::Int(k), &RID::new(2, k as usize));
-                    txn.commit().unwrap();
+                    txn.write_session().commit().unwrap();
                 }
             }));
         }
@@ -3358,7 +3358,7 @@ mod btree_index_tests {
                     if !idx.next() {
                         missed_ref.fetch_add(1, Ordering::Relaxed);
                     }
-                    txn.commit().unwrap();
+                    txn.write_session().commit().unwrap();
                 }
             }));
         }
@@ -3388,7 +3388,7 @@ mod btree_index_tests {
         )
         .unwrap();
         super::validator::validate_btree_integrity(&val_txn, &val_idx).unwrap();
-        val_txn.commit().unwrap();
+        val_txn.write_session().commit().unwrap();
     }
 
     #[test]
@@ -3414,7 +3414,7 @@ mod btree_index_tests {
             )
             .unwrap();
             next_key = insert_until_next_insert_splits(&mut idx, 0);
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3446,7 +3446,7 @@ mod btree_index_tests {
             .unwrap();
             idx.set_test_hook(reader_hook);
             idx.before_first(&Constant::Int(0));
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         });
 
         hook.wait_for(BTreeTestEvent::ReadSplitGateAcquired);
@@ -3473,7 +3473,7 @@ mod btree_index_tests {
             .unwrap();
             idx.set_test_hook(writer_hook);
             idx.insert(&Constant::Int(next_key), &RID::new(1, next_key as usize));
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
             writer_done_flag.store(true, Ordering::Release);
         });
 
@@ -3508,7 +3508,7 @@ mod btree_index_tests {
             "split-causing insert should be visible after completion"
         );
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
-        verify_tx.commit().unwrap();
+        verify_tx.write_session().commit().unwrap();
     }
 
     #[test]
@@ -3536,7 +3536,7 @@ mod btree_index_tests {
             .unwrap();
             split_key = insert_until_next_insert_splits(&mut idx, 0);
             second_key = split_key + 1;
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let file_manager = Arc::clone(&db.file_manager);
@@ -3572,7 +3572,7 @@ mod btree_index_tests {
             .unwrap();
             idx.set_test_hook(first_hook_thread);
             idx.insert(&Constant::Int(split_key), &RID::new(1, split_key as usize));
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
             first_done_flag.store(true, Ordering::Release);
         });
 
@@ -3603,7 +3603,7 @@ mod btree_index_tests {
                 &Constant::Int(second_key),
                 &RID::new(2, second_key as usize),
             );
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
             second_done_flag.store(true, Ordering::Release);
         });
 
@@ -3647,7 +3647,7 @@ mod btree_index_tests {
         }
         assert!(second_key_rids.contains(&RID::new(2, second_key as usize)));
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
-        verify_tx.commit().unwrap();
+        verify_tx.write_session().commit().unwrap();
     }
 
     #[test]
@@ -3670,7 +3670,7 @@ mod btree_index_tests {
             )
             .unwrap();
             split_key = insert_until_next_insert_splits(&mut idx, 0);
-            setup_tx.commit().unwrap();
+            setup_tx.write_session().commit().unwrap();
         }
 
         let hook = Arc::new(PauseEventHook::new(&[]));
@@ -3687,7 +3687,7 @@ mod btree_index_tests {
         .unwrap();
         idx.set_test_hook(hook.clone());
         idx.insert(&Constant::Int(split_key), &RID::new(1, split_key as usize));
-        write_tx.commit().unwrap();
+        write_tx.write_session().commit().unwrap();
 
         assert_eq!(
             hook.count(BTreeTestEvent::WriteNeedSlowPinUnderSplitGate),
@@ -3716,7 +3716,7 @@ mod btree_index_tests {
         );
         assert_eq!(verify_idx.get_data_rid(), RID::new(1, split_key as usize));
         super::validator::validate_btree_integrity(&verify_tx, &verify_idx).unwrap();
-        verify_tx.commit().unwrap();
+        verify_tx.write_session().commit().unwrap();
     }
 
     #[test]
@@ -3739,7 +3739,7 @@ mod btree_index_tests {
             Arc::new(SplitGate::new()),
         )
         .unwrap();
-        setup_tx.commit().unwrap();
+        setup_tx.write_session().commit().unwrap();
 
         let holder_tx = db.new_tx();
         let index_lock_table_id = BTreeIndex::index_lock_table_id_for(TEST_INDEXED_TABLE_ID);
@@ -3774,7 +3774,7 @@ mod btree_index_tests {
             .unwrap();
             started_tx.send(()).unwrap();
             idx.insert(&Constant::Int(25), &RID::new(9, 25));
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
             done_tx.send(()).unwrap();
         });
 
@@ -3784,7 +3784,7 @@ mod btree_index_tests {
             "overlapping insert should block while range-S lock is held"
         );
 
-        holder_tx.commit().unwrap();
+        holder_tx.write_session().commit().unwrap();
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("insert should complete after range lock is released");
@@ -3802,7 +3802,7 @@ mod btree_index_tests {
         verify_idx.before_first(&Constant::Int(25));
         assert!(verify_idx.next());
         assert_eq!(verify_idx.get_data_rid(), RID::new(9, 25));
-        verify_tx.commit().unwrap();
+        verify_tx.write_session().commit().unwrap();
     }
 
     #[test]
@@ -3825,7 +3825,7 @@ mod btree_index_tests {
             Arc::new(SplitGate::new()),
         )
         .unwrap();
-        setup_tx.commit().unwrap();
+        setup_tx.write_session().commit().unwrap();
 
         let holder_tx = db.new_tx();
         let index_lock_table_id = BTreeIndex::index_lock_table_id_for(TEST_INDEXED_TABLE_ID);
@@ -3858,7 +3858,7 @@ mod btree_index_tests {
             )
             .unwrap();
             idx.insert(&Constant::Int(40), &RID::new(9, 40));
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
             done_tx.send(()).unwrap();
         });
 
@@ -3866,7 +3866,7 @@ mod btree_index_tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("disjoint insert should not block on non-overlapping range lock");
         handle.join().unwrap();
-        holder_tx.commit().unwrap();
+        holder_tx.write_session().commit().unwrap();
 
         let verify_tx = db.new_tx();
         let mut verify_idx = BTreeIndex::new(
@@ -3880,7 +3880,7 @@ mod btree_index_tests {
         verify_idx.before_first(&Constant::Int(40));
         assert!(verify_idx.next());
         assert_eq!(verify_idx.get_data_rid(), RID::new(9, 40));
-        verify_tx.commit().unwrap();
+        verify_tx.write_session().commit().unwrap();
     }
 }
 
