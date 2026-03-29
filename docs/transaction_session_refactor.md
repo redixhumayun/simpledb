@@ -1,6 +1,6 @@
 # Transaction Session Refactor
 
-Tracking Issue: [#63](https://github.com/redixhumayun/simpledb/issues/63)
+Tracking Issues: [#63](https://github.com/redixhumayun/simpledb/issues/63), [#98](https://github.com/redixhumayun/simpledb/issues/98)
 
 ## Motivation
 - `transaction_tests::test_transaction_multi_threaded_single_reader_single_writer` now deadlocks because `PageWriteGuard` holds `RwLockWriteGuard<Page>` across `Transaction::commit`, and `RecoveryManager::commit -> BufferManager::flush_all` tries to grab the same write lock again.
@@ -22,7 +22,8 @@ Tracking Issue: [#63](https://github.com/redixhumayun/simpledb/issues/63)
 - Transaction core (TransactionInner, session/handle API, lifecycle)
 
 ### Related Follow-up
-- If this refactor pushes plan objects and scan construction to require explicit runtime session binding, track that broader planner/executor boundary work under [#96](https://github.com/redixhumayun/simpledb/issues/96) instead of expanding #63 indefinitely.
+- The planner/executor boundary work from [#96](https://github.com/redixhumayun/simpledb/issues/96) is now in place, so this refactor can focus on transaction/runtime ownership without simultaneously redesigning logical and physical planning.
+- The concrete staged implementation tracker for this work is [#98](https://github.com/redixhumayun/simpledb/issues/98).
 
 ### TransactionHandle + Sessions
 ```rust
@@ -77,7 +78,7 @@ std::thread::spawn(move || {
     let mut session = writer.write_session();
     {
         let mut page = session.pin_write_guard(&block);
-        page.set_int(80, 1);
+        page.set_value(80, Constant::Int(1));
         page.mark_modified(session.txn_id(), Lsn::MAX);
     } // guard drops, mutable borrow released
     session.commit().unwrap(); // now allowed
@@ -95,14 +96,31 @@ With exclusive access guaranteed:
 ### Parallelism Story
 - Read-heavy workloads: multiple threads call `read_session()` simultaneously and pin pages without blocking each other.
 - Writers: still serialize on the write session (matching strict 2PL requirements), but guard scoping ensures flushing can never deadlock.
-- Future intra-query parallelism splits scans into read sessions; write sessions remain short-lived for mutation phases.
+- Future intra-query parallelism splits execution work into read sessions; write sessions remain short-lived for mutation phases.
+
+### Why this is easier to do now
+
+The query engine now has a much cleaner separation between:
+
+- logical planning
+- physical planning
+- runtime execution
+
+That means this refactor can primarily target:
+
+- `TransactionHandle` / `TransactionInner`
+- page guards and buffer handles
+- execution-time storage / scan code
+
+instead of also having to untangle planner-owned transaction state at the same time.
 
 ## Migration Plan
 1. Introduce `TransactionHandle`, `TransactionInner`, and session types while keeping existing API behind feature flag or adapter.
 2. Update guard constructors to require `&mut TransactionInner` and propagate lifetimes through `BufferHandle`, `PageReadGuard`, `PageWriteGuard`.
-3. Refactor tests and call sites to obtain sessions before pinning/committing; enforce guard scoping idioms in documentation.
-4. Remove interior-mutability wrappers (`RefCell`, `Cell`) that become redundant once exclusive borrows exist.
-5. Delete legacy `Transaction` methods that take `Arc<Self>` directly and update docs/examples.
+3. Refactor execution/storage call sites to obtain sessions before pinning/committing; thread the new runtime authority through execution paths.
+4. Refactor tests and examples to use explicit sessions and guard-scoping idioms.
+5. Remove interior-mutability wrappers (`RefCell`, `Cell`) that become redundant once exclusive borrows exist.
+6. Delete legacy `Transaction` methods that take `Arc<Self>` directly and update docs/examples.
 
 ## Open Questions
 - Should `read_session()` allow pinning multiple blocks simultaneously, or do we expose a finer-grained borrow (e.g., `PageReadCursor`) to reduce lock hold time?
@@ -112,3 +130,4 @@ With exclusive access guaranteed:
 ## References
 - Deadlock surfaced in `transaction_tests::test_transaction_multi_threaded_single_reader_single_writer` after guard/view migration.
 - Related roadmap items: Intra-query parallelism (#32), Read/Write handle design (#29).
+- Prerequisite architecture cleanup: [#96](https://github.com/redixhumayun/simpledb/issues/96)
