@@ -135,12 +135,12 @@ fn show_tables(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
     let tables = match db.metadata_manager().get_table_names(&txn) {
         Ok(t) => t,
         Err(e) => {
-            txn.rollback()?;
+            txn.write_session().rollback()?;
             return Err(e);
         }
     };
 
-    txn.commit()?;
+    txn.write_session().commit()?;
 
     if tables.is_empty() {
         Ok("No tables found.".to_string())
@@ -162,13 +162,13 @@ fn show_buffers(db: &SimpleDB) {
 fn recover_database(db: &SimpleDB) -> Result<String, Box<dyn Error>> {
     let txn = db.new_tx();
 
-    match txn.recover() {
+    match txn.write_session().recover() {
         Ok(_) => {
-            txn.commit()?;
+            txn.write_session().commit()?;
             Ok("Database recovery completed successfully.".to_string())
         }
         Err(e) => {
-            txn.rollback()?;
+            txn.write_session().rollback()?;
             Err(e)
         }
     }
@@ -189,7 +189,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
     // Capture block_size before committing to avoid creating new transactions in the index loop
     let block_size = txn.block_size();
 
-    txn.commit()?;
+    txn.write_session().commit()?;
 
     let mut result = format!("Table: {}\n", table_name);
     result.push_str(&format!(
@@ -266,12 +266,12 @@ fn execute_sql(db: &SimpleDB, sql: &str) -> Result<String, Box<dyn Error>> {
     //  commit the txn or rollback on error
     match result {
         Ok(_) => {
-            txn.commit()?;
+            txn.write_session().commit()?;
             result
         }
         Err(e) => {
             // Rollback on error
-            txn.rollback()?;
+            txn.write_session().rollback()?;
             Err(e)
         }
     }

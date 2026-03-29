@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -123,7 +123,7 @@ impl SimpleDB {
             Box::new(query_planner),
             Box::new(index_update_planner),
         ));
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
         Self {
             db_directory: path.as_ref().to_path_buf(),
             log_manager,
@@ -9656,7 +9656,8 @@ impl RecordPage {
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -9672,7 +9673,8 @@ impl RecordPage {
     fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -9688,7 +9690,8 @@ impl RecordPage {
     pub fn delete(&self, slot: usize) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.delete_slot(slot)?;
         Ok(())
@@ -9706,7 +9709,8 @@ impl RecordPage {
         };
         let append_lsn = record.write_log_record(&self.txn.log_manager())?;
 
-        let mut guard = self.txn.pin_write_guard(&block_id)?;
+        let ws = self.txn.write_session();
+        let mut guard = ws.pin_write_guard(&block_id)?;
         guard.mark_modified(txn_id as usize, append_lsn);
 
         // Format (emits HeapPageFormatFresh internally and overwrites with newer LSN)
@@ -9735,7 +9739,8 @@ impl RecordPage {
         // Acquire table-IX before touching the page so concurrent table-S holders are
         // blocked before we mutate anything.
         self.txn.lock_table_ix(self.table_id)?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let slot = view.insert_row_values(values)?;
         // Attempt row-X on the assigned slot while still holding the write guard.
@@ -10195,20 +10200,92 @@ impl Drop for BufferHandle {
 
 trait RecoveryWriteContext {
     fn txn_id(&self) -> usize;
-    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>>;
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>>;
 }
 
-struct TransactionRecoveryContext<'a> {
+pub(crate) trait TransactionWriteContext {
+    fn txn_id(&self) -> usize;
+    fn log_manager(&self) -> Arc<Mutex<LogManager>>;
+    fn append_block(&self, file_name: &str) -> BlockId;
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>>;
+    fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>>;
+}
+
+pub struct TransactionWriteSession<'a> {
     txn: &'a Arc<Transaction>,
+    _write_guard: MutexGuard<'a, ()>,
 }
 
-impl RecoveryWriteContext for TransactionRecoveryContext<'_> {
+impl RecoveryWriteContext for TransactionWriteSession<'_> {
     fn txn_id(&self) -> usize {
         self.txn.id()
     }
 
-    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
-        self.txn.pin_write_guard(block_id)
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+}
+
+impl TransactionWriteContext for TransactionWriteSession<'_> {
+    fn txn_id(&self) -> usize {
+        self.txn.id()
+    }
+
+    fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        self.txn.log_manager()
+    }
+
+    fn append_block(&self, file_name: &str) -> BlockId {
+        self.txn.append(file_name)
+    }
+
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+
+    fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.txn.pin_write_guard_fast_locked(block_id)
+    }
+}
+
+impl TransactionWriteSession<'_> {
+    pub fn txn(&self) -> &Arc<Transaction> {
+        self.txn
+    }
+
+    pub fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+
+    pub fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.txn.pin_write_guard_fast_locked(block_id)
+    }
+
+    pub fn commit(self) -> SimpleDBResult<()> {
+        self.txn.commit_locked()
+    }
+
+    pub fn rollback(self) -> SimpleDBResult<()> {
+        self.txn.recovery_manager.rollback(&self)?;
+        self.txn.concurrency_manager.release()?;
+        self.txn.pin_state.unpin_all();
+        Ok(())
+    }
+
+    pub fn recover(self) -> SimpleDBResult<()> {
+        self.txn.recovery_manager.recover(&self)?;
+        self.txn.concurrency_manager.release()?;
+        self.txn.pin_state.unpin_all();
+        Ok(())
     }
 }
 
@@ -10278,6 +10355,7 @@ pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<BufferManager>,
+    write_mutex: Mutex<()>,
     recovery_manager: RecoveryManager,
     concurrency_manager: ConcurrencyManager,
     pin_state: Arc<PinState>,
@@ -10313,6 +10391,7 @@ impl Transaction {
                 Arc::clone(&log_manager),
                 Arc::clone(&buffer_manager),
             ),
+            write_mutex: Mutex::new(()),
             pin_state: Arc::new(PinState::new(tx_id, Arc::clone(&buffer_manager))),
             buffer_manager,
             log_manager,
@@ -10321,32 +10400,34 @@ impl Transaction {
         }
     }
 
+    pub fn write_session(self: &Arc<Self>) -> TransactionWriteSession<'_> {
+        TransactionWriteSession {
+            txn: self,
+            _write_guard: self.write_mutex.lock().unwrap(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn commit(self: &Arc<Self>) -> SimpleDBResult<()> {
+        self.write_session().commit()
+    }
+
+    #[cfg(test)]
+    pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
+        self.write_session().rollback()
+    }
+
+    #[cfg(test)]
+    pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
+        self.write_session().recover()
+    }
+
     /// Commit this transaction
     /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
-    pub fn commit(&self) -> SimpleDBResult<()> {
+    fn commit_locked(&self) -> SimpleDBResult<()> {
         self.recovery_manager.commit()?;
-        self.concurrency_manager.release()?;
-        self.pin_state.unpin_all();
-        Ok(())
-    }
-
-    /// Rollback this transaction
-    /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
-    /// It will also handle meta operations like unpinning buffers
-    pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
-        let recovery_ctx = TransactionRecoveryContext { txn: self };
-        self.recovery_manager.rollback(&recovery_ctx).unwrap();
-        self.concurrency_manager.release()?;
-        self.pin_state.unpin_all();
-        Ok(())
-    }
-
-    /// Recover the database on start-up or after a crash
-    pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
-        let recovery_ctx = TransactionRecoveryContext { txn: self };
-        self.recovery_manager.recover(&recovery_ctx).unwrap();
         self.concurrency_manager.release()?;
         self.pin_state.unpin_all();
         Ok(())
@@ -10390,13 +10471,21 @@ impl Transaction {
         Ok(self.make_read_guard_from_frame(handle, frame))
     }
 
-    pub fn pin_write_guard(
-        self: &Arc<Self>,
+    fn pin_write_guard_locked<'a>(
+        self: &'a Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<PageWriteGuard<'_>> {
+    ) -> SimpleDBResult<PageWriteGuard<'a>> {
         let handle = self.pin(block_id);
         let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(self.make_write_guard_from_frame(handle, frame))
+    }
+
+    #[cfg(test)]
+    pub fn pin_write_guard<'a>(
+        self: &'a Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.pin_write_guard_locked(block_id)
     }
 
     /// Fast resident-only read pin.
@@ -10420,10 +10509,10 @@ impl Transaction {
     }
 
     /// Fast resident-only write pin.
-    pub fn pin_write_guard_fast(
-        self: &Arc<Self>,
+    fn pin_write_guard_fast_locked<'a>(
+        self: &'a Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'_>>> {
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
         match self.pin_state.pin_fast(block_id) {
             FastPinOutcome::Ready(()) => {}
             FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
@@ -10437,6 +10526,14 @@ impl Transaction {
         Ok(FastPinOutcome::Ready(
             self.make_write_guard_from_frame(handle, frame),
         ))
+    }
+
+    #[cfg(test)]
+    pub fn pin_write_guard_fast<'a>(
+        self: &'a Arc<Self>,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.pin_write_guard_fast_locked(block_id)
     }
 
     pub fn lock_row_s(&self, table_id: u32, rid: RID) -> SimpleDBResult<()> {
@@ -10665,10 +10762,11 @@ mod transaction_tests {
             assert_eq!(snapshot.str_val, "one");
         }
         {
-            let guard = t2.pin_write_guard(&block_id).unwrap();
+            let ws = t2.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 2, "two");
         }
-        t2.commit().unwrap();
+        t2.write_session().commit().unwrap();
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
@@ -10677,10 +10775,11 @@ mod transaction_tests {
         assert_eq!(snapshot.int_val, 2);
         assert_eq!(snapshot.str_val, "two");
         {
-            let guard = t3.pin_write_guard(&block_id).unwrap();
+            let ws = t3.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 3, "three");
         }
-        t3.rollback().unwrap();
+        t3.write_session().rollback().unwrap();
 
         //  Start a transaction t4 which should see the result of t2 since t3 rolled back
         //  This will be a read only transaction that commits
@@ -10690,7 +10789,7 @@ mod transaction_tests {
             assert_eq!(snapshot.int_val, 2);
             assert_eq!(snapshot.str_val, "two");
         }
-        t4.commit().unwrap();
+        t4.write_session().commit().unwrap();
     }
 
     #[test]
@@ -10707,9 +10806,10 @@ mod transaction_tests {
         // Initialize page so readers always see a formatted heap page.
         {
             let init_txn = test_db.new_tx();
-            let guard = init_txn.pin_write_guard(&block_id).unwrap();
+            let ws = init_txn.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
-            init_txn.commit().unwrap();
+            ws.commit().unwrap();
         }
 
         let fm1 = Arc::clone(&test_db.file_manager);
@@ -10730,20 +10830,19 @@ mod transaction_tests {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
             let _ =
                 maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         });
 
         //  Create a write only transaction
         let layout_writer = Arc::clone(&layout);
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
+            let ws = txn.write_session();
             {
-                let guard = txn.pin_write_guard(&bid2).unwrap();
+                let guard = ws.pin_write_guard(&bid2).unwrap();
                 update_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
-            //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
-            //  The related GitHub issue is https://github.com/redixhumayun/simpledb/issues/63
-            txn.commit().unwrap();
+            ws.commit().unwrap();
         });
         t1.join().unwrap();
         t2.join().unwrap();
