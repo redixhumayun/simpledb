@@ -141,8 +141,8 @@ fn run_select_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std
             TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
         scan.move_to_start();
         while scan.next().is_some() {
-            if scan.get_int("id")? == id as i32 {
-                let _ = scan.get_int("age")?;
+            if scan.get_value("id")?.as_int() == id as i32 {
+                let _ = scan.get_value("age")?.as_int();
                 break;
             }
         }
@@ -162,9 +162,9 @@ fn run_update_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std
             TableScan::new(Arc::clone(&txn), rt.layout.clone(), CONC_TABLE, rt.table_id)?;
         scan.move_to_start();
         while scan.next().is_some() {
-            if scan.get_int("id")? == id as i32 {
-                let age = scan.get_int("age")?;
-                scan.set_int("age", age + 1)?;
+            if scan.get_value("id")?.as_int() == id as i32 {
+                let age = scan.get_value("age")?.as_int();
+                scan.set_value("age", Constant::Int(age + 1))?;
                 break;
             }
         }

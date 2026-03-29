@@ -87,8 +87,11 @@ There is a test suite which provides basic coverage to ensure the code still wor
    ```
 
 7. **Create PR with descriptive title and summary**
-   - Include what was implemented
-   - Note any breaking changes
+   - Write the description for a reviewer, not as an implementation log — no phases, no task lists, no "step 1/2/3" framing
+   - Lead with what changed and why, in plain prose
+   - Group related changes into short paragraphs if there are multiple concerns; one paragraph per distinct concern is enough
+   - Note breaking changes (renamed methods, removed APIs, changed signatures) explicitly
+   - No test plan checklist — CI covers that
 
 ### Profiling Workflow (REQUIRED for bottleneck analysis)
 Use this workflow when asked to profile a benchmark/workload and identify hotspots.
