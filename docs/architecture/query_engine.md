@@ -239,45 +239,6 @@ Today it is still an early seam rather than a final abstraction. The intended lo
 - planner code depends on planning-specific queries
 - execution code depends on runtime authority
 
-## What is already clean
-
-- logical plans are separate from physical plans
-- physical plans are separate from runtime scan objects
-- runtime authority is bound at execution via `ExecutionContext`
-- the logical optimizer rewrites logical IR, not executable plans
-
-## What is still transitional
-
-Two areas are still intentionally incomplete.
-
-### 1. Planning context is not yet a narrow planning-only interface
-
-`PlanningContext` exists, but the planning API surface is not yet fully narrowed to planner-safe accessors.
-
-### 2. Some physical plans still know concrete executor classes too directly
-
-The remaining blur between the physical and execution layers is mostly about execution capabilities vs concrete executor types.
-
-Examples:
-
-- `TableSource` currently returns a concrete `TableScan`
-- merge join currently depends on `SortScan`-specific behavior rather than only on a narrower runtime capability
-
-The intended long-term direction is:
-
-- physical plans depend on execution capabilities
-- not concrete executor classes
-
-## Architecture status summary
-
-```text
-Logical <-> Physical   : mostly clean
-Physical <-> Execution : real boundary exists; still some capability leakage
-Planning <-> Execution : started, not yet fully narrowed
-```
-
-That is already much better than the earlier mixed-layer planner/executor design.
-
 ## Why this architecture matters
 
 This structure is what makes future work tractable:
@@ -292,16 +253,6 @@ In particular, session-based transaction authority becomes easier once:
 - logical plans are pure query IR
 - physical plans are operator descriptors
 - execution is the only place where runtime authority and lifetimes matter
-
-## Related docs
-
-- `docs/architecture/WAL.md`
-- `docs/transaction_session_refactor.md`
-- `docs/planning_context_and_snapshot.md`
-- `docs/planning_context_interface_note.md`
-- `docs/physical_execution_boundary_plan.md`
-- `docs/execution_capability_boundary_notes.md`
-- `docs/value_based_scan_interface_plan.md`
 
 ## External references
 
