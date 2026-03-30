@@ -36,7 +36,7 @@ fn setup_db() -> (SimpleDB, simpledb::TestDir) {
             Arc::clone(&txn),
         )
         .unwrap();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let txn = db.new_tx();
     for i in 0..100 {
@@ -48,7 +48,7 @@ fn setup_db() -> (SimpleDB, simpledb::TestDir) {
         );
         db.planner.execute_update(sql, Arc::clone(&txn)).unwrap();
     }
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     (db, dir)
 }
@@ -86,7 +86,7 @@ fn setup_concurrency_runtime() -> (Arc<ConcurrencyRuntime>, simpledb::TestDir) {
             Arc::clone(&txn),
         )
         .unwrap();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let txn = db.new_tx();
     for id in 0..(CONC_WORKERS * CONC_IDS_PER_WORKER) {
@@ -101,7 +101,7 @@ fn setup_concurrency_runtime() -> (Arc<ConcurrencyRuntime>, simpledb::TestDir) {
             )
             .unwrap();
     }
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let txn = db.new_tx();
     let layout = db
@@ -111,7 +111,7 @@ fn setup_concurrency_runtime() -> (Arc<ConcurrencyRuntime>, simpledb::TestDir) {
         .metadata_manager()
         .get_table_id(CONC_TABLE, Arc::clone(&txn))
         .unwrap();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let runtime = ConcurrencyRuntime {
         file_manager: Arc::clone(&db.file_manager),
@@ -146,11 +146,11 @@ fn run_select_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std
                 break;
             }
         }
-        txn.commit()?;
+        txn.write_session().commit()?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = txn.rollback();
+        let _ = txn.write_session().rollback();
     }
     result
 }
@@ -168,11 +168,11 @@ fn run_update_once(rt: &ConcurrencyRuntime, id: usize) -> Result<(), Box<dyn std
                 break;
             }
         }
-        txn.commit()?;
+        txn.write_session().commit()?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = txn.rollback();
+        let _ = txn.write_session().rollback();
     }
     result
 }
@@ -270,7 +270,7 @@ fn bench_insert(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
 
             let txn = db.new_tx();
             db.planner
@@ -279,7 +279,7 @@ fn bench_insert(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         })
     });
 
@@ -311,7 +311,7 @@ fn bench_select(c: &mut Criterion) {
                 let mut scan = plan.open(&ctx);
                 let _ = scan.by_ref().count();
             }
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         })
     });
 
@@ -327,7 +327,7 @@ fn bench_select(c: &mut Criterion) {
                 let mut scan = plan.open(&ctx);
                 let _count = scan.by_ref().count();
             }
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         })
     });
 
@@ -353,7 +353,7 @@ fn bench_update(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
 
             let txn = db.new_tx();
             db.planner
@@ -362,7 +362,7 @@ fn bench_update(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         })
     });
 
@@ -389,7 +389,7 @@ fn bench_delete(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
 
             let txn = db.new_tx();
             db.planner
@@ -398,7 +398,7 @@ fn bench_delete(c: &mut Criterion) {
                     Arc::clone(&txn),
                 )
                 .unwrap();
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         })
     });
 
@@ -530,7 +530,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
             Arc::clone(&txn),
         )
         .unwrap();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let txn = db.new_tx();
     db.planner
@@ -539,7 +539,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
             Arc::clone(&txn),
         )
         .unwrap();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     // Pre-populate 200 rows so lookups always find data.
     let txn = db.new_tx();
@@ -554,7 +554,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
             )
             .unwrap();
     }
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     // Extract index metadata for direct BTreeIndex construction in worker threads.
     let txn = db.new_tx();
@@ -566,7 +566,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
     let index_name = index_info.index_name().to_string();
     let leaf_layout = index_info.index_layout().clone();
     let indexed_table_id = index_info.indexed_table_id();
-    txn.commit().unwrap();
+    txn.write_session().commit().unwrap();
 
     let runtime = IndexConcurrencyRuntime {
         file_manager: Arc::clone(&db.file_manager),
@@ -633,7 +633,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                 )
                 .unwrap();
                 idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
-                txn.commit().unwrap();
+                txn.write_session().commit().unwrap();
             });
         b.iter_batched(
             setup_index_concurrency_runtime,
@@ -659,7 +659,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                 .unwrap();
                 idx.before_first(&Constant::Int(key));
                 let _ = idx.next();
-                txn.commit().unwrap();
+                txn.write_session().commit().unwrap();
             });
         b.iter_batched(
             setup_index_concurrency_runtime,
@@ -692,7 +692,7 @@ fn bench_index_concurrency(c: &mut Criterion) {
                     idx.before_first(&Constant::Int(key));
                     let _ = idx.next();
                 }
-                txn.commit().unwrap();
+                txn.write_session().commit().unwrap();
             });
         b.iter_batched(
             setup_index_concurrency_runtime,
