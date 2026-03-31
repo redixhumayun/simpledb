@@ -706,28 +706,24 @@ impl BTreeIndex {
     fn apply_root_update<W: TransactionWriteContext + ?Sized>(
         &mut self,
         ws: &W,
-        old_root_block: usize,
-        new_root_block: usize,
-        old_tree_height: u16,
-        new_tree_height: u16,
-        old_structure_version: u64,
-        new_structure_version: u64,
+        old_state: RootUpdateState,
+        new_state: RootUpdateState,
     ) -> Result<(), Box<dyn Error>> {
         let record = LogRecord::BTreeRootUpdate {
             txnum: ws.txn_id(),
             meta_block_id: self.meta_block.clone(),
-            old_root_block: old_root_block as u32,
-            new_root_block: new_root_block as u32,
-            old_tree_height,
-            new_tree_height,
-            old_structure_version,
-            new_structure_version,
+            old_root_block: old_state.block as u32,
+            new_root_block: new_state.block as u32,
+            old_tree_height: old_state.tree_height,
+            new_tree_height: new_state.tree_height,
+            old_structure_version: old_state.structure_version,
+            new_structure_version: new_state.structure_version,
         };
         let lsn = record.write_log_record(&ws.log_manager())?;
 
-        self.root_block = BlockId::new(self.index_file_name.clone(), new_root_block);
-        self.tree_height = new_tree_height;
-        self.structure_version = new_structure_version;
+        self.root_block = BlockId::new(self.index_file_name.clone(), new_state.block);
+        self.tree_height = new_state.tree_height;
+        self.structure_version = new_state.structure_version;
         Self::update_meta(
             ws,
             &self.meta_block,
@@ -816,22 +812,30 @@ impl BTreeIndex {
                 )?;
                 self.apply_root_update(
                     ws,
-                    old_root_block,
-                    new_root_block.block_num,
-                    old_tree_height,
-                    old_tree_height.saturating_add(1),
-                    old_structure_version,
-                    new_structure_version,
+                    RootUpdateState {
+                        block: old_root_block,
+                        tree_height: old_tree_height,
+                        structure_version: old_structure_version,
+                    },
+                    RootUpdateState {
+                        block: new_root_block.block_num,
+                        tree_height: old_tree_height.saturating_add(1),
+                        structure_version: new_structure_version,
+                    },
                 )?;
             } else {
                 self.apply_root_update(
                     ws,
-                    old_root_block,
-                    old_root_block,
-                    old_tree_height,
-                    old_tree_height,
-                    old_structure_version,
-                    new_structure_version,
+                    RootUpdateState {
+                        block: old_root_block,
+                        tree_height: old_tree_height,
+                        structure_version: old_structure_version,
+                    },
+                    RootUpdateState {
+                        block: old_root_block,
+                        tree_height: old_tree_height,
+                        structure_version: new_structure_version,
+                    },
                 )?;
             }
         }
@@ -1097,6 +1101,12 @@ impl BTreeIndex {
     fn set_test_hook(&mut self, hook: SharedBTreeTestHook) {
         self.test_hook = Some(hook);
     }
+}
+
+struct RootUpdateState {
+    block: usize,
+    tree_height: u16,
+    structure_version: u64,
 }
 
 impl Index for BTreeIndex {
@@ -4003,6 +4013,7 @@ pub mod validator {
     /// Phase 1: Walk internal pages top-down to collect leaf block numbers in order.
     ///   - Internal page keys are verified to be strictly ascending.
     ///   - Each separator key is verified to equal the first key of its right child's subtree.
+    ///
     /// Phase 2: Walk the leaf sibling chain and verify:
     ///   - Keys within each page are sorted ascending.
     ///   - All keys on a page are < the page's high_key (if set).

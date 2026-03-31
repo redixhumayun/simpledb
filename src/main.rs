@@ -3524,7 +3524,7 @@ mod planner_tests {
             let mut table_scan =
                 TablePlan::new("student_alt", &planning_ctx).open_table_cursor(&ctx);
             table_scan.move_to_rid(rid).unwrap();
-            if table_scan.get_value("sname").unwrap().as_str().to_string() == "sam" {
+            if table_scan.get_value("sname").unwrap().as_str() == "sam" {
                 found = true;
                 break;
             }
@@ -5843,7 +5843,7 @@ mod plan_test_single_table {
                 println!(
                     "sid {}, sname {}, majorid {}, gradyear {}",
                     scan.get_value("sid").unwrap().as_int(),
-                    scan.get_value("sname").unwrap().as_str().to_string(),
+                    scan.get_value("sname").unwrap().as_str(),
                     scan.get_value("majorid").unwrap().as_int(),
                     scan.get_value("gradyear").unwrap().as_int()
                 );
@@ -16418,7 +16418,7 @@ mod file_manager_tests {
             .unwrap();
         let before = direct_io_fallback_count();
         DIRECT_IO_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-        assert!(direct_io_fallback_count() >= before + 1);
+        assert!(direct_io_fallback_count() > before);
         DIRECT_IO_FALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }

@@ -186,7 +186,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         let file = format!("seqread_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        group.bench_function(&format!("Sequential Read ({total_ops} ops)"), |b| {
+        group.bench_function(format!("Sequential Read ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..total_ops {
@@ -203,7 +203,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         let file = format!("seqwrite_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        group.bench_function(&format!("Sequential Write ({total_ops} ops)"), |b| {
+        group.bench_function(format!("Sequential Write ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..total_ops {
@@ -222,7 +222,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        group.bench_function(&format!("Random Read ({total_ops} ops)"), |b| {
+        group.bench_function(format!("Random Read ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let indices: Vec<usize> = (0..total_ops).map(|_| rng.next_range(ws)).collect();
                 let mut page = Page::new();
@@ -241,7 +241,7 @@ fn bench_phase1_io(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        group.bench_function(&format!("Random Write ({total_ops} ops)"), |b| {
+        group.bench_function(format!("Random Write ({total_ops} ops)"), |b| {
             b.iter(|| {
                 let indices: Vec<usize> = (0..total_ops).map(|_| rng.next_range(ws)).collect();
                 let mut page = Page::new();
@@ -385,7 +385,8 @@ fn bench_wal(c: &mut Criterion) {
     }
 
     // WAL group commit (1000 ops, batch sizes 10/50/100)
-    for batch_size in [10usize] {
+    {
+        let batch_size = 10usize;
         let (db, _dir) = setup_io_test();
         let log = db.log_manager();
         let total_ops = 1000usize;
@@ -593,7 +594,7 @@ fn bench_durability(c: &mut Criterion) {
             let log = db.log_manager();
             let mut rng = FastRng::new();
 
-            group.bench_function(&format!("{wal_name} {data_name}"), |b| {
+            group.bench_function(format!("{wal_name} {data_name}"), |b| {
                 b.iter(|| {
                     let indices: Vec<usize> =
                         (0..durability_ops).map(|_| rng.next_range(ws)).collect();
@@ -640,7 +641,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
         let file = format!("onepass_seq_{ws}");
         precreate_blocks(&db, &file, ws);
 
-        group.bench_function(&format!("One-pass Seq Scan ({ws} blocks)"), |b| {
+        group.bench_function(format!("One-pass Seq Scan ({ws} blocks)"), |b| {
             b.iter(|| {
                 let mut page = Page::new();
                 for i in 0..ws {
@@ -658,7 +659,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
         precreate_blocks(&db, &file, ws);
         let mut rng = FastRng::new();
 
-        group.bench_function(&format!("Low-locality Rand Read ({ws} blocks)"), |b| {
+        group.bench_function(format!("Low-locality Rand Read ({ws} blocks)"), |b| {
             b.iter(|| {
                 let mut indices: Vec<usize> = (0..ws).collect();
                 for i in (1..ws).rev() {
@@ -684,7 +685,7 @@ fn bench_cache_adverse(c: &mut Criterion) {
             precreate_blocks(&db, &f, blocks_per_stream);
         }
 
-        group.bench_function(&format!("Multi-stream Scan ({ws} blocks)"), |b| {
+        group.bench_function(format!("Multi-stream Scan ({ws} blocks)"), |b| {
             b.iter(|| {
                 let handles: Vec<_> = (0..num_streams)
                     .map(|s| {
@@ -730,7 +731,7 @@ fn bench_cache_evict(c: &mut Criterion) {
         let file_path: PathBuf = test_dir.path.join(&file_name);
         precreate_blocks(&db, &file_name, ws);
 
-        group.bench_function(&format!("One-pass Seq Scan+Evict ({ws} blocks)"), |b| {
+        group.bench_function(format!("One-pass Seq Scan+Evict ({ws} blocks)"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -756,30 +757,27 @@ fn bench_cache_evict(c: &mut Criterion) {
         precreate_blocks(&db, &file_name, ws);
         let mut rng = FastRng::new();
 
-        group.bench_function(
-            &format!("Low-locality Rand Read+Evict ({ws} blocks)"),
-            |b| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let mut indices: Vec<usize> = (0..ws).collect();
-                        for i in (1..ws).rev() {
-                            let j = rng.next_range(i + 1);
-                            indices.swap(i, j);
-                        }
-                        let t = Instant::now();
-                        let mut page = Page::new();
-                        for &idx in &indices {
-                            db.file_manager
-                                .read(&BlockId::new(file_name.clone(), idx), &mut page);
-                        }
-                        total += t.elapsed();
-                        posix_fadvise_dontneed(&file_path);
+        group.bench_function(format!("Low-locality Rand Read+Evict ({ws} blocks)"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let mut indices: Vec<usize> = (0..ws).collect();
+                    for i in (1..ws).rev() {
+                        let j = rng.next_range(i + 1);
+                        indices.swap(i, j);
                     }
-                    total
-                })
-            },
-        );
+                    let t = Instant::now();
+                    let mut page = Page::new();
+                    for &idx in &indices {
+                        db.file_manager
+                            .read(&BlockId::new(file_name.clone(), idx), &mut page);
+                    }
+                    total += t.elapsed();
+                    posix_fadvise_dontneed(&file_path);
+                }
+                total
+            })
+        });
     }
 
     // Multi-stream scan + evict
@@ -795,7 +793,7 @@ fn bench_cache_evict(c: &mut Criterion) {
             precreate_blocks(&db, name, blocks_per_stream);
         }
 
-        group.bench_function(&format!("Multi-stream Scan+Evict ({ws} blocks)"), |b| {
+        group.bench_function(format!("Multi-stream Scan+Evict ({ws} blocks)"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {

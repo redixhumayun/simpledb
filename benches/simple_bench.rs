@@ -77,6 +77,9 @@ struct RunStats {
     errors: u64,
 }
 
+type ConcurrencyOp = dyn Fn(&ConcurrencyRuntime, usize, usize) -> RunStats + Send + Sync;
+type IndexConcurrencyOp = dyn Fn(&IndexConcurrencyRuntime, usize, usize) + Send + Sync;
+
 fn setup_concurrency_runtime() -> (Arc<ConcurrencyRuntime>, simpledb::TestDir) {
     let (db, dir) = SimpleDB::new_for_test(64, 1000);
     let txn = db.new_tx();
@@ -213,10 +216,7 @@ fn run_with_retry(
     }
 }
 
-fn run_concurrent_disjoint_ids(
-    rt: &Arc<ConcurrencyRuntime>,
-    op: Arc<dyn Fn(&ConcurrencyRuntime, usize, usize) -> RunStats + Send + Sync>,
-) -> RunStats {
+fn run_concurrent_disjoint_ids(rt: &Arc<ConcurrencyRuntime>, op: Arc<ConcurrencyOp>) -> RunStats {
     let start_barrier = Arc::new(Barrier::new(CONC_WORKERS));
     let mut handles = Vec::with_capacity(CONC_WORKERS);
 
@@ -421,7 +421,7 @@ fn bench_sql_concurrency(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             let mut total = RunStats::default();
-            let op: Arc<dyn Fn(&ConcurrencyRuntime, usize, usize) -> RunStats + Send + Sync> =
+            let op: Arc<ConcurrencyOp> =
                 Arc::new(|rt, id, _op_idx| run_with_retry(rt, |rt| run_select_once(rt, id)));
             for _ in 0..iters {
                 let s = run_concurrent_disjoint_ids(&rt, Arc::clone(&op));
@@ -442,7 +442,7 @@ fn bench_sql_concurrency(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             let mut total = RunStats::default();
-            let op: Arc<dyn Fn(&ConcurrencyRuntime, usize, usize) -> RunStats + Send + Sync> =
+            let op: Arc<ConcurrencyOp> =
                 Arc::new(|rt, id, _op_idx| run_with_retry(rt, |rt| run_update_once(rt, id)));
             for _ in 0..iters {
                 let s = run_concurrent_disjoint_ids(&rt, Arc::clone(&op));
@@ -463,8 +463,7 @@ fn bench_sql_concurrency(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             let mut total = RunStats::default();
-            let op: Arc<dyn Fn(&ConcurrencyRuntime, usize, usize) -> RunStats + Send + Sync> =
-                Arc::new(|rt, id, op_idx| {
+            let op: Arc<ConcurrencyOp> = Arc::new(|rt, id, op_idx| {
                     run_with_retry(rt, |rt| {
                         let mixed_probe = op_idx % 5;
                         if mixed_probe == 0 {
@@ -584,10 +583,7 @@ fn setup_index_concurrency_runtime() -> (Arc<IndexConcurrencyRuntime>, simpledb:
 
 /// Drive CONC_WORKERS threads, each calling `op(rt, worker_id, op_idx)` for
 /// CONC_OPS_PER_WORKER iterations, all starting behind a Barrier.
-fn run_idx_concurrent(
-    rt: &Arc<IndexConcurrencyRuntime>,
-    op: Arc<dyn Fn(&IndexConcurrencyRuntime, usize, usize) + Send + Sync>,
-) {
+fn run_idx_concurrent(rt: &Arc<IndexConcurrencyRuntime>, op: Arc<IndexConcurrencyOp>) {
     let start_barrier = Arc::new(Barrier::new(CONC_WORKERS));
     let mut handles = Vec::with_capacity(CONC_WORKERS);
 
@@ -620,21 +616,20 @@ fn bench_index_concurrency(c: &mut Criterion) {
     ));
 
     group.bench_function("Concurrent INSERT disjoint-key", |b| {
-        let op: Arc<dyn Fn(&IndexConcurrencyRuntime, usize, usize) + Send + Sync> =
-            Arc::new(|rt, worker, op_idx| {
-                let key = (1000 + worker * CONC_OPS_PER_WORKER + op_idx) as i32;
-                let txn = new_idx_txn(rt);
-                let mut idx = BTreeIndex::new(
-                    Arc::clone(&txn),
-                    &rt.index_name,
-                    rt.leaf_layout.clone(),
-                    rt.indexed_table_id,
-                    Arc::clone(&rt.split_gate),
-                )
-                .unwrap();
-                idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
-                txn.write_session().commit().unwrap();
-            });
+        let op: Arc<IndexConcurrencyOp> = Arc::new(|rt, worker, op_idx| {
+            let key = (1000 + worker * CONC_OPS_PER_WORKER + op_idx) as i32;
+            let txn = new_idx_txn(rt);
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &rt.index_name,
+                rt.leaf_layout.clone(),
+                rt.indexed_table_id,
+                Arc::clone(&rt.split_gate),
+            )
+            .unwrap();
+            idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
+            txn.write_session().commit().unwrap();
+        });
         b.iter_batched(
             setup_index_concurrency_runtime,
             |(rt, _dir)| {
@@ -645,22 +640,21 @@ fn bench_index_concurrency(c: &mut Criterion) {
     });
 
     group.bench_function("Concurrent LOOKUP pre-populated", |b| {
-        let op: Arc<dyn Fn(&IndexConcurrencyRuntime, usize, usize) + Send + Sync> =
-            Arc::new(|rt, worker, op_idx| {
-                let key = ((worker * CONC_OPS_PER_WORKER + op_idx) % 200) as i32;
-                let txn = new_idx_txn(rt);
-                let mut idx = BTreeIndex::new(
-                    Arc::clone(&txn),
-                    &rt.index_name,
-                    rt.leaf_layout.clone(),
-                    rt.indexed_table_id,
-                    Arc::clone(&rt.split_gate),
-                )
-                .unwrap();
-                idx.before_first(&Constant::Int(key));
-                let _ = idx.next();
-                txn.write_session().commit().unwrap();
-            });
+        let op: Arc<IndexConcurrencyOp> = Arc::new(|rt, worker, op_idx| {
+            let key = ((worker * CONC_OPS_PER_WORKER + op_idx) % 200) as i32;
+            let txn = new_idx_txn(rt);
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &rt.index_name,
+                rt.leaf_layout.clone(),
+                rt.indexed_table_id,
+                Arc::clone(&rt.split_gate),
+            )
+            .unwrap();
+            idx.before_first(&Constant::Int(key));
+            let _ = idx.next();
+            txn.write_session().commit().unwrap();
+        });
         b.iter_batched(
             setup_index_concurrency_runtime,
             |(rt, _dir)| {
@@ -671,29 +665,28 @@ fn bench_index_concurrency(c: &mut Criterion) {
     });
 
     group.bench_function("Concurrent mixed 80/20 RW", |b| {
-        let op: Arc<dyn Fn(&IndexConcurrencyRuntime, usize, usize) + Send + Sync> =
-            Arc::new(|rt, worker, op_idx| {
-                let txn = new_idx_txn(rt);
-                let mut idx = BTreeIndex::new(
-                    Arc::clone(&txn),
-                    &rt.index_name,
-                    rt.leaf_layout.clone(),
-                    rt.indexed_table_id,
-                    Arc::clone(&rt.split_gate),
-                )
-                .unwrap();
-                if op_idx % 5 == 0 {
-                    // 20% writes
-                    let key = (1000 + worker * CONC_OPS_PER_WORKER + op_idx) as i32;
-                    idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
-                } else {
-                    // 80% reads
-                    let key = ((worker * CONC_OPS_PER_WORKER + op_idx) % 200) as i32;
-                    idx.before_first(&Constant::Int(key));
-                    let _ = idx.next();
-                }
-                txn.write_session().commit().unwrap();
-            });
+        let op: Arc<IndexConcurrencyOp> = Arc::new(|rt, worker, op_idx| {
+            let txn = new_idx_txn(rt);
+            let mut idx = BTreeIndex::new(
+                Arc::clone(&txn),
+                &rt.index_name,
+                rt.leaf_layout.clone(),
+                rt.indexed_table_id,
+                Arc::clone(&rt.split_gate),
+            )
+            .unwrap();
+            if op_idx % 5 == 0 {
+                // 20% writes
+                let key = (1000 + worker * CONC_OPS_PER_WORKER + op_idx) as i32;
+                idx.insert(&Constant::Int(key), &RID::new(0, key as usize));
+            } else {
+                // 80% reads
+                let key = ((worker * CONC_OPS_PER_WORKER + op_idx) % 200) as i32;
+                idx.before_first(&Constant::Int(key));
+                let _ = idx.next();
+            }
+            txn.write_session().commit().unwrap();
+        });
         b.iter_batched(
             setup_index_concurrency_runtime,
             |(rt, _dir)| {
