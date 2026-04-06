@@ -10219,41 +10219,6 @@ pub struct TransactionWriteSession<'a> {
     _write_guard: MutexGuard<'a, ()>,
 }
 
-impl RecoveryWriteContext for TransactionWriteSession<'_> {
-    fn txn_id(&self) -> usize {
-        self.txn.id()
-    }
-
-    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
-        self.txn.pin_write_guard_locked(block_id)
-    }
-}
-
-impl TransactionWriteContext for TransactionWriteSession<'_> {
-    fn txn_id(&self) -> usize {
-        self.txn.id()
-    }
-
-    fn log_manager(&self) -> Arc<Mutex<LogManager>> {
-        self.txn.log_manager()
-    }
-
-    fn append_block(&self, file_name: &str) -> BlockId {
-        self.txn.append(file_name)
-    }
-
-    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
-        self.txn.pin_write_guard_locked(block_id)
-    }
-
-    fn pin_write_guard_fast<'a>(
-        &'a self,
-        block_id: &BlockId,
-    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
-        self.txn.pin_write_guard_fast_locked(block_id)
-    }
-}
-
 impl TransactionWriteSession<'_> {
     pub fn txn(&self) -> &Arc<Transaction> {
         self.txn
@@ -10286,6 +10251,41 @@ impl TransactionWriteSession<'_> {
         self.txn.concurrency_manager.release()?;
         self.txn.pin_state.unpin_all();
         Ok(())
+    }
+}
+
+impl RecoveryWriteContext for TransactionWriteSession<'_> {
+    fn txn_id(&self) -> usize {
+        self.txn.id()
+    }
+
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+}
+
+impl TransactionWriteContext for TransactionWriteSession<'_> {
+    fn txn_id(&self) -> usize {
+        self.txn.id()
+    }
+
+    fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        self.txn.log_manager()
+    }
+
+    fn append_block(&self, file_name: &str) -> BlockId {
+        self.txn.append(file_name)
+    }
+
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+
+    fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.txn.pin_write_guard_fast_locked(block_id)
     }
 }
 
