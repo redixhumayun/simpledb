@@ -121,9 +121,10 @@ fn bench_phase1(c: &mut Criterion) {
 
         // Fill pool with dirty buffers
         let txn = db.new_tx();
+        let ws = txn.write_session();
         for i in 0..nb {
             let block_id = BlockId::new(test_file.clone(), i);
-            let mut guard = txn.pin_write_guard(&block_id).unwrap();
+            let mut guard = ws.pin_write_guard(&block_id).unwrap();
             write_i32_at(guard.bytes_mut(), 60, 999);
             guard.mark_modified(txn.id(), Lsn::MAX);
         }
@@ -144,7 +145,7 @@ fn bench_phase1(c: &mut Criterion) {
             })
         });
 
-        txn.commit().unwrap();
+        ws.commit().unwrap();
     }
 
     group.finish();
@@ -172,7 +173,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
         precreate_blocks(&db, &test_file, total_blocks);
         let buffer_manager = db.buffer_manager();
 
-        group.bench_function(&format!("Sequential Scan ({total_blocks} blocks)"), |b| {
+        group.bench_function(format!("Sequential Scan ({total_blocks} blocks)"), |b| {
             b.iter(|| {
                 for i in 0..total_blocks {
                     let block_id = BlockId::new(test_file.clone(), i);
@@ -192,7 +193,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
         precreate_blocks(&db, &test_file, working_set);
         let buffer_manager = db.buffer_manager();
 
-        group.bench_function(&format!("Repeated Access ({total_accesses} ops)"), |b| {
+        group.bench_function(format!("Repeated Access ({total_accesses} ops)"), |b| {
             b.iter(|| {
                 for i in 0..total_accesses {
                     let block_idx = i % working_set;
@@ -216,7 +217,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
         let buffer_manager = db.buffer_manager();
 
         group.bench_function(
-            &format!("Random (K={working_set_size}, {total_accesses} ops)"),
+            format!("Random (K={working_set_size}, {total_accesses} ops)"),
             |b| {
                 b.iter(|| {
                     for &block_idx in &random_indices {
@@ -249,7 +250,7 @@ fn bench_access_patterns_st(c: &mut Criterion) {
             .collect();
         let buffer_manager = db.buffer_manager();
 
-        group.bench_function(&format!("Zipfian (80/20, {total_accesses} ops)"), |b| {
+        group.bench_function(format!("Zipfian (80/20, {total_accesses} ops)"), |b| {
             b.iter(|| {
                 for &block_idx in &zipfian_indices {
                     let block_id = BlockId::new(test_file.clone(), block_idx);
@@ -346,7 +347,7 @@ fn bench_access_patterns_mt(c: &mut Criterion) {
         );
 
         group.bench_function(
-            &format!("Seq Scan MT x{num_threads} ({total_blocks} blocks)"),
+            format!("Seq Scan MT x{num_threads} ({total_blocks} blocks)"),
             |b| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
@@ -464,7 +465,7 @@ fn bench_concurrent_pin(c: &mut Criterion) {
             .collect();
 
         group.bench_function(
-            &format!("Concurrent ({num_threads} threads, {ops_per_thread} ops)"),
+            format!("Concurrent ({num_threads} threads, {ops_per_thread} ops)"),
             |b| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
@@ -538,7 +539,7 @@ fn bench_hotset_contention(c: &mut Criterion) {
             .collect();
 
         group.bench_function(
-            &format!(
+            format!(
                 "Concurrent Hotset ({num_threads} threads, K={HOTSET_K}, {ops_per_thread} ops)"
             ),
             |b| {

@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize},
-        Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -123,7 +123,7 @@ impl SimpleDB {
             Box::new(query_planner),
             Box::new(index_update_planner),
         ));
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
         Self {
             db_directory: path.as_ref().to_path_buf(),
             log_manager,
@@ -2767,7 +2767,7 @@ mod sort_scan_tests {
 
         assert_eq!(count, 6, "Should have retrieved all records");
 
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 
     #[test]
@@ -2810,7 +2810,7 @@ mod sort_scan_tests {
         assert_eq!(count, 5);
 
         drop(sort_scan);
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 
     #[test]
@@ -2838,7 +2838,7 @@ mod sort_scan_tests {
         assert_eq!(count, 0, "No records should be returned for empty tables");
 
         drop(sort_scan);
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -3524,7 +3524,7 @@ mod planner_tests {
             let mut table_scan =
                 TablePlan::new("student_alt", &planning_ctx).open_table_cursor(&ctx);
             table_scan.move_to_rid(rid).unwrap();
-            if table_scan.get_value("sname").unwrap().as_str().to_string() == "sam" {
+            if table_scan.get_value("sname").unwrap().as_str() == "sam" {
                 found = true;
                 break;
             }
@@ -5843,7 +5843,7 @@ mod plan_test_single_table {
                 println!(
                     "sid {}, sname {}, majorid {}, gradyear {}",
                     scan.get_value("sid").unwrap().as_int(),
-                    scan.get_value("sname").unwrap().as_str().to_string(),
+                    scan.get_value("sname").unwrap().as_str(),
                     scan.get_value("majorid").unwrap().as_int(),
                     scan.get_value("gradyear").unwrap().as_int()
                 );
@@ -6067,7 +6067,7 @@ mod product_scan_tests {
                 assert_eq!(lhs, rhs);
             }
         }
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -6202,7 +6202,7 @@ mod project_scan_tests {
             }
             assert_eq!(projected_count, 5);
         }
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -6667,7 +6667,7 @@ mod index_join_scan_tests {
             assert_eq!(join_count, inserted_count);
         }
 
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -6837,7 +6837,7 @@ mod index_select_scan_tests {
             }
             assert_eq!(selection_count, 5);
         }
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -6963,7 +6963,7 @@ mod select_scan_tests {
             }
             assert_eq!(selection_count, 5);
         }
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
     }
 }
 
@@ -8130,7 +8130,7 @@ mod metadata_manager_tests {
         assert_eq!(idx_b.records_output(), 2);
         assert!(idx_b.distinct_values("B") == 1); //  we have an index on B
 
-        tx.commit().unwrap();
+        tx.write_session().commit().unwrap();
     }
 
     #[test]
@@ -8157,16 +8157,16 @@ mod metadata_manager_tests {
                 table_scan.insert_row(&[Constant::Int(i)]).unwrap();
             }
         }
-        setup_txn.commit().unwrap();
+        setup_txn.write_session().commit().unwrap();
 
         let layout_txn = db.new_tx();
         let layout = mdm.get_layout(table_name, Arc::clone(&layout_txn));
-        layout_txn.commit().unwrap();
+        layout_txn.write_session().commit().unwrap();
 
         // Prime the cache so concurrent readers hit the fast path
         let prime_txn = db.new_tx();
         mdm.get_stat_info(table_name, layout.clone(), Arc::clone(&prime_txn));
-        prime_txn.commit().unwrap();
+        prime_txn.write_session().commit().unwrap();
 
         let file_manager = Arc::clone(&db.file_manager);
         let log_manager = Arc::clone(&db.log_manager);
@@ -8188,7 +8188,7 @@ mod metadata_manager_tests {
                         mdm_clone.get_stat_info(table_name, layout_clone.clone(), Arc::clone(&txn));
                     assert_eq!(stats.num_records, 20);
                 }
-                txn.commit().unwrap();
+                txn.write_session().commit().unwrap();
             }));
         }
 
@@ -9064,7 +9064,7 @@ mod table_manager_tests {
         assert_eq!(layout.offset("A").unwrap(), 4); // First field after slot header
         assert_eq!(layout.offset("B").unwrap(), 8); // After int field
 
-        tx.commit().unwrap();
+        tx.write_session().commit().unwrap();
     }
 }
 
@@ -9656,7 +9656,8 @@ impl RecordPage {
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -9672,7 +9673,8 @@ impl RecordPage {
     fn set_string(&self, slot: usize, field_name: &str, value: &str) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let mut row = view
             .row_mut(slot)?
@@ -9688,7 +9690,8 @@ impl RecordPage {
     pub fn delete(&self, slot: usize) -> SimpleDBResult<()> {
         self.txn
             .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         view.delete_slot(slot)?;
         Ok(())
@@ -9706,7 +9709,8 @@ impl RecordPage {
         };
         let append_lsn = record.write_log_record(&self.txn.log_manager())?;
 
-        let mut guard = self.txn.pin_write_guard(&block_id)?;
+        let ws = self.txn.write_session();
+        let mut guard = ws.pin_write_guard(&block_id)?;
         guard.mark_modified(txn_id as usize, append_lsn);
 
         // Format (emits HeapPageFormatFresh internally and overwrites with newer LSN)
@@ -9735,7 +9739,8 @@ impl RecordPage {
         // Acquire table-IX before touching the page so concurrent table-S holders are
         // blocked before we mutate anything.
         self.txn.lock_table_ix(self.table_id)?;
-        let guard = self.txn.pin_write_guard(&self.block_id)?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
         let mut view = guard.into_heap_view_mut(&self.layout)?;
         let slot = view.insert_row_values(values)?;
         // Attempt row-X on the assigned slot while still holding the write guard.
@@ -10155,14 +10160,17 @@ impl Schema {
 pub struct BufferHandle {
     /// The pinned block this handle is responsible for unpinning on drop.
     block_id: BlockId,
-    /// Shared transaction used only for pin bookkeeping.
-    txn: Arc<Transaction>,
+    /// Narrow shared state used only for transaction-local pin bookkeeping.
+    pin_state: Arc<PinState>,
 }
 
 impl BufferHandle {
-    pub fn new(block_id: BlockId, txn: Arc<Transaction>) -> Self {
-        txn.pin_internal(&block_id);
-        BufferHandle { block_id, txn }
+    fn new(block_id: BlockId, pin_state: Arc<PinState>) -> Self {
+        pin_state.pin(&block_id);
+        BufferHandle {
+            block_id,
+            pin_state,
+        }
     }
 
     pub fn block_id(&self) -> &BlockId {
@@ -10170,38 +10178,124 @@ impl BufferHandle {
     }
 
     pub fn txn_id(&self) -> usize {
-        self.txn.id()
+        self.pin_state.txn_id() as usize
     }
 }
 
 impl Clone for BufferHandle {
     fn clone(&self) -> Self {
-        self.txn.pin_internal(&self.block_id);
+        self.pin_state.pin(&self.block_id);
         Self {
             block_id: self.block_id.clone(),
-            txn: Arc::clone(&self.txn),
+            pin_state: Arc::clone(&self.pin_state),
         }
     }
 }
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
-        self.txn.unpin_internal(&self.block_id);
+        self.pin_state.unpin(&self.block_id);
     }
 }
 
-trait TransactionOperations {
+trait RecoveryWriteContext {
     fn txn_id(&self) -> usize;
-    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>>;
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>>;
 }
 
-impl TransactionOperations for Arc<Transaction> {
-    fn txn_id(&self) -> usize {
-        self.id()
+pub(crate) trait TransactionWriteContext {
+    fn txn_id(&self) -> usize;
+    fn log_manager(&self) -> Arc<Mutex<LogManager>>;
+    fn append_block(&self, file_name: &str) -> BlockId;
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>>;
+    fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>>;
+}
+
+pub struct TransactionWriteSession<'a> {
+    txn: &'a Arc<Transaction>,
+    _write_guard: MutexGuard<'a, ()>,
+}
+
+impl TransactionWriteSession<'_> {
+    fn cleanup(self) -> SimpleDBResult<()> {
+        let release_res = self.txn.concurrency_manager.release();
+        self.txn.pin_state.unpin_all();
+        release_res
     }
 
-    fn pin_write_guard(&self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'_>> {
-        Transaction::pin_write_guard(self, block_id)
+    pub fn txn(&self) -> &Arc<Transaction> {
+        self.txn
+    }
+
+    pub fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+
+    pub fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.txn.pin_write_guard_fast_locked(block_id)
+    }
+
+    pub fn commit(self) -> SimpleDBResult<()> {
+        self.txn.commit_locked()
+    }
+
+    pub fn rollback(self) -> SimpleDBResult<()> {
+        let rollback_res = self.txn.recovery_manager.rollback(&self);
+        let cleanup_res = self.cleanup();
+
+        rollback_res?;
+        cleanup_res?;
+        Ok(())
+    }
+
+    pub fn recover(self) -> SimpleDBResult<()> {
+        let recover_res = self.txn.recovery_manager.recover(&self);
+        let cleanup_res = self.cleanup();
+
+        recover_res?;
+        cleanup_res?;
+        Ok(())
+    }
+}
+
+impl RecoveryWriteContext for TransactionWriteSession<'_> {
+    fn txn_id(&self) -> usize {
+        self.txn.id()
+    }
+
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+}
+
+impl TransactionWriteContext for TransactionWriteSession<'_> {
+    fn txn_id(&self) -> usize {
+        self.txn.id()
+    }
+
+    fn log_manager(&self) -> Arc<Mutex<LogManager>> {
+        self.txn.log_manager()
+    }
+
+    fn append_block(&self, file_name: &str) -> BlockId {
+        self.txn.append(file_name)
+    }
+
+    fn pin_write_guard<'a>(&'a self, block_id: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+        self.txn.pin_write_guard_locked(block_id)
+    }
+
+    fn pin_write_guard_fast<'a>(
+        &'a self,
+        block_id: &BlockId,
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        self.txn.pin_write_guard_fast_locked(block_id)
     }
 }
 
@@ -10222,13 +10316,59 @@ impl TxIdGenerator {
 
 static TX_ID_GENERATOR: OnceLock<TxIdGenerator> = OnceLock::new();
 
+#[derive(Debug)]
+struct PinState {
+    tx_id: TransactionID,
+    buffer_list: BufferList,
+}
+
+impl PinState {
+    fn new(tx_id: TransactionID, buffer_manager: Arc<BufferManager>) -> Self {
+        Self {
+            tx_id,
+            buffer_list: BufferList::new(buffer_manager),
+        }
+    }
+
+    fn txn_id(&self) -> TransactionID {
+        self.tx_id
+    }
+
+    fn get_buffer(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
+        self.buffer_list.get_buffer(block_id)
+    }
+
+    fn pin(&self, block_id: &BlockId) {
+        self.buffer_list.pin(block_id);
+    }
+
+    fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
+        self.buffer_list.pin_fast(block_id)
+    }
+
+    fn unpin(&self, block_id: &BlockId) {
+        self.buffer_list.unpin(block_id);
+    }
+
+    fn unpin_all(&self) {
+        self.buffer_list.unpin_all();
+    }
+
+    #[cfg(test)]
+    fn assert_pin_invariant(&self, block_id: &BlockId, expected_handles: usize) {
+        self.buffer_list
+            .assert_pin_invariant(block_id, expected_handles);
+    }
+}
+
 pub struct Transaction {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_manager: Arc<BufferManager>,
+    write_mutex: Mutex<()>,
     recovery_manager: RecoveryManager,
     concurrency_manager: ConcurrencyManager,
-    buffer_list: BufferList,
+    pin_state: Arc<PinState>,
     tx_id: TransactionID,
 }
 
@@ -10261,7 +10401,8 @@ impl Transaction {
                 Arc::clone(&log_manager),
                 Arc::clone(&buffer_manager),
             ),
-            buffer_list: BufferList::new(Arc::clone(&buffer_manager)),
+            write_mutex: Mutex::new(()),
+            pin_state: Arc::new(PinState::new(tx_id, Arc::clone(&buffer_manager))),
             buffer_manager,
             log_manager,
             concurrency_manager: ConcurrencyManager::new(tx_id, lock_table),
@@ -10269,38 +10410,27 @@ impl Transaction {
         }
     }
 
+    pub fn write_session(self: &Arc<Self>) -> TransactionWriteSession<'_> {
+        TransactionWriteSession {
+            txn: self,
+            _write_guard: self.write_mutex.lock().unwrap(),
+        }
+    }
+
     /// Commit this transaction
     /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
-    pub fn commit(&self) -> SimpleDBResult<()> {
+    fn commit_locked(&self) -> SimpleDBResult<()> {
         self.recovery_manager.commit()?;
         self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
-        Ok(())
-    }
-
-    /// Rollback this transaction
-    /// This will undo all operations performed by this transaction and append a [`LogRecord::Rollback`] to the WAL
-    /// It will also handle meta operations like unpinning buffers
-    pub fn rollback(self: &Arc<Self>) -> SimpleDBResult<()> {
-        self.recovery_manager.rollback(self).unwrap();
-        self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
-        Ok(())
-    }
-
-    /// Recover the database on start-up or after a crash
-    pub fn recover(self: &Arc<Self>) -> SimpleDBResult<()> {
-        self.recovery_manager.recover(self).unwrap();
-        self.concurrency_manager.release()?;
-        self.buffer_list.unpin_all();
+        self.pin_state.unpin_all();
         Ok(())
     }
 
     /// The pin method which will return a [`BufferHandle`] for RAII semantics
     fn pin(self: &Arc<Self>, block_id: &BlockId) -> BufferHandle {
-        BufferHandle::new(block_id.clone(), Arc::clone(self))
+        BufferHandle::new(block_id.clone(), Arc::clone(&self.pin_state))
     }
 
     fn make_read_guard_from_frame<'a>(
@@ -10332,16 +10462,16 @@ impl Transaction {
         block_id: &BlockId,
     ) -> SimpleDBResult<PageReadGuard<'_>> {
         let handle = self.pin(block_id);
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(self.make_read_guard_from_frame(handle, frame))
     }
 
-    pub fn pin_write_guard(
-        self: &Arc<Self>,
+    fn pin_write_guard_locked<'a>(
+        self: &'a Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<PageWriteGuard<'_>> {
+    ) -> SimpleDBResult<PageWriteGuard<'a>> {
         let handle = self.pin(block_id);
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(self.make_write_guard_from_frame(handle, frame))
     }
 
@@ -10350,36 +10480,36 @@ impl Transaction {
         self: &Arc<Self>,
         block_id: &BlockId,
     ) -> SimpleDBResult<FastPinOutcome<PageReadGuard<'_>>> {
-        match self.pin_internal_fast(block_id) {
+        match self.pin_state.pin_fast(block_id) {
             FastPinOutcome::Ready(()) => {}
             FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
             FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
-            txn: Arc::clone(self),
+            pin_state: Arc::clone(&self.pin_state),
         };
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
             self.make_read_guard_from_frame(handle, frame),
         ))
     }
 
     /// Fast resident-only write pin.
-    pub fn pin_write_guard_fast(
-        self: &Arc<Self>,
+    fn pin_write_guard_fast_locked<'a>(
+        self: &'a Arc<Self>,
         block_id: &BlockId,
-    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'_>>> {
-        match self.pin_internal_fast(block_id) {
+    ) -> SimpleDBResult<FastPinOutcome<PageWriteGuard<'a>>> {
+        match self.pin_state.pin_fast(block_id) {
             FastPinOutcome::Ready(()) => {}
             FastPinOutcome::NotResident => return Ok(FastPinOutcome::NotResident),
             FastPinOutcome::Contended => return Ok(FastPinOutcome::Contended),
         }
         let handle = BufferHandle {
             block_id: block_id.clone(),
-            txn: Arc::clone(self),
+            pin_state: Arc::clone(&self.pin_state),
         };
-        let frame = self.buffer_list.get_buffer(block_id).unwrap();
+        let frame = self.pin_state.get_buffer(block_id).unwrap();
         Ok(FastPinOutcome::Ready(
             self.make_write_guard_from_frame(handle, frame),
         ))
@@ -10478,22 +10608,6 @@ impl Transaction {
             }
         }
         Ok(())
-    }
-
-    /// Pin this [`BlockId`] to be used in this transaction
-    /// This should not be used anywhere outside of the following modules - [`Transaction`], [`RecoveryManager`]
-    /// It does not provide RAII semantics. Requires an explicit call to [`Transaction::unpin_internal`] after
-    fn pin_internal(&self, block_id: &BlockId) {
-        self.buffer_list.pin(block_id);
-    }
-
-    fn pin_internal_fast(&self, block_id: &BlockId) -> FastPinOutcome<()> {
-        self.buffer_list.pin_fast(block_id)
-    }
-
-    /// Unpin this [`BlockId`] since it is no longer needed by this transaction
-    fn unpin_internal(&self, block_id: &BlockId) {
-        self.buffer_list.unpin(block_id);
     }
 
     /// Get the available buffers for this transaction
@@ -10613,10 +10727,11 @@ mod transaction_tests {
         let t1 = test_db.new_tx();
         let block_id = t1.append(&file);
         {
-            let guard = t1.pin_write_guard(&block_id).unwrap();
+            let ws = t1.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 1, "one");
         }
-        t1.commit().unwrap();
+        t1.write_session().commit().unwrap();
 
         //  Start a transaction t2 that should see the results of the previously committed transaction t1
         //  Set new values in this transaction
@@ -10627,10 +10742,11 @@ mod transaction_tests {
             assert_eq!(snapshot.str_val, "one");
         }
         {
-            let guard = t2.pin_write_guard(&block_id).unwrap();
+            let ws = t2.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 2, "two");
         }
-        t2.commit().unwrap();
+        t2.write_session().commit().unwrap();
 
         //  Start a transaction t3 which should see the results of t2
         //  Set new values for t3 but roll it back instead of committing
@@ -10639,10 +10755,11 @@ mod transaction_tests {
         assert_eq!(snapshot.int_val, 2);
         assert_eq!(snapshot.str_val, "two");
         {
-            let guard = t3.pin_write_guard(&block_id).unwrap();
+            let ws = t3.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 3, "three");
         }
-        t3.rollback().unwrap();
+        t3.write_session().rollback().unwrap();
 
         //  Start a transaction t4 which should see the result of t2 since t3 rolled back
         //  This will be a read only transaction that commits
@@ -10652,7 +10769,7 @@ mod transaction_tests {
             assert_eq!(snapshot.int_val, 2);
             assert_eq!(snapshot.str_val, "two");
         }
-        t4.commit().unwrap();
+        t4.write_session().commit().unwrap();
     }
 
     #[test]
@@ -10669,9 +10786,10 @@ mod transaction_tests {
         // Initialize page so readers always see a formatted heap page.
         {
             let init_txn = test_db.new_tx();
-            let guard = init_txn.pin_write_guard(&block_id).unwrap();
+            let ws = init_txn.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
-            init_txn.commit().unwrap();
+            ws.commit().unwrap();
         }
 
         let fm1 = Arc::clone(&test_db.file_manager);
@@ -10692,20 +10810,19 @@ mod transaction_tests {
             let txn = Arc::new(Transaction::new(fm1, lm1, bm1, lt1));
             let _ =
                 maybe_snapshot_txn_row(txn.pin_read_guard(&bid1).unwrap(), layout_reader.as_ref());
-            txn.commit().unwrap();
+            txn.write_session().commit().unwrap();
         });
 
         //  Create a write only transaction
         let layout_writer = Arc::clone(&layout);
         let t2 = std::thread::spawn(move || {
             let txn = Arc::new(Transaction::new(fm2, lm2, bm2, lt2));
+            let ws = txn.write_session();
             {
-                let guard = txn.pin_write_guard(&bid2).unwrap();
+                let guard = ws.pin_write_guard(&bid2).unwrap();
                 update_txn_row(guard, layout_writer.as_ref(), 1, "Hello");
             }
-            //  TODO: Remembering to scope guards before calling txn.commit() is crucial. There is a way to design around this in @docs/transaction_session_refactor.md
-            //  The related GitHub issue is https://github.com/redixhumayun/simpledb/issues/63
-            txn.commit().unwrap();
+            ws.commit().unwrap();
         });
         t1.join().unwrap();
         t2.join().unwrap();
@@ -10741,10 +10858,11 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = init_txn.pin_write_guard(&block_id).unwrap();
+            let ws = init_txn.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "initial");
         }
-        init_txn.commit().unwrap();
+        init_txn.write_session().commit().unwrap();
 
         let reader_threads = 10;
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -10771,7 +10889,7 @@ mod transaction_tests {
                     s
                 );
 
-                txn.commit().unwrap();
+                txn.write_session().commit().unwrap();
             }));
         }
 
@@ -10782,10 +10900,11 @@ mod transaction_tests {
             test_db.lock_table.clone(),
         ));
         {
-            let guard = txn.pin_write_guard(&block_id).unwrap();
+            let ws = txn.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, layout.as_ref(), 42, "final");
         }
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
 
         handles
             .into_iter()
@@ -10806,7 +10925,7 @@ mod transaction_tests {
             assert_eq!(snapshot.int_val, 42);
             assert_eq!(snapshot.str_val, "final");
         }
-        final_txn.commit().unwrap();
+        final_txn.write_session().commit().unwrap();
     }
 
     #[test]
@@ -10827,10 +10946,11 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id).unwrap();
+            let ws = t1.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, &layout, 100, "initial");
         }
-        t1.commit().unwrap();
+        t1.write_session().commit().unwrap();
 
         // Start transaction that will modify multiple values but fail midway
         let t2 = Arc::new(Transaction::new(
@@ -10840,11 +10960,12 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t2.pin_write_guard(&block_id).unwrap();
+            let ws = t2.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             update_txn_row(guard, &layout, 200, "modified");
         }
         // Simulate failure by rolling back
-        t2.rollback().unwrap();
+        t2.write_session().rollback().unwrap();
 
         // Verify that none of t2's changes persisted
         let t3 = Arc::new(Transaction::new(
@@ -10890,10 +11011,11 @@ mod transaction_tests {
             Arc::clone(&test_db.lock_table),
         ));
         {
-            let guard = t1.pin_write_guard(&block_id).unwrap();
+            let ws = t1.write_session();
+            let guard = ws.pin_write_guard(&block_id).unwrap();
             init_txn_row(guard, layout.as_ref(), 0, "");
         }
-        t1.commit().unwrap();
+        t1.write_session().commit().unwrap();
 
         // Create channel to track operations
         let (tx, rx) = std::sync::mpsc::channel();
@@ -10931,10 +11053,11 @@ mod transaction_tests {
                         std::thread::sleep(Duration::from_millis(10));
 
                         {
-                            let guard = txn.pin_write_guard(&bid).unwrap();
+                            let ws = txn.write_session();
+                            let guard = ws.pin_write_guard(&bid).unwrap();
                             update_txn_row(guard, layout_clone.as_ref(), val + 1, "");
                         }
-                        txn.commit()?;
+                        txn.write_session().commit()?;
                         tx.send(format!(
                             "Transaction {} successfully incremented from {} to {}",
                             txn.tx_id,
@@ -10949,7 +11072,7 @@ mod transaction_tests {
                             // If lock error (timeout or wait-die abort), retry
                             if e.downcast_ref::<LockError>().is_some() {
                                 retry_count += 1;
-                                txn.rollback().unwrap();
+                                txn.write_session().rollback().unwrap();
                                 tx.send(format!(
                                     "Transaction {} retrying after lock error: {e}",
                                     txn.tx_id
@@ -11026,10 +11149,11 @@ mod transaction_tests {
             ));
             let block_id = t1.append(&file);
             {
-                let guard = t1.pin_write_guard(&block_id).unwrap();
+                let ws = t1.write_session();
+                let guard = ws.pin_write_guard(&block_id).unwrap();
                 init_txn_row(guard, &layout, 100, "");
             }
-            t1.commit().unwrap();
+            t1.write_session().commit().unwrap();
             block_id
         };
 
@@ -11042,7 +11166,7 @@ mod transaction_tests {
                 Arc::clone(&db.buffer_manager),
                 Arc::clone(&db.lock_table),
             ));
-            t2.recover().unwrap();
+            t2.write_session().recover().unwrap();
 
             let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 100);
@@ -11056,17 +11180,17 @@ mod transaction_tests {
         let block_id = txn.append("test");
 
         {
-            let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+            let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
             // Verify pin count = 1
-            let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+            let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
             assert_eq!(buffer.pin_count(), 1);
 
-            txn.buffer_list.assert_pin_invariant(&block_id, 1);
+            txn.pin_state.assert_pin_invariant(&block_id, 1);
         }
 
         // After handle is dropped, buffer should be unpinned
-        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+        assert!(txn.pin_state.get_buffer(&block_id).is_none());
 
         db.buffer_manager.assert_buffer_count_invariant();
     }
@@ -11080,30 +11204,30 @@ mod transaction_tests {
         //  append a correctly formatted page to the file
         txn.append("test");
 
-        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+        txn.pin_state.assert_pin_invariant(&block_id, 1);
 
         let handle2 = handle1.clone();
 
         // Both handles should keep block pinned - pin count should be 2
-        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 2);
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 2);
+        txn.pin_state.assert_pin_invariant(&block_id, 2);
 
         drop(handle1);
 
         // After dropping one handle, pin count should be 1
-        let buffer = txn.buffer_list.get_buffer(&block_id).unwrap();
+        let buffer = txn.pin_state.get_buffer(&block_id).unwrap();
         assert_eq!(buffer.pin_count(), 1);
 
-        txn.buffer_list.assert_pin_invariant(&block_id, 1);
+        txn.pin_state.assert_pin_invariant(&block_id, 1);
 
         drop(handle2);
 
         // After dropping both handles, buffer should be unpinned
-        assert!(txn.buffer_list.get_buffer(&block_id).is_none());
+        assert!(txn.pin_state.get_buffer(&block_id).is_none());
 
         db.buffer_manager.assert_buffer_count_invariant();
     }
@@ -11114,9 +11238,9 @@ mod transaction_tests {
         let txn = db.new_tx();
         let block_id = txn.append("test");
 
-        let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let _handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
 
         // All buffers should be unpinned after commit
         // Even though handle still exists
@@ -11130,10 +11254,10 @@ mod transaction_tests {
         let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
         let txn = db.new_tx();
         let block_id = txn.append("test");
-        let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
 
         // Commit unpins everything and sets committed flag
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
 
         // Handle still exists - this should NOT panic
         drop(handle); // Should be no-op (committed flag prevents double-unpin)
@@ -11152,11 +11276,11 @@ mod transaction_tests {
         let txn = db.new_tx();
         let block_id = txn.append("test");
 
-        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn));
+        let handle1 = BufferHandle::new(block_id.clone(), Arc::clone(&txn.pin_state));
         let handle2 = handle1.clone();
         let handle3 = handle2.clone();
 
-        txn.commit().unwrap();
+        txn.write_session().commit().unwrap();
 
         // All three handles should drop safely (no-op after commit)
         drop(handle1);
@@ -12204,7 +12328,7 @@ impl RecoveryManager {
     /// Iterate over the WAL records in reverse order and undo any modifications done for this [`Transaction`]
     /// Flush all data associated with this transaction
     /// Create, write and flush a [`LogRecord::Checkpoint`] record
-    fn rollback(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn rollback(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
         for (_, log) in log_iter {
@@ -12229,7 +12353,7 @@ impl RecoveryManager {
     /// Recover the database from the last [`LogRecord::Checkpoint`]
     /// Find all the incomplete transactions and undo their operations
     /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
-    fn recover(&self, tx: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn recover(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
         let log_iter = self.log_manager.lock().unwrap().iterator();
         let mut finished_txns: Vec<usize> = Vec::new();
@@ -13745,7 +13869,7 @@ impl LogRecord {
 
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
-    fn undo(&self, txn: &dyn TransactionOperations) -> SimpleDBResult<()> {
+    fn undo(&self, txn: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         match self {
             LogRecord::Start(_) => Ok(()),    //  no-op
             LogRecord::Commit(_) => Ok(()),   //  no-op
@@ -14173,7 +14297,7 @@ impl LogRecord {
     /// Rollback path intentionally does not use this check.
     fn should_undo_during_recovery(
         &self,
-        txn: &dyn TransactionOperations,
+        txn: &dyn RecoveryWriteContext,
         record_lsn: Lsn,
     ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
@@ -14263,7 +14387,8 @@ mod recovery_manager_tests {
     }
 
     fn format_heap(txn: &Arc<Transaction>, block: &BlockId) {
-        let mut guard = txn.pin_write_guard(block).unwrap();
+        let ws = txn.write_session();
+        let mut guard = ws.pin_write_guard(block).unwrap();
         guard.format_as_heap().unwrap();
     }
 
@@ -14274,7 +14399,8 @@ mod recovery_manager_tests {
         int_value: i32,
         text_value: &str,
     ) -> SlotId {
-        let guard = txn.pin_write_guard(block).unwrap();
+        let ws = txn.write_session();
+        let guard = ws.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.insert_row_values(&[
             Constant::Int(int_value),
@@ -14290,7 +14416,8 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: i32,
     ) {
-        let guard = txn.pin_write_guard(block).unwrap();
+        let ws = txn.write_session();
+        let guard = ws.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -14307,7 +14434,8 @@ mod recovery_manager_tests {
         slot: SlotId,
         value: &str,
     ) {
-        let guard = txn.pin_write_guard(block).unwrap();
+        let ws = txn.write_session();
+        let guard = ws.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         let mut row = view
             .row_mut(slot)
@@ -14318,7 +14446,8 @@ mod recovery_manager_tests {
     }
 
     fn delete_slot(txn: &Arc<Transaction>, block: &BlockId, layout: &Layout, slot: SlotId) {
-        let guard = txn.pin_write_guard(block).unwrap();
+        let ws = txn.write_session();
+        let guard = ws.pin_write_guard(block).unwrap();
         let mut view = guard.into_heap_view_mut(layout).expect("heap view mut");
         view.delete_slot(slot).expect("delete slot");
     }
@@ -14358,12 +14487,12 @@ mod recovery_manager_tests {
         let setup_txn = db.new_tx();
         let block = setup_txn.append(&filename);
         format_heap(&setup_txn, &block);
-        setup_txn.commit().unwrap();
+        setup_txn.write_session().commit().unwrap();
 
         // Test: insert and rollback
         let txn = db.new_tx();
         insert_row(&txn, &block, &layout, 10, "alpha");
-        txn.rollback().unwrap();
+        txn.write_session().rollback().unwrap();
 
         // Verify: page is formatted, insert is rolled back
         let check_txn = db.new_tx();
@@ -14383,11 +14512,11 @@ mod recovery_manager_tests {
         let block = txn1.append(&filename);
         format_heap(&txn1, &block);
         let slot = insert_row(&txn1, &block, &layout, 22, "gamma");
-        txn1.commit().unwrap();
+        txn1.write_session().commit().unwrap();
 
         let txn2 = db.new_tx();
         delete_slot(&txn2, &block, &layout, slot);
-        txn2.rollback().unwrap();
+        txn2.write_session().rollback().unwrap();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block, &layout, slot), 22);
@@ -14403,7 +14532,7 @@ mod recovery_manager_tests {
         let setup_txn = db.new_tx();
         let block = setup_txn.append(&filename);
         format_heap(&setup_txn, &block);
-        setup_txn.commit().unwrap();
+        setup_txn.write_session().commit().unwrap();
 
         // Test: multiple operations and rollback
         let txn = db.new_tx();
@@ -14411,7 +14540,7 @@ mod recovery_manager_tests {
         let slot2 = insert_row(&txn, &block, &layout, 2, "two");
         update_int_at(&txn, &block, &layout, slot1, 10);
         delete_slot(&txn, &block, &layout, slot2);
-        txn.rollback().unwrap();
+        txn.write_session().rollback().unwrap();
 
         // Verify: page is formatted, all operations are rolled back
         let check_txn = db.new_tx();
@@ -14430,11 +14559,11 @@ mod recovery_manager_tests {
         let block = txn1.append(&filename);
         format_heap(&txn1, &block);
         let slot = insert_row(&txn1, &block, &layout, 33, "delta");
-        txn1.commit().unwrap();
+        txn1.write_session().commit().unwrap();
 
         let txn2 = db.new_tx();
         update_string_at(&txn2, &block, &layout, slot, "epsilon");
-        txn2.rollback().unwrap();
+        txn2.write_session().rollback().unwrap();
 
         let check_txn = db.new_tx();
         assert_eq!(read_string_at(&check_txn, &block, &layout, slot), "delta");
@@ -14451,7 +14580,7 @@ mod recovery_manager_tests {
             let block = init_txn.append(&filename);
             format_heap(&init_txn, &block);
             insert_row(&init_txn, &block, &layout, 0, "seed");
-            init_txn.commit().unwrap();
+            init_txn.write_session().commit().unwrap();
 
             let txn = db.new_tx();
             insert_row(&txn, &block, &layout, 10, "alpha");
@@ -14460,7 +14589,7 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.recover().unwrap();
+        txn.write_session().recover().unwrap();
 
         let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
@@ -14478,7 +14607,7 @@ mod recovery_manager_tests {
             let block = txn1.append(&filename);
             format_heap(&txn1, &block);
             let slot_a = insert_row(&txn1, &block, &layout, 1, "a");
-            txn1.commit().unwrap();
+            txn1.write_session().commit().unwrap();
 
             let txn2 = db.new_tx();
             let slot_b = insert_row(&txn2, &block, &layout, 2, "b");
@@ -14487,7 +14616,7 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.recover().unwrap();
+        txn.write_session().recover().unwrap();
 
         let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
@@ -14506,7 +14635,7 @@ mod recovery_manager_tests {
             let block = txn1.append(&filename);
             format_heap(&txn1, &block);
             let slot = insert_row(&txn1, &block, &layout, 7, "orig");
-            txn1.commit().unwrap();
+            txn1.write_session().commit().unwrap();
 
             let txn2 = db.new_tx();
             update_int_at(&txn2, &block, &layout, slot, 99);
@@ -14515,7 +14644,7 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.recover().unwrap();
+        txn.write_session().recover().unwrap();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 7);
@@ -14532,7 +14661,7 @@ mod recovery_manager_tests {
             let block = txn1.append(&filename);
             format_heap(&txn1, &block);
             let slot = insert_row(&txn1, &block, &layout, 5, "keep");
-            txn1.commit().unwrap();
+            txn1.write_session().commit().unwrap();
 
             let txn2 = db.new_tx();
             delete_slot(&txn2, &block, &layout, slot);
@@ -14541,7 +14670,7 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.recover().unwrap();
+        txn.write_session().recover().unwrap();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 5);
@@ -14557,11 +14686,12 @@ mod recovery_manager_tests {
         let block = txn1.append(&filename);
         format_heap(&txn1, &block);
         let slot = insert_row(&txn1, &block, &layout, 1, "a");
-        txn1.commit().unwrap();
+        txn1.write_session().commit().unwrap();
 
         let txn2 = db.new_tx();
         {
-            let guard = txn2.pin_write_guard(&block).unwrap();
+            let ws = txn2.write_session();
+            let guard = ws.pin_write_guard(&block).unwrap();
             let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
             let int_idx = layout.column_idx(INT_FIELD).unwrap();
             let str_idx = layout.column_idx(STR_FIELD).unwrap();
@@ -14575,7 +14705,7 @@ mod recovery_manager_tests {
             view.update_tuple(slot, &new_bytes)
                 .expect("update tuple with relocation");
         }
-        txn2.rollback().unwrap();
+        txn2.write_session().rollback().unwrap();
 
         let txn3 = db.new_tx();
         assert_eq!(read_int_at(&txn3, &block, &layout, slot), 1);
@@ -14594,7 +14724,7 @@ mod recovery_manager_tests {
             format_heap(&txn1, &block);
             let slot0 = insert_row(&txn1, &block, &layout, 1, "one");
             let slot1 = insert_row(&txn1, &block, &layout, 2, "two");
-            txn1.commit().unwrap();
+            txn1.write_session().commit().unwrap();
 
             let txn2 = db.new_tx();
             let slot2 = insert_row(&txn2, &block, &layout, 3, "three");
@@ -14605,7 +14735,7 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.recover().unwrap();
+        txn.write_session().recover().unwrap();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot0), 1);
@@ -16298,7 +16428,7 @@ mod file_manager_tests {
             .unwrap();
         let before = direct_io_fallback_count();
         DIRECT_IO_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-        assert!(direct_io_fallback_count() >= before + 1);
+        assert!(direct_io_fallback_count() > before);
         DIRECT_IO_FALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 }
