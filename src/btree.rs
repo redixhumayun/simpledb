@@ -502,6 +502,16 @@ mod split_wal {
     }
 }
 
+/// Compact before/after root metadata passed to root-update logging and meta-page rewrites.
+struct RootUpdateState {
+    /// Root block number for the old or new tree state.
+    block: usize,
+    /// Tree height associated with this root state.
+    tree_height: u16,
+    /// Structure version associated with this root state.
+    structure_version: u64,
+}
+
 pub struct BTreeIndex {
     txn: Arc<Transaction>,
     index_name: String,
@@ -1101,12 +1111,6 @@ impl BTreeIndex {
     fn set_test_hook(&mut self, hook: SharedBTreeTestHook) {
         self.test_hook = Some(hook);
     }
-}
-
-struct RootUpdateState {
-    block: usize,
-    tree_height: u16,
-    structure_version: u64,
 }
 
 impl Index for BTreeIndex {
