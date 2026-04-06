@@ -41,44 +41,35 @@ The refactor should target these outcomes:
 
 ### Split Transaction Authority
 
-Use a stable outer handle plus split internal state:
+The implemented shape is narrower than the earlier `TransactionHandle` / `TxnReadState` / `TxnWriteState` sketch.
+
+Today the code keeps `Transaction` as the shared outer handle and splits authority this way:
 
 ```rust
-pub struct TransactionHandle {
-    read_state: Arc<TxnReadState>,
-    write_state: Arc<Mutex<TxnWriteState>>,
-}
-
-pub struct TransactionReadSession<'a> {
-    txn: &'a TransactionHandle,
+pub struct Transaction {
+    write_mutex: Mutex<()>,
+    pin_state: Arc<PinState>,
+    // other transaction state
 }
 
 pub struct TransactionWriteSession<'a> {
-    txn: &'a TransactionHandle,
-    guard: MutexGuard<'a, TxnWriteState>,
+    txn: &'a Arc<Transaction>,
+    _write_guard: MutexGuard<'a, ()>,
 }
 ```
 
 The important split is semantic, not cosmetic:
 
-- `TxnReadState` owns shared read-pin state and other read-side capabilities that must outlive a single method call.
-- `TxnWriteState` owns lifecycle-sensitive write authority: commit, rollback, recovery, lock release, and write-only txn bookkeeping.
+- `PinState` owns shared transaction-local pin bookkeeping needed by guards and iterators.
+- `TransactionWriteSession` owns exclusive transaction-local write/lifecycle authority.
 
 ### Read Path: Shared State, Synchronized Pins
 
-Read sessions may borrow the transaction immutably, but read pinning still needs synchronized shared state.
+The current code keeps read pinning on shared pin state rather than introducing a borrowed read-session API.
 
 ```rust
-struct TxnReadState {
-    pin_state: Arc<PinState>,
-    buffer_manager: Arc<BufferManager>,
-    file_manager: SharedFS,
-    log_manager: Arc<Mutex<LogManager>>,
-    tx_id: TransactionID,
-}
-
 struct PinState {
-    buffer_list: Mutex<BufferList>,
+    buffer_list: BufferList,
 }
 ```
 
@@ -88,7 +79,6 @@ Read-side guard ownership should point only at pin state, not at the whole trans
 pub struct BufferHandle {
     block_id: BlockId,
     pin_state: Arc<PinState>,
-    tx_id: TransactionID,
 }
 ```
 
@@ -103,21 +93,17 @@ This keeps current executor behavior workable:
 Write operations go through an exclusive session.
 
 ```rust
-impl TransactionHandle {
-    pub fn read_session(&self) -> TransactionReadSession<'_> {
-        TransactionReadSession { txn: self }
-    }
-
-    pub fn write_session(&self) -> TransactionWriteSession<'_> {
+impl Transaction {
+    pub fn write_session(self: &Arc<Self>) -> TransactionWriteSession<'_> {
         TransactionWriteSession {
             txn: self,
-            guard: self.write_state.lock().unwrap(),
+            _write_guard: self.write_mutex.lock().unwrap(),
         }
     }
 }
 
 impl TransactionWriteSession<'_> {
-    pub fn pin_write_guard<'a>(&'a mut self, block: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
+    pub fn pin_write_guard<'a>(&'a self, block: &BlockId) -> SimpleDBResult<PageWriteGuard<'a>> {
         // write pin path
         unimplemented!()
     }
@@ -129,10 +115,10 @@ impl TransactionWriteSession<'_> {
 }
 ```
 
-The critical property is that `pin_write_guard` borrows `&mut self`. That makes this illegal:
+The critical property is that write guards borrow from the session, and `commit(self)` consumes that same session. That makes this illegal:
 
 ```rust
-let mut ws = txn.write_session();
+let ws = txn.write_session();
 let page = ws.pin_write_guard(&block)?;
 ws.commit()?; // does not compile while `page` is alive
 ```

@@ -10220,6 +10220,12 @@ pub struct TransactionWriteSession<'a> {
 }
 
 impl TransactionWriteSession<'_> {
+    fn cleanup(self) -> SimpleDBResult<()> {
+        let release_res = self.txn.concurrency_manager.release();
+        self.txn.pin_state.unpin_all();
+        release_res
+    }
+
     pub fn txn(&self) -> &Arc<Transaction> {
         self.txn
     }
@@ -10240,16 +10246,20 @@ impl TransactionWriteSession<'_> {
     }
 
     pub fn rollback(self) -> SimpleDBResult<()> {
-        self.txn.recovery_manager.rollback(&self)?;
-        self.txn.concurrency_manager.release()?;
-        self.txn.pin_state.unpin_all();
+        let rollback_res = self.txn.recovery_manager.rollback(&self);
+        let cleanup_res = self.cleanup();
+
+        rollback_res?;
+        cleanup_res?;
         Ok(())
     }
 
     pub fn recover(self) -> SimpleDBResult<()> {
-        self.txn.recovery_manager.recover(&self)?;
-        self.txn.concurrency_manager.release()?;
-        self.txn.pin_state.unpin_all();
+        let recover_res = self.txn.recovery_manager.recover(&self);
+        let cleanup_res = self.cleanup();
+
+        recover_res?;
+        cleanup_res?;
         Ok(())
     }
 }
