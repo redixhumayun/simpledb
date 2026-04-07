@@ -1865,6 +1865,10 @@ impl<'a> BTreeMetaPageViewMut<'a> {
         self.page_mut().update_crc32();
     }
 
+    pub(crate) fn into_inner(self) -> PageWriteGuard<'a> {
+        self.guard
+    }
+
     fn page_mut(&mut self) -> BTreeMetaPageMut<'_> {
         BTreeMetaPageMut::new(self.guard.bytes_mut())
             .expect("meta page view constructed with valid meta page")
@@ -2321,9 +2325,66 @@ impl<'a> HeapPageMut<'a> {
         offset: usize,
         tuple: &[u8],
     ) -> SimpleDBResult<()> {
-        let tuple_len = tuple.len();
+        self.redo_install_tuple(slot, offset, tuple)
+    }
 
-        {
+    pub(crate) fn redo_update(
+        &mut self,
+        slot: SlotId,
+        new_offset: usize,
+        new_tuple: &[u8],
+        relocated: bool,
+        relocated_slot: Option<SlotId>,
+    ) -> SimpleDBResult<()> {
+        if slot >= self.header.as_ref().slot_count() as usize {
+            return Err(format!("slot {slot} out of bounds").into());
+        }
+
+        let new_len: u16 = new_tuple
+            .len()
+            .try_into()
+            .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
+        let new_offset: u16 = new_offset
+            .try_into()
+            .map_err(|_| "tuple offset larger than max offset")?;
+
+        if relocated {
+            let relocated_slot = relocated_slot.ok_or("relocated update missing relocated_slot")?;
+            self.redo_install_tuple(relocated_slot, new_offset as usize, new_tuple)?;
+
+            let mut parts = self.split()?;
+            let mut redirect_lp = parts.line_ptrs().as_ref().get(slot);
+            redirect_lp.mark_redirect(relocated_slot as u16);
+            parts.line_ptrs().set(slot, redirect_lp);
+            parts.rebuild_free_list();
+        } else {
+            let mut parts = self.split()?;
+            parts
+                .record_space()
+                .write_tuple(new_offset as usize, new_tuple)?;
+            parts
+                .line_ptrs()
+                .set(slot, LinePtr::new(new_offset, new_len, LineState::Live));
+            parts.rebuild_free_list();
+        }
+        Ok(())
+    }
+
+    fn redo_install_tuple(
+        &mut self,
+        slot: SlotId,
+        offset: usize,
+        tuple: &[u8],
+    ) -> SimpleDBResult<()> {
+        let tuple_len = tuple.len();
+        let current_slot_count = self.header.as_ref().slot_count() as usize;
+        let appends_new_slot = slot == current_slot_count;
+
+        if slot > current_slot_count {
+            return Err(format!("slot {slot} out of bounds").into());
+        }
+
+        if appends_new_slot {
             let current_lower = self.header.as_ref().free_lower();
             let new_lower = current_lower
                 .checked_add(LinePtrBytes::LINE_PTR_BYTES as u16)
@@ -2331,9 +2392,18 @@ impl<'a> HeapPageMut<'a> {
                     "free_lower overflow during redo insert".into()
                 })?;
             self.header.set_free_lower(new_lower);
+            self.header
+                .set_slot_count((current_slot_count as u16).saturating_add(1));
         }
 
         let mut parts = self.split()?;
+        if !appends_new_slot {
+            let target_lp = parts.line_ptrs().as_ref().get(slot);
+            if !target_lp.is_free() {
+                return Err(format!("redo target slot {slot} is not free").into());
+            }
+        }
+
         let new_free_upper = parts.header().as_ref().free_upper() as usize;
         let old_free_upper = new_free_upper
             .checked_sub(tuple_len)
@@ -2350,7 +2420,13 @@ impl<'a> HeapPageMut<'a> {
 
         let len = parts.line_ptrs().len();
         for idx in 0..len {
+            if idx == slot {
+                continue;
+            }
             let mut lp = parts.line_ptrs().as_ref().get(idx);
+            if !lp.is_live() {
+                continue;
+            }
             let lp_offset = lp.offset() as usize;
             if lp_offset >= new_free_upper && lp_offset < offset + tuple_len {
                 lp.set_offset((lp_offset - tuple_len) as u16);
@@ -2362,7 +2438,7 @@ impl<'a> HeapPageMut<'a> {
             .try_into()
             .map_err(|_| "tuple length exceeds u16::MAX")?;
         let offset_u16: u16 = offset.try_into().map_err(|_| "offset exceeds u16::MAX")?;
-        parts.line_ptrs().insert(
+        parts.line_ptrs().set(
             slot,
             LinePtr::new(offset_u16, tuple_len_u16, LineState::Live),
         );
@@ -2371,55 +2447,7 @@ impl<'a> HeapPageMut<'a> {
             .try_into()
             .map_err(|_| "free_upper exceeds u16::MAX")?;
         parts.header().set_free_upper(old_free_upper_u16);
-        let slot_count = parts.header().as_ref().slot_count();
-        parts.header().set_slot_count(slot_count + 1);
-        parts.rebuild_free_list();
-        Ok(())
-    }
-
-    pub(crate) fn redo_update(
-        &mut self,
-        slot: SlotId,
-        new_offset: usize,
-        new_tuple: &[u8],
-        relocated: bool,
-        relocated_slot: Option<SlotId>,
-    ) -> SimpleDBResult<()> {
-        let mut parts = self.split()?;
-        if slot >= parts.line_ptrs().len() {
-            return Err(format!("slot {slot} out of bounds").into());
-        }
-
-        let new_len: u16 = new_tuple
-            .len()
-            .try_into()
-            .map_err(|_| "tuple larger than max tuple size (u16::MAX)")?;
-        let new_offset: u16 = new_offset
-            .try_into()
-            .map_err(|_| "tuple offset larger than max offset")?;
-
-        parts
-            .record_space()
-            .write_tuple(new_offset as usize, new_tuple)?;
-
-        if relocated {
-            let relocated_slot = relocated_slot.ok_or("relocated update missing relocated_slot")?;
-            if relocated_slot >= parts.line_ptrs().len() {
-                return Err(format!("relocated slot {relocated_slot} out of bounds").into());
-            }
-            parts.line_ptrs().set(
-                relocated_slot,
-                LinePtr::new(new_offset, new_len, LineState::Live),
-            );
-            let mut redirect_lp = parts.line_ptrs().as_ref().get(slot);
-            redirect_lp.mark_redirect(relocated_slot as u16);
-            parts.line_ptrs().set(slot, redirect_lp);
-        } else {
-            parts
-                .line_ptrs()
-                .set(slot, LinePtr::new(new_offset, new_len, LineState::Live));
-        }
-
+        parts.header().set_free_ptr(old_free_upper as u32);
         parts.rebuild_free_list();
         Ok(())
     }
