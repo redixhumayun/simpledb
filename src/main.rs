@@ -10427,7 +10427,7 @@ impl Transaction {
     }
 
     /// Commit this transaction
-    /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
+    /// This will make the commit record durable in WAL without forcing this transaction's data pages to disk
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     fn commit_locked(&self) -> SimpleDBResult<()> {

@@ -5,7 +5,7 @@ Tracking Issues: [#63](https://github.com/redixhumayun/simpledb/issues/63), [#98
 ## Motivation
 
 - The current `Transaction` API is centered on `Arc<Transaction>` plus `&self` methods. That means Rust cannot prevent a caller from holding a page guard and then calling `commit`/`rollback` on the same transaction.
-- The concrete hazard is write-side: a live `PageWriteGuard` can hold a page write latch while `Transaction::commit -> RecoveryManager::commit -> BufferManager::flush_all` tries to take that write latch again.
+- Historically, the concrete write-side hazard was a self-deadlock: a live `PageWriteGuard` could hold a page write latch while `Transaction::commit -> RecoveryManager::commit -> BufferManager::flush_all` tried to take that latch again under force-at-commit. The broader API problem remains even though commit is now no-force.
 - Lower layers currently retain a broad backward edge to full transaction authority: `BufferHandle` stores `Arc<Transaction>`, and page guards / iterators own that handle for RAII unpin.
 - We want compile-time protection for the dangerous write-side overlap without forcing the entire executor onto session-borrowed read lifetimes.
 
