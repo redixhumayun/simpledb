@@ -93,7 +93,7 @@ impl PolicyState {
         for _ in 0..self.pool_len {
             let idx = *hand;
             let mut frame_guard = buffer_pool[idx].lock_meta();
-            if frame_guard.pins > 0 {
+            if frame_guard.pins > 0 || frame_guard.writeback_in_progress {
                 *hand = (idx + 1) % self.pool_len;
                 continue;
             }

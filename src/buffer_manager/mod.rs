@@ -14,12 +14,13 @@
 //! Drop-based latch cleanup.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -27,7 +28,7 @@ use crate::{
     page::PageType,
     page::{set_page_lsn, BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
     replacement::PolicyState,
-    BatchReadReq, BlockId, LogManager, Lsn, Page, SharedFS,
+    BatchReadReq, BatchWriteReq, BlockId, LogManager, Lsn, Page, SharedFS,
 };
 
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
@@ -47,17 +48,68 @@ pub enum FastPinOutcome<T> {
     Contended,
 }
 
+/// Result of moving a frame from clean/unpinned into an actively pinned state.
+///
+/// The buffer manager uses this to keep the clean-frame accounting in one place
+/// instead of re-deriving it around every pin path.
+#[derive(Debug)]
+struct PinTransition {
+    became_pinned: bool,
+    left_clean_unpinned: bool,
+}
+
+/// Result of dropping a pin on a frame.
+///
+/// This is where the transaction side hands work to the flush side: once the
+/// last pin is gone, a dirty frame may become eligible to enqueue for flush.
+#[derive(Debug)]
+struct UnpinTransition {
+    became_unpinned: bool,
+    became_clean_unpinned: bool,
+    enqueue_dirty: Option<usize>,
+}
+
+/// Result of marking a frame dirty after a page mutation.
+///
+/// Dirty transitions advance the generation and may enqueue the frame if the
+/// transaction path is no longer actively using it.
+#[derive(Debug)]
+struct DirtyTransition {
+    left_clean_unpinned: bool,
+    enqueue_dirty: Option<usize>,
+}
+
+/// Result of reconciling a completed snapshot write back into frame state.
+///
+/// Completion is generation-based: a write only clears dirtiness if no newer
+/// mutation has advanced the frame since the snapshot was claimed.
+#[derive(Debug)]
+struct WritebackCompletion {
+    became_clean_unpinned: bool,
+    enqueue_dirty: Option<usize>,
+}
+
+/// Per-frame state shared by transaction and flush paths.
+///
+/// Why this exists: transaction code and the background flusher must coordinate
+/// through explicit frame metadata rather than direct callbacks into each other.
+/// The key invariants are:
+/// - `dirty_generation` advances on every new dirty image
+/// - at most one writeback generation is in flight at a time
+/// - writeback completion only clears dirty state when the completed generation
+///   still matches the current frame generation
 #[derive(Debug)]
 pub struct FrameMeta {
     pub(crate) block_id: Option<BlockId>,
     pub(crate) pins: usize,
     pub(crate) txn: Option<usize>,
     pub(crate) lsn: Option<Lsn>,
-    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+    pub(crate) dirty_generation: u64,
+    pub(crate) dirty_queued: bool,
+    pub(crate) writeback_in_progress: bool,
+    pub(crate) writeback_generation: Option<u64>,
     pub(crate) prev_idx: Option<usize>,
-    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     pub(crate) next_idx: Option<usize>,
-    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     pub(crate) index: usize,
     #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
     pub(crate) ref_bit: bool,
@@ -65,18 +117,17 @@ pub struct FrameMeta {
 
 impl FrameMeta {
     pub(crate) fn new(index: usize) -> Self {
-        #[cfg(not(any(feature = "replacement_lru", feature = "replacement_sieve")))]
-        let _ = index;
         Self {
             block_id: None,
             pins: 0,
             txn: None,
             lsn: None,
-            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
+            dirty_generation: 0,
+            dirty_queued: false,
+            writeback_in_progress: false,
+            writeback_generation: None,
             prev_idx: None,
-            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             next_idx: None,
-            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             index,
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: false,
@@ -97,6 +148,123 @@ impl FrameMeta {
 
     pub(crate) fn reset_pins(&mut self) {
         self.pins = 0;
+    }
+
+    /// Returns whether the frame currently owns a dirty page image.
+    fn is_dirty(&self) -> bool {
+        self.lsn.is_some()
+    }
+
+    /// Returns whether this frame counts toward the clean slack the flusher is
+    /// trying to maintain.
+    fn is_clean_unpinned(&self) -> bool {
+        self.pins == 0 && !self.is_dirty() && !self.writeback_in_progress
+    }
+
+    /// Applies the pin-side transition and reports whether that removed one
+    /// clean frame from the available pool.
+    fn pin_transition(&mut self) -> PinTransition {
+        let left_clean_unpinned = self.is_clean_unpinned();
+        let became_pinned = self.pin();
+        PinTransition {
+            became_pinned,
+            left_clean_unpinned,
+        }
+    }
+
+    /// Applies the unpin-side transition and reports whether the frame became
+    /// flushable or newly clean-and-unpinned.
+    fn unpin_transition(&mut self) -> UnpinTransition {
+        let became_unpinned = self.unpin();
+        let enqueue_dirty = if became_unpinned
+            && self.is_dirty()
+            && !self.writeback_in_progress
+            && !self.dirty_queued
+        {
+            self.dirty_queued = true;
+            Some(self.index)
+        } else {
+            None
+        };
+        let became_clean_unpinned = became_unpinned && self.is_clean_unpinned();
+        UnpinTransition {
+            became_unpinned,
+            became_clean_unpinned,
+            enqueue_dirty,
+        }
+    }
+
+    /// Marks the frame dirty for a new page generation.
+    ///
+    /// The transition decides whether the dirty image should be queued for the
+    /// background flusher immediately or only after the last pin is released.
+    fn mark_dirty_transition(&mut self, txn_num: usize, lsn: Lsn) -> DirtyTransition {
+        let left_clean_unpinned = self.is_clean_unpinned();
+        self.txn = Some(txn_num);
+        self.lsn = Some(lsn);
+        self.dirty_generation = self.dirty_generation.wrapping_add(1);
+        let enqueue_dirty = if self.pins == 0 && !self.writeback_in_progress && !self.dirty_queued {
+            self.dirty_queued = true;
+            Some(self.index)
+        } else {
+            None
+        };
+        DirtyTransition {
+            left_clean_unpinned,
+            enqueue_dirty,
+        }
+    }
+
+    /// Claims the current dirty generation for writeback.
+    ///
+    /// Why this is separate: the flusher must establish one explicit in-flight
+    /// generation before it snapshots bytes, otherwise completion cannot tell
+    /// whether a newer mutation arrived while the write was outstanding.
+    fn try_begin_writeback(&mut self, require_unpinned: bool) -> Option<u64> {
+        if require_unpinned && self.pins > 0 {
+            return None;
+        }
+        if self.writeback_in_progress || !self.is_dirty() {
+            return None;
+        }
+        let generation = self.dirty_generation;
+        self.writeback_in_progress = true;
+        self.writeback_generation = Some(generation);
+        Some(generation)
+    }
+
+    /// Reconciles a completed snapshot write with the current frame state.
+    ///
+    /// Completion only clears dirty metadata when the completed generation still
+    /// matches the frame. Newer mutations leave the frame dirty and requeue it.
+    fn complete_writeback_transition(
+        &mut self,
+        block_still_matches: bool,
+        generation: u64,
+    ) -> Option<WritebackCompletion> {
+        if !block_still_matches || self.writeback_generation != Some(generation) {
+            return None;
+        }
+
+        let was_clean_unpinned = self.is_clean_unpinned();
+        self.writeback_in_progress = false;
+        self.writeback_generation = None;
+        if self.dirty_generation == generation {
+            self.txn = None;
+            self.lsn = None;
+        }
+
+        let enqueue_dirty = if self.pins == 0 && self.is_dirty() && !self.dirty_queued {
+            self.dirty_queued = true;
+            Some(self.index)
+        } else {
+            None
+        };
+
+        Some(WritebackCompletion {
+            became_clean_unpinned: !was_clean_unpinned && self.is_clean_unpinned(),
+            enqueue_dirty,
+        })
     }
 }
 
@@ -152,8 +320,6 @@ pub struct BufferFrame {
 
 impl BufferFrame {
     pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
-        #[cfg(feature = "replacement_clock")]
-        let _ = index;
         Self {
             file_manager,
             log_manager,
@@ -201,45 +367,76 @@ impl BufferFrame {
         self.page.write().unwrap()
     }
 
-    fn set_modified(&self, txn_num: usize, lsn: usize) {
-        let mut meta = self.lock_meta();
-        meta.txn = Some(txn_num);
-        meta.lsn = Some(lsn);
-    }
-
     #[cfg(test)]
     pub(crate) fn is_pinned(&self) -> bool {
         self.lock_meta().pins > 0
     }
 
-    pub(crate) fn flush_locked(&self, meta: &mut FrameMeta) {
-        if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
-            self.log_manager.lock().unwrap().flush_lsn(lsn);
-            let mut page_guard = self.page.write().unwrap();
-            set_page_lsn(page_guard.bytes_mut(), lsn);
-            match page_guard.peek_page_type().unwrap() {
-                PageType::Heap => {
-                    let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
-                    page.update_crc32();
-                }
-                PageType::IndexLeaf => {
-                    let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
-                    page.update_crc32();
-                }
-                PageType::IndexInternal => {
-                    let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
-                    page.update_crc32();
-                }
-                PageType::Overflow => {}
-                PageType::Meta => {
-                    let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
-                    page.update_crc32();
-                }
-                PageType::Free => {}
+    /// Claims one dirty generation and snapshots stable page bytes for it.
+    ///
+    /// This is the snapshot-first protocol boundary: page bytes are copied while
+    /// holding `meta -> page`, then the page lock is released before I/O begins.
+    fn claim_snapshot_for_writeback_locked(
+        &self,
+        meta: &mut FrameMeta,
+        require_unpinned: bool,
+    ) -> Option<(BlockId, Lsn, u64, Page)> {
+        // Snapshot writeback is the current protocol choice because it lets the
+        // flusher release the page lock before waiting on I/O.
+        let (block_id, lsn) = match (&meta.block_id, meta.lsn) {
+            (Some(block_id), Some(lsn)) => (block_id.clone(), lsn),
+            _ => return None,
+        };
+        let generation = meta.try_begin_writeback(require_unpinned)?;
+
+        let mut page_guard = self.page.write().unwrap();
+        set_page_lsn(page_guard.bytes_mut(), lsn);
+        match page_guard.peek_page_type().unwrap() {
+            PageType::Heap => {
+                let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
+                page.update_crc32();
             }
-            self.file_manager.write(&block_id, &page_guard);
-            meta.txn = None;
-            meta.lsn = None;
+            PageType::IndexLeaf => {
+                let mut page = BTreeLeafPageMut::new(page_guard.bytes_mut()).unwrap();
+                page.update_crc32();
+            }
+            PageType::IndexInternal => {
+                let mut page = BTreeInternalPageMut::new(page_guard.bytes_mut()).unwrap();
+                page.update_crc32();
+            }
+            PageType::Overflow => {}
+            PageType::Meta => {
+                let mut page = BTreeMetaPageMut::new(page_guard.bytes_mut()).unwrap();
+                page.update_crc32();
+            }
+            PageType::Free => {}
+        }
+
+        let mut snapshot = Page::new();
+        snapshot.bytes_mut().copy_from_slice(page_guard.bytes());
+        Some((block_id, lsn, generation, snapshot))
+    }
+
+    /// Completes one claimed writeback generation if the frame still matches.
+    ///
+    /// Stale completions are ignored so an older snapshot cannot clear newer
+    /// dirty state after the frame has advanced.
+    fn complete_writeback_locked(meta: &mut FrameMeta, block_id: &BlockId, generation: u64) {
+        let _ = meta
+            .complete_writeback_transition(meta.block_id.as_ref() == Some(block_id), generation);
+    }
+
+    pub(crate) fn flush_locked(&self, meta: &mut FrameMeta) {
+        if let Some((block_id, lsn, generation, snapshot)) =
+            self.claim_snapshot_for_writeback_locked(meta, true)
+        {
+            self.log_manager.lock().unwrap().flush_lsn(lsn);
+            let req = [BatchWriteReq {
+                block_id: block_id.clone(),
+            }];
+            let pages = [snapshot];
+            self.file_manager.write_batch(&req, &pages);
+            Self::complete_writeback_locked(meta, &block_id, generation);
         }
     }
 
@@ -404,22 +601,57 @@ struct PrefetchReservation {
 }
 
 #[derive(Debug)]
+struct FlushControl {
+    oldest_dirty_signal: Option<Instant>,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct FlushCoordinator {
+    state: Mutex<FlushControl>,
+    cond: Condvar,
+}
+
+impl FlushCoordinator {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FlushControl {
+                oldest_dirty_signal: None,
+                shutdown: false,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+}
+
+/// Buffer manager plus the background dirty-page flusher.
+///
+/// The important split is operational: normal transaction commit no longer
+/// writes data pages directly. Transactions mark frames dirty, and the flusher
+/// consumes queued dirty frames when clean-frame slack falls below a target.
+#[derive(Debug)]
 pub struct BufferManager {
     file_manager: SharedFS,
     log_manager: Arc<Mutex<LogManager>>,
     buffer_pool: Vec<Arc<BufferFrame>>,
     num_available: AtomicUsize,
+    clean_unpinned: Arc<AtomicUsize>,
     wait_mutex: Mutex<()>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
     latch_shards: [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>; Self::SHARDS],
     resident_shards: [Mutex<HashMap<BlockId, Weak<BufferFrame>>>; Self::SHARDS],
     policy: PolicyState,
+    dirty_queue: Arc<Mutex<VecDeque<usize>>>,
+    flush_coordinator: Arc<FlushCoordinator>,
+    flusher_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl BufferManager {
     const MAX_TIME: u64 = 10;
     const SHARDS: usize = 16;
+    const FLUSH_BATCH_SIZE: usize = 32;
+    const FLUSH_AGE_THRESHOLD: Duration = Duration::from_millis(2);
     const _SHARDS_POWER_OF_TWO: () = assert!(Self::SHARDS.is_power_of_two());
 
     pub fn new(
@@ -437,18 +669,254 @@ impl BufferManager {
             })
             .collect();
         let policy = PolicyState::new(&buffer_pool);
+        let flush_coordinator = Arc::new(FlushCoordinator::new());
+        let clean_unpinned = Arc::new(AtomicUsize::new(num_buffers));
+        let dirty_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let flusher_handle = {
+            let buffer_pool = buffer_pool.clone();
+            let file_manager = Arc::clone(&file_manager);
+            let log_manager = Arc::clone(&log_manager);
+            let flush_coordinator = Arc::clone(&flush_coordinator);
+            let clean_unpinned = Arc::clone(&clean_unpinned);
+            let dirty_queue = Arc::clone(&dirty_queue);
+            thread::spawn(move || {
+                Self::background_flush_loop(
+                    buffer_pool,
+                    file_manager,
+                    log_manager,
+                    clean_unpinned,
+                    dirty_queue,
+                    flush_coordinator,
+                )
+            })
+        };
 
         Self {
             file_manager,
             log_manager,
             buffer_pool,
             num_available: AtomicUsize::new(num_buffers),
+            clean_unpinned,
             wait_mutex: Mutex::new(()),
             cond: Condvar::new(),
             stats: OnceLock::new(),
             latch_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             resident_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             policy,
+            dirty_queue,
+            flush_coordinator,
+            flusher_handle: Mutex::new(Some(flusher_handle)),
+        }
+    }
+
+    /// Wakes the flusher after a frame becomes flush-eligible.
+    fn notify_flusher(&self) {
+        let mut state = self.flush_coordinator.state.lock().unwrap();
+        if state.oldest_dirty_signal.is_none() {
+            state.oldest_dirty_signal = Some(Instant::now());
+        }
+        self.flush_coordinator.cond.notify_one();
+    }
+
+    /// Enqueues a dirty frame exactly once and wakes the flusher.
+    fn enqueue_dirty_frame(&self, frame_idx: usize) {
+        self.dirty_queue.lock().unwrap().push_back(frame_idx);
+        self.notify_flusher();
+    }
+
+    /// Waits until either the oldest queued dirty frame has aged enough to
+    /// flush or shutdown has been requested.
+    fn wait_for_flush_signal(flush_coordinator: &FlushCoordinator) -> bool {
+        let mut state = flush_coordinator.state.lock().unwrap();
+        loop {
+            if state.shutdown {
+                return false;
+            }
+            match state.oldest_dirty_signal {
+                Some(oldest) => {
+                    let elapsed = oldest.elapsed();
+                    if elapsed >= Self::FLUSH_AGE_THRESHOLD {
+                        state.oldest_dirty_signal = None;
+                        return true;
+                    }
+                    let timeout = Self::FLUSH_AGE_THRESHOLD - elapsed;
+                    let (next_state, _) =
+                        flush_coordinator.cond.wait_timeout(state, timeout).unwrap();
+                    state = next_state;
+                }
+                None => {
+                    state = flush_coordinator.cond.wait(state).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Drains up to one batch of flush-eligible frames from the dirty queue and
+    /// snapshots stable page images for them.
+    fn collect_dirty_snapshots(
+        buffer_pool: &[Arc<BufferFrame>],
+        dirty_queue: &Mutex<VecDeque<usize>>,
+        batch_limit: usize,
+        txn_filter: Option<usize>,
+    ) -> Vec<(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)> {
+        // The queue keeps the flusher off the full buffer-pool scan path. We
+        // only revisit frames that transitioned into a flush-eligible state.
+        let mut pending = Vec::new();
+        let mut deferred = Vec::new();
+        while pending.len() < batch_limit {
+            let Some(frame_idx) = dirty_queue.lock().unwrap().pop_front() else {
+                break;
+            };
+            let buffer = &buffer_pool[frame_idx];
+            let mut meta = buffer.lock_meta();
+            meta.dirty_queued = false;
+            if meta.lsn.is_none() {
+                continue;
+            }
+            if pending.len() >= batch_limit {
+                break;
+            }
+            if let Some(txn_num) = txn_filter {
+                if meta.txn != Some(txn_num) {
+                    if !meta.dirty_queued {
+                        meta.dirty_queued = true;
+                        deferred.push(frame_idx);
+                    }
+                    continue;
+                }
+            }
+            let Some((block_id, lsn, generation, snapshot)) =
+                buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
+            else {
+                if meta.is_dirty() && !meta.dirty_queued {
+                    meta.dirty_queued = true;
+                    deferred.push(frame_idx);
+                }
+                continue;
+            };
+            pending.push((
+                frame_idx,
+                Arc::clone(buffer),
+                block_id,
+                lsn,
+                generation,
+                snapshot,
+            ));
+        }
+        if !deferred.is_empty() {
+            let mut queue = dirty_queue.lock().unwrap();
+            for frame_idx in deferred {
+                queue.push_back(frame_idx);
+            }
+        }
+        pending
+    }
+
+    /// Writes one batch of already-snapshotted pages after enforcing WAL-before-data.
+    fn write_snapshot_batch(
+        file_manager: &SharedFS,
+        log_manager: &Arc<Mutex<LogManager>>,
+        pending: &[(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)],
+    ) {
+        // WAL-before-data is enforced once per batch so snapshot writeback does
+        // not turn into one WAL flush per frame.
+        if pending.is_empty() {
+            return;
+        }
+        let max_lsn = pending
+            .iter()
+            .map(|(_, _, _, lsn, _, _)| *lsn)
+            .max()
+            .expect("pending batch has at least one lsn");
+        log_manager.lock().unwrap().flush_lsn(max_lsn);
+
+        let reqs: Vec<BatchWriteReq> = pending
+            .iter()
+            .map(|(_, _, block_id, _, _, _)| BatchWriteReq {
+                block_id: block_id.clone(),
+            })
+            .collect();
+        let pages: Vec<Page> = pending
+            .iter()
+            .map(|(_, _, _, _, _, snapshot)| snapshot.clone())
+            .collect();
+        file_manager.write_batch(&reqs, &pages);
+    }
+
+    /// Applies completion-side frame transitions for one finished snapshot batch.
+    fn complete_snapshot_batch(
+        pending: Vec<(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)>,
+        clean_unpinned: &AtomicUsize,
+        dirty_queue: &Mutex<VecDeque<usize>>,
+        flush_coordinator: &FlushCoordinator,
+    ) {
+        for (_frame_idx, frame, block_id, _, generation, _) in pending {
+            let mut meta = frame.lock_meta();
+            let block_still_matches = meta.block_id.as_ref() == Some(&block_id);
+            if let Some(transition) =
+                meta.complete_writeback_transition(block_still_matches, generation)
+            {
+                if transition.became_clean_unpinned {
+                    clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(frame_idx) = transition.enqueue_dirty {
+                    dirty_queue.lock().unwrap().push_back(frame_idx);
+                }
+            }
+        }
+        flush_coordinator.cond.notify_all();
+    }
+
+    /// Returns whether this transaction still owns any dirty generations that
+    /// must be forced before rollback/recovery returns.
+    fn has_dirty_for_txn(&self, txn_num: usize) -> bool {
+        self.buffer_pool.iter().any(|buffer| {
+            let meta = buffer.lock_meta();
+            meta.txn == Some(txn_num) && meta.lsn.is_some()
+        })
+    }
+
+    /// Background precleaning loop.
+    ///
+    /// The loop stays pressure-driven: it only consumes the dirty queue when the
+    /// number of clean unpinned frames falls below a low watermark.
+    fn background_flush_loop(
+        buffer_pool: Vec<Arc<BufferFrame>>,
+        file_manager: SharedFS,
+        log_manager: Arc<Mutex<LogManager>>,
+        clean_unpinned: Arc<AtomicUsize>,
+        dirty_queue: Arc<Mutex<VecDeque<usize>>>,
+        flush_coordinator: Arc<FlushCoordinator>,
+    ) {
+        // A low-watermark policy keeps this first cut focused on precleaning
+        // under buffer-pool pressure instead of eagerly flushing every dirty page.
+        let clean_target = (buffer_pool.len() / 4).max(1);
+        while Self::wait_for_flush_signal(&flush_coordinator) {
+            if clean_unpinned.load(Ordering::Acquire) >= clean_target {
+                continue;
+            }
+            loop {
+                let pending = Self::collect_dirty_snapshots(
+                    &buffer_pool,
+                    &dirty_queue,
+                    Self::FLUSH_BATCH_SIZE,
+                    None,
+                );
+                if pending.is_empty() {
+                    break;
+                }
+                Self::write_snapshot_batch(&file_manager, &log_manager, &pending);
+                let hit_batch_limit = pending.len() == Self::FLUSH_BATCH_SIZE;
+                Self::complete_snapshot_batch(
+                    pending,
+                    clean_unpinned.as_ref(),
+                    &dirty_queue,
+                    &flush_coordinator,
+                );
+                if !hit_batch_limit {
+                    break;
+                }
+            }
         }
     }
 
@@ -573,10 +1041,16 @@ impl BufferManager {
             meta_guard.txn = None;
             meta_guard.lsn = None;
 
-            let became_pinned = meta_guard.pin();
-            debug_assert!(became_pinned, "reserved prefetch frame must have zero pins");
+            let transition = meta_guard.pin_transition();
+            debug_assert!(
+                transition.became_pinned,
+                "reserved prefetch frame must have zero pins"
+            );
             drop(meta_guard);
             self.num_available.fetch_sub(1, Ordering::AcqRel);
+            if transition.left_clean_unpinned {
+                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+            }
 
             reservations.push(PrefetchReservation {
                 block_id: block_id.clone(),
@@ -645,13 +1119,19 @@ impl BufferManager {
         }
 
         for frame in frames_to_release {
-            let became_unpinned = {
+            let transition = {
                 let mut meta_guard = frame.lock_meta();
-                meta_guard.unpin()
+                meta_guard.unpin_transition()
             };
-            if became_unpinned {
+            if transition.became_unpinned {
                 self.num_available.fetch_add(1, Ordering::AcqRel);
                 self.cond.notify_all();
+            }
+            if transition.became_clean_unpinned {
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(frame_idx) = transition.enqueue_dirty {
+                self.enqueue_dirty_frame(frame_idx);
             }
         }
 
@@ -659,11 +1139,29 @@ impl BufferManager {
     }
 
     pub(crate) fn flush_all(&self, txn_num: usize) {
-        for buffer in &self.buffer_pool {
-            let mut meta = buffer.lock_meta();
-            if matches!(meta.txn, Some(t) if t == txn_num) {
-                buffer.flush_locked(&mut meta);
+        while self.has_dirty_for_txn(txn_num) {
+            let pending = Self::collect_dirty_snapshots(
+                &self.buffer_pool,
+                &self.dirty_queue,
+                Self::FLUSH_BATCH_SIZE,
+                Some(txn_num),
+            );
+            if pending.is_empty() {
+                let state = self.flush_coordinator.state.lock().unwrap();
+                let _ = self
+                    .flush_coordinator
+                    .cond
+                    .wait_timeout(state, Self::FLUSH_AGE_THRESHOLD)
+                    .unwrap();
+                continue;
             }
+            Self::write_snapshot_batch(&self.file_manager, &self.log_manager, &pending);
+            Self::complete_snapshot_batch(
+                pending,
+                self.clean_unpinned.as_ref(),
+                &self.dirty_queue,
+                &self.flush_coordinator,
+            );
         }
     }
 
@@ -717,9 +1215,12 @@ impl BufferManager {
                 }
                 return FastPinOutcome::NotResident;
             }
-            let was_unpinned = meta_guard.pin();
-            if was_unpinned {
+            let transition = meta_guard.pin_transition();
+            if transition.became_pinned {
                 self.num_available.fetch_sub(1, Ordering::AcqRel);
+                if transition.left_clean_unpinned {
+                    self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         }
 
@@ -775,9 +1276,12 @@ impl BufferManager {
         if let Some(frame_ptr) = frame_ptr {
             {
                 let mut meta_guard = self.record_hit(&frame_ptr, block_id)?;
-                let was_unpinned = meta_guard.pin();
-                if was_unpinned {
+                let transition = meta_guard.pin_transition();
+                if transition.became_pinned {
                     self.num_available.fetch_sub(1, Ordering::AcqRel);
+                    if transition.left_clean_unpinned {
+                        self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
                 if let Some(stats) = self.stats.get() {
                     stats
@@ -805,8 +1309,11 @@ impl BufferManager {
         }
         let frame = Arc::clone(&self.buffer_pool[tail_idx]);
         frame.assign_to_block_locked(&mut meta_guard, block_id);
-        let became_pinned = meta_guard.pin();
-        debug_assert!(became_pinned, "newly assigned frame must have zero pins");
+        let transition = meta_guard.pin_transition();
+        debug_assert!(
+            transition.became_pinned,
+            "newly assigned frame must have zero pins"
+        );
         drop(meta_guard);
 
         self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
@@ -816,22 +1323,46 @@ impl BufferManager {
             .unwrap()
             .insert(block_id.clone(), Arc::downgrade(&frame));
         self.num_available.fetch_sub(1, Ordering::AcqRel);
+        if transition.left_clean_unpinned {
+            self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+        }
         Some(frame)
     }
 
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
-        let mut meta = frame.lock_meta();
-        let became_unpinned = meta.unpin();
-        if became_unpinned {
+        let transition = {
+            let mut meta = frame.lock_meta();
+            meta.unpin_transition()
+        };
+        if transition.became_unpinned {
             self.num_available.fetch_add(1, Ordering::AcqRel);
             self.cond.notify_all();
+        }
+        if transition.became_clean_unpinned {
+            self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+        }
+        if let Some(frame_idx) = transition.enqueue_dirty {
+            self.enqueue_dirty_frame(frame_idx);
         }
     }
 
     /// Applies dirty metadata updates through the buffer manager boundary so
     /// callers cannot mutate frame metadata directly.
+    /// Marks a frame dirty through the buffer-manager protocol boundary.
+    ///
+    /// Callers hand off the new txn/LSN pair here so queueing and clean-slack
+    /// bookkeeping stay centralized with the rest of the frame-state machine.
     pub(crate) fn mark_modified(&self, frame: &Arc<BufferFrame>, txn_num: usize, lsn: usize) {
-        frame.set_modified(txn_num, lsn);
+        let transition = {
+            let mut meta = frame.lock_meta();
+            meta.mark_dirty_transition(txn_num, lsn)
+        };
+        if transition.left_clean_unpinned {
+            self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Some(frame_idx) = transition.enqueue_dirty {
+            self.enqueue_dirty_frame(frame_idx);
+        }
     }
 
     fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
@@ -869,5 +1400,18 @@ impl BufferManager {
             num_pinned_buffers,
             self.buffer_pool.len()
         );
+    }
+}
+
+impl Drop for BufferManager {
+    fn drop(&mut self) {
+        {
+            let mut state = self.flush_coordinator.state.lock().unwrap();
+            state.shutdown = true;
+            self.flush_coordinator.cond.notify_all();
+        }
+        if let Some(handle) = self.flusher_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 }

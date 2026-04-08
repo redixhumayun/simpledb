@@ -149,7 +149,7 @@ impl PolicyState {
         let mut current = tail;
         loop {
             let mut current_guard = buffer_pool[current].lock_meta();
-            if current_guard.pins > 0 {
+            if current_guard.pins > 0 || current_guard.writeback_in_progress {
                 if let Some(head) = intrusive_list_guard.peek_head() {
                     if current_guard.index == head {
                         return None;

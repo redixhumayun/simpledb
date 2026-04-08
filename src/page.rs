@@ -1542,7 +1542,7 @@ pub trait PageKind: Sized {
 /// Slot identifier within a page.
 pub type SlotId = usize;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[repr(align(4096))]
 pub struct PageBytes {
     bytes: [u8; PAGE_SIZE_BYTES as usize],

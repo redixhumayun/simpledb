@@ -16274,6 +16274,15 @@ pub struct BatchReadReq {
     pub block_id: BlockId,
 }
 
+#[derive(Debug, Clone)]
+/// Identifies one stable page image in a write batch.
+///
+/// The buffer manager snapshots pages first, then hands those stable images to
+/// the filesystem layer through this lightweight request type.
+pub struct BatchWriteReq {
+    pub block_id: BlockId,
+}
+
 /// Trait defining the file system interface for database operations
 pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     fn block_size(&self) -> usize;
@@ -16291,6 +16300,22 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
         );
         for (req, page) in reqs.iter().zip(pages.iter_mut()) {
             self.read(&req.block_id, page);
+        }
+    }
+
+    /// Writes a batch of already-stable page images.
+    ///
+    /// This keeps the transaction/flush protocol above the filesystem layer:
+    /// the buffer manager decides which generations are safe to flush, and the
+    /// filesystem decides how those writes are submitted.
+    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[Page]) {
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch write request/page length mismatch"
+        );
+        for (req, page) in reqs.iter().zip(pages.iter()) {
+            self.write(&req.block_id, page);
         }
     }
     fn append(&self, filename: String) -> BlockId;
@@ -16663,6 +16688,102 @@ impl FileManager {
             submitted += queued;
         }
     }
+
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
+    /// Batches direct data-page writes through `io_uring` using already-stable
+    /// snapshot buffers supplied by the buffer manager.
+    fn submit_direct_writes_uring(
+        &self,
+        reqs: &[BatchWriteReq],
+        direct_indices: &[usize],
+        direct_files: &[Arc<OpenFile>],
+        offsets: &[u64],
+        pages: &[Page],
+    ) {
+        // Snapshot writeback guarantees these buffers stay stable for the whole
+        // I/O lifetime, so direct writes can batch through io_uring safely.
+        assert_eq!(direct_indices.len(), direct_files.len());
+        assert_eq!(direct_indices.len(), offsets.len());
+
+        let page_size = crate::page::PAGE_SIZE_BYTES as usize;
+
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(direct_indices.len());
+        let mut fds: Vec<i32> = Vec::with_capacity(direct_indices.len());
+
+        for pos in 0..direct_indices.len() {
+            let page_idx = direct_indices[pos];
+            let ptr = pages[page_idx].bytes().as_ptr();
+            iovecs.push(libc::iovec {
+                iov_base: ptr.cast_mut().cast(),
+                iov_len: page_size,
+            });
+            fds.push(direct_files[pos].file.as_raw_fd());
+        }
+
+        let mut ring = self.io_uring.ring.lock().unwrap();
+        let mut submitted = 0usize;
+        while submitted < direct_indices.len() {
+            let mut queued = 0usize;
+            {
+                let mut sq = ring.submission();
+                while submitted + queued < direct_indices.len() && !sq.is_full() {
+                    let request_pos = submitted + queued;
+                    let sqe = opcode::Writev::new(
+                        types::Fd(fds[request_pos]),
+                        &iovecs[request_pos] as *const libc::iovec,
+                        1,
+                    )
+                    .offset(offsets[request_pos])
+                    .build()
+                    .user_data(request_pos as u64);
+                    unsafe {
+                        sq.push(&sqe).expect("submission queue push failed");
+                    }
+                    queued += 1;
+                }
+            }
+
+            assert!(
+                queued > 0,
+                "io_uring queue depth is zero; cannot make progress"
+            );
+            ring.submit().expect("io_uring submit failed");
+
+            let mut completed = 0usize;
+            while completed < queued {
+                if ring.completion().is_empty() {
+                    ring.submit_and_wait(1)
+                        .expect("io_uring submit_and_wait failed");
+                }
+
+                let mut cq = ring.completion();
+                for cqe in &mut cq {
+                    let request_pos = cqe.user_data() as usize;
+                    let page_idx = direct_indices[request_pos];
+                    let result = cqe.result();
+                    if result < 0 {
+                        let errno = -result;
+                        panic!(
+                            "io_uring write failed for {:?}: {}",
+                            &reqs[page_idx].block_id,
+                            io::Error::from_raw_os_error(errno)
+                        );
+                    }
+
+                    let bytes_written = result as usize;
+                    if bytes_written != page_size {
+                        panic!(
+                            "io_uring write returned partial bytes: got {}, page size {}",
+                            bytes_written, page_size
+                        );
+                    }
+                    completed += 1;
+                }
+            }
+
+            submitted += queued;
+        }
+    }
 }
 
 impl FileSystemInterface for FileManager {
@@ -16695,6 +16816,69 @@ impl FileSystemInterface for FileManager {
         let offset = block_offset(block_id.block_num);
         let of = self.get_open_file(&block_id.filename, FileClass::Data);
         of.write_page_at(offset, page.bytes());
+    }
+
+    /// Writes one batch of page images, using direct `io_uring` submission for
+    /// direct-opened data files and the existing synchronous path otherwise.
+    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[Page]) {
+        // Keep batching policy here so the buffer manager only reasons about
+        // frame generations and stable page images, not direct-io submission.
+        assert_eq!(
+            reqs.len(),
+            pages.len(),
+            "batch write request/page length mismatch"
+        );
+        let stats_enabled = self
+            .io_stats_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if stats_enabled {
+            self.io_batch_counters.record_submitted(reqs.len());
+        }
+
+        #[cfg(all(target_os = "linux", feature = "direct-io"))]
+        {
+            let mut direct_indices: Vec<usize> = Vec::new();
+            let mut direct_files: Vec<Arc<OpenFile>> = Vec::new();
+            let mut direct_offsets: Vec<u64> = Vec::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                let of = self.get_open_file(&req.block_id.filename, FileClass::Data);
+                match of.mode {
+                    IoMode::Buffered => {
+                        let offset = block_offset(req.block_id.block_num);
+                        of.write_page_at(offset, pages[idx].bytes());
+                    }
+                    IoMode::Direct => {
+                        direct_indices.push(idx);
+                        direct_files.push(of);
+                        direct_offsets.push(block_offset(req.block_id.block_num));
+                    }
+                }
+            }
+
+            if !direct_indices.is_empty() {
+                self.submit_direct_writes_uring(
+                    reqs,
+                    &direct_indices,
+                    &direct_files,
+                    &direct_offsets,
+                    pages,
+                );
+            }
+            if stats_enabled {
+                self.io_batch_counters.record_completed(reqs.len());
+            }
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "direct-io")))]
+        {
+            for (req, page) in reqs.iter().zip(pages.iter()) {
+                self.write(&req.block_id, page);
+            }
+            if stats_enabled {
+                self.io_batch_counters.record_completed(reqs.len());
+            }
+        }
     }
 
     fn read_wal_block(&self, block_id: &BlockId, buf: &mut [u8]) {
@@ -17107,6 +17291,8 @@ mod file_manager_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    use crate::BatchWriteReq;
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
     use crate::IoMode;
     #[cfg(feature = "direct-io")]
     use crate::DIRECT_IO_FALLBACK_COUNT;
@@ -17177,6 +17363,42 @@ mod file_manager_tests {
         let mut read_page = Page::new();
         file_manager.read(&block_id, &mut read_page);
         assert_eq!(read_page.bytes(), write_page.bytes());
+    }
+
+    #[cfg(all(feature = "direct-io", target_os = "linux"))]
+    #[test]
+    fn test_direct_io_write_batch_round_trip() {
+        let (_temp_dir, file_manager) = setup();
+        let filename = "direct_io_batch_round_trip".to_string();
+        let block0 = file_manager.append(filename.clone());
+        let block1 = file_manager.append(filename);
+
+        let mut page0 = Page::new();
+        let mut page1 = Page::new();
+        for (idx, b) in page0.bytes_mut().iter_mut().enumerate() {
+            *b = (idx % 251) as u8;
+        }
+        for (idx, b) in page1.bytes_mut().iter_mut().enumerate() {
+            *b = (250 - (idx % 251)) as u8;
+        }
+
+        let reqs = [
+            BatchWriteReq {
+                block_id: block0.clone(),
+            },
+            BatchWriteReq {
+                block_id: block1.clone(),
+            },
+        ];
+        let pages = [page0, page1];
+        file_manager.write_batch(&reqs, &pages);
+
+        let mut read0 = Page::new();
+        let mut read1 = Page::new();
+        file_manager.read(&block0, &mut read0);
+        file_manager.read(&block1, &mut read1);
+        assert_eq!(read0.bytes(), pages[0].bytes());
+        assert_eq!(read1.bytes(), pages[1].bytes());
     }
 
     #[cfg(all(feature = "direct-io", target_os = "linux"))]

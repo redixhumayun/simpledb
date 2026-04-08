@@ -137,7 +137,7 @@ impl PolicyState {
             match list_guard.hand {
                 Some(hand) => {
                     let mut current_guard = buffer_pool[hand].lock_meta();
-                    if current_guard.pins > 0 {
+                    if current_guard.pins > 0 || current_guard.writeback_in_progress {
                         if let Some(head) = list_guard.intrusive_list.peek_head() {
                             if current_guard.index == head {
                                 list_guard.hand = list_guard.intrusive_list.peek_tail();
