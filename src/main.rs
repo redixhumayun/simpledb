@@ -12385,6 +12385,22 @@ impl RecoveryManager {
             }
         }
 
+        let mut original_page_lsns = HashMap::new();
+        for (_, record) in &records {
+            let txnum = record.get_tx_num();
+            if committed_txns.contains(&txnum) || rolled_back_txns.contains(&txnum) {
+                continue;
+            }
+            let Some(block_id) = record.undo_block_id() else {
+                continue;
+            };
+            if original_page_lsns.contains_key(block_id) {
+                continue;
+            }
+            let guard = tx.pin_write_guard(block_id)?;
+            original_page_lsns.insert(block_id.clone(), page_lsn_from_bytes(guard.bytes()));
+        }
+
         for (record_lsn, record) in &records {
             let txnum = record.get_tx_num();
             if committed_txns.contains(&txnum) {
@@ -12397,7 +12413,7 @@ impl RecoveryManager {
             if committed_txns.contains(&txnum) || rolled_back_txns.contains(&txnum) {
                 continue;
             }
-            if record.should_undo_during_recovery(tx, *record_lsn)? {
+            if record.should_undo_during_recovery(&original_page_lsns, *record_lsn)? {
                 record.undo(tx)?;
             }
         }
@@ -13972,13 +13988,17 @@ impl LogRecord {
         }
     }
 
-    fn page_needs_redo(
-        txn: &dyn RecoveryWriteContext,
+    fn pin_if_needs_redo<'a>(
+        txn: &'a dyn RecoveryWriteContext,
         block_id: &BlockId,
         record_lsn: Lsn,
-    ) -> SimpleDBResult<bool> {
+    ) -> SimpleDBResult<Option<PageWriteGuard<'a>>> {
         let guard = txn.pin_write_guard(block_id)?;
-        Ok(page_lsn_from_bytes(guard.bytes()) < record_lsn)
+        if page_lsn_from_bytes(guard.bytes()) < record_lsn {
+            Ok(Some(guard))
+        } else {
+            Ok(None)
+        }
     }
 
     fn redo(&self, txn: &dyn RecoveryWriteContext, record_lsn: Lsn) -> SimpleDBResult<()> {
@@ -13997,10 +14017,9 @@ impl LogRecord {
                 tuple,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = HeapPageMut::new(guard.bytes_mut())?;
                     page.redo_insert(*slot, *offset, tuple)?;
@@ -14022,10 +14041,9 @@ impl LogRecord {
                 relocated_slot,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = HeapPageMut::new(guard.bytes_mut())?;
                     page.redo_update(*slot, *new_offset, new_tuple, *relocated, *relocated_slot)?;
@@ -14039,10 +14057,9 @@ impl LogRecord {
                 Ok(())
             }
             LogRecord::HeapTupleDelete { block_id, slot, .. } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = HeapPageMut::new(guard.bytes_mut())?;
                     page.undo_insert(*slot)?;
@@ -14062,10 +14079,9 @@ impl LogRecord {
                 entry,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
                     page.undo_delete(*slot, *offset, entry)?;
@@ -14079,10 +14095,9 @@ impl LogRecord {
                 Ok(())
             }
             LogRecord::BTreeLeafDelete { block_id, slot, .. } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
                     page.undo_insert(*slot)?;
@@ -14104,10 +14119,9 @@ impl LogRecord {
                 new_children,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
                     page.undo_delete(*slot, *offset, entry)?;
@@ -14128,10 +14142,9 @@ impl LogRecord {
                 new_children,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 {
                     let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
                     page.undo_insert(*slot)?;
@@ -14150,10 +14163,9 @@ impl LogRecord {
                 new_header,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 let header = guard
                     .bytes_mut()
                     .get_mut(..new_header.len())
@@ -14172,10 +14184,9 @@ impl LogRecord {
                 new_header,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 let header = guard
                     .bytes_mut()
                     .get_mut(..new_header.len())
@@ -14196,10 +14207,10 @@ impl LogRecord {
                 new_structure_version,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, meta_block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)?
+                else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(meta_block_id)?;
+                };
                 {
                     let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
                     meta_view.set_root_block(*new_root_block);
@@ -14221,10 +14232,10 @@ impl LogRecord {
                 new_head,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, meta_block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)?
+                else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(meta_block_id)?;
+                };
                 {
                     let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
                     meta_view.set_first_free_block(*new_head);
@@ -14246,14 +14257,10 @@ impl LogRecord {
                 new_head,
                 ..
             } => {
-                let block_needs = Self::page_needs_redo(txn, block_id, record_lsn)?;
-                if block_needs {
-                    let mut block_guard = txn.pin_write_guard(block_id)?;
+                if let Some(mut block_guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? {
                     block_guard.format_as_free(*old_head, record_lsn);
                 }
-                let meta_needs = Self::page_needs_redo(txn, meta_block_id, record_lsn)?;
-                if meta_needs {
-                    let mut guard = txn.pin_write_guard(meta_block_id)?;
+                if let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)? {
                     {
                         let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
                         meta_view.set_first_free_block(*new_head);
@@ -14270,10 +14277,9 @@ impl LogRecord {
                 Ok(())
             }
             LogRecord::HeapPageFormatFresh { block_id, .. } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 HeapPageMut::init_bytes(guard.bytes_mut());
                 set_page_lsn(guard.bytes_mut(), record_lsn);
                 {
@@ -14291,10 +14297,9 @@ impl LogRecord {
                 first_free_block,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 BTreeMetaPageMut::init_bytes(
                     guard.bytes_mut(),
                     *version,
@@ -14317,10 +14322,9 @@ impl LogRecord {
                 rightmost_child,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 BTreeInternalPageMut::init_bytes(
                     guard.bytes_mut(),
                     *level as u8,
@@ -14339,10 +14343,9 @@ impl LogRecord {
                 overflow_block,
                 ..
             } => {
-                if !Self::page_needs_redo(txn, block_id, record_lsn)? {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
                     return Ok(());
-                }
-                let mut guard = txn.pin_write_guard(block_id)?;
+                };
                 BTreeLeafPageMut::init_bytes(guard.bytes_mut(), *overflow_block);
                 set_page_lsn(guard.bytes_mut(), record_lsn);
                 {
@@ -14785,7 +14788,7 @@ impl LogRecord {
     /// Rollback path intentionally does not use this check.
     fn should_undo_during_recovery(
         &self,
-        txn: &dyn RecoveryWriteContext,
+        original_page_lsns: &HashMap<BlockId, Lsn>,
         record_lsn: Lsn,
     ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
@@ -14808,8 +14811,9 @@ impl LogRecord {
         let Some(block_id) = self.undo_block_id() else {
             return Ok(true);
         };
-        let guard = txn.pin_write_guard(block_id)?;
-        let page_lsn = crate::page::page_lsn_from_bytes(guard.bytes());
+        let page_lsn = *original_page_lsns.get(block_id).ok_or_else(|| {
+            format!("missing original disk lsn for undo-gated block {block_id:?}")
+        })?;
         Ok(page_lsn >= record_lsn)
     }
 
@@ -14856,12 +14860,14 @@ impl LogRecord {
 
 #[cfg(test)]
 mod recovery_manager_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::{
-        page::{test_helpers, SlotId},
+        mock_file_manager::MockFileManager,
+        page::{set_page_lsn, test_helpers, HeapPageMut, SlotId, PAGE_SIZE_BYTES},
         test_utils::{generate_filename, generate_random_number},
-        BlockId, Constant, Layout, Schema, SimpleDB, TestDir, Transaction,
+        BlockId, BufferManager, Constant, Layout, LockTable, LogManager, LogRecord, Lsn, Schema,
+        SharedFS, SimpleDB, TestDir, Transaction, WalMode,
     };
 
     const INT_FIELD: &str = "int_val";
@@ -14963,6 +14969,72 @@ mod recovery_manager_tests {
             Some(Constant::String(value)) => value,
             other => panic!("expected string value, got {other:?}"),
         }
+    }
+
+    fn tuple_bytes(layout: &Layout, int_value: i32, text_value: &str) -> Vec<u8> {
+        test_helpers::build_tuple_bytes(layout, |values| {
+            values[layout.column_idx(INT_FIELD).unwrap()] = Some(Constant::Int(int_value));
+            values[layout.column_idx(STR_FIELD).unwrap()] =
+                Some(Constant::String(text_value.to_string()));
+        })
+        .expect("build tuple bytes")
+    }
+
+    fn write_formatted_heap_page(fs: &SharedFS, block: &BlockId, page_lsn: Lsn) {
+        let mut page_bytes = crate::Page::new();
+        HeapPageMut::init_bytes(page_bytes.bytes_mut());
+        set_page_lsn(page_bytes.bytes_mut(), page_lsn);
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.update_crc32();
+        }
+        fs.write(block, &page_bytes);
+    }
+
+    fn write_heap_page_with_single_row(
+        fs: &SharedFS,
+        block: &BlockId,
+        tuple: &[u8],
+        page_lsn: Lsn,
+    ) -> usize {
+        let offset = PAGE_SIZE_BYTES as usize - tuple.len();
+        let mut page_bytes = crate::Page::new();
+        HeapPageMut::init_bytes(page_bytes.bytes_mut());
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.redo_insert(0, offset, tuple).unwrap();
+        }
+        set_page_lsn(page_bytes.bytes_mut(), page_lsn);
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.update_crc32();
+        }
+        fs.write(block, &page_bytes);
+        offset
+    }
+
+    fn durable_log_manager(fs: &SharedFS, wal_file: &str) -> Arc<Mutex<LogManager>> {
+        Arc::new(Mutex::new(LogManager::new_with_mode(
+            Arc::clone(fs),
+            wal_file,
+            WalMode::Durable,
+        )))
+    }
+
+    fn recovery_tx(fs: &SharedFS, wal_file: &str, pool_size: usize) -> Arc<Transaction> {
+        let log_manager = durable_log_manager(fs, wal_file);
+        let buffer_manager = Arc::new(BufferManager::new(
+            Arc::clone(fs),
+            Arc::clone(&log_manager),
+            pool_size,
+        ));
+        let lock_table = Arc::new(LockTable::new(100));
+        Arc::new(Transaction::new(
+            Arc::clone(fs),
+            log_manager,
+            buffer_manager,
+            lock_table,
+        ))
     }
 
     #[test]
@@ -15328,6 +15400,91 @@ mod recovery_manager_tests {
         let txn = db.new_tx();
         assert_eq!(read_int_at(&txn, &block, &layout, 0), 99);
         assert_eq!(read_string_at(&txn, &block, &layout, 0), "relocated");
+    }
+
+    #[test]
+    fn recovery_uses_original_disk_lsn_for_undo_gate_under_eviction_pressure() {
+        let layout = recovery_layout();
+        let data_file = generate_filename();
+        let wal_file = "simpledb.log";
+        let mock_fs = Arc::new(MockFileManager::new());
+        let fs: SharedFS = mock_fs.clone();
+
+        let block_p = fs.append(data_file.clone());
+        let block_q = fs.append(data_file.clone());
+        let block_r = fs.append(data_file.clone());
+        fs.sync_directory();
+
+        let tuple_10 = tuple_bytes(&layout, 10, "seed");
+        let tuple_20 = tuple_bytes(&layout, 20, "seed");
+        let tuple_30 = tuple_bytes(&layout, 30, "seed");
+        let tuple_q = tuple_bytes(&layout, 42, "other");
+        let tuple_r = tuple_bytes(&layout, 77, "third");
+        let offset_p = write_heap_page_with_single_row(&fs, &block_p, &tuple_10, 0);
+        let offset_q = PAGE_SIZE_BYTES as usize - tuple_q.len();
+        let offset_r = PAGE_SIZE_BYTES as usize - tuple_r.len();
+        write_formatted_heap_page(&fs, &block_q, 0);
+        write_formatted_heap_page(&fs, &block_r, 0);
+        fs.sync(&data_file);
+        fs.sync_directory();
+
+        let log_manager = durable_log_manager(&fs, wal_file);
+        let records = [
+            LogRecord::HeapTupleUpdate {
+                txnum: 1,
+                block_id: block_p.clone(),
+                slot: 0,
+                old_offset: offset_p,
+                old_tuple: tuple_10.clone(),
+                new_offset: offset_p,
+                new_tuple: tuple_20.clone(),
+                relocated: false,
+                relocated_slot: None,
+            },
+            LogRecord::HeapTupleUpdate {
+                txnum: 2,
+                block_id: block_p.clone(),
+                slot: 0,
+                old_offset: offset_p,
+                old_tuple: tuple_20,
+                new_offset: offset_p,
+                new_tuple: tuple_30,
+                relocated: false,
+                relocated_slot: None,
+            },
+            LogRecord::Commit(2),
+            LogRecord::HeapTupleInsert {
+                txnum: 3,
+                block_id: block_q,
+                slot: 0,
+                offset: offset_q,
+                tuple: tuple_q,
+            },
+            LogRecord::Commit(3),
+            LogRecord::HeapTupleInsert {
+                txnum: 4,
+                block_id: block_r,
+                slot: 0,
+                offset: offset_r,
+                tuple: tuple_r,
+            },
+            LogRecord::Commit(4),
+        ];
+        let mut final_lsn = 0;
+        for record in records {
+            final_lsn = record.write_log_record(&log_manager).unwrap();
+        }
+        log_manager.lock().unwrap().flush_lsn(final_lsn);
+        fs.sync_directory();
+        drop(log_manager);
+
+        mock_fs.simulate_crash();
+        mock_fs.restore_from_crash();
+
+        let txn = recovery_tx(&fs, wal_file, 2);
+        txn.write_session().recover().unwrap();
+
+        assert_eq!(read_int_at(&txn, &block_p, &layout, 0), 30);
     }
 }
 
