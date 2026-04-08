@@ -10,7 +10,7 @@ use std::{
     any::Any,
     cell::{Cell, RefCell},
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt::Display,
     fs::{self, File, OpenOptions},
@@ -40,7 +40,11 @@ mod page;
 mod parser;
 mod replacement;
 pub use crate::page::PAGE_SIZE_BYTES;
-use crate::page::{HeapIterator, HeapTuple, NullBitmapMut, PageReadGuard, PageWriteGuard, WalPage};
+use crate::page::{
+    page_lsn_from_bytes, set_page_lsn, BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut,
+    BTreeMetaPageViewMut, HeapIterator, HeapPageMut, HeapTuple, NullBitmapMut, PageReadGuard,
+    PageWriteGuard, WalPage,
+};
 mod buffer_manager;
 
 pub type Lsn = usize;
@@ -115,6 +119,11 @@ impl SimpleDB {
             Arc::clone(&buffer_manager),
             Arc::clone(&lock_table),
         ));
+        if !clean && runtime_options.wal_mode != WalMode::UnsafeNoWal {
+            txn.write_session()
+                .recover()
+                .expect("startup recovery should complete");
+        }
         let metadata_manager = Arc::new(MetadataManager::new(clean, Arc::clone(&txn)));
         let query_planner = PipelineQueryPlanner::new(Arc::clone(&metadata_manager));
         let _update_planner = BasicUpdatePlanner::new(Arc::clone(&metadata_manager));
@@ -10418,7 +10427,7 @@ impl Transaction {
     }
 
     /// Commit this transaction
-    /// This will write all data associated with this transaction out to disk and append a [`LogRecord::Commit`] to the WAL
+    /// This will make the commit record durable in WAL without forcing this transaction's data pages to disk
     /// It will release all locks that are currently held by this transaction
     /// It will also handle meta operations like unpinning buffers
     fn commit_locked(&self) -> SimpleDBResult<()> {
@@ -12313,11 +12322,9 @@ impl RecoveryManager {
     }
 
     /// Commit the [`Transaction`]
-    /// It flushes all the buffers associated with this transaction
     /// It creates and writes a new [`LogRecord::Commit`] record to the WAL
-    /// It then forces a flush on the WAL to ensure logs are committed
+    /// It then forces a flush on the WAL to ensure the commit record is durable.
     fn commit(&self) -> SimpleDBResult<()> {
-        self.buffer_manager.flush_all(self.tx_num);
         let record = LogRecord::Commit(self.tx_num);
         let lsn = record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
@@ -12344,39 +12351,76 @@ impl RecoveryManager {
         //  Flush all data associated with this transaction
         self.buffer_manager.flush_all(self.tx_num);
         //  Write a checkpoint record and flush it
-        let checkpoint_record = LogRecord::Checkpoint;
+        let latest_lsn = self.log_manager.lock().unwrap().latest_lsn();
+        let checkpoint_record = LogRecord::Checkpoint { latest_lsn };
         let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
     }
 
     /// Recover the database from the last [`LogRecord::Checkpoint`]
-    /// Find all the incomplete transactions and undo their operations
-    /// Write a quiescent [`LogRecord::Checkpoint`] to the log and flush it
+    /// Redo committed operations missing from disk, undo unfinished ones,
+    /// then write a quiescent [`LogRecord::Checkpoint`] to the log and flush it.
     fn recover(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
-        //  Iterate over the WAL records in reverse order and add any that don't have a COMMIT to unfinished txns
-        let log_iter = self.log_manager.lock().unwrap().iterator();
-        let mut finished_txns: Vec<usize> = Vec::new();
-        for (record_lsn, log) in log_iter {
-            let record = LogRecord::from_bytes(log)?;
-            match record {
-                LogRecord::Checkpoint => return Ok(()),
-                LogRecord::Commit(_) | LogRecord::Rollback(_) => {
-                    finished_txns.push(record.get_tx_num());
-                }
-                _ => {
-                    if !finished_txns.contains(&record.get_tx_num())
-                        && record.should_undo_during_recovery(tx, record_lsn)?
-                    {
-                        record.undo(tx)?;
-                    }
-                }
+        let mut records: Vec<(Lsn, LogRecord)> = Vec::new();
+        {
+            let log_iter = self.log_manager.lock().unwrap().iterator();
+            for (record_lsn, log) in log_iter {
+                records.push((record_lsn, LogRecord::from_bytes(log)?));
             }
         }
-        //  Flush all data associated with this transaction
+        records.reverse();
+
+        let mut committed_txns = HashSet::new();
+        let mut rolled_back_txns = HashSet::new();
+        for (_, record) in &records {
+            match record {
+                LogRecord::Commit(txnum) => {
+                    committed_txns.insert(*txnum);
+                }
+                LogRecord::Rollback(txnum) => {
+                    rolled_back_txns.insert(*txnum);
+                }
+                _ => {}
+            }
+        }
+
+        let mut original_page_lsns = HashMap::new();
+        for (_, record) in &records {
+            let txnum = record.get_tx_num();
+            if committed_txns.contains(&txnum) || rolled_back_txns.contains(&txnum) {
+                continue;
+            }
+            let Some(block_id) = record.undo_block_id() else {
+                continue;
+            };
+            if original_page_lsns.contains_key(block_id) {
+                continue;
+            }
+            let guard = tx.pin_write_guard(block_id)?;
+            original_page_lsns.insert(block_id.clone(), page_lsn_from_bytes(guard.bytes()));
+        }
+
+        for (record_lsn, record) in &records {
+            let txnum = record.get_tx_num();
+            if committed_txns.contains(&txnum) {
+                record.redo(tx, *record_lsn)?;
+            }
+        }
+
+        for (record_lsn, record) in records.iter().rev() {
+            let txnum = record.get_tx_num();
+            if committed_txns.contains(&txnum) || rolled_back_txns.contains(&txnum) {
+                continue;
+            }
+            if record.should_undo_during_recovery(&original_page_lsns, *record_lsn)? {
+                record.undo(tx)?;
+            }
+        }
+
         self.buffer_manager.flush_all(self.tx_num);
-        //  Write a checkpoint record and flush it
-        let checkpoint_record = LogRecord::Checkpoint;
+        let latest_lsn = self.log_manager.lock().unwrap().latest_lsn();
+        let checkpoint_record = LogRecord::Checkpoint { latest_lsn };
         let lsn = checkpoint_record.write_log_record(&self.log_manager)?;
         self.log_manager.lock().unwrap().flush_lsn(lsn);
         Ok(())
@@ -12389,7 +12433,9 @@ enum LogRecord {
     Start(usize),
     Commit(usize),
     Rollback(usize),
-    Checkpoint,
+    Checkpoint {
+        latest_lsn: usize,
+    },
     /// Physical tuple-level insert: logs full tuple bytes for undo
     HeapTupleInsert {
         txnum: usize,
@@ -12445,6 +12491,7 @@ enum LogRecord {
         entry: Vec<u8>,
         child_field_offset: usize,
         old_children: Vec<usize>,
+        new_children: Vec<usize>,
     },
     /// Physical B-tree internal delete: logs slot, offset, and entry bytes for inverse compaction
     BTreeInternalDelete {
@@ -12457,6 +12504,7 @@ enum LogRecord {
         entry_bytes: Vec<u8>,
         child_field_offset: usize,
         old_children: Vec<usize>,
+        new_children: Vec<usize>,
     },
     /// Leaf header structural update (high key / sibling / overflow)
     BTreeLeafHeaderUpdate {
@@ -12531,6 +12579,10 @@ enum LogRecord {
     BTreeMetaFormatFresh {
         txnum: usize,
         block_id: BlockId,
+        version: u8,
+        tree_height: u16,
+        root_block: u32,
+        first_free_block: u32,
     },
     /// BTree internal page format: logs fresh internal page formatting
     BTreeInternalFormatFresh {
@@ -12553,7 +12605,9 @@ impl Display for LogRecord {
             LogRecord::Start(txnum) => write!(f, "Start({txnum})"),
             LogRecord::Commit(txnum) => write!(f, "Commit({txnum})"),
             LogRecord::Rollback(txnum) => write!(f, "Rollback({txnum})"),
-            LogRecord::Checkpoint => write!(f, "Checkpoint"),
+            LogRecord::Checkpoint { latest_lsn } => {
+                write!(f, "Checkpoint(latest_lsn: {latest_lsn})")
+            }
             LogRecord::HeapTupleInsert {
                 txnum,
                 block_id,
@@ -12622,12 +12676,14 @@ impl Display for LogRecord {
                 offset,
                 entry,
                 old_children,
+                new_children,
                 ..
             } => write!(
                 f,
-                "BTreeInternalInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {}, old_children: {})",
+                "BTreeInternalInsert(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, entry_len: {}, old_children: {}, new_children: {})",
                 entry.len(),
-                old_children.len()
+                old_children.len(),
+                new_children.len()
             ),
             LogRecord::BTreeInternalDelete {
                 txnum,
@@ -12637,11 +12693,13 @@ impl Display for LogRecord {
                 key,
                 child_block,
                 old_children,
+                new_children,
                 ..
             } => write!(
                 f,
-                "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block}, old_children: {})",
-                old_children.len()
+                "BTreeInternalDelete(txnum: {txnum}, block_id: {block_id:?}, slot: {slot}, offset: {offset}, key: {key:?}, child_block: {child_block}, old_children: {}, new_children: {})",
+                old_children.len(),
+                new_children.len()
             ),
             LogRecord::BTreeLeafHeaderUpdate {
                 txnum,
@@ -12727,9 +12785,16 @@ impl Display for LogRecord {
                 f,
                 "BTreePageAppend(txnum: {txnum}, meta: {meta_block_id:?}, block: {block_id:?})"
             ),
-            LogRecord::BTreeMetaFormatFresh { txnum, block_id } => write!(
+            LogRecord::BTreeMetaFormatFresh {
+                txnum,
+                block_id,
+                version,
+                tree_height,
+                root_block,
+                first_free_block,
+            } => write!(
                 f,
-                "BTreeMetaFormatFresh(txnum: {txnum}, block: {block_id:?})"
+                "BTreeMetaFormatFresh(txnum: {txnum}, block: {block_id:?}, version: {version}, tree_height: {tree_height}, root_block: {root_block}, first_free_block: {first_free_block})"
             ),
             LogRecord::BTreeInternalFormatFresh {
                 txnum,
@@ -12778,7 +12843,7 @@ impl From<&LogRecord> for Vec<u8> {
             LogRecord::Start(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Commit(txnum) => push_i32(&mut buf, *txnum as i32),
             LogRecord::Rollback(txnum) => push_i32(&mut buf, *txnum as i32),
-            LogRecord::Checkpoint => {}
+            LogRecord::Checkpoint { latest_lsn } => push_i32(&mut buf, *latest_lsn as i32),
             LogRecord::HeapTupleInsert {
                 txnum,
                 block_id,
@@ -12886,6 +12951,7 @@ impl From<&LogRecord> for Vec<u8> {
                 entry,
                 child_field_offset,
                 old_children,
+                new_children,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
@@ -12896,6 +12962,10 @@ impl From<&LogRecord> for Vec<u8> {
                 push_i32(&mut buf, *child_field_offset as i32);
                 push_i32(&mut buf, old_children.len() as i32);
                 for child in old_children {
+                    push_i32(&mut buf, *child as i32);
+                }
+                push_i32(&mut buf, new_children.len() as i32);
+                for child in new_children {
                     push_i32(&mut buf, *child as i32);
                 }
             }
@@ -12909,6 +12979,7 @@ impl From<&LogRecord> for Vec<u8> {
                 entry_bytes,
                 child_field_offset,
                 old_children,
+                new_children,
             } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
@@ -12931,6 +13002,10 @@ impl From<&LogRecord> for Vec<u8> {
                 push_i32(&mut buf, *child_field_offset as i32);
                 push_i32(&mut buf, old_children.len() as i32);
                 for child in old_children {
+                    push_i32(&mut buf, *child as i32);
+                }
+                push_i32(&mut buf, new_children.len() as i32);
+                for child in new_children {
                     push_i32(&mut buf, *child as i32);
                 }
             }
@@ -13076,10 +13151,21 @@ impl From<&LogRecord> for Vec<u8> {
                 push_string(&mut buf, &block_id.filename);
                 push_i32(&mut buf, block_id.block_num as i32);
             }
-            LogRecord::BTreeMetaFormatFresh { txnum, block_id } => {
+            LogRecord::BTreeMetaFormatFresh {
+                txnum,
+                block_id,
+                version,
+                tree_height,
+                root_block,
+                first_free_block,
+            } => {
                 push_i32(&mut buf, *txnum as i32);
                 push_string(&mut buf, &block_id.filename);
                 push_i32(&mut buf, block_id.block_num as i32);
+                push_i32(&mut buf, *version as i32);
+                push_i32(&mut buf, *tree_height as i32);
+                push_i32(&mut buf, *root_block as i32);
+                push_i32(&mut buf, *first_free_block as i32);
             }
             LogRecord::BTreeInternalFormatFresh {
                 txnum,
@@ -13170,7 +13256,14 @@ impl TryFrom<Vec<u8>> for LogRecord {
             0 => Ok(LogRecord::Start(read_usize(&value, &mut pos)?)),
             1 => Ok(LogRecord::Commit(read_usize(&value, &mut pos)?)),
             2 => Ok(LogRecord::Rollback(read_usize(&value, &mut pos)?)),
-            3 => Ok(LogRecord::Checkpoint),
+            3 => {
+                let latest_lsn = if pos < value.len() {
+                    read_usize(&value, &mut pos)?
+                } else {
+                    0
+                };
+                Ok(LogRecord::Checkpoint { latest_lsn })
+            }
             4 => Ok(LogRecord::HeapTupleInsert {
                 txnum: read_usize(&value, &mut pos)?,
                 block_id: BlockId::new(
@@ -13264,6 +13357,14 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     }
                     children
                 },
+                new_children: {
+                    let len = read_usize(&value, &mut pos)?;
+                    let mut children = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        children.push(read_usize(&value, &mut pos)?);
+                    }
+                    children
+                },
             }),
             10 => {
                 let txnum = read_usize(&value, &mut pos)?;
@@ -13288,6 +13389,11 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 for _ in 0..old_children_len {
                     old_children.push(read_usize(&value, &mut pos)?);
                 }
+                let new_children_len = read_usize(&value, &mut pos)?;
+                let mut new_children = Vec::with_capacity(new_children_len);
+                for _ in 0..new_children_len {
+                    new_children.push(read_usize(&value, &mut pos)?);
+                }
                 Ok(LogRecord::BTreeInternalDelete {
                     txnum,
                     block_id,
@@ -13298,6 +13404,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     entry_bytes,
                     child_field_offset,
                     old_children,
+                    new_children,
                 })
             }
             11 => {
@@ -13379,8 +13486,8 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 ),
-                old_root_block: read_usize(&value, &mut pos)? as u32,
-                new_root_block: read_usize(&value, &mut pos)? as u32,
+                old_root_block: read_i32(&value, &mut pos)? as u32,
+                new_root_block: read_i32(&value, &mut pos)? as u32,
                 old_tree_height: read_usize(&value, &mut pos)? as u16,
                 new_tree_height: read_usize(&value, &mut pos)? as u16,
                 old_structure_version: read_u64(&value, &mut pos)?,
@@ -13396,9 +13503,9 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 ),
-                old_head: read_usize(&value, &mut pos)? as u32,
-                new_head: read_usize(&value, &mut pos)? as u32,
-                old_block_next: read_usize(&value, &mut pos)? as u32,
+                old_head: read_i32(&value, &mut pos)? as u32,
+                new_head: read_i32(&value, &mut pos)? as u32,
+                old_block_next: read_i32(&value, &mut pos)? as u32,
             }),
             16 => Ok(LogRecord::BTreeFreeListPush {
                 txnum: read_usize(&value, &mut pos)?,
@@ -13410,8 +13517,8 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 ),
-                old_head: read_usize(&value, &mut pos)? as u32,
-                new_head: read_usize(&value, &mut pos)? as u32,
+                old_head: read_i32(&value, &mut pos)? as u32,
+                new_head: read_i32(&value, &mut pos)? as u32,
             }),
             17 => Ok(LogRecord::HeapPageAppend {
                 txnum: read_usize(&value, &mut pos)?,
@@ -13444,6 +13551,10 @@ impl TryFrom<Vec<u8>> for LogRecord {
                     read_string(&value, &mut pos)?,
                     read_usize(&value, &mut pos)?,
                 ),
+                version: read_i32(&value, &mut pos)? as u8,
+                tree_height: read_i32(&value, &mut pos)? as u16,
+                root_block: read_i32(&value, &mut pos)? as u32,
+                first_free_block: read_i32(&value, &mut pos)? as u32,
             }),
             21 => Ok(LogRecord::BTreeInternalFormatFresh {
                 txnum: read_usize(&value, &mut pos)?,
@@ -13495,7 +13606,7 @@ impl LogRecord {
             LogRecord::Start(_) | LogRecord::Commit(_) | LogRecord::Rollback(_) => {
                 base_size + Self::TXNUM_SIZE
             }
-            LogRecord::Checkpoint => base_size,
+            LogRecord::Checkpoint { .. } => base_size + Self::INT_BYTES,
             LogRecord::HeapTupleInsert {
                 block_id, tuple, ..
             } => {
@@ -13587,6 +13698,7 @@ impl LogRecord {
                 block_id,
                 entry,
                 old_children,
+                new_children,
                 ..
             } => {
                 base_size
@@ -13601,12 +13713,15 @@ impl LogRecord {
                     + Self::INT_BYTES // child_field_offset
                     + Self::INT_BYTES // old_children len
                     + old_children.len() * Self::INT_BYTES
+                    + Self::INT_BYTES // new_children len
+                    + new_children.len() * Self::INT_BYTES
             }
             LogRecord::BTreeInternalDelete {
                 block_id,
                 key,
                 entry_bytes,
                 old_children,
+                new_children,
                 ..
             } => {
                 base_size
@@ -13623,6 +13738,8 @@ impl LogRecord {
                     + Self::INT_BYTES // child_field_offset
                     + Self::INT_BYTES // old_children len
                     + old_children.len() * Self::INT_BYTES
+                    + Self::INT_BYTES // new_children len
+                    + new_children.len() * Self::INT_BYTES
             }
             LogRecord::BTreeLeafHeaderUpdate {
                 block_id,
@@ -13778,6 +13895,10 @@ impl LogRecord {
                     + Self::STR_LEN_SIZE
                     + block_id.filename.len()
                     + Self::BLOCK_NUM_SIZE
+                    + Self::INT_BYTES // version
+                    + Self::INT_BYTES // tree_height
+                    + Self::INT_BYTES // root_block
+                    + Self::INT_BYTES // first_free_block
             }
             LogRecord::BTreeInternalFormatFresh { block_id, .. } => {
                 base_size
@@ -13814,7 +13935,7 @@ impl LogRecord {
             LogRecord::Start(_) => 0,
             LogRecord::Commit(_) => 1,
             LogRecord::Rollback(_) => 2,
-            LogRecord::Checkpoint => 3,
+            LogRecord::Checkpoint { .. } => 3,
             LogRecord::HeapTupleInsert { .. } => 4,
             LogRecord::HeapTupleUpdate { .. } => 5,
             LogRecord::HeapTupleDelete { .. } => 6,
@@ -13843,7 +13964,7 @@ impl LogRecord {
         match self {
             LogRecord::Start(txnum) => *txnum,
             LogRecord::Commit(txnum) => *txnum,
-            LogRecord::Checkpoint => usize::MAX, //  dummy value
+            LogRecord::Checkpoint { .. } => usize::MAX, //  dummy value
             LogRecord::Rollback(txnum) => *txnum,
             LogRecord::HeapTupleInsert { txnum, .. } => *txnum,
             LogRecord::HeapTupleUpdate { txnum, .. } => *txnum,
@@ -13867,14 +13988,384 @@ impl LogRecord {
         }
     }
 
+    fn pin_if_needs_redo<'a>(
+        txn: &'a dyn RecoveryWriteContext,
+        block_id: &BlockId,
+        record_lsn: Lsn,
+    ) -> SimpleDBResult<Option<PageWriteGuard<'a>>> {
+        let guard = txn.pin_write_guard(block_id)?;
+        if page_lsn_from_bytes(guard.bytes()) < record_lsn {
+            Ok(Some(guard))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn redo(&self, txn: &dyn RecoveryWriteContext, record_lsn: Lsn) -> SimpleDBResult<()> {
+        match self {
+            LogRecord::Start(_)
+            | LogRecord::Commit(_)
+            | LogRecord::Rollback(_)
+            | LogRecord::Checkpoint { .. }
+            | LogRecord::HeapPageAppend { .. }
+            | LogRecord::BTreePageAppend { .. }
+            | LogRecord::BTreePageSplit { .. } => Ok(()),
+            LogRecord::HeapTupleInsert {
+                block_id,
+                slot,
+                offset,
+                tuple,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.redo_insert(*slot, *offset, tuple)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::HeapTupleUpdate {
+                block_id,
+                slot,
+                new_offset,
+                new_tuple,
+                relocated,
+                relocated_slot,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.redo_update(*slot, *new_offset, new_tuple, *relocated, *relocated_slot)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::HeapTupleDelete { block_id, slot, .. } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.undo_insert(*slot)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeLeafInsert {
+                block_id,
+                slot,
+                offset,
+                entry,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.undo_delete(*slot, *offset, entry)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeLeafDelete { block_id, slot, .. } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.undo_insert(*slot)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeInternalInsert {
+                block_id,
+                slot,
+                offset,
+                entry,
+                child_field_offset,
+                new_children,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.undo_delete(*slot, *offset, entry)?;
+                    page.restore_children_snapshot(*child_field_offset, new_children)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeInternalDelete {
+                block_id,
+                slot,
+                child_field_offset,
+                new_children,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.undo_insert(*slot)?;
+                    page.restore_children_snapshot(*child_field_offset, new_children)?;
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeLeafHeaderUpdate {
+                block_id,
+                new_header,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                let header = guard
+                    .bytes_mut()
+                    .get_mut(..new_header.len())
+                    .ok_or("leaf header slice out of bounds during redo")?;
+                header.copy_from_slice(new_header);
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeInternalHeaderUpdate {
+                block_id,
+                new_header,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                let header = guard
+                    .bytes_mut()
+                    .get_mut(..new_header.len())
+                    .ok_or("internal header slice out of bounds during redo")?;
+                header.copy_from_slice(new_header);
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeRootUpdate {
+                meta_block_id,
+                new_root_block,
+                new_tree_height,
+                new_structure_version,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)?
+                else {
+                    return Ok(());
+                };
+                {
+                    let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                    meta_view.set_root_block(*new_root_block);
+                    meta_view.set_tree_height(*new_tree_height);
+                    meta_view.set_structure_version(*new_structure_version);
+                    guard = meta_view.into_inner();
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                    meta_view.update_crc32();
+                    guard = meta_view.into_inner();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeFreeListPop {
+                meta_block_id,
+                new_head,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)?
+                else {
+                    return Ok(());
+                };
+                {
+                    let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                    meta_view.set_first_free_block(*new_head);
+                    guard = meta_view.into_inner();
+                }
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                    meta_view.update_crc32();
+                    guard = meta_view.into_inner();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeFreeListPush {
+                meta_block_id,
+                block_id,
+                old_head,
+                new_head,
+                ..
+            } => {
+                if let Some(mut block_guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? {
+                    block_guard.format_as_free(*old_head, record_lsn);
+                }
+                if let Some(mut guard) = Self::pin_if_needs_redo(txn, meta_block_id, record_lsn)? {
+                    {
+                        let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                        meta_view.set_first_free_block(*new_head);
+                        guard = meta_view.into_inner();
+                    }
+                    set_page_lsn(guard.bytes_mut(), record_lsn);
+                    {
+                        let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                        meta_view.update_crc32();
+                        guard = meta_view.into_inner();
+                    }
+                    guard.mark_modified(txn.txn_id(), record_lsn);
+                }
+                Ok(())
+            }
+            LogRecord::HeapPageFormatFresh { block_id, .. } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                HeapPageMut::init_bytes(guard.bytes_mut());
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = HeapPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeMetaFormatFresh {
+                block_id,
+                version,
+                tree_height,
+                root_block,
+                first_free_block,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                BTreeMetaPageMut::init_bytes(
+                    guard.bytes_mut(),
+                    *version,
+                    *tree_height,
+                    *root_block,
+                    *first_free_block,
+                );
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut meta_view = BTreeMetaPageViewMut::new(guard)?;
+                    meta_view.update_crc32();
+                    guard = meta_view.into_inner();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeInternalFormatFresh {
+                block_id,
+                level,
+                rightmost_child,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                BTreeInternalPageMut::init_bytes(
+                    guard.bytes_mut(),
+                    *level as u8,
+                    Some(*rightmost_child),
+                );
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeInternalPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+            LogRecord::BTreeLeafFormatFresh {
+                block_id,
+                overflow_block,
+                ..
+            } => {
+                let Some(mut guard) = Self::pin_if_needs_redo(txn, block_id, record_lsn)? else {
+                    return Ok(());
+                };
+                BTreeLeafPageMut::init_bytes(guard.bytes_mut(), *overflow_block);
+                set_page_lsn(guard.bytes_mut(), record_lsn);
+                {
+                    let mut page = BTreeLeafPageMut::new(guard.bytes_mut())?;
+                    page.update_crc32();
+                }
+                guard.mark_modified(txn.txn_id(), record_lsn);
+                Ok(())
+            }
+        }
+    }
+
     /// Undo the operation performed by this log record
     /// This is used by the [`RecoveryManager`] when performing a recovery
     fn undo(&self, txn: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
         match self {
-            LogRecord::Start(_) => Ok(()),    //  no-op
-            LogRecord::Commit(_) => Ok(()),   //  no-op
-            LogRecord::Rollback(_) => Ok(()), //  no-op
-            LogRecord::Checkpoint => Ok(()),  //  no-op
+            LogRecord::Start(_) => Ok(()),          //  no-op
+            LogRecord::Commit(_) => Ok(()),         //  no-op
+            LogRecord::Rollback(_) => Ok(()),       //  no-op
+            LogRecord::Checkpoint { .. } => Ok(()), //  no-op
             LogRecord::HeapTupleInsert { .. } => {
                 let LogRecord::HeapTupleInsert { block_id, slot, .. } = self else {
                     return Err("HeapTupleInsert: invalid record structure".into());
@@ -14297,7 +14788,7 @@ impl LogRecord {
     /// Rollback path intentionally does not use this check.
     fn should_undo_during_recovery(
         &self,
-        txn: &dyn RecoveryWriteContext,
+        original_page_lsns: &HashMap<BlockId, Lsn>,
         record_lsn: Lsn,
     ) -> SimpleDBResult<bool> {
         // Special cases: multi-page and append operations bypass LSN gate
@@ -14320,8 +14811,9 @@ impl LogRecord {
         let Some(block_id) = self.undo_block_id() else {
             return Ok(true);
         };
-        let guard = txn.pin_write_guard(block_id)?;
-        let page_lsn = crate::page::page_lsn_from_bytes(guard.bytes());
+        let page_lsn = *original_page_lsns.get(block_id).ok_or_else(|| {
+            format!("missing original disk lsn for undo-gated block {block_id:?}")
+        })?;
         Ok(page_lsn >= record_lsn)
     }
 
@@ -14330,7 +14822,7 @@ impl LogRecord {
             LogRecord::Start(_)
             | LogRecord::Commit(_)
             | LogRecord::Rollback(_)
-            | LogRecord::Checkpoint => None,
+            | LogRecord::Checkpoint { .. } => None,
             LogRecord::HeapTupleInsert { block_id, .. }
             | LogRecord::HeapTupleUpdate { block_id, .. }
             | LogRecord::HeapTupleDelete { block_id, .. }
@@ -14368,12 +14860,14 @@ impl LogRecord {
 
 #[cfg(test)]
 mod recovery_manager_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::{
-        page::{test_helpers, SlotId},
+        mock_file_manager::MockFileManager,
+        page::{set_page_lsn, test_helpers, HeapPageMut, SlotId, PAGE_SIZE_BYTES},
         test_utils::{generate_filename, generate_random_number},
-        BlockId, Constant, Layout, Schema, SimpleDB, TestDir, Transaction,
+        BlockId, BufferManager, Constant, Layout, LockTable, LogManager, LogRecord, Lsn, Schema,
+        SharedFS, SimpleDB, TestDir, Transaction, WalMode,
     };
 
     const INT_FIELD: &str = "int_val";
@@ -14475,6 +14969,72 @@ mod recovery_manager_tests {
             Some(Constant::String(value)) => value,
             other => panic!("expected string value, got {other:?}"),
         }
+    }
+
+    fn tuple_bytes(layout: &Layout, int_value: i32, text_value: &str) -> Vec<u8> {
+        test_helpers::build_tuple_bytes(layout, |values| {
+            values[layout.column_idx(INT_FIELD).unwrap()] = Some(Constant::Int(int_value));
+            values[layout.column_idx(STR_FIELD).unwrap()] =
+                Some(Constant::String(text_value.to_string()));
+        })
+        .expect("build tuple bytes")
+    }
+
+    fn write_formatted_heap_page(fs: &SharedFS, block: &BlockId, page_lsn: Lsn) {
+        let mut page_bytes = crate::Page::new();
+        HeapPageMut::init_bytes(page_bytes.bytes_mut());
+        set_page_lsn(page_bytes.bytes_mut(), page_lsn);
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.update_crc32();
+        }
+        fs.write(block, &page_bytes);
+    }
+
+    fn write_heap_page_with_single_row(
+        fs: &SharedFS,
+        block: &BlockId,
+        tuple: &[u8],
+        page_lsn: Lsn,
+    ) -> usize {
+        let offset = PAGE_SIZE_BYTES as usize - tuple.len();
+        let mut page_bytes = crate::Page::new();
+        HeapPageMut::init_bytes(page_bytes.bytes_mut());
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.redo_insert(0, offset, tuple).unwrap();
+        }
+        set_page_lsn(page_bytes.bytes_mut(), page_lsn);
+        {
+            let mut page = HeapPageMut::new(page_bytes.bytes_mut()).unwrap();
+            page.update_crc32();
+        }
+        fs.write(block, &page_bytes);
+        offset
+    }
+
+    fn durable_log_manager(fs: &SharedFS, wal_file: &str) -> Arc<Mutex<LogManager>> {
+        Arc::new(Mutex::new(LogManager::new_with_mode(
+            Arc::clone(fs),
+            wal_file,
+            WalMode::Durable,
+        )))
+    }
+
+    fn recovery_tx(fs: &SharedFS, wal_file: &str, pool_size: usize) -> Arc<Transaction> {
+        let log_manager = durable_log_manager(fs, wal_file);
+        let buffer_manager = Arc::new(BufferManager::new(
+            Arc::clone(fs),
+            Arc::clone(&log_manager),
+            pool_size,
+        ));
+        let lock_table = Arc::new(LockTable::new(100));
+        Arc::new(Transaction::new(
+            Arc::clone(fs),
+            log_manager,
+            buffer_manager,
+            lock_table,
+        ))
     }
 
     #[test]
@@ -14747,6 +15307,184 @@ mod recovery_manager_tests {
         let view = guard.into_heap_view(&layout).expect("heap view");
         assert!(view.row(slot2).is_none());
         assert_eq!(view.live_slot_iter().count(), 2);
+    }
+
+    #[test]
+    fn startup_recovery_redoes_committed_insert_without_manual_recover() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, slot) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn = db.new_tx();
+            let block = txn.append(&filename);
+            format_heap(&txn, &block);
+            let slot = insert_row(&txn, &block, &layout, 41, "committed");
+            txn.write_session().commit().unwrap();
+            (block, slot)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        assert_eq!(read_int_at(&txn, &block_id, &layout, slot), 41);
+        assert_eq!(read_string_at(&txn, &block_id, &layout, slot), "committed");
+    }
+
+    #[test]
+    fn startup_recovery_redoes_committed_and_undoes_uncommitted_changes() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+        let (block_id, committed_slot) = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let committed_slot = insert_row(&txn1, &block, &layout, 7, "stable");
+            txn1.write_session().commit().unwrap();
+
+            let txn2 = db.new_tx();
+            update_int_at(&txn2, &block, &layout, committed_slot, 99);
+            insert_row(&txn2, &block, &layout, 88, "volatile");
+            (block, committed_slot)
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        assert_eq!(read_int_at(&txn, &block_id, &layout, committed_slot), 7);
+        assert_eq!(
+            read_string_at(&txn, &block_id, &layout, committed_slot),
+            "stable"
+        );
+
+        let guard = txn.pin_read_guard(&block_id).unwrap();
+        let view = guard.into_heap_view(&layout).expect("heap view");
+        assert_eq!(view.live_slot_iter().count(), 1);
+    }
+
+    #[test]
+    fn startup_recovery_redoes_committed_relocated_update() {
+        let dir = TestDir::new(format!("/tmp/recovery_test/{}", generate_random_number()));
+        let layout = recovery_layout();
+        let filename = generate_filename();
+
+        let block = {
+            let db = SimpleDB::new(&dir, 3, true, 100);
+            let txn1 = db.new_tx();
+            let block = txn1.append(&filename);
+            format_heap(&txn1, &block);
+            let slot = insert_row(&txn1, &block, &layout, 1, "a");
+            txn1.write_session().commit().unwrap();
+
+            let txn2 = db.new_tx();
+            {
+                let ws = txn2.write_session();
+                let guard = ws.pin_write_guard(&block).unwrap();
+                let mut view = guard.into_heap_view_mut(&layout).expect("heap view mut");
+                let int_idx = layout.column_idx(INT_FIELD).unwrap();
+                let str_idx = layout.column_idx(STR_FIELD).unwrap();
+                let mut new_bytes = test_helpers::build_tuple_bytes(&layout, |values| {
+                    values[int_idx] = Some(Constant::Int(99));
+                    values[str_idx] = Some(Constant::String("relocated".to_string()));
+                })
+                .expect("build tuple bytes");
+                new_bytes.resize(new_bytes.len() + layout.max_encoded_size() + 32, 0);
+                view.update_tuple(slot, &new_bytes)
+                    .expect("update tuple with relocation");
+            }
+            txn2.write_session().commit().unwrap();
+            block
+        };
+
+        let db = SimpleDB::new(&dir, 3, false, 100);
+        let txn = db.new_tx();
+        assert_eq!(read_int_at(&txn, &block, &layout, 0), 99);
+        assert_eq!(read_string_at(&txn, &block, &layout, 0), "relocated");
+    }
+
+    #[test]
+    fn recovery_uses_original_disk_lsn_for_undo_gate_under_eviction_pressure() {
+        let layout = recovery_layout();
+        let data_file = generate_filename();
+        let wal_file = "simpledb.log";
+        let mock_fs = Arc::new(MockFileManager::new());
+        let fs: SharedFS = mock_fs.clone();
+
+        let block_p = fs.append(data_file.clone());
+        let block_q = fs.append(data_file.clone());
+        let block_r = fs.append(data_file.clone());
+        fs.sync_directory();
+
+        let tuple_10 = tuple_bytes(&layout, 10, "seed");
+        let tuple_20 = tuple_bytes(&layout, 20, "seed");
+        let tuple_30 = tuple_bytes(&layout, 30, "seed");
+        let tuple_q = tuple_bytes(&layout, 42, "other");
+        let tuple_r = tuple_bytes(&layout, 77, "third");
+        let offset_p = write_heap_page_with_single_row(&fs, &block_p, &tuple_10, 0);
+        let offset_q = PAGE_SIZE_BYTES as usize - tuple_q.len();
+        let offset_r = PAGE_SIZE_BYTES as usize - tuple_r.len();
+        write_formatted_heap_page(&fs, &block_q, 0);
+        write_formatted_heap_page(&fs, &block_r, 0);
+        fs.sync(&data_file);
+        fs.sync_directory();
+
+        let log_manager = durable_log_manager(&fs, wal_file);
+        let records = [
+            LogRecord::HeapTupleUpdate {
+                txnum: 1,
+                block_id: block_p.clone(),
+                slot: 0,
+                old_offset: offset_p,
+                old_tuple: tuple_10.clone(),
+                new_offset: offset_p,
+                new_tuple: tuple_20.clone(),
+                relocated: false,
+                relocated_slot: None,
+            },
+            LogRecord::HeapTupleUpdate {
+                txnum: 2,
+                block_id: block_p.clone(),
+                slot: 0,
+                old_offset: offset_p,
+                old_tuple: tuple_20,
+                new_offset: offset_p,
+                new_tuple: tuple_30,
+                relocated: false,
+                relocated_slot: None,
+            },
+            LogRecord::Commit(2),
+            LogRecord::HeapTupleInsert {
+                txnum: 3,
+                block_id: block_q,
+                slot: 0,
+                offset: offset_q,
+                tuple: tuple_q,
+            },
+            LogRecord::Commit(3),
+            LogRecord::HeapTupleInsert {
+                txnum: 4,
+                block_id: block_r,
+                slot: 0,
+                offset: offset_r,
+                tuple: tuple_r,
+            },
+            LogRecord::Commit(4),
+        ];
+        let mut final_lsn = 0;
+        for record in records {
+            final_lsn = record.write_log_record(&log_manager).unwrap();
+        }
+        log_manager.lock().unwrap().flush_lsn(final_lsn);
+        fs.sync_directory();
+        drop(log_manager);
+
+        mock_fs.simulate_crash();
+        mock_fs.restore_from_crash();
+
+        let txn = recovery_tx(&fs, wal_file, 2);
+        txn.write_session().recover().unwrap();
+
+        assert_eq!(read_int_at(&txn, &block_p, &layout, 0), 30);
     }
 }
 
@@ -15308,15 +16046,53 @@ impl LogManager {
             file_manager.read_wal_block(&block, log_page.bytes_mut());
             block
         };
+        let latest_lsn = if log_size == 0 {
+            0
+        } else {
+            Self::count_records(&file_manager, log_file)
+        };
         Self {
             file_manager,
             log_file: log_file.to_string(),
             wal_mode,
             log_page,
             current_block,
-            latest_lsn: 0,
-            last_saved_lsn: 0,
+            latest_lsn,
+            last_saved_lsn: latest_lsn,
         }
+    }
+
+    /// Counts persisted WAL records on startup so new log records continue with
+    /// higher LSNs after restart.
+    ///
+    /// Uses the most recent checkpoint payload as a lower bound when available,
+    /// and falls back to a full scan for older WALs that do not carry it.
+    fn count_records(file_manager: &SharedFS, log_file: &str) -> usize {
+        let blocks = file_manager.wal_length(log_file.to_string());
+        let mut count_since_checkpoint = 0usize;
+        for block_num in (0..blocks).rev() {
+            let mut page = WalPage::new();
+            let block_id = BlockId::new(log_file.to_string(), block_num);
+            file_manager.read_wal_block(&block_id, page.bytes_mut());
+            let mut pos = page.boundary();
+            while pos < page.capacity() {
+                let (record_bytes, next_pos) = page.read_record(pos);
+                if let Ok(LogRecord::Checkpoint { latest_lsn }) =
+                    LogRecord::from_bytes(record_bytes.clone())
+                {
+                    if record_bytes.len() > LogRecord::INT_BYTES {
+                        return latest_lsn + count_since_checkpoint + 1;
+                    }
+                }
+                count_since_checkpoint += 1;
+                pos = next_pos;
+            }
+        }
+        count_since_checkpoint
+    }
+
+    fn latest_lsn(&self) -> Lsn {
+        self.latest_lsn
     }
 
     pub fn set_wal_mode(&mut self, wal_mode: WalMode) {

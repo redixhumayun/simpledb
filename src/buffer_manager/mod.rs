@@ -25,7 +25,7 @@ use std::{
 
 use crate::{
     page::PageType,
-    page::{BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
+    page::{set_page_lsn, BTreeInternalPageMut, BTreeLeafPageMut, BTreeMetaPageMut, HeapPageMut},
     replacement::PolicyState,
     BatchReadReq, BlockId, LogManager, Lsn, Page, SharedFS,
 };
@@ -216,6 +216,7 @@ impl BufferFrame {
         if let (Some(block_id), Some(lsn)) = (meta.block_id.clone(), meta.lsn) {
             self.log_manager.lock().unwrap().flush_lsn(lsn);
             let mut page_guard = self.page.write().unwrap();
+            set_page_lsn(page_guard.bytes_mut(), lsn);
             match page_guard.peek_page_type().unwrap() {
                 PageType::Heap => {
                     let mut page = HeapPageMut::new(page_guard.bytes_mut()).unwrap();
@@ -520,6 +521,8 @@ impl BufferManager {
             return 0;
         }
 
+        let end_block = start_block.saturating_add(count);
+
         let mut reservations: Vec<PrefetchReservation> = Vec::new();
         let mut reqs: Vec<BatchReadReq> = Vec::new();
 
@@ -537,7 +540,25 @@ impl BufferManager {
                 continue;
             }
 
-            let (frame_idx, mut meta_guard) = match self.evict_frame() {
+            let mut victim = None;
+            for _ in 0..self.buffer_pool.len() {
+                let Some((frame_idx, meta_guard)) = self.evict_frame() else {
+                    break;
+                };
+                let protects_target_range = meta_guard.block_id.as_ref().is_some_and(|old| {
+                    old.filename == file
+                        && old.block_num >= start_block
+                        && old.block_num < end_block
+                });
+                if protects_target_range {
+                    drop(meta_guard);
+                    self.policy.on_frame_assigned(&self.buffer_pool, frame_idx);
+                    continue;
+                }
+                victim = Some((frame_idx, meta_guard));
+                break;
+            }
+            let (frame_idx, mut meta_guard) = match victim {
                 Some(victim) => victim,
                 None => break, // best-effort: do not block waiting for frames
             };
@@ -578,6 +599,8 @@ impl BufferManager {
 
         let mut installed = 0usize;
 
+        let mut frames_to_release: Vec<Arc<BufferFrame>> = Vec::with_capacity(reservations.len());
+
         for (idx, reservation) in reservations.into_iter().enumerate() {
             let shard_index = self.shard_index(&reservation.block_id);
             let latch_table_guard =
@@ -603,7 +626,7 @@ impl BufferManager {
                 self.resident_shards[shard_index]
                     .lock()
                     .unwrap()
-                    .insert(reservation.block_id, Arc::downgrade(&frame));
+                    .insert(reservation.block_id.clone(), Arc::downgrade(&frame));
                 installed += 1;
                 if let Some(stats) = self.stats.get() {
                     stats.prefetch_installed.fetch_add(1, Ordering::Relaxed);
@@ -618,6 +641,10 @@ impl BufferManager {
                 }
             }
 
+            frames_to_release.push(frame);
+        }
+
+        for frame in frames_to_release {
             let became_unpinned = {
                 let mut meta_guard = frame.lock_meta();
                 meta_guard.unpin()

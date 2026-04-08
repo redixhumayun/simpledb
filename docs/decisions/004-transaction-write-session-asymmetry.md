@@ -4,7 +4,7 @@
 
 The transaction API had two related problems.
 
-First, broad transaction authority was available everywhere through `Arc<Transaction>` plus `&self` methods. That meant Rust could not prevent a caller from holding a write page guard and then calling `commit` or `rollback` on the same transaction. The concrete failure mode was a self-deadlock: a live `PageWriteGuard` could keep a page write latch held while commit-time flushing tried to reacquire that same latch.
+First, broad transaction authority was available everywhere through `Arc<Transaction>` plus `&self` methods. That meant Rust could not prevent a caller from holding a write page guard and then calling `commit` or `rollback` on the same transaction. Under the old force-at-commit design, the concrete failure mode was a self-deadlock: a live `PageWriteGuard` could keep a page write latch held while commit-time flushing tried to reacquire that same latch.
 
 ```rust
 let txn = Arc::new(Transaction::new(...));

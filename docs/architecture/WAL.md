@@ -3,7 +3,7 @@
 ## Overview
 
 SimpleDB uses write-ahead logging (WAL) with physical/page-oriented mutation records for heap and B-tree operations.
-The implementation currently follows a **steal + force** buffer policy with an **undo-only** recovery pass.
+The implementation currently follows a **steal + no-force** buffer policy with a **redo + undo** recovery pass.
 
 Core components:
 - `LogManager` (`src/main.rs`): append-only WAL writer/iterator over WAL pages.
@@ -14,24 +14,27 @@ Core components:
 
 ## Durability Model
 
-### Steal + Force
+### Steal + No-Force
 
 - **Steal**: dirty pages may be flushed before transaction commit (e.g. replacement/assignment flush paths).
-- **Force**: commit calls `flush_all(txn)` before writing/flushing the commit record.
+- **No-force**: commit flushes WAL only; data pages are not forced before commit returns.
 
 Code points:
-- Force on commit: `RecoveryManager::commit()` in `src/main.rs`.
+- WAL-only commit durability: `RecoveryManager::commit()` in `src/main.rs`.
 - Flush ordering enforcement: `BufferFrame::flush_locked()` calls `flush_lsn(lsn)` before data page write in `src/buffer_manager/mod.rs`.
 
 ### Recovery Strategy
 
-- Recovery is **undo-focused** for unfinished transactions.
-- WAL is scanned backward using `LogIterator`.
-- Undo eligibility uses page LSN gating: `page_lsn >= record_lsn`.
+- Recovery performs:
+  - analysis of committed / rolled-back / unfinished txns
+  - forward redo for committed records when page LSN is behind the record LSN
+  - backward undo for unfinished txns
+- WAL is still read from the reverse iterator, then reordered in memory for redo.
+- Undo and redo both use page LSN gating where the record shape permits it.
 
 Code points:
 - Recovery loop: `RecoveryManager::recover()` in `src/main.rs`.
-- LSN gate: `LogRecord::should_undo_during_recovery()` in `src/main.rs`.
+- LSN gates: `LogRecord::redo()` and `LogRecord::should_undo_during_recovery()` in `src/main.rs`.
 
 ## WAL Write Path
 
@@ -40,7 +43,7 @@ Code points:
 3. On drop of dirty mutable view:
    - page header LSN is written,
    - frame marked modified with that LSN.
-4. On frame flush, WAL is flushed to that LSN before writing page bytes.
+4. On frame flush, WAL is flushed to that LSN before writing page bytes; the flush path stamps the page-header LSN from frame metadata before writeout.
 
 This ties page bytes to a concrete WAL position and preserves WAL ordering on disk flush.
 
@@ -52,17 +55,17 @@ This ties page bytes to a concrete WAL position and preserves WAL ordering on di
 2. **Dirty mutable view must have page LSN**
    - Mutable view `Drop` now treats `dirty && page_lsn.is_none()` as invariant violation (panic), not silent fallback.
 
-3. **Undo records carry sufficient preimage for supported operations**
-   - Heap tuple and B-tree entry/header operations include enough old state for implemented undo paths.
+3. **WAL records used in recovery must remain redo/undo sufficient**
+   - Heap tuple and B-tree entry/header operations must carry enough post-image or structural state for redo as well as enough preimage/state for undo.
 
 4. **Meta/root mutations use real WAL LSN**
    - Root update flow propagates emitted record LSN into meta-page dirty marking.
 
 ## Tradeoffs
 
-1. **Simple undo-focused recovery**
-   - Easier to reason about than full ARIES+CLR design.
-   - Limitation: less robust for crash-during-recovery scenarios (no CLRs yet).
+1. **Redo+undo without CLRs**
+- Simpler than full ARIES while still supporting no-force commit.
+- Limitation: still less robust for crash-during-recovery scenarios because CLRs are not implemented.
 
 2. **Single-page WAL record constraint**
    - Record payload must fit one WAL page payload (`PAGE_SIZE - wal_header`).
@@ -82,9 +85,10 @@ This ties page bytes to a concrete WAL position and preserves WAL ordering on di
      - richer preimage logging (potentially needing multi-page WAL).
    - Tracking issue: https://github.com/redixhumayun/simpledb/issues/69
 
-2. **Recovery/checkpoint semantics are minimal**
-   - Recovery currently stops at first checkpoint seen in backward scan (assumes quiescent marker semantics).
-   - No CLRs; crash-during-recovery handling is limited.
+2. **Checkpoint semantics are still minimal**
+- Recovery currently scans the full log conservatively.
+- No fuzzy-checkpoint metadata yet.
+- No CLRs; crash-during-recovery handling is limited.
 
 3. **WAL format scalability**
    - No spanning/multi-page log record support.

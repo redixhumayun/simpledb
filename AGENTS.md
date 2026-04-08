@@ -40,7 +40,12 @@ There is a test suite which provides basic coverage to ensure the code still wor
 
 3. **Work autonomously using available tools** until blocked
 
-4. **Test thoroughly before committing**:
+4. **Treat documentation as part of the code change**:
+   - when you add or change Rust code, add or update Rust docs/comments where needed
+   - docs should explain **why** first, especially the reasoning behind decisions and invariants
+   - keep docs clear and concise; do not write verbose commentary
+
+5. **Test thoroughly before committing**:
    Testing requires running tests with combinations of compiler flags. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
@@ -57,7 +62,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    # Verify direct-io build works and tests pass
    ```
 
-5. **Run benchmarks before committing only when asked**
+6. **Run benchmarks before committing only when asked**
    ```bash
    cargo run --bin simpledb
    # verify the CLI starts up without errors
@@ -75,7 +80,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    SIMPLEDB_BENCH_BUFFERS=12 cargo bench --bench buffer_pool -- "Sequential Scan"
    ```
 
-6. **Run cargo formatting before committing**
+7. **Run cargo formatting before committing**
    ```bash
    # check whether clippy reports errors
    cargo clippy -- -D warnings
@@ -86,7 +91,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    # fix remaining errors before committing
    ```
 
-7. **Create PR with descriptive title and summary**
+8. **Create PR with descriptive title and summary**
    - Write the description for a reviewer, not as an implementation log — no phases, no task lists, no "step 1/2/3" framing
    - Lead with what changed and why, in plain prose
    - Group related changes into short paragraphs if there are multiple concerns; one paragraph per distinct concern is enough
