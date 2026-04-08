@@ -765,6 +765,9 @@ struct FlushCoordinator {
     cond: Condvar,
 }
 
+/// One claimed dirty generation plus its stable page snapshot.
+type PendingWriteback = (usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page);
+
 impl FlushCoordinator {
     fn new() -> Self {
         Self {
@@ -913,7 +916,7 @@ impl BufferManager {
         dirty_queue: &Mutex<VecDeque<usize>>,
         batch_limit: usize,
         txn_filter: Option<usize>,
-    ) -> Vec<(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)> {
+    ) -> Vec<PendingWriteback> {
         // The queue keeps the flusher off the full buffer-pool scan path. We
         // only revisit frames that transitioned into a flush-eligible state.
         let mut pending = Vec::new();
@@ -969,7 +972,7 @@ impl BufferManager {
     fn write_snapshot_batch(
         file_manager: &SharedFS,
         log_manager: &Arc<Mutex<LogManager>>,
-        pending: &[(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)],
+        pending: &[PendingWriteback],
     ) {
         // WAL-before-data is enforced once per batch so snapshot writeback does
         // not turn into one WAL flush per frame.
@@ -998,7 +1001,7 @@ impl BufferManager {
 
     /// Applies completion-side frame transitions for one finished snapshot batch.
     fn complete_snapshot_batch(
-        pending: Vec<(usize, Arc<BufferFrame>, BlockId, Lsn, u64, Page)>,
+        pending: Vec<PendingWriteback>,
         clean_unpinned: &AtomicUsize,
         dirty_queue: &Mutex<VecDeque<usize>>,
         flush_coordinator: &FlushCoordinator,
