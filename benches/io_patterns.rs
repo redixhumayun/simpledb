@@ -78,6 +78,7 @@ fn num_buffers() -> usize {
     std::env::var("SIMPLEDB_BENCH_BUFFERS")
         .ok()
         .and_then(|s| s.parse().ok())
+        .map(|n: usize| n.max(1))
         .unwrap_or(12)
 }
 
@@ -271,7 +272,8 @@ fn bench_writeback(c: &mut Criterion) {
         let log = db.log_manager();
         let hot_pages = (nb / 4).max(1);
         let cold_pages = nb.max(1);
-        let mut next_cold = hot_pages;
+        let cold_span = (ws * 2).saturating_sub(hot_pages).max(1);
+        let mut next_cold = 0usize;
 
         group.throughput(Throughput::Elements((hot_pages + cold_pages) as u64));
         group.bench_function("hot re-dirty plus stream", |b| {
@@ -281,14 +283,11 @@ fn bench_writeback(c: &mut Criterion) {
                     touch_block(&txn, &file, i, generate_random_number() as i32, &log);
                 }
                 for i in 0..cold_pages {
-                    let block_num = next_cold + i;
-                    touch_block(&txn, &file, block_num % (ws * 2), (block_num) as i32, &log);
+                    let block_num = hot_pages + ((next_cold + i) % cold_span);
+                    touch_block(&txn, &file, block_num, block_num as i32, &log);
                 }
                 txn.write_session().commit().unwrap();
-                next_cold = (next_cold + cold_pages) % (ws * 2);
-                if next_cold < hot_pages {
-                    next_cold = hot_pages;
-                }
+                next_cold = (next_cold + cold_pages) % cold_span;
             })
         });
     }
