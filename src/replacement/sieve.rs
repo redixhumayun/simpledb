@@ -79,8 +79,7 @@ impl PolicyState {
     ) -> Option<MutexGuard<'a, FrameMeta>> {
         let mut frame_guard = frame_ptr.lock_meta();
         if !frame_guard
-            .block_id
-            .as_ref()
+            .block_id()
             .is_some_and(|current| current == block_id)
         {
             resident_table.lock().unwrap().remove(block_id);
@@ -137,7 +136,7 @@ impl PolicyState {
             match list_guard.hand {
                 Some(hand) => {
                     let mut current_guard = buffer_pool[hand].lock_meta();
-                    if current_guard.pins > 0 || current_guard.writeback_in_progress {
+                    if current_guard.pin_count() > 0 || current_guard.is_writeback_in_progress() {
                         if let Some(head) = list_guard.intrusive_list.peek_head() {
                             if current_guard.index == head {
                                 list_guard.hand = list_guard.intrusive_list.peek_tail();

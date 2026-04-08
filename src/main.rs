@@ -16280,6 +16280,7 @@ pub struct BatchReadReq {
 /// The buffer manager snapshots pages first, then hands those stable images to
 /// the filesystem layer through this lightweight request type.
 pub struct BatchWriteReq {
+    /// Destination block for the stable page image in the same batch slot.
     pub block_id: BlockId,
 }
 
