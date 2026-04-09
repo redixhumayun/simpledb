@@ -16309,7 +16309,7 @@ pub trait FileSystemInterface: std::fmt::Debug + Send + Sync {
     /// This keeps the transaction/flush protocol above the filesystem layer:
     /// the buffer manager decides which generations are safe to flush, and the
     /// filesystem decides how those writes are submitted.
-    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[Page]) {
+    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[&Page]) {
         assert_eq!(
             reqs.len(),
             pages.len(),
@@ -16690,16 +16690,16 @@ impl FileManager {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "direct-io"))]
     /// Batches direct data-page writes through `io_uring` using already-stable
     /// snapshot buffers supplied by the buffer manager.
+    #[cfg(all(target_os = "linux", feature = "direct-io"))]
     fn submit_direct_writes_uring(
         &self,
         reqs: &[BatchWriteReq],
         direct_indices: &[usize],
         direct_files: &[Arc<OpenFile>],
         offsets: &[u64],
-        pages: &[Page],
+        pages: &[&Page],
     ) {
         // Snapshot writeback guarantees these buffers stay stable for the whole
         // I/O lifetime, so direct writes can batch through io_uring safely.
@@ -16715,6 +16715,7 @@ impl FileManager {
             let page_idx = direct_indices[pos];
             let ptr = pages[page_idx].bytes().as_ptr();
             iovecs.push(libc::iovec {
+                // `Writev` reads from this buffer; the kernel does not mutate it.
                 iov_base: ptr.cast_mut().cast(),
                 iov_len: page_size,
             });
@@ -16821,7 +16822,7 @@ impl FileSystemInterface for FileManager {
 
     /// Writes one batch of page images, using direct `io_uring` submission for
     /// direct-opened data files and the existing synchronous path otherwise.
-    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[Page]) {
+    fn write_batch(&self, reqs: &[BatchWriteReq], pages: &[&Page]) {
         // Keep batching policy here so the buffer manager only reasons about
         // frame generations and stable page images, not direct-io submission.
         assert_eq!(
@@ -17392,7 +17393,8 @@ mod file_manager_tests {
             },
         ];
         let pages = [page0, page1];
-        file_manager.write_batch(&reqs, &pages);
+        let page_refs = [&pages[0], &pages[1]];
+        file_manager.write_batch(&reqs, &page_refs);
 
         let mut read0 = Page::new();
         let mut read1 = Page::new();
