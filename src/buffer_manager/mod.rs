@@ -169,8 +169,10 @@ struct FrameState {
 pub struct FrameMeta {
     /// Composed runtime state visible to transaction, replacement, and flush paths.
     state: FrameState,
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     /// LRU/SIEVE intrusive predecessor link.
     pub(crate) prev_idx: Option<usize>,
+    #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
     /// LRU/SIEVE intrusive successor link.
     pub(crate) next_idx: Option<usize>,
     /// Stable frame index used by replacement and dirty-queue bookkeeping.
@@ -189,7 +191,9 @@ impl FrameMeta {
                 flush: FlushState::Clean,
                 next_flush_generation: 0,
             },
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             prev_idx: None,
+            #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             next_idx: None,
             index,
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
