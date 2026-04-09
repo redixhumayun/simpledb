@@ -11175,7 +11175,6 @@ mod transaction_tests {
                 Arc::clone(&db.buffer_manager),
                 Arc::clone(&db.lock_table),
             ));
-            t2.write_session().recover().unwrap();
 
             let snapshot = snapshot_txn_row(t2.pin_read_guard(&block_id).unwrap(), &layout);
             assert_eq!(snapshot.int_val, 100);
@@ -15149,7 +15148,6 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.write_session().recover().unwrap();
 
         let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
@@ -15176,7 +15174,6 @@ mod recovery_manager_tests {
 
         let db = SimpleDB::new(&dir, 3, false, 100);
         let txn = db.new_tx();
-        txn.write_session().recover().unwrap();
 
         let guard = txn.pin_read_guard(&block_id).unwrap();
         let view = guard.into_heap_view(&layout).expect("heap view");
@@ -15203,8 +15200,7 @@ mod recovery_manager_tests {
         };
 
         let db = SimpleDB::new(&dir, 3, false, 100);
-        let txn = db.new_tx();
-        txn.write_session().recover().unwrap();
+        let _txn = db.new_tx();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 7);
@@ -15229,8 +15225,7 @@ mod recovery_manager_tests {
         };
 
         let db = SimpleDB::new(&dir, 3, false, 100);
-        let txn = db.new_tx();
-        txn.write_session().recover().unwrap();
+        let _txn = db.new_tx();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot), 5);
@@ -15294,8 +15289,7 @@ mod recovery_manager_tests {
         };
 
         let db = SimpleDB::new(&dir, 3, false, 100);
-        let txn = db.new_tx();
-        txn.write_session().recover().unwrap();
+        let _txn = db.new_tx();
 
         let check_txn = db.new_tx();
         assert_eq!(read_int_at(&check_txn, &block_id, &layout, slot0), 1);
