@@ -18,9 +18,9 @@ jobs:
       max-parallel: 1
       matrix:
         features:
-          - ""
-          - "--no-default-features --features replacement_clock,page-4k"
-          - "--no-default-features --features replacement_sieve,page-4k"
+          - "--no-default-features --features replacement_lru,page-4k,direct-io"
+          - "--no-default-features --features replacement_clock,page-4k,direct-io"
+          - "--no-default-features --features replacement_sieve,page-4k,direct-io"
     
     steps:
     - uses: actions/checkout@v4
