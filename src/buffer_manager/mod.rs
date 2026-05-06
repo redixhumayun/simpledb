@@ -788,6 +788,20 @@ struct PendingWriteback {
     snapshot: Page,
 }
 
+/// Owns the background dirty-page flush policy and execution loop.
+///
+/// Why this exists: the flusher needs stable access to a narrow slice of the
+/// buffer manager state, but its protocol should still read as one coherent
+/// subsystem instead of a set of free helpers hanging off `BufferManager`.
+struct BackgroundFlusher {
+    buffer_pool: Vec<Arc<BufferFrame>>,
+    file_manager: SharedFS,
+    log_manager: Arc<Mutex<LogManager>>,
+    clean_unpinned: Arc<AtomicUsize>,
+    dirty_queue: Arc<Mutex<VecDeque<usize>>>,
+    flush_coordinator: Arc<FlushCoordinator>,
+}
+
 impl FlushCoordinator {
     fn new() -> Self {
         Self {
@@ -796,6 +810,169 @@ impl FlushCoordinator {
                 shutdown: false,
             }),
             cond: Condvar::new(),
+        }
+    }
+}
+
+impl BackgroundFlusher {
+    fn new(
+        buffer_pool: Vec<Arc<BufferFrame>>,
+        file_manager: SharedFS,
+        log_manager: Arc<Mutex<LogManager>>,
+        clean_unpinned: Arc<AtomicUsize>,
+        dirty_queue: Arc<Mutex<VecDeque<usize>>>,
+        flush_coordinator: Arc<FlushCoordinator>,
+    ) -> Self {
+        Self {
+            buffer_pool,
+            file_manager,
+            log_manager,
+            clean_unpinned,
+            dirty_queue,
+            flush_coordinator,
+        }
+    }
+
+    /// Waits until either the oldest queued dirty frame has aged enough to
+    /// flush or shutdown has been requested.
+    fn wait_for_flush_signal(&self) -> bool {
+        let mut state = self.flush_coordinator.state.lock().unwrap();
+        loop {
+            if state.shutdown {
+                return false;
+            }
+            match state.oldest_dirty_signal {
+                Some(oldest) => {
+                    let elapsed = oldest.elapsed();
+                    if elapsed >= BufferManager::FLUSH_AGE_THRESHOLD {
+                        state.oldest_dirty_signal = None;
+                        return true;
+                    }
+                    let timeout = BufferManager::FLUSH_AGE_THRESHOLD - elapsed;
+                    let (next_state, _) = self
+                        .flush_coordinator
+                        .cond
+                        .wait_timeout(state, timeout)
+                        .unwrap();
+                    state = next_state;
+                }
+                None => {
+                    state = self.flush_coordinator.cond.wait(state).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Drains up to one batch of flush-eligible frames from the dirty queue and
+    /// snapshots stable page images for them.
+    fn collect_dirty_snapshots(&self, batch_limit: usize) -> Vec<PendingWriteback> {
+        let mut pending = Vec::new();
+        let mut deferred = Vec::new();
+        while pending.len() < batch_limit {
+            let Some(frame_idx) = self.dirty_queue.lock().unwrap().pop_front() else {
+                break;
+            };
+            let buffer = &self.buffer_pool[frame_idx];
+            let mut meta = buffer.lock_meta();
+            meta.mark_dequeued();
+            if !meta.is_dirty() {
+                continue;
+            }
+            let Some((block_id, lsn, generation, snapshot)) =
+                buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
+            else {
+                if meta.try_queue_dirty_if_flushable().is_some() {
+                    deferred.push(frame_idx);
+                }
+                continue;
+            };
+            pending.push(PendingWriteback {
+                frame: Arc::clone(buffer),
+                block_id,
+                lsn,
+                generation,
+                snapshot,
+            });
+        }
+        self.requeue_dirty_frames(deferred);
+        pending
+    }
+
+    /// Writes one batch of already-snapshotted pages after enforcing WAL-before-data.
+    fn write_snapshot_batch(&self, pending: &[PendingWriteback]) {
+        if pending.is_empty() {
+            return;
+        }
+        let max_lsn = pending
+            .iter()
+            .map(|pending| pending.lsn)
+            .max()
+            .expect("pending batch has at least one lsn");
+        self.log_manager.lock().unwrap().flush_lsn(max_lsn);
+
+        let reqs: Vec<BatchWriteReq> = pending
+            .iter()
+            .map(|pending| BatchWriteReq {
+                block_id: pending.block_id.clone(),
+            })
+            .collect();
+        let pages: Vec<&Page> = pending.iter().map(|pending| &pending.snapshot).collect();
+        self.file_manager.write_batch(&reqs, &pages);
+    }
+
+    fn requeue_dirty_frames(&self, frame_indices: Vec<usize>) {
+        if frame_indices.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.dirty_queue.lock().unwrap();
+            for frame_idx in frame_indices {
+                queue.push_back(frame_idx);
+            }
+        }
+        let mut state = self.flush_coordinator.state.lock().unwrap();
+        if state.oldest_dirty_signal.is_none() {
+            state.oldest_dirty_signal = Some(Instant::now());
+        }
+        self.flush_coordinator.cond.notify_one();
+    }
+
+    /// Applies completion-side frame transitions for one finished snapshot batch.
+    fn complete_snapshot_batch(&self, pending: Vec<PendingWriteback>) {
+        let mut requeued = Vec::new();
+        for pending in pending {
+            let mut meta = pending.frame.lock_meta();
+            let block_still_matches = meta.block_id() == Some(&pending.block_id);
+            if let Some(transition) =
+                meta.complete_writeback_transition(block_still_matches, pending.generation)
+            {
+                if transition.became_clean_unpinned {
+                    self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(frame_idx) = transition.enqueue_dirty {
+                    requeued.push(frame_idx);
+                }
+            }
+        }
+        self.requeue_dirty_frames(requeued);
+        self.flush_coordinator.cond.notify_all();
+    }
+
+    /// Background precleaning loop.
+    ///
+    /// The loop stays pressure-driven: it only consumes the dirty queue when the
+    /// number of clean unpinned frames falls below a low watermark.
+    fn run(&self) {
+        let clean_target = (self.buffer_pool.len() / 4).max(1);
+        while self.wait_for_flush_signal() {
+            while self.clean_unpinned.load(Ordering::Acquire) < clean_target {
+                let pending = self.collect_dirty_snapshots(BufferManager::FLUSH_BATCH_SIZE);
+                if pending.is_empty() {
+                    break;
+                }
+                self.write_snapshot_batch(&pending);
+                self.complete_snapshot_batch(pending);
+            }
         }
     }
 }
@@ -851,22 +1028,15 @@ impl BufferManager {
         let clean_unpinned = Arc::new(AtomicUsize::new(num_buffers));
         let dirty_queue = Arc::new(Mutex::new(VecDeque::new()));
         let flusher_handle = {
-            let buffer_pool = buffer_pool.clone();
-            let file_manager = Arc::clone(&file_manager);
-            let log_manager = Arc::clone(&log_manager);
-            let flush_coordinator = Arc::clone(&flush_coordinator);
-            let clean_unpinned = Arc::clone(&clean_unpinned);
-            let dirty_queue = Arc::clone(&dirty_queue);
-            thread::spawn(move || {
-                Self::background_flush_loop(
-                    buffer_pool,
-                    file_manager,
-                    log_manager,
-                    clean_unpinned,
-                    dirty_queue,
-                    flush_coordinator,
-                )
-            })
+            let flusher = BackgroundFlusher::new(
+                buffer_pool.clone(),
+                Arc::clone(&file_manager),
+                Arc::clone(&log_manager),
+                Arc::clone(&clean_unpinned),
+                Arc::clone(&dirty_queue),
+                Arc::clone(&flush_coordinator),
+            );
+            thread::spawn(move || flusher.run())
         };
 
         Self {
@@ -902,68 +1072,34 @@ impl BufferManager {
         self.notify_flusher();
     }
 
-    /// Waits until either the oldest queued dirty frame has aged enough to
-    /// flush or shutdown has been requested.
-    fn wait_for_flush_signal(flush_coordinator: &FlushCoordinator) -> bool {
-        let mut state = flush_coordinator.state.lock().unwrap();
-        loop {
-            if state.shutdown {
-                return false;
-            }
-            match state.oldest_dirty_signal {
-                Some(oldest) => {
-                    let elapsed = oldest.elapsed();
-                    if elapsed >= Self::FLUSH_AGE_THRESHOLD {
-                        state.oldest_dirty_signal = None;
-                        return true;
-                    }
-                    let timeout = Self::FLUSH_AGE_THRESHOLD - elapsed;
-                    let (next_state, _) =
-                        flush_coordinator.cond.wait_timeout(state, timeout).unwrap();
-                    state = next_state;
-                }
-                None => {
-                    state = flush_coordinator.cond.wait(state).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Drains up to one batch of flush-eligible frames from the dirty queue and
-    /// snapshots stable page images for them.
-    fn collect_dirty_snapshots(
-        buffer_pool: &[Arc<BufferFrame>],
-        dirty_queue: &Mutex<VecDeque<usize>>,
+    /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
+    fn collect_dirty_snapshots_for_txn(
+        &self,
         batch_limit: usize,
-        txn_filter: Option<usize>,
+        txn_num: usize,
     ) -> Vec<PendingWriteback> {
-        // The queue keeps the flusher off the full buffer-pool scan path. We
-        // only revisit frames that transitioned into a flush-eligible state.
         let mut pending = Vec::new();
-        let mut deferred = Vec::new();
         while pending.len() < batch_limit {
-            let Some(frame_idx) = dirty_queue.lock().unwrap().pop_front() else {
+            let Some(frame_idx) = self.dirty_queue.lock().unwrap().pop_front() else {
                 break;
             };
-            let buffer = &buffer_pool[frame_idx];
+            let buffer = &self.buffer_pool[frame_idx];
             let mut meta = buffer.lock_meta();
             meta.mark_dequeued();
             if !meta.is_dirty() {
                 continue;
             }
-            if let Some(txn_num) = txn_filter {
-                if meta.txn() != Some(txn_num) {
-                    if meta.try_queue_dirty_if_flushable().is_some() {
-                        deferred.push(frame_idx);
-                    }
-                    continue;
+            if meta.txn() != Some(txn_num) {
+                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
+                    self.enqueue_dirty_frame(frame_idx);
                 }
+                continue;
             }
             let Some((block_id, lsn, generation, snapshot)) =
                 buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
             else {
-                if meta.try_queue_dirty_if_flushable().is_some() {
-                    deferred.push(frame_idx);
+                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
+                    self.enqueue_dirty_frame(frame_idx);
                 }
                 continue;
             };
@@ -975,88 +1111,7 @@ impl BufferManager {
                 snapshot,
             });
         }
-        if !deferred.is_empty() {
-            let mut queue = dirty_queue.lock().unwrap();
-            for frame_idx in deferred {
-                queue.push_back(frame_idx);
-            }
-        }
         pending
-    }
-
-    /// Writes one batch of already-snapshotted pages after enforcing WAL-before-data.
-    fn write_snapshot_batch(
-        file_manager: &SharedFS,
-        log_manager: &Arc<Mutex<LogManager>>,
-        pending: &[PendingWriteback],
-    ) {
-        // WAL-before-data is enforced once per batch so snapshot writeback does
-        // not turn into one WAL flush per frame.
-        if pending.is_empty() {
-            return;
-        }
-        let max_lsn = pending
-            .iter()
-            .map(|pending| pending.lsn)
-            .max()
-            .expect("pending batch has at least one lsn");
-        log_manager.lock().unwrap().flush_lsn(max_lsn);
-
-        let reqs: Vec<BatchWriteReq> = pending
-            .iter()
-            .map(|pending| BatchWriteReq {
-                block_id: pending.block_id.clone(),
-            })
-            .collect();
-        let pages: Vec<&Page> = pending.iter().map(|pending| &pending.snapshot).collect();
-        file_manager.write_batch(&reqs, &pages);
-    }
-
-    fn requeue_dirty_frames(
-        dirty_queue: &Mutex<VecDeque<usize>>,
-        flush_coordinator: &FlushCoordinator,
-        frame_indices: Vec<usize>,
-    ) {
-        if frame_indices.is_empty() {
-            return;
-        }
-        {
-            let mut queue = dirty_queue.lock().unwrap();
-            for frame_idx in frame_indices {
-                queue.push_back(frame_idx);
-            }
-        }
-        let mut state = flush_coordinator.state.lock().unwrap();
-        if state.oldest_dirty_signal.is_none() {
-            state.oldest_dirty_signal = Some(Instant::now());
-        }
-        flush_coordinator.cond.notify_one();
-    }
-
-    /// Applies completion-side frame transitions for one finished snapshot batch.
-    fn complete_snapshot_batch(
-        pending: Vec<PendingWriteback>,
-        clean_unpinned: &AtomicUsize,
-        dirty_queue: &Mutex<VecDeque<usize>>,
-        flush_coordinator: &FlushCoordinator,
-    ) {
-        let mut requeued = Vec::new();
-        for pending in pending {
-            let mut meta = pending.frame.lock_meta();
-            let block_still_matches = meta.block_id() == Some(&pending.block_id);
-            if let Some(transition) =
-                meta.complete_writeback_transition(block_still_matches, pending.generation)
-            {
-                if transition.became_clean_unpinned {
-                    clean_unpinned.fetch_add(1, Ordering::AcqRel);
-                }
-                if let Some(frame_idx) = transition.enqueue_dirty {
-                    requeued.push(frame_idx);
-                }
-            }
-        }
-        Self::requeue_dirty_frames(dirty_queue, flush_coordinator, requeued);
-        flush_coordinator.cond.notify_all();
     }
 
     /// Returns whether this transaction still owns any dirty generations that
@@ -1066,50 +1121,6 @@ impl BufferManager {
             let meta = buffer.lock_meta();
             meta.txn() == Some(txn_num) && meta.is_dirty()
         })
-    }
-
-    /// Background precleaning loop.
-    ///
-    /// The loop stays pressure-driven: it only consumes the dirty queue when the
-    /// number of clean unpinned frames falls below a low watermark.
-    fn background_flush_loop(
-        buffer_pool: Vec<Arc<BufferFrame>>,
-        file_manager: SharedFS,
-        log_manager: Arc<Mutex<LogManager>>,
-        clean_unpinned: Arc<AtomicUsize>,
-        dirty_queue: Arc<Mutex<VecDeque<usize>>>,
-        flush_coordinator: Arc<FlushCoordinator>,
-    ) {
-        // A low-watermark policy keeps this first cut focused on precleaning
-        // under buffer-pool pressure instead of eagerly flushing every dirty page.
-        let clean_target = (buffer_pool.len() / 4).max(1);
-        while Self::wait_for_flush_signal(&flush_coordinator) {
-            if clean_unpinned.load(Ordering::Acquire) >= clean_target {
-                continue;
-            }
-            loop {
-                let pending = Self::collect_dirty_snapshots(
-                    &buffer_pool,
-                    &dirty_queue,
-                    Self::FLUSH_BATCH_SIZE,
-                    None,
-                );
-                if pending.is_empty() {
-                    break;
-                }
-                Self::write_snapshot_batch(&file_manager, &log_manager, &pending);
-                let hit_batch_limit = pending.len() == Self::FLUSH_BATCH_SIZE;
-                Self::complete_snapshot_batch(
-                    pending,
-                    clean_unpinned.as_ref(),
-                    &dirty_queue,
-                    &flush_coordinator,
-                );
-                if !hit_batch_limit {
-                    break;
-                }
-            }
-        }
     }
 
     /// FNV-1a hash to select shard
@@ -1342,13 +1353,16 @@ impl BufferManager {
             }),
             "flush_all assumes target transaction has released all page pins before forcing writeback"
         );
+        let flusher = BackgroundFlusher::new(
+            self.buffer_pool.clone(),
+            Arc::clone(&self.file_manager),
+            Arc::clone(&self.log_manager),
+            Arc::clone(&self.clean_unpinned),
+            Arc::clone(&self.dirty_queue),
+            Arc::clone(&self.flush_coordinator),
+        );
         while self.has_dirty_for_txn(txn_num) {
-            let pending = Self::collect_dirty_snapshots(
-                &self.buffer_pool,
-                &self.dirty_queue,
-                Self::FLUSH_BATCH_SIZE,
-                Some(txn_num),
-            );
+            let pending = self.collect_dirty_snapshots_for_txn(Self::FLUSH_BATCH_SIZE, txn_num);
             if pending.is_empty() {
                 let state = self.flush_coordinator.state.lock().unwrap();
                 let _ = self
@@ -1358,13 +1372,8 @@ impl BufferManager {
                     .unwrap();
                 continue;
             }
-            Self::write_snapshot_batch(&self.file_manager, &self.log_manager, &pending);
-            Self::complete_snapshot_batch(
-                pending,
-                self.clean_unpinned.as_ref(),
-                &self.dirty_queue,
-                &self.flush_coordinator,
-            );
+            flusher.write_snapshot_batch(&pending);
+            flusher.complete_snapshot_batch(pending);
         }
     }
 
