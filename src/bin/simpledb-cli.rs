@@ -226,11 +226,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
 
             // Calculate BTree search cost for comparison
             let max_size = layout.max_encoded_size();
-            let records_per_block = if max_size > 0 {
-                block_size / max_size
-            } else {
-                1
-            };
+            let records_per_block = block_size.checked_div(max_size).unwrap_or(1);
             let btree_cost = BTreeIndex::search_cost(blocks, records_per_block);
 
             result.push_str(&format!(
