@@ -4753,6 +4753,80 @@ mod heuristic_equivalence_tests {
             &["name", "dept"],
         );
     }
+
+    #[test]
+    fn pipeline_planner_order_by_asc() {
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "c"), (1, "a"), (2, "b")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        let plan = p
+            .create_query_plan(
+                "select a, b from t order by a asc".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut rows = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            rows.push((scan.get_value("a").unwrap(), scan.get_value("b").unwrap()));
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (Constant::Int(1), Constant::String("a".into())),
+                (Constant::Int(2), Constant::String("b".into())),
+                (Constant::Int(3), Constant::String("c".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_planner_order_by_desc() {
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "c"), (1, "a"), (2, "b")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        let plan = p
+            .create_query_plan(
+                "select a, b from t order by b desc".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut rows = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            rows.push((scan.get_value("a").unwrap(), scan.get_value("b").unwrap()));
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (Constant::Int(3), Constant::String("c".into())),
+                (Constant::Int(2), Constant::String("b".into())),
+                (Constant::Int(1), Constant::String("a".into())),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5533,9 +5607,14 @@ impl QueryPlanner for PipelineQueryPlanner {
         txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
         let ctx = PlanningContext::new(txn, Arc::clone(&self.metadata_manager));
+        let order_by = query_data.order_by.clone();
         let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
         let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
-        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
+        let mut plan = DefaultPhysicalPlanner::new().lower(&optimized, &ctx)?;
+        if !order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, order_by));
+        }
+        Ok(plan)
     }
 }
 
