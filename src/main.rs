@@ -4145,16 +4145,17 @@ impl HeuristicQueryPlanner {
             }
         }
 
-        let mut plan: Arc<dyn Plan> = Arc::new(ProjectPlan::new(
-            current_plan,
+        //  Sort before projection so ORDER BY can reference non-projected columns
+        let pre_project: Arc<dyn Plan> = if !order_by.is_empty() {
+            Arc::new(SortPlan::with_directions(current_plan, order_by))
+        } else {
+            current_plan
+        };
+
+        Ok(Arc::new(ProjectPlan::new(
+            pre_project,
             query_data.fields.iter().map(String::as_str).collect(),
-        )?);
-
-        if !order_by.is_empty() {
-            plan = Arc::new(SortPlan::with_directions(plan, order_by));
-        }
-
-        Ok(plan)
+        )?))
     }
 
     /// Find the [SelectPlan] with the lowest record output
@@ -4271,16 +4272,16 @@ impl QueryPlanner for BasicQueryPlanner {
         //  3. Create the selection with the predicate
         plan = Arc::new(SelectPlan::new(plan, query_data.predicate));
 
-        //  4. Create the projection
+        //  4. Sort before projection so ORDER BY can reference non-projected columns
+        if !query_data.order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, query_data.order_by));
+        }
+
+        //  5. Create the projection
         plan = Arc::new(ProjectPlan::new(
             plan,
             query_data.fields.iter().map(AsRef::as_ref).collect(),
         )?);
-
-        //  5. Sort if ORDER BY was specified
-        if !query_data.order_by.is_empty() {
-            plan = Arc::new(SortPlan::with_directions(plan, query_data.order_by));
-        }
 
         Ok(plan)
     }
@@ -4583,6 +4584,46 @@ mod basic_query_planner_tests {
                 (Constant::Int(2), Constant::String("z".into())),
                 (Constant::Int(2), Constant::String("a".into())),
             ]
+        );
+    }
+
+    #[test]
+    fn order_by_non_projected_column() {
+        // SELECT a FROM t ORDER BY b — b is not in the select list.
+        // Sort must run before projection or get_value("b") will fail.
+        let (db, txn, _dir) = setup_db();
+        let planner = basic_planner(&db);
+
+        exec(
+            &planner,
+            Arc::clone(&txn),
+            "create table t(a int, b varchar(10))",
+        );
+        for (a, b) in [(3, "a"), (1, "b"), (2, "c")] {
+            exec(
+                &planner,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        let plan = planner
+            .create_query_plan(
+                "select a from t order by b asc".to_string(),
+                Arc::clone(&txn),
+            )
+            .unwrap();
+        let ctx = ExecutionContext::new(Arc::clone(&txn));
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut rows = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            rows.push(scan.get_value("a").unwrap());
+        }
+        // sorted by b: "a"->3, "b"->1, "c"->2
+        assert_eq!(
+            rows,
+            vec![Constant::Int(3), Constant::Int(1), Constant::Int(2)]
         );
     }
 }
@@ -5610,11 +5651,20 @@ impl QueryPlanner for PipelineQueryPlanner {
         let order_by = query_data.order_by.clone();
         let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
         let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
-        let mut plan = DefaultPhysicalPlanner::new().lower(&optimized, &ctx)?;
-        if !order_by.is_empty() {
-            plan = Arc::new(SortPlan::with_directions(plan, order_by));
+
+        // Sort before projection so ORDER BY can reference non-projected columns.
+        // The optimized top node is always Project for a SELECT, so we lower the
+        // Project's input, wrap with SortPlan, then apply ProjectPlan on top.
+        if !order_by.is_empty() && optimized.kind() == LogicalPlanKind::Project {
+            let input = optimized.input().unwrap();
+            let fields = optimized.project_fields().unwrap();
+            let lowered = DefaultPhysicalPlanner::new().lower(input, &ctx)?;
+            let sorted: Arc<dyn Plan> = Arc::new(SortPlan::with_directions(lowered, order_by));
+            let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+            return Ok(Arc::new(ProjectPlan::new(sorted, field_refs)?));
         }
-        Ok(plan)
+
+        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
     }
 }
 
