@@ -129,21 +129,48 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a complete SELECT query
-    /// Returns: QueryData containing fields, tables, and predicates
+    /// Returns: QueryData containing fields, tables, predicates, and ORDER BY
     pub fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
         let select_list = self.select_list()?;
         self.lexer.eat_keyword("from")?;
         let table_list = self.select_tables()?;
-        let predicate = {
-            if self.lexer.match_keyword("where") {
-                self.lexer.eat_keyword("where")?;
-                self.parse_predicate()?
-            } else {
-                Predicate::new(Vec::new())
-            }
+        let predicate = if self.lexer.match_keyword("where") {
+            self.lexer.eat_keyword("where")?;
+            self.parse_predicate()?
+        } else {
+            Predicate::new(Vec::new())
         };
-        Ok(QueryData::new(select_list, table_list, predicate))
+        let order_by = if self.lexer.match_keyword("order") {
+            self.lexer.eat_keyword("order")?;
+            self.lexer.eat_keyword("by")?;
+            self.parse_order_by_list()?
+        } else {
+            Vec::new()
+        };
+        Ok(QueryData::new(select_list, table_list, predicate, order_by))
+    }
+
+    fn parse_order_by_list(&mut self) -> Result<Vec<(String, SortDirection)>, ParserError> {
+        let mut list = Vec::new();
+        loop {
+            let field = self.lexer.eat_identifier()?;
+            let dir = if self.lexer.match_keyword("desc") {
+                self.lexer.eat_keyword("desc")?;
+                SortDirection::Desc
+            } else {
+                if self.lexer.match_keyword("asc") {
+                    self.lexer.eat_keyword("asc")?;
+                }
+                SortDirection::Asc
+            };
+            list.push((field, dir));
+            if !self.lexer.match_delim(',') {
+                break;
+            }
+            self.lexer.eat_delim(',')?;
+        }
+        Ok(list)
     }
 
     /// Parses any SQL command that modifies the database
@@ -698,19 +725,32 @@ impl CreateIndexData {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
 #[derive(Debug)]
 pub struct QueryData {
     pub fields: Vec<String>,
     pub tables: Vec<String>,
     pub predicate: Predicate,
+    pub order_by: Vec<(String, SortDirection)>,
 }
 
 impl QueryData {
-    fn new(fields: Vec<String>, tables: Vec<String>, predicate: Predicate) -> Self {
+    fn new(
+        fields: Vec<String>,
+        tables: Vec<String>,
+        predicate: Predicate,
+        order_by: Vec<(String, SortDirection)>,
+    ) -> Self {
         Self {
             fields,
             tables,
             predicate,
+            order_by,
         }
     }
 
@@ -751,6 +791,7 @@ impl<'a> Lexer<'a> {
         let keywords = [
             "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
             "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
+            "order", "by", "asc", "desc",
         ];
         let mut lexer = Self {
             input: string.chars().peekable(),
