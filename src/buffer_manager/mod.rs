@@ -576,11 +576,15 @@ impl BufferFrame {
     ///
     /// Stale completions are ignored so an older snapshot cannot clear newer
     /// dirty state after the frame has advanced.
-    fn complete_writeback_locked(meta: &mut FrameMeta, block_id: &BlockId, generation: u64) {
-        let _ = meta.complete_writeback_transition(meta.block_id() == Some(block_id), generation);
+    fn complete_writeback_locked(
+        meta: &mut FrameMeta,
+        block_id: &BlockId,
+        generation: u64,
+    ) -> Option<WritebackCompletion> {
+        meta.complete_writeback_transition(meta.block_id() == Some(block_id), generation)
     }
 
-    pub(crate) fn flush_locked(&self, meta: &mut FrameMeta) {
+    fn flush_locked(&self, meta: &mut FrameMeta) -> Option<WritebackCompletion> {
         if let Some((block_id, lsn, generation, snapshot)) =
             self.claim_snapshot_for_writeback_locked(meta, true)
         {
@@ -590,12 +594,17 @@ impl BufferFrame {
             }];
             let pages = [&snapshot];
             self.file_manager.write_batch(&req, &pages);
-            Self::complete_writeback_locked(meta, &block_id, generation);
+            return Self::complete_writeback_locked(meta, &block_id, generation);
         }
+        None
     }
 
-    pub(crate) fn assign_to_block_locked(&self, meta: &mut FrameMeta, block_id: &BlockId) {
-        self.flush_locked(meta);
+    fn assign_to_block_locked(
+        &self,
+        meta: &mut FrameMeta,
+        block_id: &BlockId,
+    ) -> Option<WritebackCompletion> {
+        let completion = self.flush_locked(meta);
         meta.assign_resident(block_id.clone());
         let mut page_guard = self.page.write().unwrap();
         self.file_manager.read(block_id, &mut page_guard);
@@ -645,6 +654,7 @@ impl BufferFrame {
         }
         meta.reset_pins();
         meta.mark_flush_clean();
+        completion
     }
 }
 
@@ -1218,7 +1228,13 @@ impl BufferManager {
                 let old_shard = self.shard_index(&old);
                 self.resident_shards[old_shard].lock().unwrap().remove(&old);
             }
-            frame.flush_locked(&mut meta_guard);
+            let flush_completion = frame.flush_locked(&mut meta_guard);
+            if flush_completion
+                .as_ref()
+                .is_some_and(|transition| transition.became_clean_unpinned)
+            {
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+            }
             meta_guard.clear_residency();
             meta_guard.mark_flush_clean();
 
@@ -1494,7 +1510,13 @@ impl BufferManager {
             self.resident_shards[old_shard].lock().unwrap().remove(&old);
         }
         let frame = Arc::clone(&self.buffer_pool[tail_idx]);
-        frame.assign_to_block_locked(&mut meta_guard, block_id);
+        let flush_completion = frame.assign_to_block_locked(&mut meta_guard, block_id);
+        if flush_completion
+            .as_ref()
+            .is_some_and(|transition| transition.became_clean_unpinned)
+        {
+            self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+        }
         let transition = meta_guard.pin_transition();
         debug_assert!(
             transition.became_pinned,
