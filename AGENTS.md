@@ -4,7 +4,7 @@ This documentation provides information about the SimpleDB project and also prov
 
 ## Project Overview
 
-**Purpose**: A simple SQL database which is a port of an existing SimpleDB database written in Java to Rust. It is mainly for pedagogical purposes and also as a way to experiment with Rust code and performance optimizations
+**Purpose**: A SQL database which started as a port of SimpleDB from Java to Rust. It is mainly a playground for performance profiling, testing and experimenting with novel approaches of building database engines.
 
 **Tech Stack**: Rust, Python
 
