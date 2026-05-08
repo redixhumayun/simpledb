@@ -4146,7 +4146,7 @@ impl HeuristicQueryPlanner {
         }
 
         //  Sort before projection so ORDER BY can reference non-projected columns
-        let pre_project: Arc<dyn Plan> = if !order_by.is_empty() {
+        let pre_project = if !order_by.is_empty() {
             Arc::new(SortPlan::with_directions(current_plan, order_by))
         } else {
             current_plan
@@ -5501,19 +5501,20 @@ impl QueryPlanner for PipelineQueryPlanner {
         let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
         let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
 
+        // BasicLogicalPlanner always produces a Project at the top of the tree.
+        assert_eq!(optimized.kind(), LogicalPlanKind::Project);
+
+        let input = optimized.input().unwrap();
+        let fields = optimized.project_fields().unwrap();
+        let mut plan = DefaultPhysicalPlanner::new().lower(input, &ctx)?;
+
         // Sort before projection so ORDER BY can reference non-projected columns.
-        // The optimized top node is always Project for a SELECT, so we lower the
-        // Project's input, wrap with SortPlan, then apply ProjectPlan on top.
-        if !order_by.is_empty() && optimized.kind() == LogicalPlanKind::Project {
-            let input = optimized.input().unwrap();
-            let fields = optimized.project_fields().unwrap();
-            let lowered = DefaultPhysicalPlanner::new().lower(input, &ctx)?;
-            let sorted: Arc<dyn Plan> = Arc::new(SortPlan::with_directions(lowered, order_by));
-            let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-            return Ok(Arc::new(ProjectPlan::new(sorted, field_refs)?));
+        if !order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, order_by));
         }
 
-        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
+        let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+        Ok(Arc::new(ProjectPlan::new(plan, field_refs)?))
     }
 }
 
