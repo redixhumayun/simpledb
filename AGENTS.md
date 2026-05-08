@@ -4,7 +4,7 @@ This documentation provides information about the SimpleDB project and also prov
 
 ## Project Overview
 
-**Purpose**: A simple SQL database which is a port of an existing SimpleDB database written in Java to Rust. It is mainly for pedagogical purposes and also as a way to experiment with Rust code and performance optimizations
+**Purpose**: A SQL database which started as a port of SimpleDB from Java to Rust. It is mainly a playground for performance profiling, testing and experimenting with novel approaches of building database engines.
 
 **Tech Stack**: Rust, Python
 
@@ -46,20 +46,17 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - keep docs clear and concise; do not write verbose commentary
 
 5. **Test thoroughly before committing**:
-   Testing requires running tests with combinations of compiler flags. Run these commands one after another; do not use `--test-threads=1`.
+   Testing requires running tests with combinations of compiler flags. Direct-IO is the default IO path and must be included in every run. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
-   cargo test --no-default-features --features replacement_lru --features page-4k
-   # Verify build works and tests pass
-
-   cargo test --no-default-features --features replacement_clock --features page-4k
-   # Verify build works and tests pass
-
-   cargo test --no-default-features --features replacement_sieve --features page-4k
-   # Verify build works and tests pass
-
    cargo test --no-default-features --features replacement_lru --features page-4k --features direct-io
-   # Verify direct-io build works and tests pass
+   # Verify build works and tests pass
+
+   cargo test --no-default-features --features replacement_clock --features page-4k --features direct-io
+   # Verify build works and tests pass
+
+   cargo test --no-default-features --features replacement_sieve --features page-4k --features direct-io
+   # Verify build works and tests pass
    ```
 
 6. **Run benchmarks before committing only when asked**

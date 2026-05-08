@@ -28,7 +28,7 @@ pub use btree::BTreeIndex;
 pub use btree::SplitGate;
 use parser::{
     CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
-    QueryData,
+    QueryData, SortDirection,
 };
 
 pub use test_utils::TestDir;
@@ -2245,6 +2245,19 @@ impl SortPlan {
         }
     }
 
+    pub fn with_directions(
+        source_plan: Arc<dyn Plan>,
+        field_list: Vec<(String, SortDirection)>,
+    ) -> Self {
+        let schema = source_plan.schema();
+        let record_comparator = RecordComparator::with_directions(field_list);
+        Self {
+            source_plan,
+            schema,
+            record_comparator,
+        }
+    }
+
     pub fn open_sort_scan(&self, ctx: &ExecutionContext) -> SortScan {
         let source_scan = self.source_plan.open(ctx);
         let executor = SortExecutor::new(self.schema.clone(), self.record_comparator.clone());
@@ -2853,21 +2866,34 @@ mod sort_scan_tests {
 
 #[derive(Clone)]
 pub struct RecordComparator {
-    field_list: Vec<String>,
+    field_list: Vec<(String, SortDirection)>,
 }
 
 impl RecordComparator {
-    pub fn new(field_list: Vec<String>) -> Self {
+    /// Creates a comparator that sorts all fields ascending.
+    pub fn new(fields: Vec<String>) -> Self {
+        Self {
+            field_list: fields
+                .into_iter()
+                .map(|f| (f, SortDirection::Asc))
+                .collect(),
+        }
+    }
+
+    pub fn with_directions(field_list: Vec<(String, SortDirection)>) -> Self {
         Self { field_list }
     }
 
     fn compare<S1: Scan, S2: Scan>(&self, s1: &S1, s2: &S2) -> Result<Ordering, Box<dyn Error>> {
-        for field in &self.field_list {
+        for (field, dir) in &self.field_list {
             let value_1 = s1.get_value(field)?;
             let value_2 = s2.get_value(field)?;
             let cmp = value_1.cmp(&value_2);
             if cmp != std::cmp::Ordering::Equal {
-                return Ok(cmp);
+                return Ok(match dir {
+                    SortDirection::Asc => cmp,
+                    SortDirection::Desc => cmp.reverse(),
+                });
             }
         }
         Ok(Ordering::Equal)
@@ -4092,6 +4118,8 @@ impl HeuristicQueryPlanner {
         query_data: QueryData,
         ctx: &PlanningContext,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let order_by = query_data.order_by;
+
         //  Construct all instances of [TablePlanner]
         for table_name in query_data.tables {
             let table_planner =
@@ -4117,8 +4145,15 @@ impl HeuristicQueryPlanner {
             }
         }
 
+        //  Sort before projection so ORDER BY can reference non-projected columns
+        let pre_project = if !order_by.is_empty() {
+            Arc::new(SortPlan::with_directions(current_plan, order_by))
+        } else {
+            current_plan
+        };
+
         Ok(Arc::new(ProjectPlan::new(
-            current_plan,
+            pre_project,
             query_data.fields.iter().map(String::as_str).collect(),
         )?))
     }
@@ -4214,6 +4249,7 @@ impl QueryPlanner for BasicQueryPlanner {
     /// 2. Create a join of all tables
     /// 3. Create a selection with the predicate
     /// 4. Create a projection of the required columns
+    /// 5. If ORDER BY is present, wrap with SortPlan
     fn create_plan(
         &self,
         query_data: QueryData,
@@ -4236,11 +4272,17 @@ impl QueryPlanner for BasicQueryPlanner {
         //  3. Create the selection with the predicate
         plan = Arc::new(SelectPlan::new(plan, query_data.predicate));
 
-        //  4. Create the projection
+        //  4. Sort before projection so ORDER BY can reference non-projected columns
+        if !query_data.order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, query_data.order_by));
+        }
+
+        //  5. Create the projection
         plan = Arc::new(ProjectPlan::new(
             plan,
             query_data.fields.iter().map(AsRef::as_ref).collect(),
         )?);
+
         Ok(plan)
     }
 }
@@ -4586,6 +4628,93 @@ mod heuristic_equivalence_tests {
             Arc::clone(&txn),
             "select name, dept from e, d where id = depid",
             &["name", "dept"],
+        );
+    }
+
+    fn collect_ordered<F, T>(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        extract: F,
+    ) -> Vec<T>
+    where
+        F: Fn(&dyn Scan) -> T,
+    {
+        let plan = planner
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut rows = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            rows.push(extract(scan.as_ref()));
+        }
+        rows
+    }
+
+    #[test]
+    fn order_by_asc_and_desc() {
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "c"), (1, "a"), (2, "b")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        let asc = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by a asc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            asc,
+            vec![Constant::Int(1), Constant::Int(2), Constant::Int(3)]
+        );
+
+        let desc = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by a desc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            desc,
+            vec![Constant::Int(3), Constant::Int(2), Constant::Int(1)]
+        );
+    }
+
+    #[test]
+    fn order_by_non_projected_column() {
+        // Sort must run before projection so ORDER BY can reference columns not in the select list.
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "a"), (1, "b"), (2, "c")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        // b is not projected; sorted by b asc -> "a"->3, "b"->1, "c"->2
+        let rows = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by b asc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![Constant::Int(3), Constant::Int(1), Constant::Int(2)]
         );
     }
 }
@@ -5368,9 +5497,24 @@ impl QueryPlanner for PipelineQueryPlanner {
         txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
         let ctx = PlanningContext::new(txn, Arc::clone(&self.metadata_manager));
+        let order_by = query_data.order_by.clone();
         let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
         let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
-        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
+
+        // BasicLogicalPlanner always produces a Project at the top of the tree.
+        assert_eq!(optimized.kind(), LogicalPlanKind::Project);
+
+        let input = optimized.input().unwrap();
+        let fields = optimized.project_fields().unwrap();
+        let mut plan = DefaultPhysicalPlanner::new().lower(input, &ctx)?;
+
+        // Sort before projection so ORDER BY can reference non-projected columns.
+        if !order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, order_by));
+        }
+
+        let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+        Ok(Arc::new(ProjectPlan::new(plan, field_refs)?))
     }
 }
 
