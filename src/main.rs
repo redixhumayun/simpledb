@@ -5891,7 +5891,8 @@ impl Plan for ProjectPlan {
 enum AggregateRunState {
     /// Used for both Min and Max — None until the first row is seen.
     MinMax(Option<Constant>),
-    Sum(f64),
+    SumInt(i64),
+    SumFloat(f64),
     CountDistinct(HashSet<Constant>),
 }
 
@@ -5924,9 +5925,13 @@ impl<S: Scan> AggregateScan<S> {
         let mut state: Vec<AggregateRunState> = self
             .specs
             .iter()
-            .map(|spec| match spec.op {
+            .enumerate()
+            .map(|(i, spec)| match spec.op {
                 AggregateOp::Min | AggregateOp::Max => AggregateRunState::MinMax(None),
-                AggregateOp::Sum => AggregateRunState::Sum(0.0),
+                AggregateOp::Sum => match &self.empty_defaults[i] {
+                    Constant::Float(_) => AggregateRunState::SumFloat(0.0),
+                    _ => AggregateRunState::SumInt(0),
+                },
                 AggregateOp::CountDistinct => AggregateRunState::CountDistinct(HashSet::new()),
             })
             .collect();
@@ -5948,10 +5953,16 @@ impl<S: Scan> AggregateScan<S> {
                             Some(existing) => existing.max(val),
                         });
                     }
-                    (AggregateOp::Sum, AggregateRunState::Sum(total)) => {
+                    (AggregateOp::Sum, AggregateRunState::SumInt(total)) => {
                         *total += match val {
-                            Constant::Int(v) => v as f64,
+                            Constant::Int(v) => v as i64,
+                            _ => val.as_int() as i64,
+                        };
+                    }
+                    (AggregateOp::Sum, AggregateRunState::SumFloat(total)) => {
+                        *total += match val {
                             Constant::Float(v) => v,
+                            Constant::Int(v) => v as f64,
                             _ => val.as_int() as f64,
                         };
                     }
@@ -5969,10 +5980,8 @@ impl<S: Scan> AggregateScan<S> {
                 AggregateRunState::MinMax(curr) => curr
                     .clone()
                     .unwrap_or_else(|| self.empty_defaults[i].clone()),
-                AggregateRunState::Sum(total) => match &self.empty_defaults[i] {
-                    Constant::Float(_) => Constant::Float(*total),
-                    _ => Constant::Int(*total as i64 as i32),
-                },
+                AggregateRunState::SumInt(total) => Constant::Int(*total as i32),
+                AggregateRunState::SumFloat(total) => Constant::Float(*total),
                 AggregateRunState::CountDistinct(set) => Constant::Int(set.len() as i32),
             };
             results.insert(spec.alias.clone(), result_val);
