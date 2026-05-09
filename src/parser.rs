@@ -136,13 +136,21 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// Parses a constant value (string or integer)
-    /// Returns: Constant enum variant
+    /// Parses a constant value (string, integer, or float). Handles leading '-' for negatives.
     fn constant(&mut self) -> Result<Constant, ParserError> {
         if self.lexer.match_string_constant() {
             return Ok(Constant::String(self.lexer.eat_string_constant()?));
         }
-        Ok(Constant::Int(self.lexer.eat_int_constant()?))
+        let negative = self.lexer.match_delim('-');
+        if negative {
+            self.lexer.eat_delim('-')?;
+        }
+        if self.lexer.match_float_constant() {
+            let v = self.lexer.eat_float_constant()?;
+            return Ok(Constant::Float(if negative { -v } else { v }));
+        }
+        let v = self.lexer.eat_int_constant()?;
+        Ok(Constant::Int(if negative { -v } else { v }))
     }
 
     /// Parses a comma-separated list of constants
@@ -289,6 +297,22 @@ impl<'a> Parser<'a> {
         if self.lexer.match_keyword("int") {
             self.lexer.eat_keyword("int")?;
             schema.add_int_field(&field_name);
+        } else if self.lexer.match_keyword("float")
+            || self.lexer.match_keyword("decimal")
+            || self.lexer.match_keyword("numeric")
+        {
+            self.lexer.next_token();
+            // Optional precision/scale: DECIMAL(p) or DECIMAL(p,s) — consume and ignore.
+            if self.lexer.match_delim('(') {
+                self.lexer.eat_delim('(')?;
+                self.lexer.eat_int_constant()?;
+                if self.lexer.match_delim(',') {
+                    self.lexer.eat_delim(',')?;
+                    self.lexer.eat_int_constant()?;
+                }
+                self.lexer.eat_delim(')')?;
+            }
+            schema.add_float_field(&field_name);
         } else if self.lexer.match_keyword("varchar") {
             self.lexer.eat_keyword("varchar")?;
             self.lexer.eat_delim('(')?;
@@ -888,8 +912,8 @@ impl<'a> Lexer<'a> {
     fn new(string: &'a str) -> Self {
         let keywords = [
             "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
-            "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
-            "order", "by", "asc", "desc",
+            "update", "set", "create", "table", "int", "varchar", "float", "decimal", "numeric",
+            "view", "as", "index", "on", "order", "by", "asc", "desc",
         ];
         let mut lexer = Self {
             input: string.chars().peekable(),
@@ -915,7 +939,7 @@ impl<'a> Lexer<'a> {
         Some(Token::StringConstant(string))
     }
 
-    /// Parses a numeric literal
+    /// Parses a numeric literal (integer or float).
     fn parse_number(&mut self) -> Option<Token> {
         let mut number = String::new();
         while let Some(&c) = self.input.peek() {
@@ -924,6 +948,18 @@ impl<'a> Lexer<'a> {
             }
             number.push(c);
             self.input.next();
+        }
+        if self.input.peek() == Some(&'.') {
+            number.push('.');
+            self.input.next();
+            while let Some(&c) = self.input.peek() {
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                number.push(c);
+                self.input.next();
+            }
+            return Some(Token::FloatConstant(number.parse().unwrap()));
         }
         Some(Token::IntConstant(number.parse().unwrap()))
     }
@@ -1035,6 +1071,21 @@ impl<'a> Lexer<'a> {
         Ok(i)
     }
 
+    fn match_float_constant(&self) -> bool {
+        matches!(self.current_token, Some(Token::FloatConstant(_)))
+    }
+
+    fn eat_float_constant(&mut self) -> Result<f64, ParserError> {
+        if !self.match_float_constant() {
+            return Err(ParserError::BadSyntax);
+        }
+        let Some(Token::FloatConstant(f)) = self.current_token else {
+            return Err(ParserError::BadSyntax);
+        };
+        self.next_token();
+        Ok(f)
+    }
+
     /// Checks if current token is a string constant
     fn match_string_constant(&self) -> bool {
         matches!(self.current_token, Some(Token::StringConstant(_)))
@@ -1092,11 +1143,12 @@ impl<'a> Lexer<'a> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Token {
     Keyword(String),
     Identifier(String),
     IntConstant(i32),
+    FloatConstant(f64),
     StringConstant(String),
     Delimiter(char),
     // Multi-character operators
@@ -1104,6 +1156,25 @@ pub enum Token {
     GreaterOrEqual,
     NotEqual,
 }
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Token::Keyword(a), Token::Keyword(b)) => a == b,
+            (Token::Identifier(a), Token::Identifier(b)) => a == b,
+            (Token::IntConstant(a), Token::IntConstant(b)) => a == b,
+            (Token::FloatConstant(a), Token::FloatConstant(b)) => a.to_bits() == b.to_bits(),
+            (Token::StringConstant(a), Token::StringConstant(b)) => a == b,
+            (Token::Delimiter(a), Token::Delimiter(b)) => a == b,
+            (Token::LessOrEqual, Token::LessOrEqual) => true,
+            (Token::GreaterOrEqual, Token::GreaterOrEqual) => true,
+            (Token::NotEqual, Token::NotEqual) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Token {}
 
 #[cfg(test)]
 mod lexer_tests {

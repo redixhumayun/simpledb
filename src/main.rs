@@ -908,6 +908,7 @@ impl Scan for ChunkScan {
         })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => Ok(Constant::Int(record_page.get_int(slot, field_name)?)),
+            FieldType::Float => Ok(Constant::Float(record_page.get_float(slot, field_name)?)),
             FieldType::String => Ok(Constant::String(record_page.get_string(slot, field_name)?)),
         }
     }
@@ -3607,6 +3608,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
                 field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
                     match schema.info[f].field_type {
                         FieldType::Int => Constant::Int(0),
+                        FieldType::Float => Constant::Float(0.0),
                         FieldType::String => Constant::String(String::new()),
                     }
                 })
@@ -3787,6 +3789,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
                 field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
                     match schema.info[f].field_type {
                         FieldType::Int => Constant::Int(0),
+                        FieldType::Float => Constant::Float(0.0),
                         FieldType::String => Constant::String(String::new()),
                     }
                 })
@@ -5888,7 +5891,7 @@ impl Plan for ProjectPlan {
 enum AggregateRunState {
     /// Used for both Min and Max — None until the first row is seen.
     MinMax(Option<Constant>),
-    Sum(i64),
+    Sum(f64),
     CountDistinct(HashSet<Constant>),
 }
 
@@ -5923,7 +5926,7 @@ impl<S: Scan> AggregateScan<S> {
             .iter()
             .map(|spec| match spec.op {
                 AggregateOp::Min | AggregateOp::Max => AggregateRunState::MinMax(None),
-                AggregateOp::Sum => AggregateRunState::Sum(0),
+                AggregateOp::Sum => AggregateRunState::Sum(0.0),
                 AggregateOp::CountDistinct => AggregateRunState::CountDistinct(HashSet::new()),
             })
             .collect();
@@ -5946,7 +5949,11 @@ impl<S: Scan> AggregateScan<S> {
                         });
                     }
                     (AggregateOp::Sum, AggregateRunState::Sum(total)) => {
-                        *total += val.as_int() as i64;
+                        *total += match val {
+                            Constant::Int(v) => v as f64,
+                            Constant::Float(v) => v,
+                            _ => val.as_int() as f64,
+                        };
                     }
                     (AggregateOp::CountDistinct, AggregateRunState::CountDistinct(set)) => {
                         set.insert(val);
@@ -5962,7 +5969,10 @@ impl<S: Scan> AggregateScan<S> {
                 AggregateRunState::MinMax(curr) => curr
                     .clone()
                     .unwrap_or_else(|| self.empty_defaults[i].clone()),
-                AggregateRunState::Sum(total) => Constant::Int(*total as i32),
+                AggregateRunState::Sum(total) => match &self.empty_defaults[i] {
+                    Constant::Float(_) => Constant::Float(*total),
+                    _ => Constant::Int(*total as i64 as i32),
+                },
                 AggregateRunState::CountDistinct(set) => Constant::Int(set.len() as i32),
             };
             results.insert(spec.alias.clone(), result_val);
@@ -6034,10 +6044,20 @@ impl AggregatePlan {
                     schema.add_int_field(&spec.alias);
                     empty_defaults.push(Constant::Int(0));
                 }
-                // SUM is always integer for now (no DECIMAL support yet).
+                // SUM preserves the input field's numeric type.
                 AggregateOp::Sum => {
-                    schema.add_int_field(&spec.alias);
-                    empty_defaults.push(Constant::Int(0));
+                    if let Some(info) = source_schema.info.get(&spec.field) {
+                        if info.field_type == FieldType::Float {
+                            schema.add_float_field(&spec.alias);
+                            empty_defaults.push(Constant::Float(0.0));
+                        } else {
+                            schema.add_int_field(&spec.alias);
+                            empty_defaults.push(Constant::Int(0));
+                        }
+                    } else {
+                        schema.add_int_field(&spec.alias);
+                        empty_defaults.push(Constant::Int(0));
+                    }
                 }
                 // MIN/MAX preserve the input field's type and default accordingly.
                 AggregateOp::Min | AggregateOp::Max => {
@@ -6046,6 +6066,10 @@ impl AggregatePlan {
                             FieldType::Int => {
                                 schema.add_int_field(&spec.alias);
                                 empty_defaults.push(Constant::Int(0));
+                            }
+                            FieldType::Float => {
+                                schema.add_float_field(&spec.alias);
+                                empty_defaults.push(Constant::Float(0.0));
                             }
                             FieldType::String => {
                                 schema.add_string_field(&spec.alias, info.length);
@@ -8511,6 +8535,7 @@ impl Expression {
         match self {
             Expression::Constant(constant) => match constant {
                 Constant::Int(value) => value.to_string(),
+                Constant::Float(value) => value.to_string(),
                 Constant::String(string) => string.to_string(),
             },
             Expression::FieldName(field_name) => field_name.clone(),
@@ -8673,6 +8698,7 @@ mod metadata_manager_tests {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
                 FieldType::Int => "int".to_string(),
+                FieldType::Float => "float".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{field}: {type_str}");
@@ -9003,6 +9029,9 @@ impl IndexInfo {
         match table_schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => {
                 schema.add_int_field(Self::DATA_FIELD);
+            }
+            FieldType::Float => {
+                schema.add_float_field(Self::DATA_FIELD);
             }
             FieldType::String => {
                 let field_length = table_schema.info.get(field_name).unwrap().length;
@@ -9656,6 +9685,7 @@ mod table_manager_tests {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
                 FieldType::Int => "int".to_string(),
+                FieldType::Float => "float".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{field}: {type_str}");
@@ -9889,6 +9919,7 @@ impl Scan for TableScan {
         })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => Ok(Constant::Int(page.get_int(slot, field_name)?)),
+            FieldType::Float => Ok(Constant::Float(page.get_float(slot, field_name)?)),
             FieldType::String => Ok(Constant::String(page.get_string(slot, field_name)?)),
         }
     }
@@ -9910,6 +9941,11 @@ impl TableCursor for TableScan {
                 *self.current_slot.as_ref().unwrap(),
                 field_name,
                 value.as_int(),
+            )?,
+            FieldType::Float => self.record_page.as_ref().unwrap().set_float(
+                *self.current_slot.as_ref().unwrap(),
+                field_name,
+                value.as_float(),
             )?,
             FieldType::String => self.record_page.as_ref().unwrap().set_string(
                 *self.current_slot.as_ref().unwrap(),
@@ -10134,10 +10170,65 @@ mod table_scan_tests {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug)]
 pub enum Constant {
     Int(i32),
+    Float(f64),
     String(String),
+}
+
+impl PartialEq for Constant {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Constant::Int(a), Constant::Int(b)) => a == b,
+            (Constant::Float(a), Constant::Float(b)) => a.to_bits() == b.to_bits(),
+            (Constant::String(a), Constant::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Constant {}
+
+impl std::hash::Hash for Constant {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Constant::Int(v) => {
+                0i32.hash(state);
+                v.hash(state);
+            }
+            Constant::Float(v) => {
+                2i32.hash(state);
+                v.to_bits().hash(state);
+            }
+            Constant::String(s) => {
+                1i32.hash(state);
+                s.hash(state);
+            }
+        }
+    }
+}
+
+impl PartialOrd for Constant {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Constant {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Constant::Int(a), Constant::Int(b)) => a.cmp(b),
+            (Constant::Float(a), Constant::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Constant::String(a), Constant::String(b)) => a.cmp(b),
+            // Cross-type ordering: Int < Float < String
+            (Constant::Int(_), _) => Ordering::Less,
+            (_, Constant::Int(_)) => Ordering::Greater,
+            (Constant::Float(_), Constant::String(_)) => Ordering::Less,
+            (Constant::String(_), Constant::Float(_)) => Ordering::Greater,
+        }
+    }
 }
 
 impl Constant {
@@ -10145,6 +10236,13 @@ impl Constant {
         match self {
             Constant::Int(value) => *value,
             _ => panic!("Expected an integer constant"),
+        }
+    }
+
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Constant::Float(value) => *value,
+            _ => panic!("Expected a float constant"),
         }
     }
 
@@ -10156,13 +10254,15 @@ impl Constant {
     }
 
     fn serialized_size(&self) -> usize {
-        const TYPE_TAG_SIZE: usize = 4; // i32 for type tag
-        const INT_SIZE: usize = 4; // i32 for integer value
-        const STR_LEN_SIZE: usize = 4; // i32 for string length
+        const TYPE_TAG_SIZE: usize = 4;
+        const INT_SIZE: usize = 4;
+        const FLOAT_SIZE: usize = 8;
+        const STR_LEN_SIZE: usize = 4;
 
         TYPE_TAG_SIZE
             + match self {
                 Constant::Int(_) => INT_SIZE,
+                Constant::Float(_) => FLOAT_SIZE,
                 Constant::String(s) => STR_LEN_SIZE + s.len(),
             }
     }
@@ -10170,6 +10270,7 @@ impl Constant {
     fn successor(&self) -> Option<Constant> {
         match self {
             Constant::Int(value) => value.checked_add(1).map(Constant::Int),
+            Constant::Float(_) => None,
             Constant::String(value) => {
                 let mut next = value.clone();
                 next.push('\0');
@@ -10182,11 +10283,21 @@ impl Constant {
 impl TryInto<Vec<u8>> for Constant {
     type Error = Box<dyn Error>;
 
+    /// Encodes with a 4-byte little-endian type tag so all variants are unambiguous:
+    /// tag 0 = Int (4 bytes), tag 1 = String (4-byte len + bytes), tag 2 = Float (8 bytes).
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         let mut buf = Vec::new();
         match self {
-            Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            Constant::Int(v) => {
+                buf.extend_from_slice(&0i32.to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Constant::Float(v) => {
+                buf.extend_from_slice(&2i32.to_le_bytes());
+                buf.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
             Constant::String(s) => {
+                buf.extend_from_slice(&1i32.to_le_bytes());
                 let len: u32 = s
                     .len()
                     .try_into()
@@ -10268,6 +10379,21 @@ impl RecordPage {
             .to_string())
     }
 
+    fn get_float(&self, slot: usize, field_name: &str) -> SimpleDBResult<f64> {
+        self.txn
+            .lock_row_s(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        Ok(self
+            .txn
+            .pin_read_guard(&self.block_id)?
+            .into_heap_view(&self.layout)
+            .unwrap()
+            .row(slot)
+            .unwrap()
+            .get_column(field_name)
+            .unwrap()
+            .as_float())
+    }
+
     /// Sets an integer value in the specified slot and field.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.txn
@@ -10296,6 +10422,22 @@ impl RecordPage {
             .row_mut(slot)?
             .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
         row.set_column(field_name, &Constant::String(value.to_string()))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
+    }
+
+    fn set_float(&self, slot: usize, field_name: &str, value: f64) -> SimpleDBResult<()> {
+        self.txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::Float(value))
             .ok_or_else(|| -> Box<dyn Error> {
                 format!("field '{field_name}' not in schema").into()
             })?;
@@ -10472,6 +10614,7 @@ impl Layout {
             let info = self.schema.info.get(f)?;
             match info.field_type {
                 FieldType::Int => offset += info.length,
+                FieldType::Float => offset += info.length,
                 FieldType::String => offset += Self::INT_BYTES + info.length,
             }
         }
@@ -10489,6 +10632,7 @@ impl Layout {
             let info = self.schema.info.get(f).unwrap();
             match info.field_type {
                 FieldType::Int => size += info.length,
+                FieldType::Float => size += info.length,
                 FieldType::String => size += Self::INT_BYTES + info.length,
             }
         }
@@ -10514,6 +10658,7 @@ impl Layout {
         for value in values {
             match value {
                 Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+                Constant::Float(v) => buf.extend_from_slice(&v.to_bits().to_le_bytes()),
                 Constant::String(s) => {
                     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
@@ -10572,6 +10717,9 @@ impl Layout {
                     Some(Constant::Int(v)) => {
                         data.extend_from_slice(&v.to_le_bytes());
                     }
+                    Some(Constant::Float(v)) => {
+                        data.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
                     Some(Constant::String(s)) => {
                         data.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         data.extend_from_slice(s.as_bytes());
@@ -10604,6 +10752,7 @@ impl Layout {
             let info = self.schema.info.get(fname)?;
             match info.field_type {
                 FieldType::Int => offset += 4,
+                FieldType::Float => offset += 8,
                 FieldType::String => {
                     let len =
                         u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
@@ -10616,6 +10765,9 @@ impl Layout {
             FieldType::Int => Some(Constant::Int(i32::from_le_bytes(
                 payload[offset..offset + 4].try_into().ok()?,
             ))),
+            FieldType::Float => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            )))),
             FieldType::String => {
                 let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
                 Some(Constant::String(
@@ -10645,6 +10797,11 @@ impl Layout {
                     let v = i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
                     result.push(Some(Constant::Int(v)));
                     offset += 4;
+                }
+                FieldType::Float => {
+                    let bits = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+                    result.push(Some(Constant::Float(f64::from_bits(bits))));
+                    offset += 8;
                 }
                 FieldType::String => {
                     let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap())
@@ -10688,6 +10845,7 @@ mod layout_tests {
 pub enum FieldType {
     Int = 0,
     String = 1,
+    Float = 2,
 }
 
 impl From<i32> for FieldType {
@@ -10695,6 +10853,7 @@ impl From<i32> for FieldType {
         match value {
             0 => FieldType::Int,
             1 => FieldType::String,
+            2 => FieldType::Float,
             _ => panic!("Invalid field type"),
         }
     }
@@ -10740,8 +10899,14 @@ impl Schema {
             .or_insert_with(|| FieldInfo { field_type, length });
     }
 
+    const FLOAT_BYTES: usize = 8;
+
     fn add_int_field(&mut self, field_name: &str) {
         self.add_field(field_name, FieldType::Int, Self::INT_BYTES);
+    }
+
+    pub fn add_float_field(&mut self, field_name: &str) {
+        self.add_field(field_name, FieldType::Float, Self::FLOAT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
@@ -13540,6 +13705,10 @@ impl From<&LogRecord> for Vec<u8> {
                         push_i32(&mut buf, 0); // type tag for Int
                         push_i32(&mut buf, *v);
                     }
+                    Constant::Float(v) => {
+                        push_i32(&mut buf, 2); // type tag for Float
+                        buf.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
                     Constant::String(s) => {
                         push_i32(&mut buf, 1); // type tag for String
                         push_string(&mut buf, s);
@@ -13597,6 +13766,10 @@ impl From<&LogRecord> for Vec<u8> {
                     Constant::Int(v) => {
                         push_i32(&mut buf, 0); // type tag for Int
                         push_i32(&mut buf, *v);
+                    }
+                    Constant::Float(v) => {
+                        push_i32(&mut buf, 2); // type tag for Float
+                        buf.extend_from_slice(&v.to_bits().to_le_bytes());
                     }
                     Constant::String(s) => {
                         push_i32(&mut buf, 1); // type tag for String
@@ -13931,6 +14104,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 let key = match key_type {
                     0 => Constant::Int(read_i32(&value, &mut pos)?),
                     1 => Constant::String(read_string(&value, &mut pos)?),
+                    2 => Constant::Float(f64::from_bits(read_u64(&value, &mut pos)?)),
                     _ => return Err("invalid constant type tag".into()),
                 };
                 let rid = RID::new(read_usize(&value, &mut pos)?, read_usize(&value, &mut pos)?);
@@ -13985,6 +14159,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 let key = match key_type {
                     0 => Constant::Int(read_i32(&value, &mut pos)?),
                     1 => Constant::String(read_string(&value, &mut pos)?),
+                    2 => Constant::Float(f64::from_bits(read_u64(&value, &mut pos)?)),
                     _ => return Err("invalid constant type tag".into()),
                 };
                 let child_block = read_usize(&value, &mut pos)?;

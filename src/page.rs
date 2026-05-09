@@ -4198,6 +4198,9 @@ impl BTreeLeafEntry {
             Constant::Int(v) => {
                 bytes[key_offset..key_offset + 4].copy_from_slice(&v.to_le_bytes());
             }
+            Constant::Float(v) => {
+                bytes[key_offset..key_offset + 8].copy_from_slice(&v.to_bits().to_le_bytes());
+            }
             Constant::String(s) => {
                 let len = s.len() as u32;
                 bytes[key_offset..key_offset + 4].copy_from_slice(&len.to_le_bytes());
@@ -4232,6 +4235,10 @@ impl BTreeLeafEntry {
             FieldType::Int => {
                 let val = i32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?);
                 Constant::Int(val)
+            }
+            FieldType::Float => {
+                let bits = u64::from_le_bytes(bytes[key_offset..key_offset + 8].try_into()?);
+                Constant::Float(f64::from_bits(bits))
             }
             FieldType::String => {
                 let len =
@@ -4279,6 +4286,9 @@ impl BTreeInternalEntry {
             Constant::Int(v) => {
                 bytes[key_offset..key_offset + 4].copy_from_slice(&v.to_le_bytes());
             }
+            Constant::Float(v) => {
+                bytes[key_offset..key_offset + 8].copy_from_slice(&v.to_bits().to_le_bytes());
+            }
             Constant::String(s) => {
                 let len = s.len() as u32;
                 bytes[key_offset..key_offset + 4].copy_from_slice(&len.to_le_bytes());
@@ -4309,6 +4319,10 @@ impl BTreeInternalEntry {
             FieldType::Int => {
                 let val = i32::from_le_bytes(bytes[key_offset..key_offset + 4].try_into()?);
                 Constant::Int(val)
+            }
+            FieldType::Float => {
+                let bits = u64::from_le_bytes(bytes[key_offset..key_offset + 8].try_into()?);
+                Constant::Float(f64::from_bits(bits))
             }
             FieldType::String => {
                 let len =
@@ -6152,22 +6166,30 @@ impl<'a> BTreeLeafPage<'a> {
         self.record_space.bytes.get(start..start + len)
     }
 
-    /// Decode high key using leaf encoding (int or len+utf8 string).
+    /// Decode high key. Encoding uses a 4-byte little-endian type tag:
+    /// 0 = Int (next 4 bytes), 1 = String (next 4-byte len + bytes), 2 = Float (next 8 bytes).
     fn high_key(&self, _layout: &Layout) -> Option<Constant> {
         let bytes = self.high_key_bytes()?;
-        if bytes.len() == 4 {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(bytes);
-            return Some(Constant::Int(i32::from_le_bytes(buf)));
+        if bytes.len() < 4 {
+            return None;
         }
-        if bytes.len() >= 4 {
-            let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-            let sbytes = bytes.get(4..4 + len)?;
-            if let Ok(s) = std::str::from_utf8(sbytes) {
-                return Some(Constant::String(s.to_string()));
+        let tag = i32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        match tag {
+            0 => Some(Constant::Int(i32::from_le_bytes(
+                bytes[4..8].try_into().ok()?,
+            ))),
+            2 => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
+                bytes[4..12].try_into().ok()?,
+            )))),
+            1 => {
+                let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+                let sbytes = bytes.get(8..8 + len)?;
+                std::str::from_utf8(sbytes)
+                    .ok()
+                    .map(|s| Constant::String(s.to_string()))
             }
+            _ => None,
         }
-        None
     }
 
     fn find_slot_before(&self, layout: &Layout, search_key: &Constant) -> Option<SlotId> {
@@ -6696,19 +6718,26 @@ impl<'a> BTreeInternalPage<'a> {
     #[cfg(test)]
     fn high_key(&self, _layout: &Layout) -> Option<Constant> {
         let bytes = self.high_key_bytes()?;
-        if bytes.len() == 4 {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(bytes);
-            return Some(Constant::Int(i32::from_le_bytes(buf)));
+        if bytes.len() < 4 {
+            return None;
         }
-        if bytes.len() >= 4 {
-            let len = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-            let sbytes = bytes.get(4..4 + len)?;
-            if let Ok(s) = std::str::from_utf8(sbytes) {
-                return Some(Constant::String(s.to_string()));
+        let tag = i32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        match tag {
+            0 => Some(Constant::Int(i32::from_le_bytes(
+                bytes[4..8].try_into().ok()?,
+            ))),
+            2 => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
+                bytes[4..12].try_into().ok()?,
+            )))),
+            1 => {
+                let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+                let sbytes = bytes.get(8..8 + len)?;
+                std::str::from_utf8(sbytes)
+                    .ok()
+                    .map(|s| Constant::String(s.to_string()))
             }
+            _ => None,
         }
-        None
     }
 
     fn slot_count(&self) -> usize {
