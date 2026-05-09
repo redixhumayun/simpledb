@@ -4757,23 +4757,23 @@ mod aggregate_tests {
         planner.execute_update(sql.to_string(), txn).unwrap();
     }
 
-    fn fetch_single_int(planner: &Planner, txn: Arc<Transaction>, sql: &str, field: &str) -> i32 {
+    fn fetch_rows(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        fields: &[&str],
+    ) -> Vec<Vec<Constant>> {
         let plan = planner
             .create_query_plan(sql.to_string(), Arc::clone(&txn))
             .unwrap();
         let ctx = ExecutionContext::new(txn);
         let mut scan = plan.open(&ctx);
         scan.before_first().unwrap();
-        assert!(
-            matches!(scan.next(), Some(Ok(()))),
-            "aggregate query produced no rows"
-        );
-        let val = scan.get_value(field).unwrap().as_int();
-        assert!(
-            scan.next().is_none(),
-            "aggregate query produced more than one row"
-        );
-        val
+        let mut out = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            out.push(fields.iter().map(|f| scan.get_value(f).unwrap()).collect());
+        }
+        out
     }
 
     #[test]
@@ -4788,13 +4788,15 @@ mod aggregate_tests {
                 &format!("insert into t(id, score) values ({id}, {score})"),
             );
         }
-        let result = fetch_single_int(
-            &p,
-            Arc::clone(&txn),
-            "select max(score) from t",
-            "max_score",
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select max(score) from t",
+                &["max_score"]
+            ),
+            vec![vec![Constant::Int(70)]]
         );
-        assert_eq!(result, 70);
     }
 
     #[test]
@@ -4809,13 +4811,15 @@ mod aggregate_tests {
                 &format!("insert into t(id, score) values ({id}, {score})"),
             );
         }
-        let result = fetch_single_int(
-            &p,
-            Arc::clone(&txn),
-            "select min(score) from t",
-            "min_score",
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select min(score) from t",
+                &["min_score"]
+            ),
+            vec![vec![Constant::Int(30)]]
         );
-        assert_eq!(result, 30);
     }
 
     #[test]
@@ -4830,13 +4834,15 @@ mod aggregate_tests {
                 &format!("insert into t(id, score) values ({id}, {score})"),
             );
         }
-        let result = fetch_single_int(
-            &p,
-            Arc::clone(&txn),
-            "select sum(score) from t",
-            "sum_score",
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select sum(score) from t",
+                &["sum_score"]
+            ),
+            vec![vec![Constant::Int(60)]]
         );
-        assert_eq!(result, 60);
     }
 
     #[test]
@@ -4852,13 +4858,15 @@ mod aggregate_tests {
                 &format!("insert into t(id, cat) values ({id}, {cat})"),
             );
         }
-        let result = fetch_single_int(
-            &p,
-            Arc::clone(&txn),
-            "select count(distinct cat) from t",
-            "count_distinct_cat",
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select count(distinct cat) from t",
+                &["count_distinct_cat"]
+            ),
+            vec![vec![Constant::Int(3)]]
         );
-        assert_eq!(result, 3);
     }
 
     #[test]
@@ -4874,13 +4882,15 @@ mod aggregate_tests {
                 &format!("insert into t(dept, salary) values ({dept}, {salary})"),
             );
         }
-        let result = fetch_single_int(
-            &p,
-            Arc::clone(&txn),
-            "select max(salary) from t where dept = 1",
-            "max_salary",
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select max(salary) from t where dept = 1",
+                &["max_salary"]
+            ),
+            vec![vec![Constant::Int(200)]]
         );
-        assert_eq!(result, 200);
     }
 
     #[test]
@@ -4895,12 +4905,18 @@ mod aggregate_tests {
                 &format!("insert into t(id, val) values ({id}, {val})"),
             );
         }
-        let result = fetch_single_int(&p, Arc::clone(&txn), "select max(val) from t", "max_val");
-        assert_eq!(result, 15);
-        let result = fetch_single_int(&p, Arc::clone(&txn), "select min(val) from t", "min_val");
-        assert_eq!(result, 5);
-        let result = fetch_single_int(&p, Arc::clone(&txn), "select sum(val) from t", "sum_val");
-        assert_eq!(result, 30);
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select max(val) from t", &["max_val"]),
+            vec![vec![Constant::Int(15)]]
+        );
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select min(val) from t", &["min_val"]),
+            vec![vec![Constant::Int(5)]]
+        );
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select sum(val) from t", &["sum_val"]),
+            vec![vec![Constant::Int(30)]]
+        );
     }
 }
 
