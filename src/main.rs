@@ -8262,6 +8262,16 @@ impl PredicateRangeState {
     }
 }
 
+/// Promotes an Int/Float mixed pair to (Float, Float) so comparisons are numeric.
+/// Same-type pairs are returned unchanged.
+fn coerce_numeric_pair(a: Constant, b: Constant) -> (Constant, Constant) {
+    match (&a, &b) {
+        (Constant::Int(i), Constant::Float(_)) => (Constant::Float(*i as f64), b),
+        (Constant::Float(_), Constant::Int(i)) => (a, Constant::Float(*i as f64)),
+        _ => (a, b),
+    }
+}
+
 impl Term {
     pub fn new(lhs: Expression, rhs: Expression) -> Self {
         Self {
@@ -8285,6 +8295,7 @@ impl Term {
     {
         let lhs = self.lhs.evaluate(scan)?;
         let rhs = self.rhs.evaluate(scan)?;
+        let (lhs, rhs) = coerce_numeric_pair(lhs, rhs);
 
         match self.comparison_op {
             ComparisonOp::Equal => Ok(lhs == rhs),
