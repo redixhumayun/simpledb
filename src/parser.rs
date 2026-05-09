@@ -44,20 +44,26 @@ impl<'a> Parser<'a> {
     }
 
     /// Returns true if the current token starts an aggregate function call.
+    /// These are not reserved keywords so any identifier matching a function
+    /// name is treated as an aggregate only in the SELECT context.
     fn is_aggregate_fn(&self) -> bool {
-        self.lexer.match_keyword("min")
-            || self.lexer.match_keyword("max")
-            || self.lexer.match_keyword("sum")
-            || self.lexer.match_keyword("count")
+        self.lexer.match_identifier_value("min")
+            || self.lexer.match_identifier_value("max")
+            || self.lexer.match_identifier_value("sum")
+            || self.lexer.match_identifier_value("count")
     }
 
     /// Parses one aggregate expression: `MIN(field)`, `MAX(field)`, `SUM(field)`,
     /// or `COUNT(DISTINCT field)`.
     fn parse_aggregate(&mut self) -> Result<AggregateSpec, ParserError> {
-        if self.lexer.match_keyword("count") {
-            self.lexer.eat_keyword("count")?;
+        if self.lexer.match_identifier_value("count") {
+            self.lexer.eat_identifier()?;
             self.lexer.eat_delim('(')?;
-            self.lexer.eat_keyword("distinct")?;
+            // "distinct" is not a keyword — consume it as an identifier.
+            let kw = self.lexer.eat_identifier()?;
+            if kw != "distinct" {
+                return Err(ParserError::BadSyntax);
+            }
             let field = self.lexer.eat_identifier()?;
             self.lexer.eat_delim(')')?;
             let alias = format!("count_distinct_{field}");
@@ -68,14 +74,14 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let (op, prefix) = if self.lexer.match_keyword("min") {
-            self.lexer.eat_keyword("min")?;
+        let (op, prefix) = if self.lexer.match_identifier_value("min") {
+            self.lexer.eat_identifier()?;
             (AggregateOp::Min, "min")
-        } else if self.lexer.match_keyword("max") {
-            self.lexer.eat_keyword("max")?;
+        } else if self.lexer.match_identifier_value("max") {
+            self.lexer.eat_identifier()?;
             (AggregateOp::Max, "max")
-        } else if self.lexer.match_keyword("sum") {
-            self.lexer.eat_keyword("sum")?;
+        } else if self.lexer.match_identifier_value("sum") {
+            self.lexer.eat_identifier()?;
             (AggregateOp::Sum, "sum")
         } else {
             return Err(ParserError::BadSyntax);
@@ -883,7 +889,7 @@ impl<'a> Lexer<'a> {
         let keywords = [
             "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
             "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on",
-            "order", "by", "asc", "desc", "min", "max", "sum", "count", "distinct",
+            "order", "by", "asc", "desc",
         ];
         let mut lexer = Self {
             input: string.chars().peekable(),
@@ -1049,6 +1055,11 @@ impl<'a> Lexer<'a> {
     /// Checks if current token is an identifier
     fn match_identifier(&self) -> bool {
         matches!(self.current_token, Some(Token::Identifier(_)))
+    }
+
+    /// Checks if current token is an identifier with the given value.
+    fn match_identifier_value(&self, value: &str) -> bool {
+        matches!(&self.current_token, Some(Token::Identifier(id)) if id == value)
     }
 
     /// Consumes and returns the current identifier
