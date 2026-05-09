@@ -95,6 +95,22 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - Note breaking changes (renamed methods, removed APIs, changed signatures) explicitly
    - No test plan checklist — CI covers that
 
+9. **Address PR review comments**
+   - Evaluate each comment: determine whether it identifies a genuine bug or design issue before acting
+   - Fix each distinct issue in a separate commit
+   - Reply to the comment thread using the GitHub API once the fix is committed and pushed:
+     ```bash
+     # List comment IDs for a PR
+     gh api repos/redixhumayun/simpledb/pulls/<PR>/comments --jq '.[] | {id: .id, login: .user.login, path: .path, body: .body[:80]}'
+
+     # Reply to a comment
+     gh api repos/redixhumayun/simpledb/pulls/<PR>/comments/<comment_id>/replies \
+       -f body="Fixed in <commit hash>.
+
+     <One or two sentences describing what changed and why.>"
+     ```
+   - Reply format: first line is "Fixed in <hash>.", blank line, then the brief explanation as a separate paragraph
+
 ### Profiling Workflow (REQUIRED for bottleneck analysis)
 Use this workflow when asked to profile a benchmark/workload and identify hotspots.
 

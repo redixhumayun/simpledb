@@ -43,14 +43,85 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// Parses the SELECT clause field list
-    /// Returns: Vec<String> containing selected field names
-    fn select_list(&mut self) -> Result<Vec<String>, ParserError> {
+    /// Returns true if the current token starts an aggregate function call.
+    /// These are not reserved keywords so any identifier matching a function
+    /// name is treated as an aggregate only in the SELECT context.
+    fn is_aggregate_fn(&self) -> bool {
+        self.lexer.match_identifier_value("min")
+            || self.lexer.match_identifier_value("max")
+            || self.lexer.match_identifier_value("sum")
+            || self.lexer.match_identifier_value("count")
+    }
+
+    /// Parses one aggregate expression: `MIN(field)`, `MAX(field)`, `SUM(field)`,
+    /// or `COUNT(DISTINCT field)`.
+    fn parse_aggregate(&mut self) -> Result<AggregateSpec, ParserError> {
+        if self.lexer.match_identifier_value("count") {
+            self.lexer.eat_identifier()?;
+            self.lexer.eat_delim('(')?;
+            // "distinct" is not a keyword — consume it as an identifier.
+            let kw = self.lexer.eat_identifier()?;
+            if kw != "distinct" {
+                return Err(ParserError::BadSyntax);
+            }
+            let field = self.lexer.eat_identifier()?;
+            self.lexer.eat_delim(')')?;
+            let alias = format!("count_distinct_{field}");
+            return Ok(AggregateSpec {
+                op: AggregateOp::CountDistinct,
+                field,
+                alias,
+            });
+        }
+
+        let (op, prefix) = if self.lexer.match_identifier_value("min") {
+            self.lexer.eat_identifier()?;
+            (AggregateOp::Min, "min")
+        } else if self.lexer.match_identifier_value("max") {
+            self.lexer.eat_identifier()?;
+            (AggregateOp::Max, "max")
+        } else if self.lexer.match_identifier_value("sum") {
+            self.lexer.eat_identifier()?;
+            (AggregateOp::Sum, "sum")
+        } else {
+            return Err(ParserError::BadSyntax);
+        };
+
+        self.lexer.eat_delim('(')?;
+        let field = self.lexer.eat_identifier()?;
+        self.lexer.eat_delim(')')?;
+        let alias = format!("{prefix}_{field}");
+        Ok(AggregateSpec { op, field, alias })
+    }
+
+    /// Parses the SELECT clause field list.
+    /// Returns: (output field names, aggregate specs).  For plain fields the
+    /// spec list is empty; for aggregate items the alias appears in the field list
+    /// so the final ProjectPlan can reference it by name.
+    fn select_list(&mut self) -> Result<(Vec<String>, Vec<AggregateSpec>), ParserError> {
         if self.lexer.match_delim('*') {
             self.lexer.eat_delim('*')?;
-            return Ok(vec!["*".to_string()]);
+            return Ok((vec!["*".to_string()], vec![]));
         }
-        self.field_list()
+
+        let mut fields = Vec::new();
+        let mut aggregates = Vec::new();
+
+        loop {
+            if self.is_aggregate_fn() {
+                let spec = self.parse_aggregate()?;
+                fields.push(spec.alias.clone());
+                aggregates.push(spec);
+            } else {
+                fields.push(self.lexer.eat_identifier()?);
+            }
+            if !self.lexer.match_delim(',') {
+                break;
+            }
+            self.lexer.eat_delim(',')?;
+        }
+
+        Ok((fields, aggregates))
     }
 
     /// Parses the FROM clause table list
@@ -129,10 +200,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a complete SELECT query
-    /// Returns: QueryData containing fields, tables, predicates, and ORDER BY
+    /// Returns: QueryData containing fields, tables, predicates, ORDER BY, and aggregates
     pub fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
-        let select_list = self.select_list()?;
+        let (select_fields, aggregates) = self.select_list()?;
         self.lexer.eat_keyword("from")?;
         let table_list = self.select_tables()?;
         let predicate = if self.lexer.match_keyword("where") {
@@ -148,7 +219,13 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        Ok(QueryData::new(select_list, table_list, predicate, order_by))
+        Ok(QueryData::new(
+            select_fields,
+            table_list,
+            predicate,
+            order_by,
+            aggregates,
+        ))
     }
 
     fn parse_order_by_list(&mut self) -> Result<Vec<(String, SortDirection)>, ParserError> {
@@ -731,12 +808,31 @@ pub enum SortDirection {
     Desc,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateOp {
+    Min,
+    Max,
+    Sum,
+    CountDistinct,
+}
+
+/// One aggregate expression from a SELECT list, e.g. `MAX(o_id)`.
+#[derive(Debug, Clone)]
+pub struct AggregateSpec {
+    pub op: AggregateOp,
+    /// Input column name.
+    pub field: String,
+    /// Output column name in the result schema, e.g. `max_o_id`.
+    pub alias: String,
+}
+
 #[derive(Debug)]
 pub struct QueryData {
     pub fields: Vec<String>,
     pub tables: Vec<String>,
     pub predicate: Predicate,
     pub order_by: Vec<(String, SortDirection)>,
+    pub aggregates: Vec<AggregateSpec>,
 }
 
 impl QueryData {
@@ -745,12 +841,14 @@ impl QueryData {
         tables: Vec<String>,
         predicate: Predicate,
         order_by: Vec<(String, SortDirection)>,
+        aggregates: Vec<AggregateSpec>,
     ) -> Self {
         Self {
             fields,
             tables,
             predicate,
             order_by,
+            aggregates,
         }
     }
 
@@ -957,6 +1055,11 @@ impl<'a> Lexer<'a> {
     /// Checks if current token is an identifier
     fn match_identifier(&self) -> bool {
         matches!(self.current_token, Some(Token::Identifier(_)))
+    }
+
+    /// Checks if current token is an identifier with the given value.
+    fn match_identifier_value(&self, value: &str) -> bool {
+        matches!(&self.current_token, Some(Token::Identifier(id)) if id == value)
     }
 
     /// Consumes and returns the current identifier
