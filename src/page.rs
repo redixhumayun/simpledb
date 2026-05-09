@@ -6170,19 +6170,16 @@ impl<'a> BTreeLeafPage<'a> {
     /// 0 = Int (next 4 bytes), 1 = String (next 4-byte len + bytes), 2 = Float (next 8 bytes).
     fn high_key(&self, _layout: &Layout) -> Option<Constant> {
         let bytes = self.high_key_bytes()?;
-        if bytes.len() < 4 {
-            return None;
-        }
-        let tag = i32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let tag = i32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
         match tag {
             0 => Some(Constant::Int(i32::from_le_bytes(
-                bytes[4..8].try_into().ok()?,
+                bytes.get(4..8)?.try_into().ok()?,
             ))),
             2 => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
-                bytes[4..12].try_into().ok()?,
+                bytes.get(4..12)?.try_into().ok()?,
             )))),
             1 => {
-                let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+                let len = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
                 let sbytes = bytes.get(8..8 + len)?;
                 std::str::from_utf8(sbytes)
                     .ok()
@@ -6718,19 +6715,16 @@ impl<'a> BTreeInternalPage<'a> {
     #[cfg(test)]
     fn high_key(&self, _layout: &Layout) -> Option<Constant> {
         let bytes = self.high_key_bytes()?;
-        if bytes.len() < 4 {
-            return None;
-        }
-        let tag = i32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let tag = i32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
         match tag {
             0 => Some(Constant::Int(i32::from_le_bytes(
-                bytes[4..8].try_into().ok()?,
+                bytes.get(4..8)?.try_into().ok()?,
             ))),
             2 => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
-                bytes[4..12].try_into().ok()?,
+                bytes.get(4..12)?.try_into().ok()?,
             )))),
             1 => {
-                let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+                let len = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
                 let sbytes = bytes.get(8..8 + len)?;
                 std::str::from_utf8(sbytes)
                     .ok()
