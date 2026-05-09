@@ -5881,16 +5881,21 @@ enum AggregateRunState {
 struct AggregateScan<S: Scan> {
     source: S,
     specs: Vec<AggregateSpec>,
+    /// Type-correct defaults for MIN/MAX over an empty source (one per spec).
+    /// Computed by AggregatePlan from the source schema so the result type
+    /// matches the output schema even when no rows are seen.
+    empty_defaults: Vec<Constant>,
     /// Populated by the first `next()` call; `None` means not yet computed.
     results: Option<HashMap<String, Constant>>,
     exhausted: bool,
 }
 
 impl<S: Scan> AggregateScan<S> {
-    fn new(source: S, specs: Vec<AggregateSpec>) -> Self {
+    fn new(source: S, specs: Vec<AggregateSpec>, empty_defaults: Vec<Constant>) -> Self {
         Self {
             source,
             specs,
+            empty_defaults,
             results: None,
             exhausted: false,
         }
@@ -5938,7 +5943,9 @@ impl<S: Scan> AggregateScan<S> {
         let mut results = HashMap::new();
         for (i, spec) in self.specs.iter().enumerate() {
             let result_val = match &state[i] {
-                AggregateRunState::MinMax(curr) => curr.clone().unwrap_or(Constant::Int(0)),
+                AggregateRunState::MinMax(curr) => curr
+                    .clone()
+                    .unwrap_or_else(|| self.empty_defaults[i].clone()),
                 AggregateRunState::Sum(total) => Constant::Int(*total as i32),
                 AggregateRunState::CountDistinct(set) => Constant::Int(set.len() as i32),
             };
@@ -5994,27 +6001,44 @@ struct AggregatePlan {
     source: Arc<dyn Plan>,
     specs: Vec<AggregateSpec>,
     schema: Schema,
+    /// Type-correct default values for MIN/MAX when the source produces no rows.
+    empty_defaults: Vec<Constant>,
 }
 
 impl AggregatePlan {
     fn new(source: Arc<dyn Plan>, specs: Vec<AggregateSpec>) -> Self {
         let source_schema = source.schema();
         let mut schema = Schema::new();
+        let mut empty_defaults = Vec::with_capacity(specs.len());
+
         for spec in &specs {
             match spec.op {
                 // COUNT always returns an integer.
-                AggregateOp::CountDistinct => schema.add_int_field(&spec.alias),
+                AggregateOp::CountDistinct => {
+                    schema.add_int_field(&spec.alias);
+                    empty_defaults.push(Constant::Int(0));
+                }
                 // SUM is always integer for now (no DECIMAL support yet).
-                AggregateOp::Sum => schema.add_int_field(&spec.alias),
-                // MIN/MAX preserve the input field's type.
+                AggregateOp::Sum => {
+                    schema.add_int_field(&spec.alias);
+                    empty_defaults.push(Constant::Int(0));
+                }
+                // MIN/MAX preserve the input field's type and default accordingly.
                 AggregateOp::Min | AggregateOp::Max => {
                     if let Some(info) = source_schema.info.get(&spec.field) {
                         match info.field_type {
-                            FieldType::Int => schema.add_int_field(&spec.alias),
-                            FieldType::String => schema.add_string_field(&spec.alias, info.length),
+                            FieldType::Int => {
+                                schema.add_int_field(&spec.alias);
+                                empty_defaults.push(Constant::Int(0));
+                            }
+                            FieldType::String => {
+                                schema.add_string_field(&spec.alias, info.length);
+                                empty_defaults.push(Constant::String(String::new()));
+                            }
                         }
                     } else {
                         schema.add_int_field(&spec.alias);
+                        empty_defaults.push(Constant::Int(0));
                     }
                 }
             }
@@ -6023,6 +6047,7 @@ impl AggregatePlan {
             source,
             specs,
             schema,
+            empty_defaults,
         }
     }
 }
@@ -6032,6 +6057,7 @@ impl Plan for AggregatePlan {
         Box::new(AggregateScan::new(
             self.source.open(ctx),
             self.specs.clone(),
+            self.empty_defaults.clone(),
         ))
     }
 
