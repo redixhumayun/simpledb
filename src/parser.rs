@@ -714,6 +714,59 @@ mod parser_tests {
             panic!("Expected Composite PredicateNode");
         }
     }
+
+    #[test]
+    fn test_float_constant_tokenization() {
+        let sql = "SELECT price FROM products WHERE price > 9.99";
+        let mut parser = Parser::new(sql);
+        let query = parser.query().unwrap();
+
+        if let PredicateNode::Term(term) = &query.predicate.root {
+            assert!(matches!(term.lhs, Expression::FieldName(ref name) if name == "price"));
+            assert!(matches!(
+                term.rhs,
+                Expression::Constant(Constant::Float(v)) if (v - 9.99).abs() < 1e-10
+            ));
+            assert!(matches!(term.comparison_op, ComparisonOp::GreaterThan));
+        } else {
+            panic!("Expected Term PredicateNode");
+        }
+    }
+
+    #[test]
+    fn test_negative_float_literal() {
+        let sql = "INSERT INTO t (x) VALUES (-3.14)";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::Insert(insert) = stmt {
+            assert_eq!(insert.values.len(), 1);
+            assert!(matches!(
+                insert.values[0],
+                Constant::Float(v) if (v - (-3.14)).abs() < 1e-10
+            ));
+        } else {
+            panic!("Expected InsertData");
+        }
+    }
+
+    #[test]
+    fn test_create_table_decimal_types() {
+        // DECIMAL(p,s) and NUMERIC(p,s) are aliases for float
+        let sql = "CREATE TABLE orders (id int, amount decimal(10,2), price numeric(8,4))";
+        let mut parser = Parser::new(sql);
+        let stmt = parser.update_command().unwrap();
+
+        if let SQLStatement::CreateTable(create_table) = stmt {
+            assert_eq!(create_table.table_name, "orders");
+            use crate::FieldType;
+            let schema = &create_table.schema;
+            assert_eq!(schema.info["amount"].field_type, FieldType::Float);
+            assert_eq!(schema.info["price"].field_type, FieldType::Float);
+        } else {
+            panic!("Expected CreateTableData");
+        }
+    }
 }
 
 #[derive(Debug)]
