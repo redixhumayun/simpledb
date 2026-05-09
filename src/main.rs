@@ -10231,7 +10231,7 @@ impl Ord for Constant {
         use std::cmp::Ordering;
         match (self, other) {
             (Constant::Int(a), Constant::Int(b)) => a.cmp(b),
-            (Constant::Float(a), Constant::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Constant::Float(a), Constant::Float(b)) => a.total_cmp(b),
             (Constant::String(a), Constant::String(b)) => a.cmp(b),
             // Cross-type ordering: Int < Float < String
             (Constant::Int(_), _) => Ordering::Less,
