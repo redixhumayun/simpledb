@@ -16,8 +16,7 @@
 //!
 //! # Interface
 //!
-//! All policies expose a `PolicyState` struct with three methods:
-//! - `record_hit()`: Called on cache hit to update access tracking
+//! All policies expose a `PolicyState` struct with two shared methods:
 //! - `on_frame_assigned()`: Called when a frame is newly allocated
 //! - `evict_frame()`: Selects and returns a victim frame for eviction
 

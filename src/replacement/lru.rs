@@ -14,15 +14,11 @@
 //! - Hit: O(1) with optimized promotion
 //! - Eviction: O(n) worst case if all frames pinned
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     buffer_manager::{BufferFrame, FrameMeta},
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId,
 };
 
 /// LRU policy state maintaining an intrusive doubly-linked list.
@@ -44,65 +40,6 @@ impl PolicyState {
         Self {
             intrusive_list: Mutex::new(intrusive_list),
         }
-    }
-
-    /// Records a cache hit by promoting the accessed frame to the head of the LRU list.
-    ///
-    /// Optimizes promotion for frames adjacent to the head. Returns None if the frame
-    /// no longer contains the requested block (eviction race).
-    pub fn record_hit<'a>(
-        &self,
-        buffer_pool: &'a [Arc<BufferFrame>],
-        frame_ptr: &'a Arc<BufferFrame>,
-        block_id: &BlockId,
-        resident_table: &Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
-    ) -> Option<MutexGuard<'a, FrameMeta>> {
-        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
-        let mut frame_guard = frame_ptr.lock_meta();
-        if !frame_guard
-            .block_id()
-            .is_some_and(|current| current == block_id)
-        {
-            resident_table.lock().unwrap().remove(block_id);
-            return None;
-        }
-        let current_head = intrusive_list_guard.peek_head();
-        if let Some(head) = current_head {
-            if frame_guard.index == head {
-                return Some(frame_guard);
-            }
-        }
-        let predecessor_index = frame_guard.prev();
-
-        let adjacent_to_head =
-            matches!((predecessor_index, current_head), (Some(prev), Some(head)) if prev == head);
-
-        if adjacent_to_head {
-            let mut current_head_guard =
-                current_head.map(|current_head| buffer_pool[current_head].lock_meta());
-            let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
-            let head_guard = current_head_guard
-                .as_mut()
-                .expect("Head guard must exist when list is non-empty");
-            intrusive_list_guard.promote_successor_to_head(
-                head_guard,
-                &mut frame_guard,
-                next_guard.as_mut(),
-            );
-        } else {
-            let mut current_head_guard =
-                current_head.map(|current_head| buffer_pool[current_head].lock_meta());
-            let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock_meta());
-            let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
-            intrusive_list_guard.move_to_head(
-                frame_guard.index,
-                &mut frame_guard,
-                current_head_guard.as_mut(),
-                prev_guard.as_mut(),
-                next_guard.as_mut(),
-            );
-        }
-        Some(frame_guard)
     }
 
     /// Notifies the policy that a frame has been assigned a new block.
@@ -135,10 +72,7 @@ impl PolicyState {
     ///
     /// Scans from tail (LRU) towards head, skipping pinned frames, and returns the
     /// first unpinned frame. Returns None if all frames are pinned.
-    pub fn evict_frame<'a>(
-        &self,
-        buffer_pool: &'a [Arc<BufferFrame>],
-    ) -> Option<(usize, MutexGuard<'a, FrameMeta>)> {
+    pub fn evict_frame(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         assert!(
             buffer_pool.len() > 1,
             "Buffer pools must have more than one frame for LRU replacement"
@@ -148,7 +82,11 @@ impl PolicyState {
         let mut current = tail;
         loop {
             let mut current_guard = buffer_pool[current].lock_meta();
-            if current_guard.pin_count() > 0 || current_guard.is_writeback_in_progress() {
+            if buffer_pool[current].pin_count() > 0
+                || current_guard.is_writeback_in_progress()
+                || buffer_pool[current].is_loading()
+                || buffer_pool[current].is_evicting()
+            {
                 if let Some(head) = intrusive_list_guard.peek_head() {
                     if current_guard.index == head {
                         return None;
@@ -172,7 +110,7 @@ impl PolicyState {
                 prev_node.as_mut(),
                 next_node.as_mut(),
             );
-            return Some((current, current_guard));
+            return Some(current);
         }
     }
 }
