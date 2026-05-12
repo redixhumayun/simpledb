@@ -51,11 +51,15 @@ pub enum FastPinOutcome<T> {
 /// The buffer manager uses this to keep the clean-frame accounting in one place
 /// instead of re-deriving it around every pin path.
 #[derive(Debug)]
-struct PinTransition {
-    /// Whether this call consumed the transition from zero pins to one pin.
-    became_pinned: bool,
-    /// Whether pinning removed one frame from the clean unpinned slack pool.
-    left_clean_unpinned: bool,
+enum PinTransition {
+    /// Pin count was already non-zero, so no availability accounting changed.
+    StillPinned,
+    /// Pin count transitioned `0 -> 1` on a clean frame, consuming one unit of
+    /// clean slack.
+    BecamePinnedClean,
+    /// Pin count transitioned `0 -> 1`, but the frame was not part of clean
+    /// slack because it was dirty.
+    BecamePinnedDirty,
 }
 
 /// Result of dropping a pin on a frame.
@@ -63,13 +67,14 @@ struct PinTransition {
 /// This is where the transaction side hands work to the flush side: once the
 /// last pin is gone, a dirty frame may become eligible to enqueue for flush.
 #[derive(Debug)]
-struct UnpinTransition {
-    /// Whether this call released the final pin on the frame.
-    became_unpinned: bool,
-    /// Whether the frame became clean and fully available after the unpin.
-    became_clean_unpinned: bool,
-    /// Frame index to enqueue if the frame became flushable.
-    enqueue_dirty: Option<usize>,
+enum UnpinTransition {
+    /// Pin count remained non-zero, so no availability or flush eligibility changed.
+    StillPinned,
+    /// The last pin was released and the frame became part of clean slack.
+    BecameUnpinnedClean,
+    /// The last pin was released on a dirty frame. The frame is available for
+    /// reuse, and may also need to be enqueued for background flush.
+    BecameUnpinnedDirty { enqueue_dirty: Option<usize> },
 }
 
 /// Result of marking a frame dirty after a page mutation.
@@ -262,28 +267,28 @@ impl FrameMeta {
     /// Applies the pin-side transition and reports whether that removed one
     /// clean frame from the available pool.
     fn pin_transition(&self, previous_pin_count: usize) -> PinTransition {
-        let left_clean_unpinned = previous_pin_count == 0 && self.is_clean_unpinned(0);
-        let became_pinned = previous_pin_count == 0;
-        PinTransition {
-            became_pinned,
-            left_clean_unpinned,
+        if previous_pin_count > 0 {
+            return PinTransition::StillPinned;
+        }
+        if self.is_clean_unpinned(0) {
+            PinTransition::BecamePinnedClean
+        } else {
+            PinTransition::BecamePinnedDirty
         }
     }
 
     /// Applies the unpin-side transition and reports whether the frame became
     /// flushable or newly clean-and-unpinned.
     fn unpin_transition(&mut self, new_pin_count: usize) -> UnpinTransition {
-        let became_unpinned = new_pin_count == 0;
-        let enqueue_dirty = if became_unpinned {
-            self.try_queue_dirty_if_flushable(0)
+        if new_pin_count > 0 {
+            return UnpinTransition::StillPinned;
+        }
+        if self.is_clean_unpinned(0) {
+            UnpinTransition::BecameUnpinnedClean
         } else {
-            None
-        };
-        let became_clean_unpinned = became_unpinned && self.is_clean_unpinned(0);
-        UnpinTransition {
-            became_unpinned,
-            became_clean_unpinned,
-            enqueue_dirty,
+            UnpinTransition::BecameUnpinnedDirty {
+                enqueue_dirty: self.try_queue_dirty_if_flushable(0),
+            }
         }
     }
 
@@ -705,10 +710,7 @@ impl BufferFrame {
             let meta = self.lock_meta();
             meta.pin_transition(previous_pin_count)
         } else {
-            PinTransition {
-                became_pinned: false,
-                left_clean_unpinned: false,
-            }
+            PinTransition::StillPinned
         };
         #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
         self.set_ref_bit(true);
@@ -751,10 +753,7 @@ impl BufferFrame {
             };
             meta.pin_transition(previous_pin_count)
         } else {
-            PinTransition {
-                became_pinned: false,
-                left_clean_unpinned: false,
-            }
+            PinTransition::StillPinned
         };
         #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
         self.set_ref_bit(true);
@@ -1484,12 +1483,15 @@ impl BufferManager {
             let previous_pin_count = frame.pin_count.fetch_add(1, Ordering::AcqRel);
             let transition = meta_guard.pin_transition(previous_pin_count);
             debug_assert!(
-                transition.became_pinned,
+                matches!(
+                    transition,
+                    PinTransition::BecamePinnedClean | PinTransition::BecamePinnedDirty
+                ),
                 "reserved prefetch frame must have zero pins"
             );
             drop(meta_guard);
             self.num_available.fetch_sub(1, Ordering::AcqRel);
-            if transition.left_clean_unpinned {
+            if matches!(transition, PinTransition::BecamePinnedClean) {
                 self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
             }
 
@@ -1553,15 +1555,20 @@ impl BufferManager {
                 let mut meta_guard = frame.lock_meta();
                 meta_guard.unpin_transition(previous_pin_count - 1)
             };
-            if transition.became_unpinned {
-                self.num_available.fetch_add(1, Ordering::AcqRel);
-                self.cond.notify_all();
-            }
-            if transition.became_clean_unpinned {
-                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
-            }
-            if let Some(frame_idx) = transition.enqueue_dirty {
-                self.enqueue_dirty_frame(frame_idx);
+            match transition {
+                UnpinTransition::StillPinned => {}
+                UnpinTransition::BecameUnpinnedClean => {
+                    self.num_available.fetch_add(1, Ordering::AcqRel);
+                    self.cond.notify_all();
+                    self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                }
+                UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
+                    self.num_available.fetch_add(1, Ordering::AcqRel);
+                    self.cond.notify_all();
+                    if let Some(frame_idx) = enqueue_dirty {
+                        self.enqueue_dirty_frame(frame_idx);
+                    }
+                }
             }
         }
 
@@ -1627,9 +1634,9 @@ impl BufferManager {
             Ok(None) => return FastPinOutcome::NotResident,
             Err(()) => return FastPinOutcome::Contended,
         };
-        if transition.became_pinned {
+        if !matches!(transition, PinTransition::StillPinned) {
             self.num_available.fetch_sub(1, Ordering::AcqRel);
-            if transition.left_clean_unpinned {
+            if matches!(transition, PinTransition::BecamePinnedClean) {
                 self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -1691,9 +1698,9 @@ impl BufferManager {
                     Some(transition) => transition,
                     None => return PinAttempt::Retry,
                 };
-                if transition.became_pinned {
+                if !matches!(transition, PinTransition::StillPinned) {
                     self.num_available.fetch_sub(1, Ordering::AcqRel);
-                    if transition.left_clean_unpinned {
+                    if matches!(transition, PinTransition::BecamePinnedClean) {
                         self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
@@ -1739,7 +1746,10 @@ impl BufferManager {
         let generation = frame.residency_generation();
         self.publish_resident_entry(block_id, frame_idx, generation);
         debug_assert!(
-            transition.became_pinned,
+            matches!(
+                transition,
+                PinTransition::BecamePinnedClean | PinTransition::BecamePinnedDirty
+            ),
             "newly assigned frame must have zero pins"
         );
         drop(meta_guard);
@@ -1748,12 +1758,22 @@ impl BufferManager {
         self.policy.on_frame_assigned(&self.buffer_pool, frame_idx);
 
         self.num_available.fetch_sub(1, Ordering::AcqRel);
-        if transition.left_clean_unpinned {
+        if matches!(transition, PinTransition::BecamePinnedClean) {
             self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
         }
         PinAttempt::Ready(frame)
     }
 
+    /// Releases one buffer pin and applies any last-pin bookkeeping.
+    ///
+    /// The decrement itself is atomic, but the `1 -> 0` transition still has
+    /// to consult `FrameMeta` to answer colder protocol questions:
+    /// - did the frame become part of clean slack?
+    /// - should a dirty frame now enter the flush queue?
+    /// - should waiters be notified that one reusable frame is available?
+    ///
+    /// So the hot pin count lives on `BufferFrame`, while the final transition
+    /// still reconciles availability and flush state under `FrameMeta`.
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
         let transition = {
             let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
@@ -1761,15 +1781,20 @@ impl BufferManager {
             let mut meta = frame.lock_meta();
             meta.unpin_transition(previous_pin_count - 1)
         };
-        if transition.became_unpinned {
-            self.num_available.fetch_add(1, Ordering::AcqRel);
-            self.cond.notify_all();
-        }
-        if transition.became_clean_unpinned {
-            self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
-        }
-        if let Some(frame_idx) = transition.enqueue_dirty {
-            self.enqueue_dirty_frame(frame_idx);
+        match transition {
+            UnpinTransition::StillPinned => {}
+            UnpinTransition::BecameUnpinnedClean => {
+                self.num_available.fetch_add(1, Ordering::AcqRel);
+                self.cond.notify_all();
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+            }
+            UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
+                self.num_available.fetch_add(1, Ordering::AcqRel);
+                self.cond.notify_all();
+                if let Some(frame_idx) = enqueue_dirty {
+                    self.enqueue_dirty_frame(frame_idx);
+                }
+            }
         }
     }
 
