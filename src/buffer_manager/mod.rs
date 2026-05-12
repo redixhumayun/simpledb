@@ -1727,43 +1727,6 @@ impl BufferManager {
         }
     }
 
-    /// Fast path for latch-crabbing callers.
-    ///
-    /// This is resident-only and never performs replacement policy bookkeeping,
-    /// eviction, or blocking waits.
-    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
-        let Some(entry) = self
-            .directory
-            .try_lock()
-            .ok()
-            .and_then(|directory| directory.get(block_id).cloned())
-        else {
-            return FastPinOutcome::Contended;
-        };
-        let (frame_idx, generation) = match entry {
-            DirectoryEntry::Resident {
-                frame_idx,
-                generation,
-            } => (frame_idx, generation),
-            DirectoryEntry::Installing => return FastPinOutcome::NotResident,
-        };
-        let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
-
-        let transition = match frame_ptr.try_pin_from_directory_nowait(generation) {
-            Ok(Some(transition)) => transition,
-            Ok(None) => return FastPinOutcome::NotResident,
-            Err(()) => return FastPinOutcome::Contended,
-        };
-        if !matches!(transition, PinTransition::StillPinned) {
-            self.num_available.fetch_sub(1, Ordering::AcqRel);
-            if matches!(transition, PinTransition::BecamePinnedClean) {
-                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-
-        FastPinOutcome::Ready(frame_ptr)
-    }
-
     /// Full pin path with immediate replacement policy updates and eviction.
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<BufferFrame>, Box<dyn Error>> {
         let start = Instant::now();
@@ -1882,6 +1845,43 @@ impl BufferManager {
             self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
         }
         PinAttempt::Ready(frame)
+    }
+
+    /// Fast path for latch-crabbing callers.
+    ///
+    /// This is resident-only and never performs replacement policy bookkeeping,
+    /// eviction, or blocking waits.
+    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
+        let Some(entry) = self
+            .directory
+            .try_lock()
+            .ok()
+            .and_then(|directory| directory.get(block_id).cloned())
+        else {
+            return FastPinOutcome::Contended;
+        };
+        let (frame_idx, generation) = match entry {
+            DirectoryEntry::Resident {
+                frame_idx,
+                generation,
+            } => (frame_idx, generation),
+            DirectoryEntry::Installing => return FastPinOutcome::NotResident,
+        };
+        let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
+
+        let transition = match frame_ptr.try_pin_from_directory_nowait(generation) {
+            Ok(Some(transition)) => transition,
+            Ok(None) => return FastPinOutcome::NotResident,
+            Err(()) => return FastPinOutcome::Contended,
+        };
+        if !matches!(transition, PinTransition::StillPinned) {
+            self.num_available.fetch_sub(1, Ordering::AcqRel);
+            if matches!(transition, PinTransition::BecamePinnedClean) {
+                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        FastPinOutcome::Ready(frame_ptr)
     }
 
     /// Releases one buffer pin and applies any last-pin bookkeeping.
