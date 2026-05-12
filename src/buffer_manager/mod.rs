@@ -447,6 +447,16 @@ impl FrameControl {
             | if self.loading { Self::LOADING_BIT } else { 0 }
             | if self.evicting { Self::EVICTING_BIT } else { 0 }
     }
+
+    /// Returns whether this decoded control state may be pinned for the given
+    /// directory generation.
+    ///
+    /// A resident pin is valid only when the frame still belongs to the same
+    /// residency generation and is not in one of the transient non-pinnable
+    /// loading/evicting phases.
+    fn can_pin_for(self, residency_generation: u64) -> bool {
+        self.generation == residency_generation && !self.loading && !self.evicting
+    }
 }
 
 /// Atomic wrapper around the packed frame residency-control word.
@@ -805,13 +815,13 @@ impl BufferFrame {
     /// slack and dirty-queue accounting remain there.
     fn try_pin_from_directory(&self, residency_generation: u64) -> Option<PinTransition> {
         let control = self.control.load();
-        if control.generation != residency_generation || control.loading || control.evicting {
+        if !control.can_pin_for(residency_generation) {
             return None;
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
         let validated = self.control.load();
-        if validated.generation != residency_generation || validated.loading || validated.evicting {
+        if !validated.can_pin_for(residency_generation) {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -845,13 +855,13 @@ impl BufferFrame {
         residency_generation: u64,
     ) -> Result<Option<PinTransition>, ()> {
         let control = self.control.load();
-        if control.generation != residency_generation || control.loading || control.evicting {
+        if !control.can_pin_for(residency_generation) {
             return Ok(None);
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
         let validated = self.control.load();
-        if validated.generation != residency_generation || validated.loading || validated.evicting {
+        if !validated.can_pin_for(residency_generation) {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return Ok(None);
         }
