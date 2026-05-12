@@ -449,6 +449,126 @@ impl FrameControl {
     }
 }
 
+/// Atomic wrapper around the packed frame residency-control word.
+///
+/// This keeps the bit encoding and CAS protocol in one place so `BufferFrame`
+/// methods work with decoded `FrameControl` values instead of raw `u64`s.
+#[derive(Debug)]
+struct AtomicFrameControl {
+    raw: AtomicU64,
+}
+
+impl AtomicFrameControl {
+    /// Creates one atomic control word from a decoded initial state.
+    fn new(initial: FrameControl) -> Self {
+        Self {
+            raw: AtomicU64::new(initial.to_raw()),
+        }
+    }
+
+    /// Loads and decodes the current residency-control state.
+    ///
+    /// Callers use this for OCC validation on resident hits and for rare
+    /// install/evict coordination when they need the full state tuple.
+    fn load(&self) -> FrameControl {
+        FrameControl::from_raw(self.raw.load(Ordering::Acquire))
+    }
+
+    /// Publishes one decoded residency-control state.
+    ///
+    /// This is used on rollback or other paths that already know the exact
+    /// state they need to restore.
+    fn store(&self, control: FrameControl) {
+        self.raw.store(control.to_raw(), Ordering::Release);
+    }
+
+    /// Returns the current residency generation used by directory validation.
+    fn generation(&self) -> u64 {
+        self.load().generation
+    }
+
+    /// Returns whether the frame is currently in its non-pinnable loading phase.
+    fn is_loading(&self) -> bool {
+        self.load().loading
+    }
+
+    /// Returns whether the frame has been claimed for reuse by an evict/install path.
+    fn is_evicting(&self) -> bool {
+        self.load().evicting
+    }
+
+    /// Starts a new residency generation and marks it non-pinnable.
+    ///
+    /// Why both bits are set here: while a frame is being refilled, hits must
+    /// fail validation exactly as if the frame had already been claimed away.
+    fn begin_loading(&self) -> u64 {
+        loop {
+            let current = self.load();
+            let next = FrameControl::new(current.generation.wrapping_add(1), true, true);
+            if self
+                .raw
+                .compare_exchange(
+                    current.to_raw(),
+                    next.to_raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return next.generation;
+            }
+        }
+    }
+
+    /// Clears the transient loading/evicting bits for the current generation.
+    ///
+    /// After this transition, ordinary resident pins may validate and proceed again.
+    fn finish_loading(&self) {
+        loop {
+            let current = self.load();
+            let next = FrameControl::new(current.generation, false, false);
+            if self
+                .raw
+                .compare_exchange(
+                    current.to_raw(),
+                    next.to_raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Tries to mark the current generation as claimed for eviction.
+    ///
+    /// Returns the pre-claim state so the caller can restore it if a later
+    /// colder check under `FrameMeta` fails.
+    fn try_claim_for_eviction(&self, pin_count: usize) -> Option<FrameControl> {
+        loop {
+            let current = self.load();
+            if current.loading || current.evicting || pin_count > 0 {
+                return None;
+            }
+            let claimed = FrameControl::new(current.generation, current.loading, true);
+            if self
+                .raw
+                .compare_exchange(
+                    current.to_raw(),
+                    claimed.to_raw(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(current);
+            }
+        }
+    }
+}
+
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for FrameMeta {
     fn prev(&self) -> Option<usize> {
@@ -491,16 +611,40 @@ impl IntrusiveNode for MutexGuard<'_, FrameMeta> {
 // BufferFrame
 // ============================================================================
 
+/// One stable slot in the buffer pool.
+///
+/// A frame owns three different kinds of state:
+/// - page bytes behind `RwLock<Page>`
+/// - cold metadata behind `FrameMeta`
+/// - hot per-frame access state in atomics
+///
+/// Why this split exists: resident hits touch pin count, policy bits, and
+/// residency-control flags far more often than they touch flush metadata or
+/// page contents. Keeping those hot fields on `BufferFrame` lets the common
+/// path avoid serializing on `FrameMeta`.
 #[derive(Debug)]
 pub struct BufferFrame {
+    /// Storage interface used to read and write the page currently assigned to this frame.
     file_manager: SharedFS,
+    /// WAL manager used by writeback paths to preserve WAL-before-data ordering.
     log_manager: Arc<Mutex<LogManager>>,
+    /// Page bytes currently cached in this frame.
+    ///
+    /// This latch protects page contents only. Buffer pinning and residency
+    /// validation are handled separately.
     page: RwLock<Page>,
+    /// Cold per-frame metadata: block identity, flush protocol state, and
+    /// replacement-list links for list-based policies.
     meta: Mutex<FrameMeta>,
+    /// Hot pin count updated on every pin/unpin.
     pin_count: AtomicUsize,
     #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+    /// Hot policy reference bit used by Clock and SIEVE.
     ref_bit: AtomicBool,
-    control: AtomicU64,
+    /// Packed residency-control word used by OCC validation.
+    ///
+    /// Holds residency generation plus transient `loading/evicting` flags.
+    control: AtomicFrameControl,
 }
 
 impl BufferFrame {
@@ -518,7 +662,7 @@ impl BufferFrame {
             pin_count: AtomicUsize::new(0),
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: AtomicBool::new(false),
-            control: AtomicU64::new(FrameControl::new(0, false, false).to_raw()),
+            control: AtomicFrameControl::new(FrameControl::new(0, false, false)),
         }
     }
 
@@ -592,32 +736,19 @@ impl BufferFrame {
         self.pin_count() > 0
     }
 
-    /// Loads the packed residency-control word.
-    ///
-    /// The control word is the source of truth for OCC validation on resident
-    /// hits: generation plus transient loading/evicting bits.
-    fn load_control(&self) -> FrameControl {
-        FrameControl::from_raw(self.control.load(Ordering::Acquire))
-    }
-
-    /// Publishes one new residency-control state.
-    fn store_control(&self, control: FrameControl) {
-        self.control.store(control.to_raw(), Ordering::Release);
-    }
-
     /// Returns the current residency generation used by directory validation.
     pub(crate) fn residency_generation(&self) -> u64 {
-        self.load_control().generation
+        self.control.generation()
     }
 
     /// Returns whether the frame is currently being filled with a new page.
     pub(crate) fn is_loading(&self) -> bool {
-        self.load_control().loading
+        self.control.is_loading()
     }
 
     /// Returns whether the frame has been claimed for reuse.
     pub(crate) fn is_evicting(&self) -> bool {
-        self.load_control().evicting
+        self.control.is_evicting()
     }
 
     /// Starts installing a specific block into this frame.
@@ -625,11 +756,8 @@ impl BufferFrame {
     /// This bumps the residency generation before the new contents become
     /// pinnable so stale directory observations fail validation.
     fn begin_loading_residency_locked(&self, meta: &mut FrameMeta, block_id: BlockId) -> u64 {
-        let current = self.load_control();
-        let next = FrameControl::new(current.generation.wrapping_add(1), true, true);
         meta.assign_resident(block_id);
-        self.store_control(next);
-        next.generation
+        self.control.begin_loading()
     }
 
     /// Marks the frame as reserved for an incoming block before bytes arrive.
@@ -637,17 +765,13 @@ impl BufferFrame {
     /// Prefetch uses this placeholder state so duplicate install attempts see a
     /// transient non-pinnable generation instead of a reusable frame.
     fn begin_loading_placeholder_locked(&self, meta: &mut FrameMeta) -> u64 {
-        let current = self.load_control();
-        let next = FrameControl::new(current.generation.wrapping_add(1), true, true);
         meta.clear_residency();
-        self.store_control(next);
-        next.generation
+        self.control.begin_loading()
     }
 
     /// Makes the current residency visible to ordinary pins again.
     fn finish_loading_residency(&self) {
-        let current = self.load_control();
-        self.store_control(FrameControl::new(current.generation, false, false));
+        self.control.finish_loading();
     }
 
     /// Tries to claim the frame for eviction/reuse.
@@ -657,27 +781,13 @@ impl BufferFrame {
     /// - then lock `FrameMeta` to verify colder writeback constraints
     fn try_claim_for_eviction(&self) -> Option<MutexGuard<'_, FrameMeta>> {
         loop {
-            let current = self.load_control();
-            if current.loading || current.evicting || self.pin_count() > 0 {
+            let Some(previous) = self.control.try_claim_for_eviction(self.pin_count()) else {
                 return None;
-            }
-            let claimed = FrameControl::new(current.generation, current.loading, true);
-            if self
-                .control
-                .compare_exchange(
-                    current.to_raw(),
-                    claimed.to_raw(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
+            };
 
             let mut meta = self.lock_meta();
             if !meta.claim_for_eviction() {
-                self.store_control(current);
+                self.control.store(previous);
                 return None;
             }
             return Some(meta);
@@ -694,13 +804,13 @@ impl BufferFrame {
     /// Only the `0 -> 1` transition still consults `FrameMeta`, because clean
     /// slack and dirty-queue accounting remain there.
     fn try_pin_from_directory(&self, residency_generation: u64) -> Option<PinTransition> {
-        let control = self.load_control();
+        let control = self.control.load();
         if control.generation != residency_generation || control.loading || control.evicting {
             return None;
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
-        let validated = self.load_control();
+        let validated = self.control.load();
         if validated.generation != residency_generation || validated.loading || validated.evicting {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return None;
@@ -734,13 +844,13 @@ impl BufferFrame {
         &self,
         residency_generation: u64,
     ) -> Result<Option<PinTransition>, ()> {
-        let control = self.load_control();
+        let control = self.control.load();
         if control.generation != residency_generation || control.loading || control.evicting {
             return Ok(None);
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
-        let validated = self.load_control();
+        let validated = self.control.load();
         if validated.generation != residency_generation || validated.loading || validated.evicting {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return Ok(None);
