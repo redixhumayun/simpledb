@@ -248,6 +248,10 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
+    /// CREATE has no explicit branch here because `create()` consumes the
+    /// `create` keyword itself, unlike INSERT/DELETE/UPDATE which are matched
+    /// above and then dispatched. Anything that isn't insert/delete/update
+    /// falls through and either succeeds as CREATE or returns BadSyntax.
     pub fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
         if self.lexer.match_keyword("insert") {
             Ok(SQLStatement::Insert(self.insert()?))
@@ -260,6 +264,9 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The `self.lexer.match_keyword("view")` and `match_keyword("index")` calls
+    /// in the view/index branches are no-ops — their return value is discarded.
+    /// The keyword is left unconsumed here and eaten by `create_view`/`create_index`.
     fn create(&mut self) -> Result<SQLStatement, ParserError> {
         self.lexer.eat_keyword("create")?;
         if self.lexer.match_keyword("table") {
@@ -355,6 +362,8 @@ impl<'a> Parser<'a> {
         Ok(CreateIndexData::new(index_name, table_name, field))
     }
 
+    /// Field count and value count are not validated to match; a mismatch
+    /// produces a silently malformed `InsertData` that will fail later at execution.
     fn insert(&mut self) -> Result<InsertData, ParserError> {
         self.lexer.eat_keyword("insert")?;
         self.lexer.eat_keyword("into")?;
@@ -369,6 +378,8 @@ impl<'a> Parser<'a> {
         Ok(InsertData::new(table_name, field_list, constants))
     }
 
+    /// WHERE is optional; omitting it produces an empty predicate that matches
+    /// every row, so the executor will delete the entire table.
     fn delete(&mut self) -> Result<DeleteData, ParserError> {
         self.lexer.eat_keyword("delete")?;
         self.lexer.eat_keyword("from")?;
@@ -384,6 +395,8 @@ impl<'a> Parser<'a> {
         Ok(DeleteData::new(table_name, predicate))
     }
 
+    /// WHERE is optional; omitting it produces an empty predicate that matches
+    /// every row, so the executor will update the entire table.
     fn modify(&mut self) -> Result<ModifyData, ParserError> {
         self.lexer.eat_keyword("update")?;
         let table_name = self.lexer.eat_identifier()?;
@@ -935,6 +948,8 @@ impl<'a> Lexer<'a> {
     const SLASH: char = '/';
     const PERCENT: char = '%';
 
+    /// `next_token()` is called at the end to prime `current_token`. Without it
+    /// every `match_*` call would return false because `current_token` starts as `None`.
     fn new(string: &'a str) -> Self {
         let keywords = [
             "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
