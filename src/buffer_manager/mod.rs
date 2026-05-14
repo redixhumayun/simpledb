@@ -1727,9 +1727,9 @@ impl BufferManager {
     ///
     /// [`PinTransition`] tells us whether this pin consumed a reusable frame from
     /// the buffer pool's slack accounting:
-    /// - `StillPinned`: no global counters change
-    /// - `BecamePinnedClean`: one available frame and one clean-slack frame were consumed
-    /// - `BecamePinnedDirty`: one available frame was consumed, but not from clean slack
+    /// - [`PinTransition::StillPinned`]: no global counters change
+    /// - [`PinTransition::BecamePinnedClean`]: one available frame and one clean-slack frame were consumed
+    /// - [`PinTransition::BecamePinnedDirty`]: one available frame was consumed, but not from clean slack
     fn apply_pin_transition_accounting(&self, transition: PinTransition) {
         if !matches!(transition, PinTransition::StillPinned) {
             self.num_available.fetch_sub(1, Ordering::AcqRel);
@@ -1858,7 +1858,7 @@ impl BufferManager {
     ///
     /// The fast path still has to complete policy hit bookkeeping. If that
     /// bookkeeping would block, the speculative pin is rolled back and the
-    /// caller sees `Contended`.
+    /// caller sees [`FastPinOutcome::Contended`].
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
         let Some(entry) = self
             .directory
