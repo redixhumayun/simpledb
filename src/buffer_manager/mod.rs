@@ -1079,6 +1079,10 @@ impl BufferManager {
         txn_num: usize,
     ) -> Vec<PendingWriteback> {
         let mut pending = Vec::new();
+        // Non-txn_num frames and unclaimed frames are deferred so they are
+        // re-enqueued in bulk after the loop. Inline re-enqueue inside the loop
+        // causes infinite cycling when the queue contains only other-txn frames.
+        let mut deferred = Vec::new();
         while pending.len() < batch_limit {
             let Some(frame_idx) = self.dirty_queue.lock().unwrap().pop_front() else {
                 break;
@@ -1090,16 +1094,16 @@ impl BufferManager {
                 continue;
             }
             if meta.txn() != Some(txn_num) {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
-                    self.enqueue_dirty_frame(frame_idx);
+                if meta.try_queue_dirty_if_flushable().is_some() {
+                    deferred.push(frame_idx);
                 }
                 continue;
             }
             let Some((block_id, lsn, generation, snapshot)) =
                 buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
             else {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
-                    self.enqueue_dirty_frame(frame_idx);
+                if meta.try_queue_dirty_if_flushable().is_some() {
+                    deferred.push(frame_idx);
                 }
                 continue;
             };
@@ -1110,6 +1114,9 @@ impl BufferManager {
                 generation,
                 snapshot,
             });
+        }
+        for frame_idx in deferred {
+            self.enqueue_dirty_frame(frame_idx);
         }
         pending
     }
