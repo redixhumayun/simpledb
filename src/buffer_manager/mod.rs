@@ -2192,8 +2192,11 @@ impl BufferManager {
         let transition = {
             let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
             assert!(previous_pin_count > 0, "BufferManager::unpin on zero pins");
+            if previous_pin_count > 1 {
+                return;
+            }
             let mut meta = frame.lock_meta();
-            meta.unpin_transition(previous_pin_count - 1)
+            meta.unpin_transition(0)
         };
         match transition {
             UnpinTransition::StillPinned => {}
