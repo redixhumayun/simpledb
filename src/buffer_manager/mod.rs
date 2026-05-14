@@ -14,6 +14,7 @@ use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        TryLockError,
     },
     thread,
     time::{Duration, Instant},
@@ -44,6 +45,51 @@ pub enum FastPinOutcome<T> {
     NotResident,
     /// The page may be resident, but the fast path would have to wait on an internal lock.
     Contended,
+}
+
+/// Opt-in counters for profiling shared buffer-pool synchronization points.
+///
+/// Enable with `SIMPLEDB_BUFFER_POOL_PROFILE_LOCKS=1`. The counters are
+/// intentionally process-global because the profiling binary owns one active
+/// buffer manager at a time and needs cheap end-of-run reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BufferPoolProfileCounters {
+    pub directory_lock_calls: u64,
+    pub directory_lock_contended: u64,
+    pub directory_lock_elapsed_ns: u64,
+    pub directory_try_lock_calls: u64,
+    pub directory_try_lock_failed: u64,
+    pub frame_meta_lock_calls: u64,
+    pub frame_meta_lock_contended: u64,
+    pub frame_meta_lock_elapsed_ns: u64,
+    pub frame_meta_try_lock_calls: u64,
+    pub frame_meta_try_lock_failed: u64,
+    pub free_wait_notify_all_calls: u64,
+    pub free_wait_notify_all_elapsed_ns: u64,
+}
+
+static PROFILE_COUNTERS_ENABLED: OnceLock<bool> = OnceLock::new();
+static DIRECTORY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIRECTORY_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static DIRECTORY_LOCK_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+static DIRECTORY_TRY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+static DIRECTORY_TRY_LOCK_FAILED: AtomicU64 = AtomicU64::new(0);
+static FRAME_META_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+static FRAME_META_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static FRAME_META_LOCK_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+static FRAME_META_TRY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+static FRAME_META_TRY_LOCK_FAILED: AtomicU64 = AtomicU64::new(0);
+static FREE_WAIT_NOTIFY_ALL_CALLS: AtomicU64 = AtomicU64::new(0);
+static FREE_WAIT_NOTIFY_ALL_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+
+fn profile_counters_enabled() -> bool {
+    *PROFILE_COUNTERS_ENABLED.get_or_init(|| {
+        std::env::var("SIMPLEDB_BUFFER_POOL_PROFILE_LOCKS").is_ok_and(|value| value == "1")
+    })
+}
+
+fn elapsed_ns_since(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 /// Result of moving a frame from clean/unpinned into an actively pinned state.
@@ -681,7 +727,25 @@ impl BufferFrame {
     /// This should stay off the uncontended resident-hit fast path as much as
     /// possible; atomics on `BufferFrame` exist to avoid taking this lock there.
     pub(crate) fn lock_meta(&self) -> MutexGuard<'_, FrameMeta> {
-        self.meta.lock().unwrap()
+        if !profile_counters_enabled() {
+            return self.meta.lock().unwrap();
+        }
+
+        FRAME_META_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        match self.meta.try_lock() {
+            Ok(guard) => {
+                FRAME_META_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                FRAME_META_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+                let guard = self.meta.lock().unwrap();
+                FRAME_META_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::Poisoned(_)) => self.meta.lock().unwrap(),
+        }
     }
 
     /// Tries to lock cold metadata without blocking.
@@ -689,7 +753,19 @@ impl BufferFrame {
     /// Used by nonblocking paths such as `pin_fast()` where waiting behind page
     /// or flush work would violate the caller contract.
     pub(crate) fn try_lock_meta(&self) -> Option<MutexGuard<'_, FrameMeta>> {
-        self.meta.try_lock().ok()
+        if profile_counters_enabled() {
+            FRAME_META_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        match self.meta.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => {
+                if profile_counters_enabled() {
+                    FRAME_META_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(TryLockError::Poisoned(_)) => None,
+        }
     }
 
     /// Returns the current resident block identity, if any.
@@ -790,18 +866,14 @@ impl BufferFrame {
     /// - atomically set `evicting` so new pins fail OCC validation
     /// - then lock [`FrameMeta`] to verify colder writeback constraints
     fn try_claim_for_eviction(&self) -> Option<MutexGuard<'_, FrameMeta>> {
-        loop {
-            let Some(previous) = self.control.try_claim_for_eviction(self.pin_count()) else {
-                return None;
-            };
+        let previous = self.control.try_claim_for_eviction(self.pin_count())?;
 
-            let mut meta = self.lock_meta();
-            if !meta.claim_for_eviction() {
-                self.control.store(previous);
-                return None;
-            }
-            return Some(meta);
+        let mut meta = self.lock_meta();
+        if !meta.claim_for_eviction() {
+            self.control.store(previous);
+            return None;
         }
+        Some(meta)
     }
 
     /// Attempts one resident pin using directory-provided generation.
@@ -1407,6 +1479,36 @@ impl BufferManager {
         self.notify_flusher();
     }
 
+    /// Wakes one thread waiting for a reusable buffer frame.
+    ///
+    /// Why this stays narrow: one returned frame can satisfy at most one waiter,
+    /// and waking every waiter turns ordinary last-unpin traffic into a global
+    /// futex storm when the pool is not actually exhausted.
+    fn notify_free_buffer_waiters_one(&self) {
+        if !profile_counters_enabled() {
+            self.cond.notify_one();
+            return;
+        }
+
+        FREE_WAIT_NOTIFY_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        self.cond.notify_one();
+        FREE_WAIT_NOTIFY_ALL_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+    }
+
+    /// Returns one frame to the available-frame count and wakes a waiter only
+    /// when the pool transitions from exhausted to non-exhausted.
+    ///
+    /// The `0 -> 1` gate is the key invariant: if `num_available` was already
+    /// positive, no pin caller should be blocked on the free-buffer condvar, so
+    /// notifying would add synchronization cost without changing progress.
+    fn release_available_frame(&self) {
+        let previous = self.num_available.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            self.notify_free_buffer_waiters_one();
+        }
+    }
+
     /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
     fn collect_dirty_snapshots_for_txn(
         &self,
@@ -1458,8 +1560,46 @@ impl BufferManager {
         })
     }
 
+    fn lock_directory(&self) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
+        if !profile_counters_enabled() {
+            return self.directory.lock().unwrap();
+        }
+
+        DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        match self.directory.try_lock() {
+            Ok(guard) => {
+                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                DIRECTORY_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+                let guard = self.directory.lock().unwrap();
+                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::Poisoned(_)) => self.directory.lock().unwrap(),
+        }
+    }
+
+    fn try_lock_directory(&self) -> Option<MutexGuard<'_, HashMap<BlockId, DirectoryEntry>>> {
+        if profile_counters_enabled() {
+            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        match self.directory.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => {
+                if profile_counters_enabled() {
+                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(TryLockError::Poisoned(_)) => None,
+        }
+    }
+
     fn directory_entry(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        self.directory.lock().unwrap().get(block_id).cloned()
+        self.lock_directory().get(block_id).cloned()
     }
 
     fn remove_directory_entry_if_matches(
@@ -1468,7 +1608,7 @@ impl BufferManager {
         frame_idx: usize,
         generation: u64,
     ) {
-        let mut directory = self.directory.lock().unwrap();
+        let mut directory = self.lock_directory();
         let remove = matches!(
             directory.get(block_id),
             Some(DirectoryEntry::Resident {
@@ -1482,7 +1622,7 @@ impl BufferManager {
     }
 
     fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        let mut directory = self.directory.lock().unwrap();
+        let mut directory = self.lock_directory();
         match directory.get(block_id).cloned() {
             Some(existing) => Some(existing),
             None => {
@@ -1493,7 +1633,7 @@ impl BufferManager {
     }
 
     fn publish_resident_entry(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
-        let mut directory = self.directory.lock().unwrap();
+        let mut directory = self.lock_directory();
         directory.insert(
             block_id.clone(),
             DirectoryEntry::Resident {
@@ -1504,7 +1644,7 @@ impl BufferManager {
     }
 
     fn clear_installing_entry(&self, block_id: &BlockId) {
-        let mut directory = self.directory.lock().unwrap();
+        let mut directory = self.lock_directory();
         if matches!(directory.get(block_id), Some(DirectoryEntry::Installing)) {
             directory.remove(block_id);
         }
@@ -1539,6 +1679,39 @@ impl BufferManager {
         }
     }
 
+    pub fn reset_profile_counters() {
+        DIRECTORY_LOCK_CALLS.store(0, Ordering::Relaxed);
+        DIRECTORY_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+        DIRECTORY_LOCK_ELAPSED_NS.store(0, Ordering::Relaxed);
+        DIRECTORY_TRY_LOCK_CALLS.store(0, Ordering::Relaxed);
+        DIRECTORY_TRY_LOCK_FAILED.store(0, Ordering::Relaxed);
+        FRAME_META_LOCK_CALLS.store(0, Ordering::Relaxed);
+        FRAME_META_LOCK_CONTENDED.store(0, Ordering::Relaxed);
+        FRAME_META_LOCK_ELAPSED_NS.store(0, Ordering::Relaxed);
+        FRAME_META_TRY_LOCK_CALLS.store(0, Ordering::Relaxed);
+        FRAME_META_TRY_LOCK_FAILED.store(0, Ordering::Relaxed);
+        FREE_WAIT_NOTIFY_ALL_CALLS.store(0, Ordering::Relaxed);
+        FREE_WAIT_NOTIFY_ALL_ELAPSED_NS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn profile_counters() -> BufferPoolProfileCounters {
+        BufferPoolProfileCounters {
+            directory_lock_calls: DIRECTORY_LOCK_CALLS.load(Ordering::Relaxed),
+            directory_lock_contended: DIRECTORY_LOCK_CONTENDED.load(Ordering::Relaxed),
+            directory_lock_elapsed_ns: DIRECTORY_LOCK_ELAPSED_NS.load(Ordering::Relaxed),
+            directory_try_lock_calls: DIRECTORY_TRY_LOCK_CALLS.load(Ordering::Relaxed),
+            directory_try_lock_failed: DIRECTORY_TRY_LOCK_FAILED.load(Ordering::Relaxed),
+            frame_meta_lock_calls: FRAME_META_LOCK_CALLS.load(Ordering::Relaxed),
+            frame_meta_lock_contended: FRAME_META_LOCK_CONTENDED.load(Ordering::Relaxed),
+            frame_meta_lock_elapsed_ns: FRAME_META_LOCK_ELAPSED_NS.load(Ordering::Relaxed),
+            frame_meta_try_lock_calls: FRAME_META_TRY_LOCK_CALLS.load(Ordering::Relaxed),
+            frame_meta_try_lock_failed: FRAME_META_TRY_LOCK_FAILED.load(Ordering::Relaxed),
+            free_wait_notify_all_calls: FREE_WAIT_NOTIFY_ALL_CALLS.load(Ordering::Relaxed),
+            free_wait_notify_all_elapsed_ns: FREE_WAIT_NOTIFY_ALL_ELAPSED_NS
+                .load(Ordering::Relaxed),
+        }
+    }
+
     pub fn available(&self) -> usize {
         self.num_available.load(Ordering::Acquire)
     }
@@ -1565,9 +1738,8 @@ impl BufferManager {
 
         for block_num in start_block..start_block.saturating_add(count) {
             let block_id = BlockId::new(file.to_string(), block_num);
-            match self.try_begin_install(&block_id) {
-                Some(_) => continue,
-                None => {}
+            if self.try_begin_install(&block_id).is_some() {
+                continue;
             }
 
             let (frame_idx, mut meta_guard) = match self.claim_victim_frame() {
@@ -1674,13 +1846,11 @@ impl BufferManager {
             match transition {
                 UnpinTransition::StillPinned => {}
                 UnpinTransition::BecameUnpinnedClean => {
-                    self.num_available.fetch_add(1, Ordering::AcqRel);
-                    self.cond.notify_all();
+                    self.release_available_frame();
                     self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
                 }
                 UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
-                    self.num_available.fetch_add(1, Ordering::AcqRel);
-                    self.cond.notify_all();
+                    self.release_available_frame();
                     if let Some(frame_idx) = enqueue_dirty {
                         self.enqueue_dirty_frame(frame_idx);
                     }
@@ -1808,9 +1978,8 @@ impl BufferManager {
             stats.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        match self.try_begin_install(block_id) {
-            Some(_) => return PinAttempt::Retry,
-            None => {}
+        if self.try_begin_install(block_id).is_some() {
+            return PinAttempt::Retry;
         }
 
         let (frame_idx, mut meta_guard) = match self.claim_victim_frame() {
@@ -1856,17 +2025,20 @@ impl BufferManager {
     ///
     /// This is resident-only and never performs eviction or blocking waits.
     ///
+    /// A directory miss is a real residency miss, not contention: callers use
+    /// [`FastPinOutcome::NotResident`] to slow-pin outside latch scope and then
+    /// retry traversal. Only failure to acquire an internal latch reports
+    /// [`FastPinOutcome::Contended`].
+    ///
     /// The fast path still has to complete policy hit bookkeeping. If that
     /// bookkeeping would block, the speculative pin is rolled back and the
     /// caller sees [`FastPinOutcome::Contended`].
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
-        let Some(entry) = self
-            .directory
-            .try_lock()
-            .ok()
-            .and_then(|directory| directory.get(block_id).cloned())
-        else {
+        let Some(directory) = self.try_lock_directory() else {
             return FastPinOutcome::Contended;
+        };
+        let Some(entry) = directory.get(block_id).cloned() else {
+            return FastPinOutcome::NotResident;
         };
         let (frame_idx, generation) = match entry {
             DirectoryEntry::Resident {
@@ -1915,13 +2087,11 @@ impl BufferManager {
         match transition {
             UnpinTransition::StillPinned => {}
             UnpinTransition::BecameUnpinnedClean => {
-                self.num_available.fetch_add(1, Ordering::AcqRel);
-                self.cond.notify_all();
+                self.release_available_frame();
                 self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
             }
             UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
-                self.num_available.fetch_add(1, Ordering::AcqRel);
-                self.cond.notify_all();
+                self.release_available_frame();
                 if let Some(frame_idx) = enqueue_dirty {
                     self.enqueue_dirty_frame(frame_idx);
                 }

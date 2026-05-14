@@ -15660,7 +15660,9 @@ mod buffer_list_tests {
 }
 
 // Re-export buffer manager types from the buffer_manager module
-pub use buffer_manager::{BufferFrame, BufferManager, BufferStats, FastPinOutcome, FrameMeta};
+pub use buffer_manager::{
+    BufferFrame, BufferManager, BufferPoolProfileCounters, BufferStats, FastPinOutcome, FrameMeta,
+};
 
 #[cfg(test)]
 mod buffer_manager_tests {
