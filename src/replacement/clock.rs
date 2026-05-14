@@ -43,6 +43,21 @@ impl PolicyState {
         }
     }
 
+    /// Records a resident hit.
+    ///
+    /// Clock only needs to set the reference bit; no shared list mutation is required.
+    pub fn on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
+    }
+
+    /// Tries to record a resident hit without blocking.
+    ///
+    /// Clock hit bookkeeping is frame-local, so this always succeeds.
+    pub fn try_on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) -> bool {
+        self.on_hit(buffer_pool, frame_idx);
+        true
+    }
+
     /// Notifies the policy that a frame has been assigned.
     ///
     /// Sets the reference bit to give the new frame a "second chance".

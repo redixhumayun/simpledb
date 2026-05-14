@@ -62,6 +62,21 @@ impl PolicyState {
         }
     }
 
+    /// Records a resident hit.
+    ///
+    /// SIEVE hit bookkeeping only sets the reference bit; list order does not change.
+    pub fn on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
+    }
+
+    /// Tries to record a resident hit without blocking.
+    ///
+    /// SIEVE hit bookkeeping is frame-local, so this always succeeds.
+    pub fn try_on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) -> bool {
+        self.on_hit(buffer_pool, frame_idx);
+        true
+    }
+
     /// Notifies the policy that a frame has been assigned.
     ///
     /// Inserts the frame at the head of the list with reference bit set,

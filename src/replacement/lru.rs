@@ -42,6 +42,23 @@ impl PolicyState {
         }
     }
 
+    /// Records a resident hit by promoting the frame to the head of the LRU list.
+    pub fn on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        self.promote_to_head_blocking(&mut intrusive_list_guard, buffer_pool, frame_idx);
+    }
+
+    /// Tries to record a resident hit without blocking.
+    ///
+    /// Returns `false` if the LRU list or any required frame metadata lock is
+    /// contended. Callers may then roll back the speculative fast pin.
+    pub fn try_on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) -> bool {
+        let Some(mut intrusive_list_guard) = self.intrusive_list.try_lock().ok() else {
+            return false;
+        };
+        self.promote_to_head_nowait(&mut intrusive_list_guard, buffer_pool, frame_idx)
+    }
+
     /// Notifies the policy that a frame has been assigned a new block.
     ///
     /// Inserts the frame at the head of the LRU list as the most recently used.
@@ -112,5 +129,132 @@ impl PolicyState {
             );
             return Some(current);
         }
+    }
+
+    /// Promotes one resident frame to the head of the LRU list, blocking as needed.
+    ///
+    /// This is the normal hit-path bookkeeping for `pin()`: once the frame is
+    /// pinned, LRU recency must be updated before the hit is considered complete.
+    fn promote_to_head_blocking(
+        &self,
+        intrusive_list_guard: &mut IntrusiveList,
+        buffer_pool: &[Arc<BufferFrame>],
+        frame_idx: usize,
+    ) {
+        let current_head = intrusive_list_guard.peek_head();
+        if current_head == Some(frame_idx) {
+            return;
+        }
+
+        let mut frame_guard = buffer_pool[frame_idx].lock_meta();
+        let predecessor_index = frame_guard.prev();
+        let adjacent_to_head =
+            matches!((predecessor_index, current_head), (Some(prev), Some(head)) if prev == head);
+
+        if adjacent_to_head {
+            let mut current_head_guard =
+                current_head.map(|current_head| buffer_pool[current_head].lock_meta());
+            let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
+            let head_guard = current_head_guard
+                .as_mut()
+                .expect("Head guard must exist when list is non-empty");
+            intrusive_list_guard.promote_successor_to_head(
+                head_guard,
+                &mut frame_guard,
+                next_guard.as_mut(),
+            );
+            return;
+        }
+
+        let mut current_head_guard =
+            current_head.map(|current_head| buffer_pool[current_head].lock_meta());
+        let mut prev_guard = predecessor_index.map(|prev| buffer_pool[prev].lock_meta());
+        let mut next_guard = frame_guard.next().map(|idx| buffer_pool[idx].lock_meta());
+        intrusive_list_guard.move_to_head(
+            frame_idx,
+            &mut frame_guard,
+            current_head_guard.as_mut(),
+            prev_guard.as_mut(),
+            next_guard.as_mut(),
+        );
+    }
+
+    /// Tries to promote one resident frame to the head of the LRU list without blocking.
+    ///
+    /// This is the [`crate::buffer_manager::BufferManager::pin_fast()`] companion to
+    /// [`PolicyState::promote_to_head_blocking()`].
+    /// Returning `false` means the fast path could not complete full LRU hit
+    /// semantics without waiting, so the caller must roll back the speculative
+    /// pin and report contention instead of half-succeeding.
+    fn promote_to_head_nowait(
+        &self,
+        intrusive_list_guard: &mut IntrusiveList,
+        buffer_pool: &[Arc<BufferFrame>],
+        frame_idx: usize,
+    ) -> bool {
+        let current_head = intrusive_list_guard.peek_head();
+        if current_head == Some(frame_idx) {
+            return true;
+        }
+
+        let Some(mut frame_guard) = buffer_pool[frame_idx].try_lock_meta() else {
+            return false;
+        };
+        let predecessor_index = frame_guard.prev();
+        let adjacent_to_head =
+            matches!((predecessor_index, current_head), (Some(prev), Some(head)) if prev == head);
+
+        if adjacent_to_head {
+            let Some(mut current_head_guard) =
+                current_head.and_then(|current_head| buffer_pool[current_head].try_lock_meta())
+            else {
+                return false;
+            };
+            let next_index = frame_guard.next();
+            let mut next_guard = match next_index {
+                Some(idx) => match buffer_pool[idx].try_lock_meta() {
+                    Some(guard) => Some(guard),
+                    None => return false,
+                },
+                None => None,
+            };
+            intrusive_list_guard.promote_successor_to_head(
+                &mut current_head_guard,
+                &mut frame_guard,
+                next_guard.as_mut(),
+            );
+            return true;
+        }
+
+        let mut current_head_guard = match current_head {
+            Some(idx) => match buffer_pool[idx].try_lock_meta() {
+                Some(guard) => Some(guard),
+                None => return false,
+            },
+            None => None,
+        };
+        let mut prev_guard = match predecessor_index {
+            Some(idx) => match buffer_pool[idx].try_lock_meta() {
+                Some(guard) => Some(guard),
+                None => return false,
+            },
+            None => None,
+        };
+        let next_index = frame_guard.next();
+        let mut next_guard = match next_index {
+            Some(idx) => match buffer_pool[idx].try_lock_meta() {
+                Some(guard) => Some(guard),
+                None => return false,
+            },
+            None => None,
+        };
+        intrusive_list_guard.move_to_head(
+            frame_idx,
+            &mut frame_guard,
+            current_head_guard.as_mut(),
+            prev_guard.as_mut(),
+            next_guard.as_mut(),
+        );
+        true
     }
 }

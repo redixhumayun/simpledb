@@ -16,7 +16,9 @@
 //!
 //! # Interface
 //!
-//! All policies expose a `PolicyState` struct with two shared methods:
+//! All policies expose a `PolicyState` struct with four shared methods:
+//! - `on_hit()`: Records a resident hit on the normal blocking pin path
+//! - `try_on_hit()`: Tries to record a resident hit without blocking
 //! - `on_frame_assigned()`: Called when a frame is newly allocated
 //! - `evict_frame()`: Selects and returns a victim frame for eviction
 

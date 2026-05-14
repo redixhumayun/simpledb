@@ -461,8 +461,8 @@ impl FrameControl {
 
 /// Atomic wrapper around the packed frame residency-control word.
 ///
-/// This keeps the bit encoding and CAS protocol in one place so `BufferFrame`
-/// methods work with decoded `FrameControl` values instead of raw `u64`s.
+/// This keeps the bit encoding and CAS protocol in one place so [`BufferFrame`]
+/// methods work with decoded [`FrameControl`] values instead of raw `u64`s.
 #[derive(Debug)]
 struct AtomicFrameControl {
     raw: AtomicU64,
@@ -555,7 +555,7 @@ impl AtomicFrameControl {
     /// Tries to mark the current generation as claimed for eviction.
     ///
     /// Returns the pre-claim state so the caller can restore it if a later
-    /// colder check under `FrameMeta` fails.
+    /// colder check under [`FrameMeta`] fails.
     fn try_claim_for_eviction(&self, pin_count: usize) -> Option<FrameControl> {
         loop {
             let current = self.load();
@@ -625,13 +625,13 @@ impl IntrusiveNode for MutexGuard<'_, FrameMeta> {
 ///
 /// A frame owns three different kinds of state:
 /// - page bytes behind `RwLock<Page>`
-/// - cold metadata behind `FrameMeta`
+/// - cold metadata behind [`FrameMeta`]
 /// - hot per-frame access state in atomics
 ///
 /// Why this split exists: resident hits touch pin count, policy bits, and
 /// residency-control flags far more often than they touch flush metadata or
 /// page contents. Keeping those hot fields on `BufferFrame` lets the common
-/// path avoid serializing on `FrameMeta`.
+/// path avoid serializing on [`FrameMeta`].
 #[derive(Debug)]
 pub struct BufferFrame {
     /// Storage interface used to read and write the page currently assigned to this frame.
@@ -702,7 +702,7 @@ impl BufferFrame {
 
     /// Returns the live pin count from the hot atomic state.
     ///
-    /// Pin count lives outside `FrameMeta` so resident hits can pin/unpin
+    /// Pin count lives outside [`FrameMeta`] so resident hits can pin/unpin
     /// without serializing on the metadata mutex.
     pub fn pin_count(&self) -> usize {
         self.pin_count.load(Ordering::Acquire)
@@ -716,7 +716,7 @@ impl BufferFrame {
     /// Returns the policy reference bit from hot state.
     ///
     /// Clock and SIEVE consult this frequently during hit/evict traffic, so it
-    /// stays out of `FrameMeta`.
+    /// stays out of [`FrameMeta`].
     #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
     pub fn ref_bit(&self) -> bool {
         self.ref_bit.load(Ordering::Acquire)
@@ -788,7 +788,7 @@ impl BufferFrame {
     ///
     /// The claim is two-stage:
     /// - atomically set `evicting` so new pins fail OCC validation
-    /// - then lock `FrameMeta` to verify colder writeback constraints
+    /// - then lock [`FrameMeta`] to verify colder writeback constraints
     fn try_claim_for_eviction(&self) -> Option<MutexGuard<'_, FrameMeta>> {
         loop {
             let Some(previous) = self.control.try_claim_for_eviction(self.pin_count()) else {
@@ -811,7 +811,7 @@ impl BufferFrame {
     /// - increment atomic pin count
     /// - revalidate and roll back on race
     ///
-    /// Only the `0 -> 1` transition still consults `FrameMeta`, because clean
+    /// Only the `0 -> 1` transition still consults [`FrameMeta`], because clean
     /// slack and dirty-queue accounting remain there.
     fn try_pin_from_directory(&self, residency_generation: u64) -> Option<PinTransition> {
         let control = self.control.load();
@@ -832,16 +832,14 @@ impl BufferFrame {
         } else {
             PinTransition::StillPinned
         };
-        #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
-        self.set_ref_bit(true);
         Some(transition)
     }
 
-    /// Attempts the same OCC resident pin as `try_pin_from_directory()`, but
-    /// preserves the `pin_fast()` nonblocking contract.
+    /// Attempts the same OCC resident pin as [`BufferFrame::try_pin_from_directory()`], but
+    /// preserves the [`BufferManager::pin_fast()`] nonblocking contract.
     ///
-    /// Why this helper exists: `pin_fast()` must distinguish three cases
-    /// without ever waiting on `FrameMeta`:
+    /// Why this helper exists: [`BufferManager::pin_fast()`] must distinguish
+    /// three cases without ever waiting on [`FrameMeta`]:
     /// - the directory/generation was stale, so the caller should treat the
     ///   page as not resident
     /// - the frame was resident and the pin succeeded
@@ -875,8 +873,6 @@ impl BufferFrame {
         } else {
             PinTransition::StillPinned
         };
-        #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
-        self.set_ref_bit(true);
         Ok(Some(transition))
     }
 
@@ -1727,6 +1723,22 @@ impl BufferManager {
         }
     }
 
+    /// Applies global availability bookkeeping for one successful pin transition.
+    ///
+    /// [`PinTransition`] tells us whether this pin consumed a reusable frame from
+    /// the buffer pool's slack accounting:
+    /// - `StillPinned`: no global counters change
+    /// - `BecamePinnedClean`: one available frame and one clean-slack frame were consumed
+    /// - `BecamePinnedDirty`: one available frame was consumed, but not from clean slack
+    fn apply_pin_transition_accounting(&self, transition: PinTransition) {
+        if !matches!(transition, PinTransition::StillPinned) {
+            self.num_available.fetch_sub(1, Ordering::AcqRel);
+            if matches!(transition, PinTransition::BecamePinnedClean) {
+                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     /// Full pin path with immediate replacement policy updates and eviction.
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<BufferFrame>, Box<dyn Error>> {
         let start = Instant::now();
@@ -1781,12 +1793,8 @@ impl BufferManager {
                     Some(transition) => transition,
                     None => return PinAttempt::Retry,
                 };
-                if !matches!(transition, PinTransition::StillPinned) {
-                    self.num_available.fetch_sub(1, Ordering::AcqRel);
-                    if matches!(transition, PinTransition::BecamePinnedClean) {
-                        self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
+                self.apply_pin_transition_accounting(transition);
+                self.policy.on_hit(&self.buffer_pool, frame_idx);
                 if let Some(stats) = self.stats.get() {
                     stats.hits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1840,17 +1848,17 @@ impl BufferManager {
         frame.finish_loading_residency();
         self.policy.on_frame_assigned(&self.buffer_pool, frame_idx);
 
-        self.num_available.fetch_sub(1, Ordering::AcqRel);
-        if matches!(transition, PinTransition::BecamePinnedClean) {
-            self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.apply_pin_transition_accounting(transition);
         PinAttempt::Ready(frame)
     }
 
     /// Fast path for latch-crabbing callers.
     ///
-    /// This is resident-only and never performs replacement policy bookkeeping,
-    /// eviction, or blocking waits.
+    /// This is resident-only and never performs eviction or blocking waits.
+    ///
+    /// The fast path still has to complete policy hit bookkeeping. If that
+    /// bookkeeping would block, the speculative pin is rolled back and the
+    /// caller sees `Contended`.
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
         let Some(entry) = self
             .directory
@@ -1874,12 +1882,15 @@ impl BufferManager {
             Ok(None) => return FastPinOutcome::NotResident,
             Err(()) => return FastPinOutcome::Contended,
         };
-        if !matches!(transition, PinTransition::StillPinned) {
-            self.num_available.fetch_sub(1, Ordering::AcqRel);
-            if matches!(transition, PinTransition::BecamePinnedClean) {
-                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-            }
+        if !self.policy.try_on_hit(&self.buffer_pool, frame_idx) {
+            let previous_pin_count = frame_ptr.pin_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(
+                previous_pin_count > 0,
+                "fast-path rollback must undo an existing speculative pin"
+            );
+            return FastPinOutcome::Contended;
         }
+        self.apply_pin_transition_accounting(transition);
 
         FastPinOutcome::Ready(frame_ptr)
     }
@@ -1887,13 +1898,13 @@ impl BufferManager {
     /// Releases one buffer pin and applies any last-pin bookkeeping.
     ///
     /// The decrement itself is atomic, but the `1 -> 0` transition still has
-    /// to consult `FrameMeta` to answer colder protocol questions:
+    /// to consult [`FrameMeta`] to answer colder protocol questions:
     /// - did the frame become part of clean slack?
     /// - should a dirty frame now enter the flush queue?
     /// - should waiters be notified that one reusable frame is available?
     ///
-    /// So the hot pin count lives on `BufferFrame`, while the final transition
-    /// still reconciles availability and flush state under `FrameMeta`.
+    /// So the hot pin count lives on [`BufferFrame`], while the final transition
+    /// still reconciles availability and flush state under [`FrameMeta`].
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
         let transition = {
             let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
