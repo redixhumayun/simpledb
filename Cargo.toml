@@ -43,6 +43,7 @@ direct-io = ["dep:io-uring"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+dashmap = "6"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

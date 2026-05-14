@@ -9,7 +9,7 @@
 //! # Implementation
 //!
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     error::Error,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -19,6 +19,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+use dashmap::{mapref::entry::Entry, try_result::TryResult, DashMap};
 
 #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
 use std::sync::atomic::AtomicBool;
@@ -90,6 +92,20 @@ fn profile_counters_enabled() -> bool {
 
 fn elapsed_ns_since(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn directory_op_start() -> Option<Instant> {
+    if !profile_counters_enabled() {
+        return None;
+    }
+    DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(Instant::now())
+}
+
+fn directory_op_end(start: Option<Instant>) {
+    if let Some(start) = start {
+        DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+    }
 }
 
 /// Result of moving a frame from clean/unpinned into an actively pinned state.
@@ -1404,7 +1420,7 @@ pub struct BufferManager {
     wait_mutex: Mutex<()>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
-    directory: Mutex<HashMap<BlockId, DirectoryEntry>>,
+    directory: DashMap<BlockId, DirectoryEntry>,
     policy: PolicyState,
     /// Frames that transitioned into a flushable dirty state.
     dirty_queue: Arc<Mutex<VecDeque<usize>>>,
@@ -1456,7 +1472,7 @@ impl BufferManager {
             wait_mutex: Mutex::new(()),
             cond: Condvar::new(),
             stats: OnceLock::new(),
-            directory: Mutex::new(HashMap::new()),
+            directory: DashMap::new(),
             policy,
             dirty_queue,
             flush_coordinator,
@@ -1560,46 +1576,14 @@ impl BufferManager {
         })
     }
 
-    fn lock_directory(&self) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
-        if !profile_counters_enabled() {
-            return self.directory.lock().unwrap();
-        }
-
-        DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
-        match self.directory.try_lock() {
-            Ok(guard) => {
-                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::WouldBlock) => {
-                DIRECTORY_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
-                let guard = self.directory.lock().unwrap();
-                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::Poisoned(_)) => self.directory.lock().unwrap(),
-        }
-    }
-
-    fn try_lock_directory(&self) -> Option<MutexGuard<'_, HashMap<BlockId, DirectoryEntry>>> {
-        if profile_counters_enabled() {
-            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        match self.directory.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::WouldBlock) => {
-                if profile_counters_enabled() {
-                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
-                }
-                None
-            }
-            Err(TryLockError::Poisoned(_)) => None,
-        }
-    }
-
     fn directory_entry(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        self.lock_directory().get(block_id).cloned()
+        let start = directory_op_start();
+        let entry = self
+            .directory
+            .get(block_id)
+            .map(|entry| entry.value().clone());
+        directory_op_end(start);
+        entry
     }
 
     fn remove_directory_entry_if_matches(
@@ -1608,46 +1592,50 @@ impl BufferManager {
         frame_idx: usize,
         generation: u64,
     ) {
-        let mut directory = self.lock_directory();
-        let remove = matches!(
-            directory.get(block_id),
-            Some(DirectoryEntry::Resident {
-                frame_idx: existing_idx,
-                generation: existing_generation
-            }) if *existing_idx == frame_idx && *existing_generation == generation
-        );
-        if remove {
-            directory.remove(block_id);
-        }
+        let start = directory_op_start();
+        self.directory.remove_if(block_id, |_, entry| {
+            matches!(
+                entry,
+                DirectoryEntry::Resident {
+                    frame_idx: existing_idx,
+                    generation: existing_generation
+                } if *existing_idx == frame_idx && *existing_generation == generation
+            )
+        });
+        directory_op_end(start);
     }
 
     fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        let mut directory = self.lock_directory();
-        match directory.get(block_id).cloned() {
-            Some(existing) => Some(existing),
-            None => {
-                directory.insert(block_id.clone(), DirectoryEntry::Installing);
+        let start = directory_op_start();
+        let result = match self.directory.entry(block_id.clone()) {
+            Entry::Occupied(existing) => Some(existing.get().clone()),
+            Entry::Vacant(vacant) => {
+                vacant.insert(DirectoryEntry::Installing);
                 None
             }
-        }
+        };
+        directory_op_end(start);
+        result
     }
 
     fn publish_resident_entry(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
-        let mut directory = self.lock_directory();
-        directory.insert(
+        let start = directory_op_start();
+        self.directory.insert(
             block_id.clone(),
             DirectoryEntry::Resident {
                 frame_idx,
                 generation,
             },
         );
+        directory_op_end(start);
     }
 
     fn clear_installing_entry(&self, block_id: &BlockId) {
-        let mut directory = self.lock_directory();
-        if matches!(directory.get(block_id), Some(DirectoryEntry::Installing)) {
-            directory.remove(block_id);
-        }
+        let start = directory_op_start();
+        self.directory.remove_if(block_id, |_, entry| {
+            matches!(entry, DirectoryEntry::Installing)
+        });
+        directory_op_end(start);
     }
 
     fn claim_victim_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
@@ -2034,11 +2022,18 @@ impl BufferManager {
     /// bookkeeping would block, the speculative pin is rolled back and the
     /// caller sees [`FastPinOutcome::Contended`].
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
-        let Some(directory) = self.try_lock_directory() else {
-            return FastPinOutcome::Contended;
-        };
-        let Some(entry) = directory.get(block_id).cloned() else {
-            return FastPinOutcome::NotResident;
+        if profile_counters_enabled() {
+            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let entry = match self.directory.try_get(block_id) {
+            TryResult::Present(entry) => entry.value().clone(),
+            TryResult::Absent => return FastPinOutcome::NotResident,
+            TryResult::Locked => {
+                if profile_counters_enabled() {
+                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+                return FastPinOutcome::Contended;
+            }
         };
         let (frame_idx, generation) = match entry {
             DirectoryEntry::Resident {
