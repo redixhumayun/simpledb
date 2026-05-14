@@ -871,7 +871,7 @@ impl BufferFrame {
     ///
     /// Only the `0 -> 1` transition still consults [`FrameMeta`], because clean
     /// slack and dirty-queue accounting remain there.
-    fn try_pin_from_directory(&self, residency_generation: u64) -> Option<PinTransition> {
+    fn pin_from_directory_entry(&self, residency_generation: u64) -> Option<PinTransition> {
         let control = self.control.load_raw();
         if !AtomicFrameControl::can_pin(control, residency_generation) {
             return None;
@@ -893,7 +893,7 @@ impl BufferFrame {
         Some(transition)
     }
 
-    /// Attempts the same OCC resident pin as [`BufferFrame::try_pin_from_directory()`], but
+    /// Attempts the same OCC resident pin as [`BufferFrame::pin_from_directory_entry()`], but
     /// preserves the [`BufferManager::pin_fast()`] nonblocking contract.
     ///
     /// Why this helper exists: [`BufferManager::pin_fast()`] must distinguish
@@ -906,7 +906,7 @@ impl BufferFrame {
     ///
     /// This method may speculatively increment `pin_count`; any stale-residency
     /// or would-block outcome rolls that increment back before returning.
-    fn try_pin_from_directory_nowait(
+    fn try_pin_from_directory_entry(
         &self,
         residency_generation: u64,
     ) -> Result<Option<PinTransition>, ()> {
@@ -1289,7 +1289,7 @@ impl ShardedDirectory {
     /// Returns the existing entry when another thread already owns installation
     /// or has published residency. Returning `None` means the caller inserted
     /// `Installing` and must either publish or clear it.
-    fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+    fn begin_install_if_absent(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
         let shard_idx = self.shard_idx(block_id);
         let mut directory = self.lock_shard(shard_idx);
         match directory.get(block_id).cloned() {
@@ -1749,8 +1749,8 @@ impl BufferManager {
             .remove_if_matches(block_id, frame_idx, generation);
     }
 
-    fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        self.directory.try_begin_install(block_id)
+    fn begin_install_if_absent(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        self.directory.begin_install_if_absent(block_id)
     }
 
     fn publish_resident_entry(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
@@ -1850,7 +1850,7 @@ impl BufferManager {
 
         for block_num in start_block..start_block.saturating_add(count) {
             let block_id = BlockId::new(file.to_string(), block_num);
-            if self.try_begin_install(&block_id).is_some() {
+            if self.begin_install_if_absent(&block_id).is_some() {
                 continue;
             }
 
@@ -2025,7 +2025,7 @@ impl BufferManager {
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<BufferFrame>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
-            match self.try_to_pin(block_id) {
+            match self.pin_once_without_free_wait(block_id) {
                 PinAttempt::Ready(buffer) => return Ok(buffer),
                 PinAttempt::Retry => {
                     thread::yield_now();
@@ -2064,14 +2064,14 @@ impl BufferManager {
     /// - succeeded immediately
     /// - lost a transient race and should be retried soon
     /// - or hit a real no-frame-available condition and should enter the global wait path
-    fn try_to_pin(&self, block_id: &BlockId) -> PinAttempt {
+    fn pin_once_without_free_wait(&self, block_id: &BlockId) -> PinAttempt {
         match self.directory_entry(block_id) {
             Some(DirectoryEntry::Resident {
                 frame_idx,
                 generation,
             }) => {
                 let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
-                let transition = match frame_ptr.try_pin_from_directory(generation) {
+                let transition = match frame_ptr.pin_from_directory_entry(generation) {
                     Some(transition) => transition,
                     None => return PinAttempt::Retry,
                 };
@@ -2090,7 +2090,7 @@ impl BufferManager {
             stats.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        if self.try_begin_install(block_id).is_some() {
+        if self.begin_install_if_absent(block_id).is_some() {
             return PinAttempt::Retry;
         }
 
@@ -2160,7 +2160,7 @@ impl BufferManager {
         };
         let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
 
-        let transition = match frame_ptr.try_pin_from_directory_nowait(generation) {
+        let transition = match frame_ptr.try_pin_from_directory_entry(generation) {
             Ok(Some(transition)) => transition,
             Ok(None) => return FastPinOutcome::NotResident,
             Err(()) => return FastPinOutcome::Contended,

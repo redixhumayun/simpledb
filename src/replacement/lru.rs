@@ -56,7 +56,7 @@ impl PolicyState {
         let Some(mut intrusive_list_guard) = self.intrusive_list.try_lock().ok() else {
             return false;
         };
-        self.promote_to_head_nowait(&mut intrusive_list_guard, buffer_pool, frame_idx)
+        self.try_promote_to_head(&mut intrusive_list_guard, buffer_pool, frame_idx)
     }
 
     /// Notifies the policy that a frame has been assigned a new block.
@@ -186,7 +186,7 @@ impl PolicyState {
     /// Returning `false` means the fast path could not complete full LRU hit
     /// semantics without waiting, so the caller must roll back the speculative
     /// pin and report contention instead of half-succeeding.
-    fn promote_to_head_nowait(
+    fn try_promote_to_head(
         &self,
         intrusive_list_guard: &mut IntrusiveList,
         buffer_pool: &[Arc<BufferFrame>],
