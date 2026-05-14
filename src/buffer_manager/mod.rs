@@ -462,96 +462,95 @@ impl FrameMeta {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FrameControl {
-    generation: u64,
-    loading: bool,
-    evicting: bool,
-}
-
-impl FrameControl {
-    const LOADING_BIT: u64 = 1;
-    const EVICTING_BIT: u64 = 1 << 1;
-
-    fn new(generation: u64, loading: bool, evicting: bool) -> Self {
-        Self {
-            generation,
-            loading,
-            evicting,
-        }
-    }
-
-    fn from_raw(raw: u64) -> Self {
-        Self {
-            generation: raw >> 2,
-            loading: raw & Self::LOADING_BIT != 0,
-            evicting: raw & Self::EVICTING_BIT != 0,
-        }
-    }
-
-    fn to_raw(self) -> u64 {
-        (self.generation << 2)
-            | if self.loading { Self::LOADING_BIT } else { 0 }
-            | if self.evicting { Self::EVICTING_BIT } else { 0 }
-    }
-
-    /// Returns whether this decoded control state may be pinned for the given
-    /// directory generation.
-    ///
-    /// A resident pin is valid only when the frame still belongs to the same
-    /// residency generation and is not in one of the transient non-pinnable
-    /// loading/evicting phases.
-    fn can_pin_for(self, residency_generation: u64) -> bool {
-        self.generation == residency_generation && !self.loading && !self.evicting
-    }
-}
-
 /// Atomic wrapper around the packed frame residency-control word.
 ///
-/// This keeps the bit encoding and CAS protocol in one place so [`BufferFrame`]
-/// methods work with decoded [`FrameControl`] values instead of raw `u64`s.
+/// Bit layout:
+/// - bit 0: `loading`
+/// - bit 1: `evicting`
+/// - bits 2..: residency generation
+///
+/// Why this is one atomic word: resident pins must validate generation and
+/// transient state from a single coherent snapshot, and install/evict paths
+/// need to CAS that whole snapshot when moving between states.
 #[derive(Debug)]
 struct AtomicFrameControl {
     raw: AtomicU64,
 }
 
+/// Opaque raw residency-control snapshot used for validation and rollback.
+type FrameControlSnapshot = u64;
+
 impl AtomicFrameControl {
-    /// Creates one atomic control word from a decoded initial state.
-    fn new(initial: FrameControl) -> Self {
+    const LOADING_BIT: u64 = 1;
+    const EVICTING_BIT: u64 = 1 << 1;
+    const FLAGS_MASK: u64 = Self::LOADING_BIT | Self::EVICTING_BIT;
+
+    /// Creates one control word for generation zero with no transient flags set.
+    fn new() -> Self {
         Self {
-            raw: AtomicU64::new(initial.to_raw()),
+            raw: AtomicU64::new(0),
         }
     }
 
-    /// Loads and decodes the current residency-control state.
-    ///
-    /// Callers use this for OCC validation on resident hits and for rare
-    /// install/evict coordination when they need the full state tuple.
-    fn load(&self) -> FrameControl {
-        FrameControl::from_raw(self.raw.load(Ordering::Acquire))
+    /// Packs a generation and transient flags into the control word layout.
+    fn encode(generation: u64, loading: bool, evicting: bool) -> u64 {
+        (generation << 2)
+            | if loading { Self::LOADING_BIT } else { 0 }
+            | if evicting { Self::EVICTING_BIT } else { 0 }
     }
 
-    /// Publishes one decoded residency-control state.
+    /// Extracts the residency generation from a raw control snapshot.
+    fn generation_from(snapshot: FrameControlSnapshot) -> u64 {
+        snapshot >> 2
+    }
+
+    /// Returns whether a raw control snapshot has the loading flag set.
+    fn is_loading_raw(snapshot: FrameControlSnapshot) -> bool {
+        snapshot & Self::LOADING_BIT != 0
+    }
+
+    /// Returns whether a raw control snapshot has the evicting flag set.
+    fn is_evicting_raw(snapshot: FrameControlSnapshot) -> bool {
+        snapshot & Self::EVICTING_BIT != 0
+    }
+
+    /// Loads the current raw residency-control snapshot.
     ///
-    /// This is used on rollback or other paths that already know the exact
-    /// state they need to restore.
-    fn store(&self, control: FrameControl) {
-        self.raw.store(control.to_raw(), Ordering::Release);
+    /// The value should be interpreted only by helpers on this type or passed
+    /// back to `store_raw()` for rollback.
+    fn load_raw(&self) -> FrameControlSnapshot {
+        self.raw.load(Ordering::Acquire)
+    }
+
+    /// Restores one previously observed raw residency-control snapshot.
+    ///
+    /// This is used only for rollback after a later cold-state check fails.
+    fn store_raw(&self, snapshot: FrameControlSnapshot) {
+        self.raw.store(snapshot, Ordering::Release);
     }
 
     /// Returns the current residency generation used by directory validation.
     fn generation(&self) -> u64 {
-        self.load().generation
+        Self::generation_from(self.load_raw())
     }
 
     /// Returns whether the frame is currently in its non-pinnable loading phase.
     fn is_loading(&self) -> bool {
-        self.load().loading
+        Self::is_loading_raw(self.load_raw())
     }
 
     /// Returns whether the frame has been claimed for reuse by an evict/install path.
     fn is_evicting(&self) -> bool {
-        self.load().evicting
+        Self::is_evicting_raw(self.load_raw())
+    }
+
+    /// Returns whether a raw control snapshot may be pinned for the given
+    /// directory generation.
+    ///
+    /// A resident pin is valid only when the frame still belongs to the same
+    /// residency generation and is not in a transient non-pinnable phase.
+    fn can_pin(snapshot: FrameControlSnapshot, residency_generation: u64) -> bool {
+        Self::generation_from(snapshot) == residency_generation && snapshot & Self::FLAGS_MASK == 0
     }
 
     /// Starts a new residency generation and marks it non-pinnable.
@@ -560,19 +559,15 @@ impl AtomicFrameControl {
     /// fail validation exactly as if the frame had already been claimed away.
     fn begin_loading(&self) -> u64 {
         loop {
-            let current = self.load();
-            let next = FrameControl::new(current.generation.wrapping_add(1), true, true);
+            let current = self.load_raw();
+            let generation = Self::generation_from(current).wrapping_add(1);
+            let next = Self::encode(generation, true, true);
             if self
                 .raw
-                .compare_exchange(
-                    current.to_raw(),
-                    next.to_raw(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return next.generation;
+                return generation;
             }
         }
     }
@@ -582,16 +577,11 @@ impl AtomicFrameControl {
     /// After this transition, ordinary resident pins may validate and proceed again.
     fn finish_loading(&self) {
         loop {
-            let current = self.load();
-            let next = FrameControl::new(current.generation, false, false);
+            let current = self.load_raw();
+            let next = Self::encode(Self::generation_from(current), false, false);
             if self
                 .raw
-                .compare_exchange(
-                    current.to_raw(),
-                    next.to_raw(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return;
@@ -603,21 +593,16 @@ impl AtomicFrameControl {
     ///
     /// Returns the pre-claim state so the caller can restore it if a later
     /// colder check under [`FrameMeta`] fails.
-    fn try_claim_for_eviction(&self, pin_count: usize) -> Option<FrameControl> {
+    fn try_claim_for_eviction(&self, pin_count: usize) -> Option<FrameControlSnapshot> {
         loop {
-            let current = self.load();
-            if current.loading || current.evicting || pin_count > 0 {
+            let current = self.load_raw();
+            if Self::is_loading_raw(current) || Self::is_evicting_raw(current) || pin_count > 0 {
                 return None;
             }
-            let claimed = FrameControl::new(current.generation, current.loading, true);
+            let claimed = current | Self::EVICTING_BIT;
             if self
                 .raw
-                .compare_exchange(
-                    current.to_raw(),
-                    claimed.to_raw(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(current, claimed, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return Some(current);
@@ -719,7 +704,7 @@ impl BufferFrame {
             pin_count: AtomicUsize::new(0),
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: AtomicBool::new(false),
-            control: AtomicFrameControl::new(FrameControl::new(0, false, false)),
+            control: AtomicFrameControl::new(),
         }
     }
 
@@ -871,7 +856,7 @@ impl BufferFrame {
 
         let mut meta = self.lock_meta();
         if !meta.claim_for_eviction() {
-            self.control.store(previous);
+            self.control.store_raw(previous);
             return None;
         }
         Some(meta)
@@ -887,14 +872,14 @@ impl BufferFrame {
     /// Only the `0 -> 1` transition still consults [`FrameMeta`], because clean
     /// slack and dirty-queue accounting remain there.
     fn try_pin_from_directory(&self, residency_generation: u64) -> Option<PinTransition> {
-        let control = self.control.load();
-        if !control.can_pin_for(residency_generation) {
+        let control = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(control, residency_generation) {
             return None;
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
-        let validated = self.control.load();
-        if !validated.can_pin_for(residency_generation) {
+        let validated = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(validated, residency_generation) {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -925,14 +910,14 @@ impl BufferFrame {
         &self,
         residency_generation: u64,
     ) -> Result<Option<PinTransition>, ()> {
-        let control = self.control.load();
-        if !control.can_pin_for(residency_generation) {
+        let control = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(control, residency_generation) {
             return Ok(None);
         }
 
         let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
-        let validated = self.control.load();
-        if !validated.can_pin_for(residency_generation) {
+        let validated = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(validated, residency_generation) {
             self.pin_count.fetch_sub(1, Ordering::AcqRel);
             return Ok(None);
         }

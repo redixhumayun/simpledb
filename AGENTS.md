@@ -49,17 +49,14 @@ There is a test suite which provides basic coverage to ensure the code still wor
    Testing requires running tests with combinations of compiler flags. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
-   cargo test --no-default-features --features replacement_lru --features page-4k
-   # Verify build works and tests pass
+   cargo test
+   # Verify default features build and tests pass. Default features include replacement_lru, page-4k, and direct-io.
 
    cargo test --no-default-features --features replacement_clock --features page-4k
    # Verify build works and tests pass
 
    cargo test --no-default-features --features replacement_sieve --features page-4k
    # Verify build works and tests pass
-
-   cargo test --no-default-features --features replacement_lru --features page-4k --features direct-io
-   # Verify direct-io build works and tests pass
    ```
 
 6. **Run benchmarks before committing only when asked**
