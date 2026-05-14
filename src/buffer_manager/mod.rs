@@ -9,8 +9,9 @@
 //! # Implementation
 //!
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::RandomState, HashMap, VecDeque},
     error::Error,
+    hash::BuildHasher,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -19,8 +20,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use dashmap::{mapref::entry::Entry, try_result::TryResult, DashMap};
 
 #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
 use std::sync::atomic::AtomicBool;
@@ -92,20 +91,6 @@ fn profile_counters_enabled() -> bool {
 
 fn elapsed_ns_since(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-}
-
-fn directory_op_start() -> Option<Instant> {
-    if !profile_counters_enabled() {
-        return None;
-    }
-    DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some(Instant::now())
-}
-
-fn directory_op_end(start: Option<Instant>) {
-    if let Some(start) = start {
-        DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-    }
 }
 
 /// Result of moving a frame from clean/unpinned into an actively pinned state.
@@ -1167,6 +1152,141 @@ enum DirectoryEntry {
     Resident { frame_idx: usize, generation: u64 },
 }
 
+const DIRECTORY_SHARD_COUNT: usize = 64;
+
+#[derive(Debug)]
+struct ShardedDirectory {
+    shards: Vec<Mutex<HashMap<BlockId, DirectoryEntry>>>,
+    hash_builder: RandomState,
+}
+
+enum DirectoryTryGet {
+    Present(DirectoryEntry),
+    Absent,
+    Locked,
+}
+
+impl ShardedDirectory {
+    fn new() -> Self {
+        let shards = (0..DIRECTORY_SHARD_COUNT)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        Self {
+            shards,
+            hash_builder: RandomState::new(),
+        }
+    }
+
+    fn shard_idx(&self, block_id: &BlockId) -> usize {
+        (self.hash_builder.hash_one(block_id) as usize) & (self.shards.len() - 1)
+    }
+
+    fn lock_shard(&self, shard_idx: usize) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
+        let shard = &self.shards[shard_idx];
+        if !profile_counters_enabled() {
+            return shard.lock().unwrap();
+        }
+
+        DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        let start = Instant::now();
+        match shard.try_lock() {
+            Ok(guard) => {
+                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                DIRECTORY_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+                let guard = shard.lock().unwrap();
+                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                guard
+            }
+            Err(TryLockError::Poisoned(_)) => shard.lock().unwrap(),
+        }
+    }
+
+    fn try_lock_shard(
+        &self,
+        shard_idx: usize,
+    ) -> Option<MutexGuard<'_, HashMap<BlockId, DirectoryEntry>>> {
+        if profile_counters_enabled() {
+            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        match self.shards[shard_idx].try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => {
+                if profile_counters_enabled() {
+                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(TryLockError::Poisoned(_)) => None,
+        }
+    }
+
+    fn get(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        let shard_idx = self.shard_idx(block_id);
+        self.lock_shard(shard_idx).get(block_id).cloned()
+    }
+
+    fn try_get(&self, block_id: &BlockId) -> DirectoryTryGet {
+        let shard_idx = self.shard_idx(block_id);
+        let Some(directory) = self.try_lock_shard(shard_idx) else {
+            return DirectoryTryGet::Locked;
+        };
+        match directory.get(block_id).cloned() {
+            Some(entry) => DirectoryTryGet::Present(entry),
+            None => DirectoryTryGet::Absent,
+        }
+    }
+
+    fn remove_if_matches(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        let remove = matches!(
+            directory.get(block_id),
+            Some(DirectoryEntry::Resident {
+                frame_idx: existing_idx,
+                generation: existing_generation
+            }) if *existing_idx == frame_idx && *existing_generation == generation
+        );
+        if remove {
+            directory.remove(block_id);
+        }
+    }
+
+    fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        match directory.get(block_id).cloned() {
+            Some(existing) => Some(existing),
+            None => {
+                directory.insert(block_id.clone(), DirectoryEntry::Installing);
+                None
+            }
+        }
+    }
+
+    fn publish_resident(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
+        let shard_idx = self.shard_idx(block_id);
+        self.lock_shard(shard_idx).insert(
+            block_id.clone(),
+            DirectoryEntry::Resident {
+                frame_idx,
+                generation,
+            },
+        );
+    }
+
+    fn clear_installing(&self, block_id: &BlockId) {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        if matches!(directory.get(block_id), Some(DirectoryEntry::Installing)) {
+            directory.remove(block_id);
+        }
+    }
+}
+
 enum PinAttempt {
     /// Pin succeeded and returned the resident frame.
     Ready(Arc<BufferFrame>),
@@ -1420,7 +1540,7 @@ pub struct BufferManager {
     wait_mutex: Mutex<()>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
-    directory: DashMap<BlockId, DirectoryEntry>,
+    directory: ShardedDirectory,
     policy: PolicyState,
     /// Frames that transitioned into a flushable dirty state.
     dirty_queue: Arc<Mutex<VecDeque<usize>>>,
@@ -1472,7 +1592,7 @@ impl BufferManager {
             wait_mutex: Mutex::new(()),
             cond: Condvar::new(),
             stats: OnceLock::new(),
-            directory: DashMap::new(),
+            directory: ShardedDirectory::new(),
             policy,
             dirty_queue,
             flush_coordinator,
@@ -1577,13 +1697,7 @@ impl BufferManager {
     }
 
     fn directory_entry(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        let start = directory_op_start();
-        let entry = self
-            .directory
-            .get(block_id)
-            .map(|entry| entry.value().clone());
-        directory_op_end(start);
-        entry
+        self.directory.get(block_id)
     }
 
     fn remove_directory_entry_if_matches(
@@ -1592,50 +1706,21 @@ impl BufferManager {
         frame_idx: usize,
         generation: u64,
     ) {
-        let start = directory_op_start();
-        self.directory.remove_if(block_id, |_, entry| {
-            matches!(
-                entry,
-                DirectoryEntry::Resident {
-                    frame_idx: existing_idx,
-                    generation: existing_generation
-                } if *existing_idx == frame_idx && *existing_generation == generation
-            )
-        });
-        directory_op_end(start);
+        self.directory
+            .remove_if_matches(block_id, frame_idx, generation);
     }
 
     fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
-        let start = directory_op_start();
-        let result = match self.directory.entry(block_id.clone()) {
-            Entry::Occupied(existing) => Some(existing.get().clone()),
-            Entry::Vacant(vacant) => {
-                vacant.insert(DirectoryEntry::Installing);
-                None
-            }
-        };
-        directory_op_end(start);
-        result
+        self.directory.try_begin_install(block_id)
     }
 
     fn publish_resident_entry(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
-        let start = directory_op_start();
-        self.directory.insert(
-            block_id.clone(),
-            DirectoryEntry::Resident {
-                frame_idx,
-                generation,
-            },
-        );
-        directory_op_end(start);
+        self.directory
+            .publish_resident(block_id, frame_idx, generation);
     }
 
     fn clear_installing_entry(&self, block_id: &BlockId) {
-        let start = directory_op_start();
-        self.directory.remove_if(block_id, |_, entry| {
-            matches!(entry, DirectoryEntry::Installing)
-        });
-        directory_op_end(start);
+        self.directory.clear_installing(block_id);
     }
 
     fn claim_victim_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
@@ -2022,18 +2107,10 @@ impl BufferManager {
     /// bookkeeping would block, the speculative pin is rolled back and the
     /// caller sees [`FastPinOutcome::Contended`].
     pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
-        if profile_counters_enabled() {
-            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
         let entry = match self.directory.try_get(block_id) {
-            TryResult::Present(entry) => entry.value().clone(),
-            TryResult::Absent => return FastPinOutcome::NotResident,
-            TryResult::Locked => {
-                if profile_counters_enabled() {
-                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
-                }
-                return FastPinOutcome::Contended;
-            }
+            DirectoryTryGet::Present(entry) => entry,
+            DirectoryTryGet::Absent => return FastPinOutcome::NotResident,
+            DirectoryTryGet::Locked => return FastPinOutcome::Contended,
         };
         let (frame_idx, generation) = match entry {
             DirectoryEntry::Resident {
