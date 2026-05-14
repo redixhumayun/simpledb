@@ -188,7 +188,8 @@ cargo build --release --bin profile_buffer_pool_pin \
 Record:
 
 ```bash
-OUT=results/profiles/buffer_pool_clock_scaling_<run-key>
+RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+OUT=results/profiles/buffer_pool_clock_scaling_${RUN_TS}_<run-key>
 mkdir -p "$OUT"
 
 for t in 4 8 16; do
@@ -221,6 +222,10 @@ done
 Write:
 
 - `$OUT/SUMMARY.md`
+
+Use the UTC report-generation timestamp in the profile folder name so multiple
+runs for the same branch/experiment sort chronologically and the latest report
+is obvious from the path.
 
 ## Remaining Work
 

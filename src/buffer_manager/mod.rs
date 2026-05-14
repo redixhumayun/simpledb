@@ -1148,18 +1148,49 @@ impl BufferStats {
 
 #[derive(Debug, Clone)]
 enum DirectoryEntry {
+    /// A thread owns installation for this block, but no pinnable frame has
+    /// been published yet.
     Installing,
+    /// A block is resident in `frame_idx` for the recorded residency generation.
+    ///
+    /// The generation is part of the lookup result so callers can validate the
+    /// frame after dropping the shard lock.
     Resident { frame_idx: usize, generation: u64 },
 }
 
+/// Fixed shard count for the resident directory.
+///
+/// Why this is constant: the directory is on the resident-hit path, so shard
+/// layout should be predictable and dependency-free. A power of two lets shard
+/// selection use a mask after hashing.
 const DIRECTORY_SHARD_COUNT: usize = 64;
 
+/// Sharded block-to-frame directory used before frame-local OCC validation.
+///
+/// Why this exists: resident hits need to find a candidate frame without the old
+/// global directory mutex or per-block latch path. Each shard protects only the
+/// `BlockId -> DirectoryEntry` map for that shard; correctness does not rely on
+/// holding the shard lock after lookup. Callers must validate the returned frame
+/// generation and transient loading/evicting bits before treating a lookup as a
+/// real pin.
+///
+/// Invariants:
+/// - at most one `DirectoryEntry` exists per `BlockId`
+/// - `Installing` reserves installation ownership for one miss path
+/// - `Resident` entries are advisory until frame generation validation succeeds
 #[derive(Debug)]
 struct ShardedDirectory {
+    /// Independent maps so disjoint resident hits do not serialize on one mutex.
     shards: Vec<Mutex<HashMap<BlockId, DirectoryEntry>>>,
+    /// Shared hash builder keeps shard choice consistent across operations.
     hash_builder: RandomState,
 }
 
+/// Nonblocking lookup result for `pin_fast()`.
+///
+/// The distinction between `Absent` and `Locked` is observable by B-tree
+/// latch-crabbing code: a real miss can be slow-pinned after releasing latches,
+/// while contention should restart without changing residency.
 enum DirectoryTryGet {
     Present(DirectoryEntry),
     Absent,
@@ -1167,6 +1198,7 @@ enum DirectoryTryGet {
 }
 
 impl ShardedDirectory {
+    /// Creates an empty directory with fixed independent shards.
     fn new() -> Self {
         let shards = (0..DIRECTORY_SHARD_COUNT)
             .map(|_| Mutex::new(HashMap::new()))
@@ -1177,10 +1209,12 @@ impl ShardedDirectory {
         }
     }
 
+    /// Chooses the shard that owns `block_id`.
     fn shard_idx(&self, block_id: &BlockId) -> usize {
         (self.hash_builder.hash_one(block_id) as usize) & (self.shards.len() - 1)
     }
 
+    /// Locks one shard, recording opt-in profiling counters when enabled.
     fn lock_shard(&self, shard_idx: usize) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
         let shard = &self.shards[shard_idx];
         if !profile_counters_enabled() {
@@ -1204,6 +1238,10 @@ impl ShardedDirectory {
         }
     }
 
+    /// Tries to lock one shard without waiting.
+    ///
+    /// Used by `pin_fast()` so callers can report internal contention instead of
+    /// blocking while holding higher-level page latches.
     fn try_lock_shard(
         &self,
         shard_idx: usize,
@@ -1224,11 +1262,13 @@ impl ShardedDirectory {
         }
     }
 
+    /// Looks up a block entry on the blocking pin path.
     fn get(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
         let shard_idx = self.shard_idx(block_id);
         self.lock_shard(shard_idx).get(block_id).cloned()
     }
 
+    /// Looks up a block entry without waiting on the shard mutex.
     fn try_get(&self, block_id: &BlockId) -> DirectoryTryGet {
         let shard_idx = self.shard_idx(block_id);
         let Some(directory) = self.try_lock_shard(shard_idx) else {
@@ -1240,6 +1280,10 @@ impl ShardedDirectory {
         }
     }
 
+    /// Removes a resident entry only if it still names the same frame generation.
+    ///
+    /// This prevents an eviction/install race from clearing a newer mapping that
+    /// reused the same `BlockId` after the caller observed an older generation.
     fn remove_if_matches(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
         let shard_idx = self.shard_idx(block_id);
         let mut directory = self.lock_shard(shard_idx);
@@ -1255,6 +1299,11 @@ impl ShardedDirectory {
         }
     }
 
+    /// Attempts to reserve installation ownership for a missing block.
+    ///
+    /// Returns the existing entry when another thread already owns installation
+    /// or has published residency. Returning `None` means the caller inserted
+    /// `Installing` and must either publish or clear it.
     fn try_begin_install(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
         let shard_idx = self.shard_idx(block_id);
         let mut directory = self.lock_shard(shard_idx);
@@ -1267,6 +1316,7 @@ impl ShardedDirectory {
         }
     }
 
+    /// Publishes a frame generation after the page bytes and frame metadata are ready.
     fn publish_resident(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
         let shard_idx = self.shard_idx(block_id);
         self.lock_shard(shard_idx).insert(
@@ -1278,6 +1328,10 @@ impl ShardedDirectory {
         );
     }
 
+    /// Clears an abandoned installation reservation.
+    ///
+    /// The entry is removed only while it is still `Installing`, so a concurrent
+    /// successful publisher cannot be erased by a stale cleanup path.
     fn clear_installing(&self, block_id: &BlockId) {
         let shard_idx = self.shard_idx(block_id);
         let mut directory = self.lock_shard(shard_idx);
