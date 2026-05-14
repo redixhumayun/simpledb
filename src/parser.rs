@@ -24,15 +24,12 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    /// Creates a new Parser with the given SQL string
     pub fn new(string: &'a str) -> Self {
         Self {
             lexer: Lexer::new(string),
         }
     }
 
-    /// Parses a comma-separated list of field names
-    /// Returns: Vec<String> containing field names
     fn field_list(&mut self) -> Result<Vec<String>, ParserError> {
         let mut list = Vec::new();
         list.push(self.lexer.eat_identifier()?);
@@ -43,9 +40,8 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// Returns true if the current token starts an aggregate function call.
-    /// These are not reserved keywords so any identifier matching a function
-    /// name is treated as an aggregate only in the SELECT context.
+    /// Aggregate function names (min, max, sum, count) are plain identifiers,
+    /// not reserved keywords, so they can still be used as column names elsewhere.
     fn is_aggregate_fn(&self) -> bool {
         self.lexer.match_identifier_value("min")
             || self.lexer.match_identifier_value("max")
@@ -53,8 +49,9 @@ impl<'a> Parser<'a> {
             || self.lexer.match_identifier_value("count")
     }
 
-    /// Parses one aggregate expression: `MIN(field)`, `MAX(field)`, `SUM(field)`,
-    /// or `COUNT(DISTINCT field)`.
+    /// `DISTINCT` is consumed as an identifier rather than a keyword so that
+    /// `count` is not forced to claim it as a reserved word, which would break
+    /// queries that use `distinct` as a column name outside aggregate context.
     fn parse_aggregate(&mut self) -> Result<AggregateSpec, ParserError> {
         if self.lexer.match_identifier_value("count") {
             self.lexer.eat_identifier()?;
@@ -94,10 +91,8 @@ impl<'a> Parser<'a> {
         Ok(AggregateSpec { op, field, alias })
     }
 
-    /// Parses the SELECT clause field list.
-    /// Returns: (output field names, aggregate specs).  For plain fields the
-    /// spec list is empty; for aggregate items the alias appears in the field list
-    /// so the final ProjectPlan can reference it by name.
+    /// Aggregate aliases (e.g. `max_price`) are inserted into the field list so
+    /// `ProjectPlan` can reference them by name without special-casing aggregates.
     fn select_list(&mut self) -> Result<(Vec<String>, Vec<AggregateSpec>), ParserError> {
         if self.lexer.match_delim('*') {
             self.lexer.eat_delim('*')?;
@@ -124,8 +119,6 @@ impl<'a> Parser<'a> {
         Ok((fields, aggregates))
     }
 
-    /// Parses the FROM clause table list
-    /// Returns: Vec<String> containing table names
     fn select_tables(&mut self) -> Result<Vec<String>, ParserError> {
         let mut list = Vec::new();
         list.push(self.lexer.eat_identifier()?);
@@ -136,7 +129,8 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// Parses a constant value (string, integer, or float). Handles leading '-' for negatives.
+    /// Float is tried before int so that `3.14` produces `Float(3.14)` rather
+    /// than `Int(3)` followed by a stray `.14` that would fail the next token.
     fn constant(&mut self) -> Result<Constant, ParserError> {
         if self.lexer.match_string_constant() {
             return Ok(Constant::String(self.lexer.eat_string_constant()?));
@@ -153,8 +147,6 @@ impl<'a> Parser<'a> {
         Ok(Constant::Int(if negative { -v } else { v }))
     }
 
-    /// Parses a comma-separated list of constants
-    /// Returns: Vec<Constant> containing parsed values
     fn constants(&mut self) -> Result<Vec<Constant>, ParserError> {
         let mut const_list = Vec::new();
         const_list.push(self.constant()?);
@@ -165,8 +157,9 @@ impl<'a> Parser<'a> {
         Ok(const_list)
     }
 
-    /// Parses an expression (field name or constant)
-    /// Returns: Expression enum variant
+    /// Identifiers are checked first: in a WHERE clause `age > 30`, `age` is a
+    /// field name and `30` is a constant, so the identifier branch must win before
+    /// falling through to constant parsing.
     fn expression(&mut self) -> Result<Expression, ParserError> {
         if self.lexer.match_identifier() {
             return Ok(Expression::FieldName(self.lexer.eat_identifier()?));
@@ -174,8 +167,8 @@ impl<'a> Parser<'a> {
         Ok(Expression::Constant(self.constant()?))
     }
 
-    /// Parses a term (comparison between expressions)
-    /// Returns: Term struct containing lhs, rhs, and operator
+    /// The operator is matched directly on `current_token` (not via `eat_*`),
+    /// so `next_token()` must be called explicitly before parsing the RHS.
     fn term(&mut self) -> Result<Term, ParserError> {
         let lhs = self.expression()?;
         let op = match self.lexer.current_token {
@@ -194,8 +187,7 @@ impl<'a> Parser<'a> {
         Ok(Term::new_with_op(lhs, rhs, op))
     }
 
-    /// Parses multiple terms connected by AND
-    /// Returns: Vec<Term> containing all parsed terms
+    /// Dead code — predicate parsing was rewritten to use `parse_predicate`.
     fn _terms(&mut self) -> Result<Vec<Term>, ParserError> {
         let mut terms = Vec::new();
         terms.push(self.term()?);
@@ -207,8 +199,6 @@ impl<'a> Parser<'a> {
         Ok(terms)
     }
 
-    /// Parses a complete SELECT query
-    /// Returns: QueryData containing fields, tables, predicates, ORDER BY, and aggregates
     pub fn query(&mut self) -> Result<QueryData, ParserError> {
         self.lexer.eat_keyword("select")?;
         let (select_fields, aggregates) = self.select_list()?;
@@ -258,8 +248,6 @@ impl<'a> Parser<'a> {
         Ok(list)
     }
 
-    /// Parses any SQL command that modifies the database
-    /// Returns: SQLStatement enum variant
     pub fn update_command(&mut self) -> Result<SQLStatement, ParserError> {
         if self.lexer.match_keyword("insert") {
             Ok(SQLStatement::Insert(self.insert()?))
@@ -272,8 +260,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses CREATE TABLE/VIEW/INDEX statements
-    /// Returns: SQLStatement enum variant
     fn create(&mut self) -> Result<SQLStatement, ParserError> {
         self.lexer.eat_keyword("create")?;
         if self.lexer.match_keyword("table") {
@@ -289,8 +275,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses a single field definition (name and type)
-    /// Returns: Schema containing the field definition
+    /// `DECIMAL(p,s)` and `NUMERIC(p,s)` are accepted as aliases for `FLOAT`.
+    /// Precision and scale are parsed and discarded — the engine stores all
+    /// floating-point values as f64 regardless of declared precision.
     fn field_def(&mut self) -> Result<Schema, ParserError> {
         let field_name = self.lexer.eat_identifier()?;
         let mut schema = Schema::new();
@@ -325,8 +312,6 @@ impl<'a> Parser<'a> {
         Ok(schema)
     }
 
-    /// Parses multiple field definitions
-    /// Returns: Schema containing all field definitions
     fn field_defs(&mut self) -> Result<Schema, ParserError> {
         let mut schema = Schema::new();
         schema
@@ -341,8 +326,6 @@ impl<'a> Parser<'a> {
         Ok(schema)
     }
 
-    /// Parses CREATE TABLE statement
-    /// Returns: CreateTableData containing table name and schema
     fn create_table(&mut self) -> Result<CreateTableData, ParserError> {
         self.lexer.eat_keyword("table")?;
         let table_name = self.lexer.eat_identifier()?;
@@ -352,8 +335,6 @@ impl<'a> Parser<'a> {
         Ok(CreateTableData::new(table_name, field_defs))
     }
 
-    /// Parses CREATE VIEW statement
-    /// Returns: CreateViewData containing view name and query
     fn create_view(&mut self) -> Result<CreateViewData, ParserError> {
         self.lexer.eat_keyword("view")?;
         let view_name = self.lexer.eat_identifier()?;
@@ -362,8 +343,7 @@ impl<'a> Parser<'a> {
         Ok(CreateViewData::new(view_name, query_data))
     }
 
-    /// Parses CREATE INDEX statement
-    /// Returns: CreateIndexData containing index details
+    /// Only single-column indexes are supported; the grammar accepts exactly one field name.
     fn create_index(&mut self) -> Result<CreateIndexData, ParserError> {
         self.lexer.eat_keyword("index")?;
         let index_name = self.lexer.eat_identifier()?;
@@ -375,8 +355,6 @@ impl<'a> Parser<'a> {
         Ok(CreateIndexData::new(index_name, table_name, field))
     }
 
-    /// Parses INSERT statement
-    /// Returns: InsertData containing table name, fields, and values
     fn insert(&mut self) -> Result<InsertData, ParserError> {
         self.lexer.eat_keyword("insert")?;
         self.lexer.eat_keyword("into")?;
@@ -391,8 +369,6 @@ impl<'a> Parser<'a> {
         Ok(InsertData::new(table_name, field_list, constants))
     }
 
-    /// Parses DELETE statement
-    /// Returns: DeleteData containing table name and predicate
     fn delete(&mut self) -> Result<DeleteData, ParserError> {
         self.lexer.eat_keyword("delete")?;
         self.lexer.eat_keyword("from")?;
@@ -408,8 +384,6 @@ impl<'a> Parser<'a> {
         Ok(DeleteData::new(table_name, predicate))
     }
 
-    /// Parses UPDATE statement
-    /// Returns: ModifyData containing update details
     fn modify(&mut self) -> Result<ModifyData, ParserError> {
         self.lexer.eat_keyword("update")?;
         let table_name = self.lexer.eat_identifier()?;
@@ -430,7 +404,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Parses a full predicate with proper precedence: NOT > AND > OR.
+    /// Precedence: NOT binds tightest, then AND, then OR — standard SQL.
     fn parse_predicate(&mut self) -> Result<Predicate, ParserError> {
         self.parse_or()
     }
@@ -473,7 +447,6 @@ impl<'a> Parser<'a> {
         self.parse_primary_predicate()
     }
 
-    /// Parses a parenthesized predicate or a single comparison term
     fn parse_primary_predicate(&mut self) -> Result<Predicate, ParserError> {
         if self.lexer.match_delim('(') {
             self.lexer.eat_delim('(')?;
@@ -929,6 +902,7 @@ impl QueryData {
         }
     }
 
+    /// Not implemented — always panics. Exists as a placeholder.
     pub fn to_sql(&self) -> String {
         let mut sql = String::from("SELECT ");
         sql.push_str(&self.fields.join(", "));
@@ -961,7 +935,6 @@ impl<'a> Lexer<'a> {
     const SLASH: char = '/';
     const PERCENT: char = '%';
 
-    /// Creates a new Lexer with the given SQL string
     fn new(string: &'a str) -> Self {
         let keywords = [
             "select", "from", "where", "and", "or", "not", "insert", "into", "values", "delete",
@@ -977,7 +950,8 @@ impl<'a> Lexer<'a> {
         lexer
     }
 
-    /// Parses a string literal enclosed in single quotes
+    /// No escape sequence support: a literal `'` inside a string cannot be
+    /// represented. `''` (SQL standard doubling) is not handled either.
     fn parse_string(&mut self) -> Option<Token> {
         self.input.next(); //  consume the opening quote
         let mut string = String::new();
@@ -992,7 +966,8 @@ impl<'a> Lexer<'a> {
         Some(Token::StringConstant(string))
     }
 
-    /// Parses a numeric literal (integer or float).
+    /// Once a `.` is seen after digits, the token is committed to Float —
+    /// a trailing dot (e.g. `3.`) therefore produces `FloatConstant(3.0)`.
     fn parse_number(&mut self) -> Option<Token> {
         let mut number = String::new();
         while let Some(&c) = self.input.peek() {
@@ -1017,7 +992,7 @@ impl<'a> Lexer<'a> {
         Some(Token::IntConstant(number.parse().unwrap()))
     }
 
-    /// Parses an identifier or keyword
+    /// All identifiers and keywords are lowercased, making the lexer case-insensitive.
     fn parse_identifier_or_keyword(&mut self) -> Option<Token> {
         let mut string = String::new();
         while let Some(&c) = self.input.peek() {
@@ -1033,7 +1008,9 @@ impl<'a> Lexer<'a> {
         Some(Token::Identifier(string.to_lowercase()))
     }
 
-    /// Returns the next token from the input stream.
+    /// Whitespace and unrecognised characters are skipped by recursing — the
+    /// `_` arm consumes one character and calls `next_token` again rather than
+    /// returning an error, so the lexer is tolerant of unknown input.
     fn next_token(&mut self) -> Option<Token> {
         let c = self.input.peek().cloned()?;
         let token = match c {
@@ -1093,12 +1070,10 @@ impl<'a> Lexer<'a> {
         token
     }
 
-    /// Checks if current token matches the given delimiter
     fn match_delim(&self, ch: char) -> bool {
         matches!(self.current_token, Some(Token::Delimiter(d)) if d == ch)
     }
 
-    /// Consumes the current token if it matches the given delimiter
     fn eat_delim(&mut self, ch: char) -> Result<(), ParserError> {
         if !self.match_delim(ch) {
             return Err(ParserError::BadSyntax);
@@ -1107,12 +1082,10 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Checks if current token is an integer constant
     fn match_int_constant(&self) -> bool {
         matches!(self.current_token, Some(Token::IntConstant(_)))
     }
 
-    /// Consumes and returns the current integer constant
     fn eat_int_constant(&mut self) -> Result<i32, ParserError> {
         if !self.match_int_constant() {
             return Err(ParserError::BadSyntax);
@@ -1139,12 +1112,10 @@ impl<'a> Lexer<'a> {
         Ok(f)
     }
 
-    /// Checks if current token is a string constant
     fn match_string_constant(&self) -> bool {
         matches!(self.current_token, Some(Token::StringConstant(_)))
     }
 
-    /// Consumes and returns the current string constant
     fn eat_string_constant(&mut self) -> Result<String, ParserError> {
         if !self.match_string_constant() {
             return Err(ParserError::BadSyntax);
@@ -1156,17 +1127,14 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
-    /// Checks if current token is an identifier
     fn match_identifier(&self) -> bool {
         matches!(self.current_token, Some(Token::Identifier(_)))
     }
 
-    /// Checks if current token is an identifier with the given value.
     fn match_identifier_value(&self, value: &str) -> bool {
         matches!(&self.current_token, Some(Token::Identifier(id)) if id == value)
     }
 
-    /// Consumes and returns the current identifier
     fn eat_identifier(&mut self) -> Result<String, ParserError> {
         if !self.match_identifier() {
             return Err(ParserError::BadSyntax);
@@ -1178,12 +1146,10 @@ impl<'a> Lexer<'a> {
         Ok(id)
     }
 
-    /// Checks if current token matches the given keyword
     fn match_keyword(&self, keyword: &str) -> bool {
         matches!(&self.current_token, Some(Token::Keyword(token)) if token == keyword)
     }
 
-    /// Consumes and returns the current keyword if it matches
     fn eat_keyword(&mut self, keyword: &str) -> Result<String, ParserError> {
         if !self.match_keyword(keyword) {
             return Err(ParserError::BadSyntax);
@@ -1210,6 +1176,8 @@ pub enum Token {
     NotEqual,
 }
 
+/// `FloatConstant` uses `to_bits()` equality for the same reason as `Constant::PartialEq`:
+/// f64 doesn't implement `Eq`, so the derived impl is unavailable.
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
