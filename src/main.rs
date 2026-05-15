@@ -13127,7 +13127,6 @@ impl RecoveryManager {
     /// Flush all data associated with this transaction
     /// Create, write and flush a [`LogRecord::Checkpoint`] record
     fn rollback(&self, tx: &dyn RecoveryWriteContext) -> SimpleDBResult<()> {
-        //  Perform the actual rollback by reading the files from WAL and undoing all changes made by this txn
         let log_iter = self.log_manager.lock().unwrap().iterator();
         for (_, log) in log_iter {
             let record = LogRecord::from_bytes(log)?;
@@ -13139,9 +13138,7 @@ impl RecoveryManager {
             }
             record.undo(tx)?;
         }
-        //  Flush all data associated with this transaction
         self.buffer_manager.flush_all(self.tx_num);
-        //  Write a checkpoint record and flush it
         let latest_lsn = self.log_manager.lock().unwrap().latest_lsn();
         let checkpoint_record = LogRecord::Checkpoint { latest_lsn };
         let lsn = checkpoint_record.write_log_record(&self.log_manager)?;

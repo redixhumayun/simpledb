@@ -1072,6 +1072,20 @@ impl BufferManager {
         self.notify_flusher();
     }
 
+    /// Bulk-enqueues deferred dirty frames under one lock acquisition.
+    fn requeue_dirty_frames(&self, frame_indices: Vec<usize>) {
+        if frame_indices.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.dirty_queue.lock().unwrap();
+            for frame_idx in frame_indices {
+                queue.push_back(frame_idx);
+            }
+        }
+        self.notify_flusher();
+    }
+
     /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
     fn collect_dirty_snapshots_for_txn(
         &self,
@@ -1079,6 +1093,10 @@ impl BufferManager {
         txn_num: usize,
     ) -> Vec<PendingWriteback> {
         let mut pending = Vec::new();
+        // Non-txn_num frames and unclaimed frames are deferred so they are
+        // re-enqueued in bulk after the loop. Inline re-enqueue inside the loop
+        // causes infinite cycling when the queue contains only other-txn frames.
+        let mut deferred = Vec::new();
         while pending.len() < batch_limit {
             let Some(frame_idx) = self.dirty_queue.lock().unwrap().pop_front() else {
                 break;
@@ -1090,16 +1108,16 @@ impl BufferManager {
                 continue;
             }
             if meta.txn() != Some(txn_num) {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
-                    self.enqueue_dirty_frame(frame_idx);
+                if meta.try_queue_dirty_if_flushable().is_some() {
+                    deferred.push(frame_idx);
                 }
                 continue;
             }
             let Some((block_id, lsn, generation, snapshot)) =
                 buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
             else {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
-                    self.enqueue_dirty_frame(frame_idx);
+                if meta.try_queue_dirty_if_flushable().is_some() {
+                    deferred.push(frame_idx);
                 }
                 continue;
             };
@@ -1111,6 +1129,7 @@ impl BufferManager {
                 snapshot,
             });
         }
+        self.requeue_dirty_frames(deferred);
         pending
     }
 
