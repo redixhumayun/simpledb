@@ -27,8 +27,8 @@ pub mod test_utils;
 pub use btree::BTreeIndex;
 pub use btree::SplitGate;
 use parser::{
-    CreateIndexData, CreateTableData, CreateViewData, DeleteData, InsertData, ModifyData, Parser,
-    QueryData,
+    AggregateOp, AggregateSpec, CreateIndexData, CreateTableData, CreateViewData, DeleteData,
+    InsertData, ModifyData, Parser, QueryData, SortDirection,
 };
 
 pub use test_utils::TestDir;
@@ -908,6 +908,7 @@ impl Scan for ChunkScan {
         })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => Ok(Constant::Int(record_page.get_int(slot, field_name)?)),
+            FieldType::Float => Ok(Constant::Float(record_page.get_float(slot, field_name)?)),
             FieldType::String => Ok(Constant::String(record_page.get_string(slot, field_name)?)),
         }
     }
@@ -2245,6 +2246,19 @@ impl SortPlan {
         }
     }
 
+    pub fn with_directions(
+        source_plan: Arc<dyn Plan>,
+        field_list: Vec<(String, SortDirection)>,
+    ) -> Self {
+        let schema = source_plan.schema();
+        let record_comparator = RecordComparator::with_directions(field_list);
+        Self {
+            source_plan,
+            schema,
+            record_comparator,
+        }
+    }
+
     pub fn open_sort_scan(&self, ctx: &ExecutionContext) -> SortScan {
         let source_scan = self.source_plan.open(ctx);
         let executor = SortExecutor::new(self.schema.clone(), self.record_comparator.clone());
@@ -2853,21 +2867,34 @@ mod sort_scan_tests {
 
 #[derive(Clone)]
 pub struct RecordComparator {
-    field_list: Vec<String>,
+    field_list: Vec<(String, SortDirection)>,
 }
 
 impl RecordComparator {
-    pub fn new(field_list: Vec<String>) -> Self {
+    /// Creates a comparator that sorts all fields ascending.
+    pub fn new(fields: Vec<String>) -> Self {
+        Self {
+            field_list: fields
+                .into_iter()
+                .map(|f| (f, SortDirection::Asc))
+                .collect(),
+        }
+    }
+
+    pub fn with_directions(field_list: Vec<(String, SortDirection)>) -> Self {
         Self { field_list }
     }
 
     fn compare<S1: Scan, S2: Scan>(&self, s1: &S1, s2: &S2) -> Result<Ordering, Box<dyn Error>> {
-        for field in &self.field_list {
+        for (field, dir) in &self.field_list {
             let value_1 = s1.get_value(field)?;
             let value_2 = s2.get_value(field)?;
             let cmp = value_1.cmp(&value_2);
             if cmp != std::cmp::Ordering::Equal {
-                return Ok(cmp);
+                return Ok(match dir {
+                    SortDirection::Asc => cmp,
+                    SortDirection::Desc => cmp.reverse(),
+                });
             }
         }
         Ok(Ordering::Equal)
@@ -3581,6 +3608,7 @@ impl UpdatePlanner for IndexUpdatePlanner {
                 field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
                     match schema.info[f].field_type {
                         FieldType::Int => Constant::Int(0),
+                        FieldType::Float => Constant::Float(0.0),
                         FieldType::String => Constant::String(String::new()),
                     }
                 })
@@ -3761,6 +3789,7 @@ impl UpdatePlanner for BasicUpdatePlanner {
                 field_map.get(f.as_str()).cloned().unwrap_or_else(|| {
                     match schema.info[f].field_type {
                         FieldType::Int => Constant::Int(0),
+                        FieldType::Float => Constant::Float(0.0),
                         FieldType::String => Constant::String(String::new()),
                     }
                 })
@@ -4092,6 +4121,8 @@ impl HeuristicQueryPlanner {
         query_data: QueryData,
         ctx: &PlanningContext,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
+        let order_by = query_data.order_by;
+
         //  Construct all instances of [TablePlanner]
         for table_name in query_data.tables {
             let table_planner =
@@ -4117,8 +4148,20 @@ impl HeuristicQueryPlanner {
             }
         }
 
+        //  Apply aggregate functions before sorting/projection
+        if !query_data.aggregates.is_empty() {
+            current_plan = Arc::new(AggregatePlan::new(current_plan, query_data.aggregates));
+        }
+
+        //  Sort before projection so ORDER BY can reference non-projected columns
+        let pre_project = if !order_by.is_empty() {
+            Arc::new(SortPlan::with_directions(current_plan, order_by))
+        } else {
+            current_plan
+        };
+
         Ok(Arc::new(ProjectPlan::new(
-            current_plan,
+            pre_project,
             query_data.fields.iter().map(String::as_str).collect(),
         )?))
     }
@@ -4214,6 +4257,7 @@ impl QueryPlanner for BasicQueryPlanner {
     /// 2. Create a join of all tables
     /// 3. Create a selection with the predicate
     /// 4. Create a projection of the required columns
+    /// 5. If ORDER BY is present, wrap with SortPlan
     fn create_plan(
         &self,
         query_data: QueryData,
@@ -4236,11 +4280,22 @@ impl QueryPlanner for BasicQueryPlanner {
         //  3. Create the selection with the predicate
         plan = Arc::new(SelectPlan::new(plan, query_data.predicate));
 
-        //  4. Create the projection
+        //  4. Apply aggregate functions before sorting/projection
+        if !query_data.aggregates.is_empty() {
+            plan = Arc::new(AggregatePlan::new(plan, query_data.aggregates));
+        }
+
+        //  5. Sort before projection so ORDER BY can reference non-projected columns
+        if !query_data.order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, query_data.order_by));
+        }
+
+        //  6. Create the projection
         plan = Arc::new(ProjectPlan::new(
             plan,
             query_data.fields.iter().map(AsRef::as_ref).collect(),
         )?);
+
         Ok(plan)
     }
 }
@@ -4586,6 +4641,284 @@ mod heuristic_equivalence_tests {
             Arc::clone(&txn),
             "select name, dept from e, d where id = depid",
             &["name", "dept"],
+        );
+    }
+
+    fn collect_ordered<F, T>(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        extract: F,
+    ) -> Vec<T>
+    where
+        F: Fn(&dyn Scan) -> T,
+    {
+        let plan = planner
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut rows = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            rows.push(extract(scan.as_ref()));
+        }
+        rows
+    }
+
+    #[test]
+    fn order_by_asc_and_desc() {
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "c"), (1, "a"), (2, "b")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        let asc = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by a asc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            asc,
+            vec![Constant::Int(1), Constant::Int(2), Constant::Int(3)]
+        );
+
+        let desc = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by a desc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            desc,
+            vec![Constant::Int(3), Constant::Int(2), Constant::Int(1)]
+        );
+    }
+
+    #[test]
+    fn order_by_non_projected_column() {
+        // Sort must run before projection so ORDER BY can reference columns not in the select list.
+        let (db, txn, _dir) = setup_db();
+        let p = heuristic_planner(&db);
+
+        exec(&p, Arc::clone(&txn), "create table t(a int, b varchar(10))");
+        for (a, b) in [(3, "a"), (1, "b"), (2, "c")] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(a,b) values ({a},'{b}')"),
+            );
+        }
+
+        // b is not projected; sorted by b asc -> "a"->3, "b"->1, "c"->2
+        let rows = collect_ordered(
+            &p,
+            Arc::clone(&txn),
+            "select a from t order by b asc",
+            |s| s.get_value("a").unwrap(),
+        );
+        assert_eq!(
+            rows,
+            vec![Constant::Int(3), Constant::Int(1), Constant::Int(2)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+
+    fn setup_db() -> (SimpleDB, Arc<Transaction>, test_utils::TestDir) {
+        let (db, dir) = SimpleDB::new_for_test(8, 5000);
+        let txn = db.new_tx();
+        (db, txn, dir)
+    }
+
+    fn basic_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(BasicQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn pipeline_planner(db: &SimpleDB) -> Planner {
+        Planner::new(
+            Box::new(PipelineQueryPlanner::new(Arc::clone(&db.metadata_manager))),
+            Box::new(IndexUpdatePlanner::new(Arc::clone(&db.metadata_manager))),
+        )
+    }
+
+    fn exec(planner: &Planner, txn: Arc<Transaction>, sql: &str) {
+        planner.execute_update(sql.to_string(), txn).unwrap();
+    }
+
+    fn fetch_rows(
+        planner: &Planner,
+        txn: Arc<Transaction>,
+        sql: &str,
+        fields: &[&str],
+    ) -> Vec<Vec<Constant>> {
+        let plan = planner
+            .create_query_plan(sql.to_string(), Arc::clone(&txn))
+            .unwrap();
+        let ctx = ExecutionContext::new(txn);
+        let mut scan = plan.open(&ctx);
+        scan.before_first().unwrap();
+        let mut out = Vec::new();
+        while let Some(Ok(())) = scan.next() {
+            out.push(fields.iter().map(|f| scan.get_value(f).unwrap()).collect());
+        }
+        out
+    }
+
+    #[test]
+    fn test_max() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(id int, score int)");
+        for (id, score) in [(1, 30), (2, 70), (3, 50)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(id, score) values ({id}, {score})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select max(score) from t",
+                &["max_score"]
+            ),
+            vec![vec![Constant::Int(70)]]
+        );
+    }
+
+    #[test]
+    fn test_min() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(id int, score int)");
+        for (id, score) in [(1, 30), (2, 70), (3, 50)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(id, score) values ({id}, {score})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select min(score) from t",
+                &["min_score"]
+            ),
+            vec![vec![Constant::Int(30)]]
+        );
+    }
+
+    #[test]
+    fn test_sum() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(id int, score int)");
+        for (id, score) in [(1, 10), (2, 20), (3, 30)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(id, score) values ({id}, {score})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select sum(score) from t",
+                &["sum_score"]
+            ),
+            vec![vec![Constant::Int(60)]]
+        );
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(id int, cat int)");
+        // cat values: 1, 2, 2, 3 — 3 distinct
+        for (id, cat) in [(1, 1), (2, 2), (3, 2), (4, 3)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(id, cat) values ({id}, {cat})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select count(distinct cat) from t",
+                &["count_distinct_cat"]
+            ),
+            vec![vec![Constant::Int(3)]]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_with_where() {
+        let (db, txn, _dir) = setup_db();
+        let p = basic_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(dept int, salary int)");
+        // dept 1: salaries 100, 200; dept 2: salaries 300, 400
+        for (dept, salary) in [(1, 100), (1, 200), (2, 300), (2, 400)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(dept, salary) values ({dept}, {salary})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(
+                &p,
+                Arc::clone(&txn),
+                "select max(salary) from t where dept = 1",
+                &["max_salary"]
+            ),
+            vec![vec![Constant::Int(200)]]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_pipeline_planner() {
+        let (db, txn, _dir) = setup_db();
+        let p = pipeline_planner(&db);
+        exec(&p, Arc::clone(&txn), "create table t(id int, val int)");
+        for (id, val) in [(1, 5), (2, 15), (3, 10)] {
+            exec(
+                &p,
+                Arc::clone(&txn),
+                &format!("insert into t(id, val) values ({id}, {val})"),
+            );
+        }
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select max(val) from t", &["max_val"]),
+            vec![vec![Constant::Int(15)]]
+        );
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select min(val) from t", &["min_val"]),
+            vec![vec![Constant::Int(5)]]
+        );
+        assert_eq!(
+            fetch_rows(&p, Arc::clone(&txn), "select sum(val) from t", &["sum_val"]),
+            vec![vec![Constant::Int(30)]]
         );
     }
 }
@@ -5368,9 +5701,57 @@ impl QueryPlanner for PipelineQueryPlanner {
         txn: Arc<Transaction>,
     ) -> SimpleDBResult<Arc<dyn Plan>> {
         let ctx = PlanningContext::new(txn, Arc::clone(&self.metadata_manager));
-        let logical = BasicLogicalPlanner::new().build(query_data, &ctx)?;
+        let order_by = query_data.order_by.clone();
+        let aggregates = query_data.aggregates.clone();
+        let has_aggregates = !aggregates.is_empty();
+        // Capture the intended output fields before potentially replacing with "*".
+        let final_fields: Vec<String> = if has_aggregates {
+            query_data.fields.clone()
+        } else {
+            vec![]
+        };
+
+        // For aggregate queries the logical planner sees a star projection so it
+        // doesn't try to look up aggregate alias names in the source schema.
+        let logical_query = if has_aggregates {
+            QueryData {
+                fields: vec!["*".to_string()],
+                tables: query_data.tables,
+                predicate: query_data.predicate,
+                order_by: query_data.order_by,
+                aggregates: vec![],
+            }
+        } else {
+            query_data
+        };
+
+        let logical = BasicLogicalPlanner::new().build(logical_query, &ctx)?;
         let optimized = HeuristicLogicalOptimizer::new().optimize(logical, &ctx)?;
-        DefaultPhysicalPlanner::new().lower(&optimized, &ctx)
+
+        // BasicLogicalPlanner always produces a Project at the top of the tree.
+        assert_eq!(optimized.kind(), LogicalPlanKind::Project);
+
+        let input = optimized.input().unwrap();
+        let logical_fields = optimized.project_fields().unwrap();
+        let mut plan = DefaultPhysicalPlanner::new().lower(input, &ctx)?;
+
+        // Apply aggregates before sorting/projection.
+        if has_aggregates {
+            plan = Arc::new(AggregatePlan::new(plan, aggregates));
+        }
+
+        // Sort before projection so ORDER BY can reference non-projected columns.
+        if !order_by.is_empty() {
+            plan = Arc::new(SortPlan::with_directions(plan, order_by));
+        }
+
+        let proj_fields: Vec<String> = if has_aggregates {
+            final_fields
+        } else {
+            logical_fields.to_vec()
+        };
+        let field_refs: Vec<&str> = proj_fields.iter().map(String::as_str).collect();
+        Ok(Arc::new(ProjectPlan::new(plan, field_refs)?))
     }
 }
 
@@ -5498,6 +5879,265 @@ impl Plan for ProjectPlan {
         println!("{}├─ Records: {}", prefix, self.records_output());
         println!("{prefix}├─ Child Plan:");
         self.plan.print_plan(indent + 1);
+        println!("{prefix}╰─");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AggregatePlan / AggregateScan
+// ---------------------------------------------------------------------------
+
+/// Runtime accumulator state for one aggregate expression.
+enum AggregateRunState {
+    /// Used for both Min and Max — None until the first row is seen.
+    MinMax(Option<Constant>),
+    SumInt(i64),
+    SumFloat(f64),
+    CountDistinct(HashSet<Constant>),
+}
+
+/// A scan that consumes its source entirely on the first `next()` call, computes
+/// aggregate results, and then returns exactly one row.
+struct AggregateScan<S: Scan> {
+    source: S,
+    specs: Vec<AggregateSpec>,
+    /// Type-correct defaults for MIN/MAX over an empty source (one per spec).
+    /// Computed by AggregatePlan from the source schema so the result type
+    /// matches the output schema even when no rows are seen.
+    empty_defaults: Vec<Constant>,
+    /// Populated by the first `next()` call; `None` means not yet computed.
+    results: Option<HashMap<String, Constant>>,
+    exhausted: bool,
+}
+
+impl<S: Scan> AggregateScan<S> {
+    fn new(source: S, specs: Vec<AggregateSpec>, empty_defaults: Vec<Constant>) -> Self {
+        Self {
+            source,
+            specs,
+            empty_defaults,
+            results: None,
+            exhausted: false,
+        }
+    }
+
+    fn compute(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut state: Vec<AggregateRunState> = self
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| match spec.op {
+                AggregateOp::Min | AggregateOp::Max => AggregateRunState::MinMax(None),
+                AggregateOp::Sum => match &self.empty_defaults[i] {
+                    Constant::Float(_) => AggregateRunState::SumFloat(0.0),
+                    _ => AggregateRunState::SumInt(0),
+                },
+                AggregateOp::CountDistinct => AggregateRunState::CountDistinct(HashSet::new()),
+            })
+            .collect();
+
+        while let Some(result) = self.source.next() {
+            result?;
+            for (i, spec) in self.specs.iter().enumerate() {
+                let val = self.source.get_value(&spec.field)?;
+                match (&spec.op, &mut state[i]) {
+                    (AggregateOp::Min, AggregateRunState::MinMax(curr)) => {
+                        *curr = Some(match curr.take() {
+                            None => val,
+                            Some(existing) => existing.min(val),
+                        });
+                    }
+                    (AggregateOp::Max, AggregateRunState::MinMax(curr)) => {
+                        *curr = Some(match curr.take() {
+                            None => val,
+                            Some(existing) => existing.max(val),
+                        });
+                    }
+                    (AggregateOp::Sum, AggregateRunState::SumInt(total)) => {
+                        *total += match val {
+                            Constant::Int(v) => v as i64,
+                            _ => val.as_int() as i64,
+                        };
+                    }
+                    (AggregateOp::Sum, AggregateRunState::SumFloat(total)) => {
+                        *total += match val {
+                            Constant::Float(v) => v,
+                            Constant::Int(v) => v as f64,
+                            _ => val.as_int() as f64,
+                        };
+                    }
+                    (AggregateOp::CountDistinct, AggregateRunState::CountDistinct(set)) => {
+                        set.insert(val);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let mut results = HashMap::new();
+        for (i, spec) in self.specs.iter().enumerate() {
+            let result_val = match &state[i] {
+                AggregateRunState::MinMax(curr) => curr
+                    .clone()
+                    .unwrap_or_else(|| self.empty_defaults[i].clone()),
+                AggregateRunState::SumInt(total) => Constant::Int(*total as i32),
+                AggregateRunState::SumFloat(total) => Constant::Float(*total),
+                AggregateRunState::CountDistinct(set) => Constant::Int(set.len() as i32),
+            };
+            results.insert(spec.alias.clone(), result_val);
+        }
+        self.results = Some(results);
+        Ok(())
+    }
+}
+
+impl<S: Scan> Iterator for AggregateScan<S> {
+    type Item = Result<(), Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+        self.exhausted = true;
+        Some(self.compute())
+    }
+}
+
+impl<S: Scan> Scan for AggregateScan<S> {
+    fn before_first(&mut self) -> SimpleDBResult<()> {
+        self.source.before_first()?;
+        self.results = None;
+        self.exhausted = false;
+        Ok(())
+    }
+
+    fn get_value(&self, field_name: &str) -> Result<Constant, Box<dyn Error>> {
+        self.results
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn Error> {
+                "AggregateScan: get_value called before next()".into()
+            })
+            .and_then(|r| {
+                r.get(field_name).cloned().ok_or_else(|| {
+                    format!("field '{field_name}' not found in aggregate results").into()
+                })
+            })
+    }
+
+    fn has_field(&self, field_name: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.specs.iter().any(|s| s.alias == field_name))
+    }
+}
+
+/// A plan node that wraps a source plan and applies whole-query aggregate
+/// functions (MIN, MAX, SUM, COUNT DISTINCT), producing exactly one output row.
+/// GROUP BY is not supported — this is for ungrouped aggregates only.
+struct AggregatePlan {
+    source: Arc<dyn Plan>,
+    specs: Vec<AggregateSpec>,
+    schema: Schema,
+    /// Type-correct default values for MIN/MAX when the source produces no rows.
+    empty_defaults: Vec<Constant>,
+}
+
+impl AggregatePlan {
+    fn new(source: Arc<dyn Plan>, specs: Vec<AggregateSpec>) -> Self {
+        let source_schema = source.schema();
+        let mut schema = Schema::new();
+        let mut empty_defaults = Vec::with_capacity(specs.len());
+
+        for spec in &specs {
+            match spec.op {
+                // COUNT always returns an integer.
+                AggregateOp::CountDistinct => {
+                    schema.add_int_field(&spec.alias);
+                    empty_defaults.push(Constant::Int(0));
+                }
+                // SUM preserves the input field's numeric type.
+                AggregateOp::Sum => {
+                    if let Some(info) = source_schema.info.get(&spec.field) {
+                        if info.field_type == FieldType::Float {
+                            schema.add_float_field(&spec.alias);
+                            empty_defaults.push(Constant::Float(0.0));
+                        } else {
+                            schema.add_int_field(&spec.alias);
+                            empty_defaults.push(Constant::Int(0));
+                        }
+                    } else {
+                        schema.add_int_field(&spec.alias);
+                        empty_defaults.push(Constant::Int(0));
+                    }
+                }
+                // MIN/MAX preserve the input field's type and default accordingly.
+                AggregateOp::Min | AggregateOp::Max => {
+                    if let Some(info) = source_schema.info.get(&spec.field) {
+                        match info.field_type {
+                            FieldType::Int => {
+                                schema.add_int_field(&spec.alias);
+                                empty_defaults.push(Constant::Int(0));
+                            }
+                            FieldType::Float => {
+                                schema.add_float_field(&spec.alias);
+                                empty_defaults.push(Constant::Float(0.0));
+                            }
+                            FieldType::String => {
+                                schema.add_string_field(&spec.alias, info.length);
+                                empty_defaults.push(Constant::String(String::new()));
+                            }
+                        }
+                    } else {
+                        schema.add_int_field(&spec.alias);
+                        empty_defaults.push(Constant::Int(0));
+                    }
+                }
+            }
+        }
+        Self {
+            source,
+            specs,
+            schema,
+            empty_defaults,
+        }
+    }
+}
+
+impl Plan for AggregatePlan {
+    fn open(&self, ctx: &ExecutionContext) -> Box<dyn Scan> {
+        Box::new(AggregateScan::new(
+            self.source.open(ctx),
+            self.specs.clone(),
+            self.empty_defaults.clone(),
+        ))
+    }
+
+    fn blocks_accessed(&self) -> usize {
+        self.source.blocks_accessed()
+    }
+
+    fn records_output(&self) -> usize {
+        1
+    }
+
+    fn distinct_values(&self, _field_name: &str) -> usize {
+        1
+    }
+
+    fn schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    fn print_plan_internal(&self, indent: usize) {
+        let prefix = "  ".repeat(indent);
+        println!("{prefix}╭─ AggregatePlan");
+        let specs_str: Vec<String> = self
+            .specs
+            .iter()
+            .map(|s| format!("{:?}({}) -> {}", s.op, s.field, s.alias))
+            .collect();
+        println!("{}├─ Aggregates: {:?}", prefix, specs_str);
+        println!("{}├─ Blocks: {}", prefix, self.blocks_accessed());
+        println!("{prefix}├─ Child Plan:");
+        self.source.print_plan(indent + 1);
         println!("{prefix}╰─");
     }
 }
@@ -7631,6 +8271,16 @@ impl PredicateRangeState {
     }
 }
 
+/// Promotes an Int/Float mixed pair to (Float, Float) so comparisons are numeric.
+/// Same-type pairs are returned unchanged.
+fn coerce_numeric_pair(a: Constant, b: Constant) -> (Constant, Constant) {
+    match (&a, &b) {
+        (Constant::Int(i), Constant::Float(_)) => (Constant::Float(*i as f64), b),
+        (Constant::Float(_), Constant::Int(i)) => (a, Constant::Float(*i as f64)),
+        _ => (a, b),
+    }
+}
+
 impl Term {
     pub fn new(lhs: Expression, rhs: Expression) -> Self {
         Self {
@@ -7654,6 +8304,7 @@ impl Term {
     {
         let lhs = self.lhs.evaluate(scan)?;
         let rhs = self.rhs.evaluate(scan)?;
+        let (lhs, rhs) = coerce_numeric_pair(lhs, rhs);
 
         match self.comparison_op {
             ComparisonOp::Equal => Ok(lhs == rhs),
@@ -7904,6 +8555,7 @@ impl Expression {
         match self {
             Expression::Constant(constant) => match constant {
                 Constant::Int(value) => value.to_string(),
+                Constant::Float(value) => value.to_string(),
                 Constant::String(string) => string.to_string(),
             },
             Expression::FieldName(field_name) => field_name.clone(),
@@ -8066,6 +8718,7 @@ mod metadata_manager_tests {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
                 FieldType::Int => "int".to_string(),
+                FieldType::Float => "float".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{field}: {type_str}");
@@ -8396,6 +9049,9 @@ impl IndexInfo {
         match table_schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => {
                 schema.add_int_field(Self::DATA_FIELD);
+            }
+            FieldType::Float => {
+                schema.add_float_field(Self::DATA_FIELD);
             }
             FieldType::String => {
                 let field_length = table_schema.info.get(field_name).unwrap().length;
@@ -9049,6 +9705,7 @@ mod table_manager_tests {
             let field_info = layout.schema.info.get(field).unwrap();
             let type_str = match field_info.field_type {
                 FieldType::Int => "int".to_string(),
+                FieldType::Float => "float".to_string(),
                 FieldType::String => format!("varchar({})", field_info.length),
             };
             println!("{field}: {type_str}");
@@ -9282,6 +9939,7 @@ impl Scan for TableScan {
         })?;
         match self.layout.schema.info.get(field_name).unwrap().field_type {
             FieldType::Int => Ok(Constant::Int(page.get_int(slot, field_name)?)),
+            FieldType::Float => Ok(Constant::Float(page.get_float(slot, field_name)?)),
             FieldType::String => Ok(Constant::String(page.get_string(slot, field_name)?)),
         }
     }
@@ -9303,6 +9961,11 @@ impl TableCursor for TableScan {
                 *self.current_slot.as_ref().unwrap(),
                 field_name,
                 value.as_int(),
+            )?,
+            FieldType::Float => self.record_page.as_ref().unwrap().set_float(
+                *self.current_slot.as_ref().unwrap(),
+                field_name,
+                value.as_float(),
             )?,
             FieldType::String => self.record_page.as_ref().unwrap().set_string(
                 *self.current_slot.as_ref().unwrap(),
@@ -9527,10 +10190,65 @@ mod table_scan_tests {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug)]
 pub enum Constant {
     Int(i32),
+    Float(f64),
     String(String),
+}
+
+impl PartialEq for Constant {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Constant::Int(a), Constant::Int(b)) => a == b,
+            (Constant::Float(a), Constant::Float(b)) => a.to_bits() == b.to_bits(),
+            (Constant::String(a), Constant::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Constant {}
+
+impl std::hash::Hash for Constant {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Constant::Int(v) => {
+                0i32.hash(state);
+                v.hash(state);
+            }
+            Constant::Float(v) => {
+                2i32.hash(state);
+                v.to_bits().hash(state);
+            }
+            Constant::String(s) => {
+                1i32.hash(state);
+                s.hash(state);
+            }
+        }
+    }
+}
+
+impl PartialOrd for Constant {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Constant {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Constant::Int(a), Constant::Int(b)) => a.cmp(b),
+            (Constant::Float(a), Constant::Float(b)) => a.total_cmp(b),
+            (Constant::String(a), Constant::String(b)) => a.cmp(b),
+            // Cross-type ordering: Int < Float < String
+            (Constant::Int(_), _) => Ordering::Less,
+            (_, Constant::Int(_)) => Ordering::Greater,
+            (Constant::Float(_), Constant::String(_)) => Ordering::Less,
+            (Constant::String(_), Constant::Float(_)) => Ordering::Greater,
+        }
+    }
 }
 
 impl Constant {
@@ -9538,6 +10256,13 @@ impl Constant {
         match self {
             Constant::Int(value) => *value,
             _ => panic!("Expected an integer constant"),
+        }
+    }
+
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Constant::Float(value) => *value,
+            _ => panic!("Expected a float constant"),
         }
     }
 
@@ -9549,13 +10274,15 @@ impl Constant {
     }
 
     fn serialized_size(&self) -> usize {
-        const TYPE_TAG_SIZE: usize = 4; // i32 for type tag
-        const INT_SIZE: usize = 4; // i32 for integer value
-        const STR_LEN_SIZE: usize = 4; // i32 for string length
+        const TYPE_TAG_SIZE: usize = 4;
+        const INT_SIZE: usize = 4;
+        const FLOAT_SIZE: usize = 8;
+        const STR_LEN_SIZE: usize = 4;
 
         TYPE_TAG_SIZE
             + match self {
                 Constant::Int(_) => INT_SIZE,
+                Constant::Float(_) => FLOAT_SIZE,
                 Constant::String(s) => STR_LEN_SIZE + s.len(),
             }
     }
@@ -9563,6 +10290,7 @@ impl Constant {
     fn successor(&self) -> Option<Constant> {
         match self {
             Constant::Int(value) => value.checked_add(1).map(Constant::Int),
+            Constant::Float(_) => None,
             Constant::String(value) => {
                 let mut next = value.clone();
                 next.push('\0');
@@ -9575,11 +10303,21 @@ impl Constant {
 impl TryInto<Vec<u8>> for Constant {
     type Error = Box<dyn Error>;
 
+    /// Encodes with a 4-byte little-endian type tag so all variants are unambiguous:
+    /// tag 0 = Int (4 bytes), tag 1 = String (4-byte len + bytes), tag 2 = Float (8 bytes).
     fn try_into(self) -> Result<Vec<u8>, Self::Error> {
         let mut buf = Vec::new();
         match self {
-            Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            Constant::Int(v) => {
+                buf.extend_from_slice(&0i32.to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Constant::Float(v) => {
+                buf.extend_from_slice(&2i32.to_le_bytes());
+                buf.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
             Constant::String(s) => {
+                buf.extend_from_slice(&1i32.to_le_bytes());
                 let len: u32 = s
                     .len()
                     .try_into()
@@ -9661,6 +10399,21 @@ impl RecordPage {
             .to_string())
     }
 
+    fn get_float(&self, slot: usize, field_name: &str) -> SimpleDBResult<f64> {
+        self.txn
+            .lock_row_s(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        Ok(self
+            .txn
+            .pin_read_guard(&self.block_id)?
+            .into_heap_view(&self.layout)
+            .unwrap()
+            .row(slot)
+            .unwrap()
+            .get_column(field_name)
+            .unwrap()
+            .as_float())
+    }
+
     /// Sets an integer value in the specified slot and field.
     fn set_int(&self, slot: usize, field_name: &str, value: i32) -> SimpleDBResult<()> {
         self.txn
@@ -9689,6 +10442,22 @@ impl RecordPage {
             .row_mut(slot)?
             .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
         row.set_column(field_name, &Constant::String(value.to_string()))
+            .ok_or_else(|| -> Box<dyn Error> {
+                format!("field '{field_name}' not in schema").into()
+            })?;
+        Ok(())
+    }
+
+    fn set_float(&self, slot: usize, field_name: &str, value: f64) -> SimpleDBResult<()> {
+        self.txn
+            .lock_row_x(self.table_id, RID::new(self.block_id.block_num, slot))?;
+        let ws = self.txn.write_session();
+        let guard = ws.pin_write_guard(&self.block_id)?;
+        let mut view = guard.into_heap_view_mut(&self.layout)?;
+        let mut row = view
+            .row_mut(slot)?
+            .ok_or_else(|| -> Box<dyn Error> { format!("slot {slot} not found").into() })?;
+        row.set_column(field_name, &Constant::Float(value))
             .ok_or_else(|| -> Box<dyn Error> {
                 format!("field '{field_name}' not in schema").into()
             })?;
@@ -9865,6 +10634,7 @@ impl Layout {
             let info = self.schema.info.get(f)?;
             match info.field_type {
                 FieldType::Int => offset += info.length,
+                FieldType::Float => offset += info.length,
                 FieldType::String => offset += Self::INT_BYTES + info.length,
             }
         }
@@ -9882,6 +10652,7 @@ impl Layout {
             let info = self.schema.info.get(f).unwrap();
             match info.field_type {
                 FieldType::Int => size += info.length,
+                FieldType::Float => size += info.length,
                 FieldType::String => size += Self::INT_BYTES + info.length,
             }
         }
@@ -9907,6 +10678,7 @@ impl Layout {
         for value in values {
             match value {
                 Constant::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
+                Constant::Float(v) => buf.extend_from_slice(&v.to_bits().to_le_bytes()),
                 Constant::String(s) => {
                     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
@@ -9965,6 +10737,9 @@ impl Layout {
                     Some(Constant::Int(v)) => {
                         data.extend_from_slice(&v.to_le_bytes());
                     }
+                    Some(Constant::Float(v)) => {
+                        data.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
                     Some(Constant::String(s)) => {
                         data.extend_from_slice(&(s.len() as u32).to_le_bytes());
                         data.extend_from_slice(s.as_bytes());
@@ -9997,6 +10772,7 @@ impl Layout {
             let info = self.schema.info.get(fname)?;
             match info.field_type {
                 FieldType::Int => offset += 4,
+                FieldType::Float => offset += 8,
                 FieldType::String => {
                     let len =
                         u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
@@ -10009,6 +10785,9 @@ impl Layout {
             FieldType::Int => Some(Constant::Int(i32::from_le_bytes(
                 payload[offset..offset + 4].try_into().ok()?,
             ))),
+            FieldType::Float => Some(Constant::Float(f64::from_bits(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            )))),
             FieldType::String => {
                 let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
                 Some(Constant::String(
@@ -10038,6 +10817,11 @@ impl Layout {
                     let v = i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
                     result.push(Some(Constant::Int(v)));
                     offset += 4;
+                }
+                FieldType::Float => {
+                    let bits = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+                    result.push(Some(Constant::Float(f64::from_bits(bits))));
+                    offset += 8;
                 }
                 FieldType::String => {
                     let len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap())
@@ -10081,6 +10865,7 @@ mod layout_tests {
 pub enum FieldType {
     Int = 0,
     String = 1,
+    Float = 2,
 }
 
 impl From<i32> for FieldType {
@@ -10088,6 +10873,7 @@ impl From<i32> for FieldType {
         match value {
             0 => FieldType::Int,
             1 => FieldType::String,
+            2 => FieldType::Float,
             _ => panic!("Invalid field type"),
         }
     }
@@ -10133,8 +10919,14 @@ impl Schema {
             .or_insert_with(|| FieldInfo { field_type, length });
     }
 
+    const FLOAT_BYTES: usize = 8;
+
     fn add_int_field(&mut self, field_name: &str) {
         self.add_field(field_name, FieldType::Int, Self::INT_BYTES);
+    }
+
+    pub fn add_float_field(&mut self, field_name: &str) {
+        self.add_field(field_name, FieldType::Float, Self::FLOAT_BYTES);
     }
 
     fn add_string_field(&mut self, field_name: &str, length: usize) {
@@ -12933,6 +13725,10 @@ impl From<&LogRecord> for Vec<u8> {
                         push_i32(&mut buf, 0); // type tag for Int
                         push_i32(&mut buf, *v);
                     }
+                    Constant::Float(v) => {
+                        push_i32(&mut buf, 2); // type tag for Float
+                        buf.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
                     Constant::String(s) => {
                         push_i32(&mut buf, 1); // type tag for String
                         push_string(&mut buf, s);
@@ -12990,6 +13786,10 @@ impl From<&LogRecord> for Vec<u8> {
                     Constant::Int(v) => {
                         push_i32(&mut buf, 0); // type tag for Int
                         push_i32(&mut buf, *v);
+                    }
+                    Constant::Float(v) => {
+                        push_i32(&mut buf, 2); // type tag for Float
+                        buf.extend_from_slice(&v.to_bits().to_le_bytes());
                     }
                     Constant::String(s) => {
                         push_i32(&mut buf, 1); // type tag for String
@@ -13324,6 +14124,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 let key = match key_type {
                     0 => Constant::Int(read_i32(&value, &mut pos)?),
                     1 => Constant::String(read_string(&value, &mut pos)?),
+                    2 => Constant::Float(f64::from_bits(read_u64(&value, &mut pos)?)),
                     _ => return Err("invalid constant type tag".into()),
                 };
                 let rid = RID::new(read_usize(&value, &mut pos)?, read_usize(&value, &mut pos)?);
@@ -13378,6 +14179,7 @@ impl TryFrom<Vec<u8>> for LogRecord {
                 let key = match key_type {
                     0 => Constant::Int(read_i32(&value, &mut pos)?),
                     1 => Constant::String(read_string(&value, &mut pos)?),
+                    2 => Constant::Float(f64::from_bits(read_u64(&value, &mut pos)?)),
                     _ => return Err("invalid constant type tag".into()),
                 };
                 let child_block = read_usize(&value, &mut pos)?;

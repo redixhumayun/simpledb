@@ -208,6 +208,7 @@ fn describe_table(db: &SimpleDB, table_name: &str) -> Result<String, Box<dyn Err
         let field_info = &layout.schema.info[field];
         let type_str = match field_info.field_type {
             FieldType::Int => "int".to_string(),
+            FieldType::Float => "float".to_string(),
             FieldType::String => format!("varchar({})", field_info.length),
         };
         result.push_str(&format!("{:<20} {:<15}\n", field, type_str));
@@ -341,6 +342,7 @@ fn execute_update(
 fn format_value(value: &Constant) -> String {
     match value {
         Constant::Int(i) => i.to_string(),
+        Constant::Float(f) => f.to_string(),
         Constant::String(s) => s.clone(),
     }
 }

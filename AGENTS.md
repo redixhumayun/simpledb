@@ -4,7 +4,7 @@ This documentation provides information about the SimpleDB project and also prov
 
 ## Project Overview
 
-**Purpose**: A simple SQL database which is a port of an existing SimpleDB database written in Java to Rust. It is mainly for pedagogical purposes and also as a way to experiment with Rust code and performance optimizations
+**Purpose**: A SQL database which started as a port of SimpleDB from Java to Rust. It is mainly a playground for performance profiling, testing and experimenting with novel approaches of building database engines.
 
 **Tech Stack**: Rust, Python
 
@@ -46,7 +46,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - keep docs clear and concise; do not write verbose commentary
 
 5. **Test thoroughly before committing**:
-   Testing requires running tests with combinations of compiler flags. Run these commands one after another; do not use `--test-threads=1`.
+   Testing requires running tests with combinations of compiler flags. Direct-IO is the default IO path and must be included in every run. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
    cargo test
@@ -94,6 +94,22 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - Group related changes into short paragraphs if there are multiple concerns; one paragraph per distinct concern is enough
    - Note breaking changes (renamed methods, removed APIs, changed signatures) explicitly
    - No test plan checklist — CI covers that
+
+9. **Address PR review comments**
+   - Evaluate each comment: determine whether it identifies a genuine bug or design issue before acting
+   - Fix each distinct issue in a separate commit
+   - Reply to the comment thread using the GitHub API once the fix is committed and pushed:
+     ```bash
+     # List comment IDs for a PR
+     gh api repos/redixhumayun/simpledb/pulls/<PR>/comments --jq '.[] | {id: .id, login: .user.login, path: .path, body: .body[:80]}'
+
+     # Reply to a comment
+     gh api repos/redixhumayun/simpledb/pulls/<PR>/comments/<comment_id>/replies \
+       -f body="Fixed in <commit hash>.
+
+     <One or two sentences describing what changed and why.>"
+     ```
+   - Reply format: first line is "Fixed in <hash>.", blank line, then the brief explanation as a separate paragraph
 
 ### Profiling Workflow (REQUIRED for bottleneck analysis)
 Use this workflow when asked to profile a benchmark/workload and identify hotspots.
