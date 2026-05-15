@@ -1072,6 +1072,20 @@ impl BufferManager {
         self.notify_flusher();
     }
 
+    /// Bulk-enqueues deferred dirty frames under one lock acquisition.
+    fn requeue_dirty_frames(&self, frame_indices: Vec<usize>) {
+        if frame_indices.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.dirty_queue.lock().unwrap();
+            for frame_idx in frame_indices {
+                queue.push_back(frame_idx);
+            }
+        }
+        self.notify_flusher();
+    }
+
     /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
     fn collect_dirty_snapshots_for_txn(
         &self,
@@ -1115,9 +1129,7 @@ impl BufferManager {
                 snapshot,
             });
         }
-        for frame_idx in deferred {
-            self.enqueue_dirty_frame(frame_idx);
-        }
+        self.requeue_dirty_frames(deferred);
         pending
     }
 

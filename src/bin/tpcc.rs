@@ -577,7 +577,6 @@ fn load_stock(db: &SimpleDB, rng: &mut Rng, w_id: i32, item_count: i32) -> Resul
 
 fn create_indexes(db: &SimpleDB) -> Result<()> {
     // Single-field indexes only (composite indexes are issue #113).
-    // Created after bulk load to avoid index maintenance during INSERT.
     let indexes = [
         "CREATE INDEX wh_idx ON warehouse (w_id)",
         "CREATE INDEX dist_wid_idx ON district (d_w_id)",
@@ -828,11 +827,8 @@ fn do_new_order(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
         Ok(true)
     })();
 
-    match &outcome {
-        Err(e) if !is_lock_error(e) => {
-            let _ = txn.write_session().rollback();
-        }
-        _ => {}
+    if outcome.is_err() {
+        let _ = txn.write_session().rollback();
     }
     outcome
 }
@@ -1007,11 +1003,8 @@ fn do_payment(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
         Ok(true)
     })();
 
-    match &outcome {
-        Err(e) if !is_lock_error(e) => {
-            let _ = txn.write_session().rollback();
-        }
-        _ => {}
+    if outcome.is_err() {
+        let _ = txn.write_session().rollback();
     }
     outcome
 }
@@ -1106,11 +1099,8 @@ fn do_order_status(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
         Ok(true)
     })();
 
-    match &outcome {
-        Err(e) if !is_lock_error(e) => {
-            let _ = txn.write_session().rollback();
-        }
-        _ => {}
+    if outcome.is_err() {
+        let _ = txn.write_session().rollback();
     }
     outcome
 }
@@ -1223,11 +1213,8 @@ fn do_delivery(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
         Ok(true)
     })();
 
-    match &outcome {
-        Err(e) if !is_lock_error(e) => {
-            let _ = txn.write_session().rollback();
-        }
-        _ => {}
+    if outcome.is_err() {
+        let _ = txn.write_session().rollback();
     }
     outcome
 }
@@ -1272,11 +1259,8 @@ fn do_stock_level(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
         Ok(true)
     })();
 
-    match &outcome {
-        Err(e) if !is_lock_error(e) => {
-            let _ = txn.write_session().rollback();
-        }
-        _ => {}
+    if outcome.is_err() {
+        let _ = txn.write_session().rollback();
     }
     outcome
 }
@@ -1423,6 +1407,11 @@ fn run_driver(db: &SimpleDB, cfg: &Config) {
 
 fn main() {
     let cfg = parse_args();
+
+    if cfg.skip_load && cfg.db_path.is_none() {
+        eprintln!("error: --skip-load requires --db <path>");
+        std::process::exit(1);
+    }
 
     let (db_path, _tmp_dir) = match &cfg.db_path {
         Some(p) => (p.clone(), None),
