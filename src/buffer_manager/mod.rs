@@ -272,7 +272,7 @@ impl FrameMeta {
         if previous_pin_count > 0 {
             return PinTransition::StillPinned;
         }
-        if self.is_clean_unpinned(0) {
+        if self.is_clean_unpinned(previous_pin_count) {
             PinTransition::BecamePinnedClean
         } else {
             PinTransition::BecamePinnedDirty

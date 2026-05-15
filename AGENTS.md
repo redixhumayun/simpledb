@@ -46,7 +46,7 @@ There is a test suite which provides basic coverage to ensure the code still wor
    - keep docs clear and concise; do not write verbose commentary
 
 5. **Test thoroughly before committing**:
-   Testing requires running tests with combinations of compiler flags. Direct-IO is the default IO path and must be included in every run. Run these commands one after another; do not use `--test-threads=1`.
+   Testing requires running tests with combinations of compiler flags. The default-feature run exercises the default Direct-IO path. The no-default-features runs below vary replacement policy coverage without repeating the default IO feature set. Run these commands one after another; do not use `--test-threads=1`.
    ```bash
    cargo build
    cargo test
