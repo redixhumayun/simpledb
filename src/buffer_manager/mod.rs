@@ -48,51 +48,6 @@ pub enum FastPinOutcome<T> {
     Contended,
 }
 
-/// Opt-in counters for profiling shared buffer-pool synchronization points.
-///
-/// Enable with `SIMPLEDB_BUFFER_POOL_PROFILE_LOCKS=1`. The counters are
-/// intentionally process-global because the profiling binary owns one active
-/// buffer manager at a time and needs cheap end-of-run reporting.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BufferPoolProfileCounters {
-    pub directory_lock_calls: u64,
-    pub directory_lock_contended: u64,
-    pub directory_lock_elapsed_ns: u64,
-    pub directory_try_lock_calls: u64,
-    pub directory_try_lock_failed: u64,
-    pub frame_meta_lock_calls: u64,
-    pub frame_meta_lock_contended: u64,
-    pub frame_meta_lock_elapsed_ns: u64,
-    pub frame_meta_try_lock_calls: u64,
-    pub frame_meta_try_lock_failed: u64,
-    pub free_wait_notify_all_calls: u64,
-    pub free_wait_notify_all_elapsed_ns: u64,
-}
-
-static PROFILE_COUNTERS_ENABLED: OnceLock<bool> = OnceLock::new();
-static DIRECTORY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
-static DIRECTORY_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
-static DIRECTORY_LOCK_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
-static DIRECTORY_TRY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
-static DIRECTORY_TRY_LOCK_FAILED: AtomicU64 = AtomicU64::new(0);
-static FRAME_META_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
-static FRAME_META_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
-static FRAME_META_LOCK_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
-static FRAME_META_TRY_LOCK_CALLS: AtomicU64 = AtomicU64::new(0);
-static FRAME_META_TRY_LOCK_FAILED: AtomicU64 = AtomicU64::new(0);
-static FREE_WAIT_NOTIFY_ALL_CALLS: AtomicU64 = AtomicU64::new(0);
-static FREE_WAIT_NOTIFY_ALL_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
-
-fn profile_counters_enabled() -> bool {
-    *PROFILE_COUNTERS_ENABLED.get_or_init(|| {
-        std::env::var("SIMPLEDB_BUFFER_POOL_PROFILE_LOCKS").is_ok_and(|value| value == "1")
-    })
-}
-
-fn elapsed_ns_since(start: Instant) -> u64 {
-    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-}
-
 /// Result of moving a frame from clean/unpinned into an actively pinned state.
 ///
 /// The buffer manager uses this to keep the clean-frame accounting in one place
@@ -782,25 +737,7 @@ impl BufferFrame {
     /// This should stay off the uncontended resident-hit fast path as much as
     /// possible; atomics on `BufferFrame` exist to avoid taking this lock there.
     pub(crate) fn lock_meta(&self) -> MutexGuard<'_, FrameMeta> {
-        if !profile_counters_enabled() {
-            return self.meta.lock().unwrap();
-        }
-
-        FRAME_META_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
-        match self.meta.try_lock() {
-            Ok(guard) => {
-                FRAME_META_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::WouldBlock) => {
-                FRAME_META_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
-                let guard = self.meta.lock().unwrap();
-                FRAME_META_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::Poisoned(_)) => self.meta.lock().unwrap(),
-        }
+        self.meta.lock().unwrap()
     }
 
     /// Tries to lock cold metadata without blocking.
@@ -808,17 +745,9 @@ impl BufferFrame {
     /// Used by nonblocking paths such as `pin_fast()` where waiting behind page
     /// or flush work would violate the caller contract.
     pub(crate) fn try_lock_meta(&self) -> Option<MutexGuard<'_, FrameMeta>> {
-        if profile_counters_enabled() {
-            FRAME_META_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
         match self.meta.try_lock() {
             Ok(guard) => Some(guard),
-            Err(TryLockError::WouldBlock) => {
-                if profile_counters_enabled() {
-                    FRAME_META_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
-                }
-                None
-            }
+            Err(TryLockError::WouldBlock) => None,
             Err(TryLockError::Poisoned(_)) => None,
         }
     }
@@ -1277,28 +1206,9 @@ impl ShardedDirectory {
         (self.hash_builder.hash_one(block_id) as usize) & (self.shards.len() - 1)
     }
 
-    /// Locks one shard, recording opt-in profiling counters when enabled.
+    /// Locks one shard on the blocking pin path.
     fn lock_shard(&self, shard_idx: usize) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
-        let shard = &self.shards[shard_idx];
-        if !profile_counters_enabled() {
-            return shard.lock().unwrap();
-        }
-
-        DIRECTORY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
-        match shard.try_lock() {
-            Ok(guard) => {
-                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::WouldBlock) => {
-                DIRECTORY_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
-                let guard = shard.lock().unwrap();
-                DIRECTORY_LOCK_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
-                guard
-            }
-            Err(TryLockError::Poisoned(_)) => shard.lock().unwrap(),
-        }
+        self.shards[shard_idx].lock().unwrap()
     }
 
     /// Tries to lock one shard without waiting.
@@ -1309,18 +1219,9 @@ impl ShardedDirectory {
         &self,
         shard_idx: usize,
     ) -> Option<MutexGuard<'_, HashMap<BlockId, DirectoryEntry>>> {
-        if profile_counters_enabled() {
-            DIRECTORY_TRY_LOCK_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-
         match self.shards[shard_idx].try_lock() {
             Ok(guard) => Some(guard),
-            Err(TryLockError::WouldBlock) => {
-                if profile_counters_enabled() {
-                    DIRECTORY_TRY_LOCK_FAILED.fetch_add(1, Ordering::Relaxed);
-                }
-                None
-            }
+            Err(TryLockError::WouldBlock) => None,
             Err(TryLockError::Poisoned(_)) => None,
         }
     }
@@ -1739,15 +1640,7 @@ impl BufferManager {
     /// and waking every waiter turns ordinary last-unpin traffic into a global
     /// futex storm when the pool is not actually exhausted.
     fn notify_free_buffer_waiters_one(&self) {
-        if !profile_counters_enabled() {
-            self.cond.notify_one();
-            return;
-        }
-
-        FREE_WAIT_NOTIFY_ALL_CALLS.fetch_add(1, Ordering::Relaxed);
-        let start = Instant::now();
         self.cond.notify_one();
-        FREE_WAIT_NOTIFY_ALL_ELAPSED_NS.fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
     }
 
     /// Returns one frame to the available-frame count and wakes a waiter only
@@ -1867,39 +1760,6 @@ impl BufferManager {
     pub fn reset_stats(&self) {
         if let Some(stats) = self.stats.get() {
             stats.reset();
-        }
-    }
-
-    pub fn reset_profile_counters() {
-        DIRECTORY_LOCK_CALLS.store(0, Ordering::Relaxed);
-        DIRECTORY_LOCK_CONTENDED.store(0, Ordering::Relaxed);
-        DIRECTORY_LOCK_ELAPSED_NS.store(0, Ordering::Relaxed);
-        DIRECTORY_TRY_LOCK_CALLS.store(0, Ordering::Relaxed);
-        DIRECTORY_TRY_LOCK_FAILED.store(0, Ordering::Relaxed);
-        FRAME_META_LOCK_CALLS.store(0, Ordering::Relaxed);
-        FRAME_META_LOCK_CONTENDED.store(0, Ordering::Relaxed);
-        FRAME_META_LOCK_ELAPSED_NS.store(0, Ordering::Relaxed);
-        FRAME_META_TRY_LOCK_CALLS.store(0, Ordering::Relaxed);
-        FRAME_META_TRY_LOCK_FAILED.store(0, Ordering::Relaxed);
-        FREE_WAIT_NOTIFY_ALL_CALLS.store(0, Ordering::Relaxed);
-        FREE_WAIT_NOTIFY_ALL_ELAPSED_NS.store(0, Ordering::Relaxed);
-    }
-
-    pub fn profile_counters() -> BufferPoolProfileCounters {
-        BufferPoolProfileCounters {
-            directory_lock_calls: DIRECTORY_LOCK_CALLS.load(Ordering::Relaxed),
-            directory_lock_contended: DIRECTORY_LOCK_CONTENDED.load(Ordering::Relaxed),
-            directory_lock_elapsed_ns: DIRECTORY_LOCK_ELAPSED_NS.load(Ordering::Relaxed),
-            directory_try_lock_calls: DIRECTORY_TRY_LOCK_CALLS.load(Ordering::Relaxed),
-            directory_try_lock_failed: DIRECTORY_TRY_LOCK_FAILED.load(Ordering::Relaxed),
-            frame_meta_lock_calls: FRAME_META_LOCK_CALLS.load(Ordering::Relaxed),
-            frame_meta_lock_contended: FRAME_META_LOCK_CONTENDED.load(Ordering::Relaxed),
-            frame_meta_lock_elapsed_ns: FRAME_META_LOCK_ELAPSED_NS.load(Ordering::Relaxed),
-            frame_meta_try_lock_calls: FRAME_META_TRY_LOCK_CALLS.load(Ordering::Relaxed),
-            frame_meta_try_lock_failed: FRAME_META_TRY_LOCK_FAILED.load(Ordering::Relaxed),
-            free_wait_notify_all_calls: FREE_WAIT_NOTIFY_ALL_CALLS.load(Ordering::Relaxed),
-            free_wait_notify_all_elapsed_ns: FREE_WAIT_NOTIFY_ALL_ELAPSED_NS
-                .load(Ordering::Relaxed),
         }
     }
 

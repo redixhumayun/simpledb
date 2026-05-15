@@ -1,4 +1,4 @@
-use simpledb::{BlockId, BufferManager, BufferPoolProfileCounters, Page, SimpleDB};
+use simpledb::{BlockId, Page, SimpleDB};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Barrier,
@@ -43,47 +43,6 @@ where
         .unwrap_or(default)
 }
 
-fn print_counter(name: &str, calls: u64, contended: Option<u64>, elapsed_ns: u64) {
-    let avg_ns = elapsed_ns.checked_div(calls).unwrap_or(0);
-    match contended {
-        Some(contended) => println!(
-            "profile_counter name={name} calls={calls} contended={contended} elapsed_ns={elapsed_ns} avg_ns={avg_ns}"
-        ),
-        None => println!(
-            "profile_counter name={name} calls={calls} elapsed_ns={elapsed_ns} avg_ns={avg_ns}"
-        ),
-    }
-}
-
-fn print_profile_counters(counters: BufferPoolProfileCounters) {
-    print_counter(
-        "directory_lock",
-        counters.directory_lock_calls,
-        Some(counters.directory_lock_contended),
-        counters.directory_lock_elapsed_ns,
-    );
-    println!(
-        "profile_counter name=directory_try_lock calls={} failed={}",
-        counters.directory_try_lock_calls, counters.directory_try_lock_failed
-    );
-    print_counter(
-        "frame_meta_lock",
-        counters.frame_meta_lock_calls,
-        Some(counters.frame_meta_lock_contended),
-        counters.frame_meta_lock_elapsed_ns,
-    );
-    println!(
-        "profile_counter name=frame_meta_try_lock calls={} failed={}",
-        counters.frame_meta_try_lock_calls, counters.frame_meta_try_lock_failed
-    );
-    print_counter(
-        "free_wait_notify_all",
-        counters.free_wait_notify_all_calls,
-        None,
-        counters.free_wait_notify_all_elapsed_ns,
-    );
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let num_threads = parse_arg(&args, "--threads", 4usize);
@@ -95,7 +54,6 @@ fn main() {
     let (db, _dir) = SimpleDB::new_for_test(num_buffers, 5000);
     precreate_blocks(&db, &test_file, num_threads * blocks_per_thread);
     prime_resident_set(&db, &test_file, num_threads, blocks_per_thread);
-    BufferManager::reset_profile_counters();
 
     let start_barrier = Arc::new(Barrier::new(num_threads + 1));
     let stop = Arc::new(AtomicBool::new(false));
@@ -143,7 +101,4 @@ fn main() {
         "threads={} duration_secs={} buffers={} blocks_per_thread={} total_ops={} ops_per_sec={:.0}",
         num_threads, duration_secs, num_buffers, blocks_per_thread, total_ops, ops_per_sec
     );
-    if std::env::var("SIMPLEDB_BUFFER_POOL_PROFILE_LOCKS").is_ok_and(|value| value == "1") {
-        print_profile_counters(BufferManager::profile_counters());
-    }
 }
