@@ -13,7 +13,7 @@ use std::{
     error::Error,
     hash::BuildHasher,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
         TryLockError,
     },
@@ -611,6 +611,69 @@ impl AtomicFrameControl {
     }
 }
 
+/// Conservative hot-path summary of frame flush state.
+///
+/// This is deliberately smaller than [`FlushState`]. The full dirty/writeback
+/// protocol remains in [`FrameMeta`]; this atomic only answers whether ordinary
+/// clean resident-hit pin/unpin accounting may skip the metadata mutex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameFastState {
+    /// Frame metadata is known to be clean for pin/unpin accounting.
+    Clean = 0,
+    /// Dirty, writeback, loading, or otherwise uncertain state: consult `FrameMeta`.
+    NeedsMeta = 1,
+}
+
+impl FrameFastState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Clean,
+            _ => Self::NeedsMeta,
+        }
+    }
+}
+
+/// Atomic wrapper around the conservative frame fast-path state.
+///
+/// Why this is separate from [`AtomicFrameControl`]: residency validation and
+/// flush/accounting summaries are different protocols. Keeping this as its own
+/// atomic avoids coupling dirty/writeback transitions to the generation/loading
+/// word used by directory OCC validation.
+#[derive(Debug)]
+struct AtomicFrameFastState {
+    raw: AtomicU8,
+}
+
+impl AtomicFrameFastState {
+    fn new() -> Self {
+        Self {
+            raw: AtomicU8::new(FrameFastState::Clean as u8),
+        }
+    }
+
+    /// Returns whether clean pin/unpin accounting may skip [`FrameMeta`].
+    fn is_clean(&self) -> bool {
+        FrameFastState::from_raw(self.raw.load(Ordering::Acquire)) == FrameFastState::Clean
+    }
+
+    /// Marks the fast path safe for clean pin/unpin accounting.
+    ///
+    /// Callers only do this after updating `FrameMeta` to `FlushState::Clean`.
+    fn mark_clean(&self) {
+        self.raw
+            .store(FrameFastState::Clean as u8, Ordering::Release);
+    }
+
+    /// Forces future pin/unpin accounting through [`FrameMeta`].
+    ///
+    /// This is cheap and conservative: false negatives only lose the fast path,
+    /// while false positives would break dirty/writeback accounting.
+    fn mark_needs_meta(&self) {
+        self.raw
+            .store(FrameFastState::NeedsMeta as u8, Ordering::Release);
+    }
+}
+
 #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
 impl IntrusiveNode for FrameMeta {
     fn prev(&self) -> Option<usize> {
@@ -687,6 +750,11 @@ pub struct BufferFrame {
     ///
     /// Holds residency generation plus transient `loading/evicting` flags.
     control: AtomicFrameControl,
+    /// Conservative clean/dirty summary for resident-hit pin/unpin accounting.
+    ///
+    /// `FrameMeta` remains the source of truth; this field only lets clean pages
+    /// skip the metadata mutex on ordinary `0 -> 1 -> 0` traffic.
+    fast_state: AtomicFrameFastState,
 }
 
 impl BufferFrame {
@@ -705,6 +773,7 @@ impl BufferFrame {
             #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
             ref_bit: AtomicBool::new(false),
             control: AtomicFrameControl::new(),
+            fast_state: AtomicFrameFastState::new(),
         }
     }
 
@@ -828,6 +897,7 @@ impl BufferFrame {
     /// This bumps the residency generation before the new contents become
     /// pinnable so stale directory observations fail validation.
     fn begin_loading_residency_locked(&self, meta: &mut FrameMeta, block_id: BlockId) -> u64 {
+        self.fast_state.mark_needs_meta();
         meta.assign_resident(block_id);
         self.control.begin_loading()
     }
@@ -837,6 +907,7 @@ impl BufferFrame {
     /// Prefetch uses this placeholder state so duplicate install attempts see a
     /// transient non-pinnable generation instead of a reusable frame.
     fn begin_loading_placeholder_locked(&self, meta: &mut FrameMeta) -> u64 {
+        self.fast_state.mark_needs_meta();
         meta.clear_residency();
         self.control.begin_loading()
     }
@@ -869,8 +940,8 @@ impl BufferFrame {
     /// - increment atomic pin count
     /// - revalidate and roll back on race
     ///
-    /// Only the `0 -> 1` transition still consults [`FrameMeta`], because clean
-    /// slack and dirty-queue accounting remain there.
+    /// Clean `0 -> 1` transitions use the frame's hot clean summary; dirty or
+    /// uncertain transitions still consult [`FrameMeta`] for flush accounting.
     fn pin_from_directory_entry(&self, residency_generation: u64) -> Option<PinTransition> {
         let control = self.control.load_raw();
         if !AtomicFrameControl::can_pin(control, residency_generation) {
@@ -885,6 +956,9 @@ impl BufferFrame {
         }
 
         let transition = if previous_pin_count == 0 {
+            if self.fast_state.is_clean() {
+                return Some(PinTransition::BecamePinnedClean);
+            }
             let meta = self.lock_meta();
             meta.pin_transition(previous_pin_count)
         } else {
@@ -901,8 +975,8 @@ impl BufferFrame {
     /// - the directory/generation was stale, so the caller should treat the
     ///   page as not resident
     /// - the frame was resident and the pin succeeded
-    /// - the only remaining step was the `0 -> 1` accounting transition, but
-    ///   that would have blocked on `FrameMeta`
+    /// - the only remaining step was a dirty/uncertain `0 -> 1` accounting
+    ///   transition, but that would have blocked on `FrameMeta`
     ///
     /// This method may speculatively increment `pin_count`; any stale-residency
     /// or would-block outcome rolls that increment back before returning.
@@ -923,6 +997,9 @@ impl BufferFrame {
         }
 
         let transition = if previous_pin_count == 0 {
+            if self.fast_state.is_clean() {
+                return Ok(Some(PinTransition::BecamePinnedClean));
+            }
             let Some(meta) = self.try_lock_meta() else {
                 self.pin_count.fetch_sub(1, Ordering::AcqRel);
                 return Err(());
@@ -1072,6 +1149,7 @@ impl BufferFrame {
             PageType::Free => {}
         }
         meta.mark_flush_clean();
+        self.fast_state.mark_clean();
         completion
     }
 }
@@ -1533,6 +1611,7 @@ impl BackgroundFlusher {
                 pending.frame.pin_count(),
             ) {
                 if transition.became_clean_unpinned {
+                    pending.frame.fast_state.mark_clean();
                     self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
                 }
                 if let Some(frame_idx) = transition.enqueue_dirty {
@@ -1879,6 +1958,7 @@ impl BufferManager {
             }
             let generation = frame.begin_loading_placeholder_locked(&mut meta_guard);
             meta_guard.mark_flush_clean();
+            frame.fast_state.mark_clean();
 
             let previous_pin_count = frame.pin_count.fetch_add(1, Ordering::AcqRel);
             let transition = meta_guard.pin_transition(previous_pin_count);
@@ -1931,6 +2011,7 @@ impl BufferManager {
                 *page_guard = std::mem::take(&mut pages[idx]);
                 meta_guard.assign_resident(reservation.block_id.clone());
                 meta_guard.mark_flush_clean();
+                frame.fast_state.mark_clean();
                 self.publish_resident_entry(
                     &reservation.block_id,
                     reservation.frame_idx,
@@ -1953,7 +2034,11 @@ impl BufferManager {
                 let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
                 debug_assert!(previous_pin_count > 0, "prefetch release must hold a pin");
                 let mut meta_guard = frame.lock_meta();
-                meta_guard.unpin_transition(previous_pin_count - 1)
+                let transition = meta_guard.unpin_transition(previous_pin_count - 1);
+                if matches!(transition, UnpinTransition::BecameUnpinnedClean) {
+                    frame.fast_state.mark_clean();
+                }
+                transition
             };
             match transition {
                 UnpinTransition::StillPinned => {}
@@ -2180,14 +2265,16 @@ impl BufferManager {
 
     /// Releases one buffer pin and applies any last-pin bookkeeping.
     ///
-    /// The decrement itself is atomic, but the `1 -> 0` transition still has
-    /// to consult [`FrameMeta`] to answer colder protocol questions:
+    /// The decrement itself is atomic, and clean `1 -> 0` transitions use the
+    /// frame's hot clean summary. Dirty or uncertain last-unpin transitions
+    /// still consult [`FrameMeta`] to answer colder protocol questions:
     /// - did the frame become part of clean slack?
     /// - should a dirty frame now enter the flush queue?
     /// - should waiters be notified that one reusable frame is available?
     ///
-    /// So the hot pin count lives on [`BufferFrame`], while the final transition
-    /// still reconciles availability and flush state under [`FrameMeta`].
+    /// So the hot pin count and clean summary live on [`BufferFrame`], while
+    /// dirty/writeback transitions reconcile availability and flush state under
+    /// [`FrameMeta`].
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
         let transition = {
             let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
@@ -2195,8 +2282,17 @@ impl BufferManager {
             if previous_pin_count > 1 {
                 return;
             }
+            if frame.fast_state.is_clean() {
+                self.release_available_frame();
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             let mut meta = frame.lock_meta();
-            meta.unpin_transition(0)
+            let transition = meta.unpin_transition(0);
+            if matches!(transition, UnpinTransition::BecameUnpinnedClean) {
+                frame.fast_state.mark_clean();
+            }
+            transition
         };
         match transition {
             UnpinTransition::StillPinned => {}
@@ -2220,6 +2316,7 @@ impl BufferManager {
     /// Callers hand off the new txn/LSN pair here so queueing and clean-slack
     /// bookkeeping stay centralized with the rest of the frame-state machine.
     pub(crate) fn mark_modified(&self, frame: &Arc<BufferFrame>, txn_num: usize, lsn: usize) {
+        frame.fast_state.mark_needs_meta();
         let transition = {
             let mut meta = frame.lock_meta();
             meta.mark_dirty_transition(frame.pin_count(), txn_num, lsn)
