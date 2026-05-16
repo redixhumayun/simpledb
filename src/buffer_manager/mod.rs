@@ -1648,17 +1648,15 @@ impl BufferManager {
         self.cond.notify_one();
     }
 
-    /// Returns one frame to the available-frame count and wakes a waiter only
-    /// when the pool transitions from exhausted to non-exhausted.
+    /// Returns one frame to the available-frame count and wakes one waiter.
     ///
-    /// The `0 -> 1` gate is the key invariant: if `num_available` was already
-    /// positive, no pin caller should be blocked on the free-buffer condvar, so
-    /// notifying would add synchronization cost without changing progress.
+    /// Why this notifies on every release: multiple callers may already be
+    /// asleep after observing `num_available == 0`. If two frames are released
+    /// back-to-back, each release can satisfy one waiter even when the second
+    /// release observes `num_available > 0`.
     fn release_available_frame(&self) {
-        let previous = self.num_available.fetch_add(1, Ordering::AcqRel);
-        if previous == 0 {
-            self.notify_free_buffer_waiters_one();
-        }
+        self.num_available.fetch_add(1, Ordering::AcqRel);
+        self.notify_free_buffer_waiters_one();
     }
 
     /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
