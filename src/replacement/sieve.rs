@@ -108,19 +108,18 @@ impl PolicyState {
         }
     }
 
-    /// Selects a victim frame using the SIEVE algorithm.
+    /// Selects a candidate victim frame using the SIEVE algorithm.
     ///
     /// Sweeps the hand backward from tail through the list, clearing reference bits
-    /// and skipping pinned frames. Evicts the first unpinned frame with ref_bit = false.
-    /// Resets hand to tail if it reaches the head. Returns None if all frames are
-    /// pinned or recently accessed after a full sweep.
-    pub fn evict_frame(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
+    /// and skipping pinned frames. Returns the first unpinned frame with ref_bit = false.
+    /// The candidate remains linked until the buffer manager successfully claims it.
+    pub fn select_victim(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         let mut list_guard = self.list_state.lock().unwrap();
 
         for _ in 0..self.pool_len {
             match list_guard.hand {
                 Some(hand) => {
-                    let mut current_guard = buffer_pool[hand].lock_meta();
+                    let current_guard = buffer_pool[hand].lock_meta();
                     if buffer_pool[hand].pin_count() > 0
                         || current_guard.is_writeback_in_progress()
                         || buffer_pool[hand].is_loading()
@@ -145,18 +144,6 @@ impl PolicyState {
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
-                    let mut prev_node = current_guard
-                        .prev()
-                        .map(|prev| buffer_pool[prev].lock_meta());
-                    let mut next_node = current_guard
-                        .next()
-                        .map(|next| buffer_pool[next].lock_meta());
-                    list_guard.intrusive_list.remove_node(
-                        hand,
-                        &mut current_guard,
-                        prev_node.as_mut(),
-                        next_node.as_mut(),
-                    );
                     list_guard.hand = current_guard
                         .prev()
                         .or_else(|| list_guard.intrusive_list.peek_tail());
@@ -169,5 +156,40 @@ impl PolicyState {
             }
         }
         None
+    }
+
+    /// Commits a successful buffer-manager claim by unlinking the victim.
+    ///
+    /// Returns `false` if the policy lock is currently held. The caller must
+    /// roll back the frame claim before retrying so we do not invert the normal
+    /// policy-lock -> metadata-lock ordering.
+    pub fn try_on_frame_claimed_for_reuse(
+        &self,
+        buffer_pool: &[Arc<BufferFrame>],
+        frame_idx: usize,
+        frame_guard: &mut FrameMeta,
+    ) -> bool {
+        let Some(mut list_guard) = self.list_state.try_lock().ok() else {
+            return false;
+        };
+        let previous = frame_guard.prev();
+        let mut prev_node = previous.map(|prev| buffer_pool[prev].lock_meta());
+        let mut next_node = frame_guard.next().map(|next| buffer_pool[next].lock_meta());
+        list_guard.intrusive_list.remove_node(
+            frame_idx,
+            frame_guard,
+            prev_node.as_deref_mut(),
+            next_node.as_deref_mut(),
+        );
+        if list_guard.hand == Some(frame_idx) {
+            list_guard.hand = previous.or_else(|| list_guard.intrusive_list.peek_tail());
+        }
+        true
+    }
+
+    /// A rejected candidate stays resident. Give it a second chance before the
+    /// hand considers it again.
+    pub fn on_victim_rejected(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
     }
 }

@@ -85,20 +85,21 @@ impl PolicyState {
         }
     }
 
-    /// Selects a victim frame for eviction.
+    /// Selects a candidate victim frame for eviction.
     ///
-    /// Scans from tail (LRU) towards head, skipping pinned frames, and returns the
-    /// first unpinned frame. Returns None if all frames are pinned.
-    pub fn evict_frame(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
+    /// Scans from tail (LRU) towards head, skipping pinned frames, and returns
+    /// the first unpinned frame. The candidate remains in the list until the
+    /// buffer manager successfully claims it for reuse.
+    pub fn select_victim(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         assert!(
             buffer_pool.len() > 1,
             "Buffer pools must have more than one frame for LRU replacement"
         );
-        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        let intrusive_list_guard = self.intrusive_list.lock().unwrap();
         let tail = intrusive_list_guard.peek_tail()?;
         let mut current = tail;
         loop {
-            let mut current_guard = buffer_pool[current].lock_meta();
+            let current_guard = buffer_pool[current].lock_meta();
             if buffer_pool[current].pin_count() > 0
                 || current_guard.is_writeback_in_progress()
                 || buffer_pool[current].is_loading()
@@ -115,20 +116,40 @@ impl PolicyState {
                 }
                 continue;
             }
-            let mut prev_node = current_guard
-                .prev()
-                .map(|prev| buffer_pool[prev].lock_meta());
-            let mut next_node = current_guard
-                .next()
-                .map(|next| buffer_pool[next].lock_meta());
-            intrusive_list_guard.remove_node(
-                current,
-                &mut current_guard,
-                prev_node.as_mut(),
-                next_node.as_mut(),
-            );
             return Some(current);
         }
+    }
+
+    /// Commits a successful buffer-manager claim by unlinking the victim.
+    ///
+    /// Returns `false` if the policy lock is currently held. The caller must
+    /// roll back the frame claim before retrying so we do not invert the normal
+    /// policy-lock -> metadata-lock ordering.
+    pub fn try_on_frame_claimed_for_reuse(
+        &self,
+        buffer_pool: &[Arc<BufferFrame>],
+        frame_idx: usize,
+        frame_guard: &mut FrameMeta,
+    ) -> bool {
+        let Some(mut intrusive_list_guard) = self.intrusive_list.try_lock().ok() else {
+            return false;
+        };
+        let mut prev_node = frame_guard.prev().map(|prev| buffer_pool[prev].lock_meta());
+        let mut next_node = frame_guard.next().map(|next| buffer_pool[next].lock_meta());
+        intrusive_list_guard.remove_node(
+            frame_idx,
+            frame_guard,
+            prev_node.as_deref_mut(),
+            next_node.as_deref_mut(),
+        );
+        true
+    }
+
+    /// A candidate rejected by a caller-specific filter stays resident, so keep
+    /// it in the policy and move it away from the immediate eviction position.
+    pub fn on_victim_rejected(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        let mut intrusive_list_guard = self.intrusive_list.lock().unwrap();
+        self.promote_to_head_blocking(&mut intrusive_list_guard, buffer_pool, frame_idx);
     }
 
     /// Promotes one resident frame to the head of the LRU list, blocking as needed.

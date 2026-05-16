@@ -851,15 +851,20 @@ impl BufferFrame {
     /// The claim is two-stage:
     /// - atomically set `evicting` so new pins fail OCC validation
     /// - then lock [`FrameMeta`] to verify colder writeback constraints
-    fn try_claim_for_eviction(&self) -> Option<MutexGuard<'_, FrameMeta>> {
+    fn try_claim_for_eviction(&self) -> Option<(FrameControlSnapshot, MutexGuard<'_, FrameMeta>)> {
         let previous = self.control.try_claim_for_eviction(self.pin_count())?;
 
         let mut meta = self.lock_meta();
-        if !meta.claim_for_eviction() {
+        if self.pin_count() > 0 || !meta.claim_for_eviction() {
             self.control.store_raw(previous);
             return None;
         }
-        Some(meta)
+        Some((previous, meta))
+    }
+
+    /// Restores the pre-claim control word when a caller abandons a claimed frame.
+    fn rollback_eviction_claim(&self, previous: FrameControlSnapshot) {
+        self.control.store_raw(previous);
     }
 
     /// Attempts one resident pin using directory-provided generation.
@@ -1734,13 +1739,63 @@ impl BufferManager {
         self.directory.clear_installing(block_id);
     }
 
+    /// Claims any reusable victim frame and commits the replacement-policy removal.
+    ///
+    /// Replacement policies only suggest candidates. The buffer manager owns the
+    /// frame-level claim so `evicting` is set before the policy destructively
+    /// removes the frame from its tracking state.
     fn claim_victim_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
         for _ in 0..self.buffer_pool.len() {
-            let frame_idx = self.policy.evict_frame(&self.buffer_pool)?;
+            let frame_idx = self.policy.select_victim(&self.buffer_pool)?;
             let frame = &self.buffer_pool[frame_idx];
-            if let Some(meta_guard) = frame.try_claim_for_eviction() {
+            let Some((previous_control, mut meta_guard)) = frame.try_claim_for_eviction() else {
+                continue;
+            };
+            if self.policy.try_on_frame_claimed_for_reuse(
+                &self.buffer_pool,
+                frame_idx,
+                &mut meta_guard,
+            ) {
                 return Some((frame_idx, meta_guard));
             }
+            frame.rollback_eviction_claim(previous_control);
+        }
+        None
+    }
+
+    /// Claims a victim frame that is not resident in the given prefetch range.
+    ///
+    /// Prefetch is best-effort and should not evict pages it is about to request
+    /// again. The range check runs after the frame claim while [`FrameMeta`] is
+    /// locked, so the block identity being checked is stable.
+    fn claim_victim_frame_excluding_range(
+        &self,
+        file: &str,
+        start_block: usize,
+        end_block: usize,
+    ) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
+        for _ in 0..self.buffer_pool.len() {
+            let frame_idx = self.policy.select_victim(&self.buffer_pool)?;
+            let frame = &self.buffer_pool[frame_idx];
+            let Some((previous_control, mut meta_guard)) = frame.try_claim_for_eviction() else {
+                continue;
+            };
+            if meta_guard.block_id().is_some_and(|old| {
+                old.filename == file && old.block_num >= start_block && old.block_num < end_block
+            }) {
+                frame.rollback_eviction_claim(previous_control);
+                drop(meta_guard);
+                self.policy.on_victim_rejected(&self.buffer_pool, frame_idx);
+                continue;
+            }
+            if self.policy.try_on_frame_claimed_for_reuse(
+                &self.buffer_pool,
+                frame_idx,
+                &mut meta_guard,
+            ) {
+                return Some((frame_idx, meta_guard));
+            }
+            frame.rollback_eviction_claim(previous_control);
         }
         None
     }
@@ -1784,6 +1839,7 @@ impl BufferManager {
             return 0;
         }
 
+        let end_block = start_block.saturating_add(count);
         let mut reservations: Vec<PrefetchReservation> = Vec::new();
         let mut reqs: Vec<BatchReadReq> = Vec::new();
 
@@ -1793,13 +1849,14 @@ impl BufferManager {
                 continue;
             }
 
-            let (frame_idx, mut meta_guard) = match self.claim_victim_frame() {
-                Some(victim) => victim,
-                None => {
-                    self.clear_installing_entry(&block_id);
-                    break;
-                }
-            };
+            let (frame_idx, mut meta_guard) =
+                match self.claim_victim_frame_excluding_range(file, start_block, end_block) {
+                    Some(victim) => victim,
+                    None => {
+                        self.clear_installing_entry(&block_id);
+                        break;
+                    }
+                };
             let frame = Arc::clone(&self.buffer_pool[frame_idx]);
 
             if let Some(old) = meta_guard.block_id_owned() {

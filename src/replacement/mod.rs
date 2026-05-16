@@ -20,7 +20,8 @@
 //! - `on_hit()`: Records a resident hit on the normal blocking pin path
 //! - `try_on_hit()`: Tries to record a resident hit without blocking
 //! - `on_frame_assigned()`: Called when a frame is newly allocated
-//! - `evict_frame()`: Selects and returns a victim frame for eviction
+//! - `select_victim()`: Selects a candidate victim without destructively removing it
+//! - `try_on_frame_claimed_for_reuse()`: Tries to commit policy state after the buffer manager claims a candidate
 
 #[cfg(any(
     all(feature = "replacement_lru", feature = "replacement_clock"),

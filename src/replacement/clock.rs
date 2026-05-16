@@ -19,7 +19,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::buffer_manager::BufferFrame;
+use crate::buffer_manager::{BufferFrame, FrameMeta};
 
 /// Clock policy state with circular hand pointer.
 #[derive(Debug)]
@@ -65,12 +65,15 @@ impl PolicyState {
         buffer_pool[frame_idx].set_ref_bit(true);
     }
 
-    /// Selects a victim frame using the clock algorithm.
+    /// Selects a candidate victim frame using the clock algorithm.
     ///
     /// Sweeps the clock hand circularly, giving "second chances" by clearing reference
-    /// bits. Evicts the first unpinned frame with ref_bit = false. Returns None if all
-    /// frames are pinned or have their reference bits set after a full sweep.
-    pub fn evict_frame(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
+    /// bits. Returns the first unpinned frame with ref_bit = false. Returns None if
+    /// all frames are pinned or have their reference bits set after a full sweep.
+    ///
+    /// The buffer manager owns the actual eviction claim; this method only suggests
+    /// which frame should be tried next.
+    pub fn select_victim(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         let mut hand = self.hand.lock().unwrap();
         for _ in 0..self.pool_len {
             let idx = *hand;
@@ -94,5 +97,20 @@ impl PolicyState {
             return Some(idx);
         }
         None
+    }
+
+    /// Clock keeps no intrusive membership to commit after a successful claim.
+    pub fn try_on_frame_claimed_for_reuse(
+        &self,
+        _buffer_pool: &[Arc<BufferFrame>],
+        _frame_idx: usize,
+        _frame_guard: &mut FrameMeta,
+    ) -> bool {
+        true
+    }
+
+    /// Gives a skipped candidate another chance before it is selected again.
+    pub fn on_victim_rejected(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
     }
 }
