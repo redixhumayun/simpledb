@@ -3,7 +3,7 @@
 // Scope: directory + frame state machine only. No writeback / dirty-flush.
 // Model size: parameterised; see buffer_pool_2x2x2 for the concrete 2·2·2 instance.
 //
-// Hit path models the double-check OCC protocol from buffer_pool_scaling_targets.md:
+// Hit path models the double-check OCC protocol from docs/architecture/buffer_manager.md:
 //   (1) directory lookup → observe (frame, gen)
 //   (2) first validate: frame ResidentStable + gen matches               → PhValidated
 //   (3) pin_attempt:    increment pin_count                              → PhPinPending
