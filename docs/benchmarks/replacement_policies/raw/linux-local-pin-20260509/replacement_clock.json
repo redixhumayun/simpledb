@@ -1,0 +1,47 @@
+[
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (1 threads, 10000 ops)",
+    "unit": "ns",
+    "value": 11619772.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (2 threads, 5000 ops)",
+    "unit": "ns",
+    "value": 6742157.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (4 threads, 2500 ops)",
+    "unit": "ns",
+    "value": 3877620.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (8 threads, 1250 ops)",
+    "unit": "ns",
+    "value": 3693359.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (16 threads, 625 ops)",
+    "unit": "ns",
+    "value": 3736476.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (32 threads, 312 ops)",
+    "unit": "ns",
+    "value": 3825607.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (64 threads, 156 ops)",
+    "unit": "ns",
+    "value": 3889065.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (128 threads, 78 ops)",
+    "unit": "ns",
+    "value": 4336081.0
+  },
+  {
+    "name": "Phase5/Concurrent Pin/Concurrent (256 threads, 39 ops)",
+    "unit": "ns",
+    "value": 5597470.0
+  }
+]

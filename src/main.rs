@@ -16471,6 +16471,8 @@ mod buffer_manager_tests {
         thread,
     };
 
+    #[cfg(feature = "replacement_lru")]
+    use crate::buffer_manager::FastPinOutcome;
     use crate::{
         page::test_helpers, BlockId, BufferManager, Constant, Layout, Lsn, Page, Schema, SimpleDB,
     };
@@ -16560,6 +16562,89 @@ mod buffer_manager_tests {
         };
         assert_eq!(observed, 100);
         // assert_eq!(buffer_manager.latch_table.lock().unwrap().len(), 0);
+    }
+
+    #[cfg(feature = "replacement_lru")]
+    #[test]
+    fn test_lru_resident_hit_promotes_frame() {
+        let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        db.buffer_manager.enable_stats();
+        let file_manager = Arc::clone(&db.file_manager);
+        let buffer_manager = db.buffer_manager;
+        let layout = buffer_layout();
+        let file = "lru_hit_promotion".to_string();
+
+        let mut block_ids = Vec::new();
+        for idx in 0..4 {
+            let block = file_manager.append(file.clone());
+            write_row_direct(&file_manager, &layout, &block, idx);
+            block_ids.push(block);
+        }
+
+        for block_id in block_ids.iter().take(3) {
+            let buffer = buffer_manager.pin(block_id).unwrap();
+            buffer_manager.unpin(buffer);
+        }
+
+        buffer_manager.reset_stats();
+        let buffer = buffer_manager.pin(&block_ids[0]).unwrap();
+        buffer_manager.unpin(buffer);
+        assert_eq!(buffer_manager.get_stats().unwrap(), (1, 0));
+
+        let buffer = buffer_manager.pin(&block_ids[3]).unwrap();
+        buffer_manager.unpin(buffer);
+
+        buffer_manager.reset_stats();
+        let buffer = buffer_manager.pin(&block_ids[1]).unwrap();
+        buffer_manager.unpin(buffer);
+        assert_eq!(
+            buffer_manager.get_stats().unwrap(),
+            (0, 1),
+            "LRU hit promotion should keep block 0 resident and evict block 1"
+        );
+    }
+
+    #[cfg(feature = "replacement_lru")]
+    #[test]
+    fn test_lru_pin_fast_promotes_frame() {
+        let (db, _test_dir) = SimpleDB::new_for_test(3, 5000);
+        db.buffer_manager.enable_stats();
+        let file_manager = Arc::clone(&db.file_manager);
+        let buffer_manager = db.buffer_manager;
+        let layout = buffer_layout();
+        let file = "lru_fast_hit_promotion".to_string();
+
+        let mut block_ids = Vec::new();
+        for idx in 0..4 {
+            let block = file_manager.append(file.clone());
+            write_row_direct(&file_manager, &layout, &block, idx);
+            block_ids.push(block);
+        }
+
+        for block_id in block_ids.iter().take(3) {
+            let buffer = buffer_manager.pin(block_id).unwrap();
+            buffer_manager.unpin(buffer);
+        }
+
+        match buffer_manager.pin_fast(&block_ids[0]) {
+            FastPinOutcome::Ready(buffer) => buffer_manager.unpin(buffer),
+            FastPinOutcome::NotResident => panic!("expected fast pin hit to stay resident"),
+            FastPinOutcome::Contended => {
+                panic!("expected fast pin hit to complete without contention")
+            }
+        }
+
+        let buffer = buffer_manager.pin(&block_ids[3]).unwrap();
+        buffer_manager.unpin(buffer);
+
+        buffer_manager.reset_stats();
+        let buffer = buffer_manager.pin(&block_ids[1]).unwrap();
+        buffer_manager.unpin(buffer);
+        assert_eq!(
+            buffer_manager.get_stats().unwrap(),
+            (0, 1),
+            "LRU fast hit promotion should keep block 0 resident and evict block 1"
+        );
     }
 
     #[test]

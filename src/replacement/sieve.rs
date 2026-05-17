@@ -23,15 +23,11 @@
 //!
 //! See the SIEVE paper: https://cachemon.github.io/SIEVE-website/
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     buffer_manager::{BufferFrame, FrameMeta},
     intrusive_dll::{IntrusiveList, IntrusiveNode},
-    BlockId,
 };
 
 /// Internal state combining list structure and hand pointer.
@@ -66,27 +62,19 @@ impl PolicyState {
         }
     }
 
-    /// Records a cache hit by setting the frame's reference bit.
+    /// Records a resident hit.
     ///
-    /// Unlike LRU, SIEVE does not move the frame in the list on hit.
-    /// Returns None if the frame no longer contains the requested block.
-    pub fn record_hit<'a>(
-        &self,
-        _buffer_pool: &[Arc<BufferFrame>],
-        frame_ptr: &'a Arc<BufferFrame>,
-        block_id: &BlockId,
-        resident_table: &Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
-    ) -> Option<MutexGuard<'a, FrameMeta>> {
-        let mut frame_guard = frame_ptr.lock_meta();
-        if !frame_guard
-            .block_id()
-            .is_some_and(|current| current == block_id)
-        {
-            resident_table.lock().unwrap().remove(block_id);
-            return None;
-        }
-        frame_guard.ref_bit = true;
-        Some(frame_guard)
+    /// SIEVE hit bookkeeping only sets the reference bit; list order does not change.
+    pub fn on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
+    }
+
+    /// Tries to record a resident hit without blocking.
+    ///
+    /// SIEVE hit bookkeeping is frame-local, so this always succeeds.
+    pub fn try_on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) -> bool {
+        self.on_hit(buffer_pool, frame_idx);
+        true
     }
 
     /// Notifies the policy that a frame has been assigned.
@@ -102,7 +90,7 @@ impl PolicyState {
                     return;
                 }
                 let mut frame_guard = buffer_pool[frame_idx].lock_meta();
-                frame_guard.ref_bit = true;
+                buffer_pool[frame_idx].set_ref_bit(true);
                 let mut current_head_guard = buffer_pool[head].lock_meta();
                 list_guard.intrusive_list.insert_at_head(
                     frame_idx,
@@ -112,7 +100,7 @@ impl PolicyState {
             }
             None => {
                 let mut frame_guard = buffer_pool[frame_idx].lock_meta();
-                frame_guard.ref_bit = true;
+                buffer_pool[frame_idx].set_ref_bit(true);
                 list_guard
                     .intrusive_list
                     .insert_at_head(frame_idx, &mut frame_guard, None);
@@ -120,23 +108,23 @@ impl PolicyState {
         }
     }
 
-    /// Selects a victim frame using the SIEVE algorithm.
+    /// Selects a candidate victim frame using the SIEVE algorithm.
     ///
     /// Sweeps the hand backward from tail through the list, clearing reference bits
-    /// and skipping pinned frames. Evicts the first unpinned frame with ref_bit = false.
-    /// Resets hand to tail if it reaches the head. Returns None if all frames are
-    /// pinned or recently accessed after a full sweep.
-    pub fn evict_frame<'a>(
-        &self,
-        buffer_pool: &'a [Arc<BufferFrame>],
-    ) -> Option<(usize, MutexGuard<'a, FrameMeta>)> {
+    /// and skipping pinned frames. Returns the first unpinned frame with ref_bit = false.
+    /// The candidate remains linked until the buffer manager successfully claims it.
+    pub fn select_victim(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         let mut list_guard = self.list_state.lock().unwrap();
 
         for _ in 0..self.pool_len {
             match list_guard.hand {
                 Some(hand) => {
-                    let mut current_guard = buffer_pool[hand].lock_meta();
-                    if current_guard.pin_count() > 0 || current_guard.is_writeback_in_progress() {
+                    let current_guard = buffer_pool[hand].lock_meta();
+                    if buffer_pool[hand].pin_count() > 0
+                        || current_guard.is_writeback_in_progress()
+                        || buffer_pool[hand].is_loading()
+                        || buffer_pool[hand].is_evicting()
+                    {
                         if let Some(head) = list_guard.intrusive_list.peek_head() {
                             if current_guard.index == head {
                                 list_guard.hand = list_guard.intrusive_list.peek_tail();
@@ -151,27 +139,15 @@ impl PolicyState {
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
-                    if current_guard.ref_bit {
-                        current_guard.ref_bit = false;
+                    if buffer_pool[hand].ref_bit() {
+                        buffer_pool[hand].set_ref_bit(false);
                         list_guard.hand = current_guard.prev();
                         continue;
                     }
-                    let mut prev_node = current_guard
-                        .prev()
-                        .map(|prev| buffer_pool[prev].lock_meta());
-                    let mut next_node = current_guard
-                        .next()
-                        .map(|next| buffer_pool[next].lock_meta());
-                    list_guard.intrusive_list.remove_node(
-                        hand,
-                        &mut current_guard,
-                        prev_node.as_mut(),
-                        next_node.as_mut(),
-                    );
                     list_guard.hand = current_guard
                         .prev()
                         .or_else(|| list_guard.intrusive_list.peek_tail());
-                    return Some((hand, current_guard));
+                    return Some(hand);
                 }
                 None => {
                     list_guard.hand = list_guard.intrusive_list.peek_tail();
@@ -180,5 +156,40 @@ impl PolicyState {
             }
         }
         None
+    }
+
+    /// Commits a successful buffer-manager claim by unlinking the victim.
+    ///
+    /// Returns `false` if the policy lock is currently held. The caller must
+    /// roll back the frame claim before retrying so we do not invert the normal
+    /// policy-lock -> metadata-lock ordering.
+    pub fn try_on_frame_claimed_for_reuse(
+        &self,
+        buffer_pool: &[Arc<BufferFrame>],
+        frame_idx: usize,
+        frame_guard: &mut FrameMeta,
+    ) -> bool {
+        let Some(mut list_guard) = self.list_state.try_lock().ok() else {
+            return false;
+        };
+        let previous = frame_guard.prev();
+        let mut prev_node = previous.map(|prev| buffer_pool[prev].lock_meta());
+        let mut next_node = frame_guard.next().map(|next| buffer_pool[next].lock_meta());
+        list_guard.intrusive_list.remove_node(
+            frame_idx,
+            frame_guard,
+            prev_node.as_deref_mut(),
+            next_node.as_deref_mut(),
+        );
+        if list_guard.hand == Some(frame_idx) {
+            list_guard.hand = previous.or_else(|| list_guard.intrusive_list.peek_tail());
+        }
+        true
+    }
+
+    /// A rejected candidate stays resident. Give it a second chance before the
+    /// hand considers it again.
+    pub fn on_victim_rejected(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
     }
 }

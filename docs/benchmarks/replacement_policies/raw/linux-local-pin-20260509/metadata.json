@@ -1,0 +1,16 @@
+{
+  "platform": "linux-local-pin-20260509",
+  "title": "Linux local Clock pin scaling",
+  "environment": "linux (x86_64)",
+  "num_buffers": 4096,
+  "pin_hotset_pool_size": 4096,
+  "page_size": "page-4k",
+  "generated_at": "2026-05-09T00:00:00+00:00",
+  "policies": {
+    "replacement_clock": {
+      "display": "Replacement Clock (4KB pages)",
+      "json_path": "docs/benchmarks/replacement_policies/raw/linux-local-pin-20260509/replacement_clock.json",
+      "log_path": null
+    }
+  }
+}

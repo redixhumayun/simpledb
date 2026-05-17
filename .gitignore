@@ -13,3 +13,4 @@ perf.*
 /results
 docs/local.md
 docs/sharded/**/*
+_apalache-out/**/*

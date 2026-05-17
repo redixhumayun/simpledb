@@ -17,15 +17,9 @@
 //! - Hit: O(1)
 //! - Eviction: O(n) worst case (full sweep), typically much better
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
-};
+use std::sync::{Arc, Mutex};
 
-use crate::{
-    buffer_manager::{BufferFrame, FrameMeta},
-    BlockId,
-};
+use crate::buffer_manager::{BufferFrame, FrameMeta};
 
 /// Clock policy state with circular hand pointer.
 #[derive(Debug)]
@@ -49,61 +43,74 @@ impl PolicyState {
         }
     }
 
-    /// Records a cache hit by setting the frame's reference bit.
+    /// Records a resident hit.
     ///
-    /// Returns None if the frame no longer contains the requested block.
-    pub fn record_hit<'a>(
-        &self,
-        _buffer_pool: &'a [Arc<BufferFrame>],
-        frame_ptr: &'a Arc<BufferFrame>,
-        block_id: &BlockId,
-        resident_table: &Mutex<HashMap<BlockId, Weak<BufferFrame>>>,
-    ) -> Option<MutexGuard<'a, FrameMeta>> {
-        let mut frame_guard = frame_ptr.lock_meta();
-        if !frame_guard
-            .block_id()
-            .is_some_and(|current| current == block_id)
-        {
-            resident_table.lock().unwrap().remove(block_id);
-            return None;
-        }
-        frame_guard.ref_bit = true;
-        Some(frame_guard)
+    /// Clock only needs to set the reference bit; no shared list mutation is required.
+    pub fn on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
+    }
+
+    /// Tries to record a resident hit without blocking.
+    ///
+    /// Clock hit bookkeeping is frame-local, so this always succeeds.
+    pub fn try_on_hit(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) -> bool {
+        self.on_hit(buffer_pool, frame_idx);
+        true
     }
 
     /// Notifies the policy that a frame has been assigned.
     ///
     /// Sets the reference bit to give the new frame a "second chance".
     pub fn on_frame_assigned(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
-        let mut guard = buffer_pool[frame_idx].lock_meta();
-        guard.ref_bit = true;
+        buffer_pool[frame_idx].set_ref_bit(true);
     }
 
-    /// Selects a victim frame using the clock algorithm.
+    /// Selects a candidate victim frame using the clock algorithm.
     ///
     /// Sweeps the clock hand circularly, giving "second chances" by clearing reference
-    /// bits. Evicts the first unpinned frame with ref_bit = false. Returns None if all
-    /// frames are pinned or have their reference bits set after a full sweep.
-    pub fn evict_frame<'a>(
-        &self,
-        buffer_pool: &'a [Arc<BufferFrame>],
-    ) -> Option<(usize, MutexGuard<'a, FrameMeta>)> {
+    /// bits. Returns the first unpinned frame with ref_bit = false. Returns None if
+    /// all frames are pinned or have their reference bits set after a full sweep.
+    ///
+    /// The buffer manager owns the actual eviction claim; this method only suggests
+    /// which frame should be tried next.
+    pub fn select_victim(&self, buffer_pool: &[Arc<BufferFrame>]) -> Option<usize> {
         let mut hand = self.hand.lock().unwrap();
         for _ in 0..self.pool_len {
             let idx = *hand;
-            let mut frame_guard = buffer_pool[idx].lock_meta();
-            if frame_guard.pin_count() > 0 || frame_guard.is_writeback_in_progress() {
+            let frame = &buffer_pool[idx];
+            let frame_guard = frame.lock_meta();
+            if frame.pin_count() > 0
+                || frame_guard.is_writeback_in_progress()
+                || frame.is_loading()
+                || frame.is_evicting()
+            {
                 *hand = (idx + 1) % self.pool_len;
                 continue;
             }
-            if frame_guard.ref_bit {
-                frame_guard.ref_bit = false;
+            drop(frame_guard);
+            if frame.ref_bit() {
+                frame.set_ref_bit(false);
                 *hand = (idx + 1) % self.pool_len;
                 continue;
             }
             *hand = (idx + 1) % self.pool_len;
-            return Some((idx, frame_guard));
+            return Some(idx);
         }
         None
+    }
+
+    /// Clock keeps no intrusive membership to commit after a successful claim.
+    pub fn try_on_frame_claimed_for_reuse(
+        &self,
+        _buffer_pool: &[Arc<BufferFrame>],
+        _frame_idx: usize,
+        _frame_guard: &mut FrameMeta,
+    ) -> bool {
+        true
+    }
+
+    /// Gives a skipped candidate another chance before it is selected again.
+    pub fn on_victim_rejected(&self, buffer_pool: &[Arc<BufferFrame>], frame_idx: usize) {
+        buffer_pool[frame_idx].set_ref_bit(true);
     }
 }

@@ -1,7 +1,5 @@
 //! Buffer Manager implementation.
 //!
-//! Sharded latch/resident tables with no Drop-based latch cleanup.
-//!
 //! # Shared Types
 //!
 //! - `FrameMeta`: Per-frame metadata (pins, block_id, replacement policy state)
@@ -10,19 +8,21 @@
 //!
 //! # Implementation
 //!
-//! Single sharded implementation with 16-shard latch/resident tables and no
-//! Drop-based latch cleanup.
-
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{hash_map::RandomState, HashMap, VecDeque},
     error::Error,
+    hash::BuildHasher,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        TryLockError,
     },
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+use std::sync::atomic::AtomicBool;
 
 use crate::{
     page::PageType,
@@ -53,11 +53,15 @@ pub enum FastPinOutcome<T> {
 /// The buffer manager uses this to keep the clean-frame accounting in one place
 /// instead of re-deriving it around every pin path.
 #[derive(Debug)]
-struct PinTransition {
-    /// Whether this call consumed the transition from zero pins to one pin.
-    became_pinned: bool,
-    /// Whether pinning removed one frame from the clean unpinned slack pool.
-    left_clean_unpinned: bool,
+enum PinTransition {
+    /// Pin count was already non-zero, so no availability accounting changed.
+    StillPinned,
+    /// Pin count transitioned `0 -> 1` on a clean frame, consuming one unit of
+    /// clean slack.
+    BecamePinnedClean,
+    /// Pin count transitioned `0 -> 1`, but the frame was not part of clean
+    /// slack because it was dirty.
+    BecamePinnedDirty,
 }
 
 /// Result of dropping a pin on a frame.
@@ -65,13 +69,14 @@ struct PinTransition {
 /// This is where the transaction side hands work to the flush side: once the
 /// last pin is gone, a dirty frame may become eligible to enqueue for flush.
 #[derive(Debug)]
-struct UnpinTransition {
-    /// Whether this call released the final pin on the frame.
-    became_unpinned: bool,
-    /// Whether the frame became clean and fully available after the unpin.
-    became_clean_unpinned: bool,
-    /// Frame index to enqueue if the frame became flushable.
-    enqueue_dirty: Option<usize>,
+enum UnpinTransition {
+    /// Pin count remained non-zero, so no availability or flush eligibility changed.
+    StillPinned,
+    /// The last pin was released and the frame became part of clean slack.
+    BecameUnpinnedClean,
+    /// The last pin was released on a dirty frame. The frame is available for
+    /// reuse, and may also need to be enqueued for background flush.
+    BecameUnpinnedDirty { enqueue_dirty: Option<usize> },
 }
 
 /// Result of marking a frame dirty after a page mutation.
@@ -142,14 +147,12 @@ enum ResidencyState {
 /// Composed runtime state of a frame.
 ///
 /// The frame protocol is now explicit at this level: residency answers where a
-/// frame is bound, pin count answers who is actively using it, and flush state
-/// answers how the transaction and writeback subsystems coordinate durability.
+/// frame is bound and flush state answers how the transaction and writeback
+/// subsystems coordinate durability.
 #[derive(Debug, Clone)]
 struct FrameState {
     /// Whether the frame is free or bound to a specific block.
     residency: ResidencyState,
-    /// Active pin count held by readers/writers.
-    pins: usize,
     /// Dirty/writeback protocol state shared with the flusher.
     flush: FlushState,
     /// Next dirty generation to assign when the page is modified again.
@@ -177,9 +180,6 @@ pub struct FrameMeta {
     pub(crate) next_idx: Option<usize>,
     /// Stable frame index used by replacement and dirty-queue bookkeeping.
     pub(crate) index: usize,
-    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
-    /// CLOCK/SIEVE reference bit updated on observed hits.
-    pub(crate) ref_bit: bool,
 }
 
 impl FrameMeta {
@@ -187,7 +187,6 @@ impl FrameMeta {
         Self {
             state: FrameState {
                 residency: ResidencyState::Free,
-                pins: 0,
                 flush: FlushState::Clean,
                 next_flush_generation: 0,
             },
@@ -196,29 +195,7 @@ impl FrameMeta {
             #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
             next_idx: None,
             index,
-            #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
-            ref_bit: false,
         }
-    }
-
-    pub(crate) fn pin(&mut self) -> bool {
-        let was_zero = self.state.pins == 0;
-        self.state.pins += 1;
-        was_zero
-    }
-
-    pub(crate) fn unpin(&mut self) -> bool {
-        assert!(self.state.pins > 0, "FrameMeta::unpin on zero pins");
-        self.state.pins -= 1;
-        self.state.pins == 0
-    }
-
-    pub(crate) fn reset_pins(&mut self) {
-        self.state.pins = 0;
-    }
-
-    pub(crate) fn pin_count(&self) -> usize {
-        self.state.pins
     }
 
     pub(crate) fn block_id(&self) -> Option<&BlockId> {
@@ -249,6 +226,13 @@ impl FrameMeta {
         matches!(self.state.flush, FlushState::Writeback { .. })
     }
 
+    fn claim_for_eviction(&mut self) -> bool {
+        if self.is_writeback_in_progress() {
+            return false;
+        }
+        true
+    }
+
     fn txn(&self) -> Option<usize> {
         match self.state.flush {
             FlushState::Clean => None,
@@ -262,13 +246,13 @@ impl FrameMeta {
 
     /// Returns whether this frame counts toward the clean slack the flusher is
     /// trying to maintain.
-    fn is_clean_unpinned(&self) -> bool {
-        self.state.pins == 0 && matches!(self.state.flush, FlushState::Clean)
+    fn is_clean_unpinned(&self, pin_count: usize) -> bool {
+        pin_count == 0 && matches!(self.state.flush, FlushState::Clean)
     }
 
-    fn try_queue_dirty_if_flushable(&mut self) -> Option<usize> {
+    fn try_queue_dirty_if_flushable(&mut self, pin_count: usize) -> Option<usize> {
         match &mut self.state.flush {
-            FlushState::Dirty { queued, .. } if self.state.pins == 0 && !*queued => {
+            FlushState::Dirty { queued, .. } if pin_count == 0 && !*queued => {
                 *queued = true;
                 Some(self.index)
             }
@@ -284,29 +268,29 @@ impl FrameMeta {
 
     /// Applies the pin-side transition and reports whether that removed one
     /// clean frame from the available pool.
-    fn pin_transition(&mut self) -> PinTransition {
-        let left_clean_unpinned = self.is_clean_unpinned();
-        let became_pinned = self.pin();
-        PinTransition {
-            became_pinned,
-            left_clean_unpinned,
+    fn pin_transition(&self, previous_pin_count: usize) -> PinTransition {
+        if previous_pin_count > 0 {
+            return PinTransition::StillPinned;
+        }
+        if self.is_clean_unpinned(previous_pin_count) {
+            PinTransition::BecamePinnedClean
+        } else {
+            PinTransition::BecamePinnedDirty
         }
     }
 
     /// Applies the unpin-side transition and reports whether the frame became
     /// flushable or newly clean-and-unpinned.
-    fn unpin_transition(&mut self) -> UnpinTransition {
-        let became_unpinned = self.unpin();
-        let enqueue_dirty = if became_unpinned {
-            self.try_queue_dirty_if_flushable()
+    fn unpin_transition(&mut self, new_pin_count: usize) -> UnpinTransition {
+        if new_pin_count > 0 {
+            return UnpinTransition::StillPinned;
+        }
+        if self.is_clean_unpinned(0) {
+            UnpinTransition::BecameUnpinnedClean
         } else {
-            None
-        };
-        let became_clean_unpinned = became_unpinned && self.is_clean_unpinned();
-        UnpinTransition {
-            became_unpinned,
-            became_clean_unpinned,
-            enqueue_dirty,
+            UnpinTransition::BecameUnpinnedDirty {
+                enqueue_dirty: self.try_queue_dirty_if_flushable(0),
+            }
         }
     }
 
@@ -314,8 +298,13 @@ impl FrameMeta {
     ///
     /// The transition decides whether the dirty image should be queued for the
     /// background flusher immediately or only after the last pin is released.
-    fn mark_dirty_transition(&mut self, txn_num: usize, lsn: Lsn) -> DirtyTransition {
-        let left_clean_unpinned = self.is_clean_unpinned();
+    fn mark_dirty_transition(
+        &mut self,
+        pin_count: usize,
+        txn_num: usize,
+        lsn: Lsn,
+    ) -> DirtyTransition {
+        let left_clean_unpinned = self.is_clean_unpinned(pin_count);
         let generation = self.state.next_flush_generation.wrapping_add(1);
         self.state.next_flush_generation = generation;
         self.state.flush = match self.state.flush {
@@ -341,7 +330,7 @@ impl FrameMeta {
                 writeback_generation,
             },
         };
-        let enqueue_dirty = self.try_queue_dirty_if_flushable();
+        let enqueue_dirty = self.try_queue_dirty_if_flushable(pin_count);
         DirtyTransition {
             left_clean_unpinned,
             enqueue_dirty,
@@ -353,8 +342,12 @@ impl FrameMeta {
     /// Why this is separate: the flusher must establish one explicit in-flight
     /// generation before it snapshots bytes, otherwise completion cannot tell
     /// whether a newer mutation arrived while the write was outstanding.
-    fn try_begin_writeback(&mut self, require_unpinned: bool) -> Option<(Lsn, u64)> {
-        if require_unpinned && self.state.pins > 0 {
+    fn try_begin_writeback(
+        &mut self,
+        pin_count: usize,
+        require_unpinned: bool,
+    ) -> Option<(Lsn, u64)> {
+        if require_unpinned && pin_count > 0 {
             return None;
         }
         match self.state.flush {
@@ -384,6 +377,7 @@ impl FrameMeta {
         &mut self,
         block_still_matches: bool,
         generation: u64,
+        pin_count: usize,
     ) -> Option<WritebackCompletion> {
         if !block_still_matches {
             return None;
@@ -402,7 +396,7 @@ impl FrameMeta {
             return None;
         }
 
-        let was_clean_unpinned = self.is_clean_unpinned();
+        let was_clean_unpinned = self.is_clean_unpinned(pin_count);
         self.state.flush = if dirty_generation == writeback_generation {
             FlushState::Clean
         } else {
@@ -414,12 +408,224 @@ impl FrameMeta {
             }
         };
 
-        let enqueue_dirty = self.try_queue_dirty_if_flushable();
+        let enqueue_dirty = self.try_queue_dirty_if_flushable(pin_count);
 
         Some(WritebackCompletion {
-            became_clean_unpinned: !was_clean_unpinned && self.is_clean_unpinned(),
+            became_clean_unpinned: !was_clean_unpinned && self.is_clean_unpinned(pin_count),
             enqueue_dirty,
         })
+    }
+}
+
+/// Atomic wrapper around the packed frame residency-control word.
+///
+/// Bit layout:
+/// - bit 0: `loading`
+/// - bit 1: `evicting`
+/// - bits 2..: residency generation
+///
+/// Why this is one atomic word: resident pins must validate generation and
+/// transient state from a single coherent snapshot, and install/evict paths
+/// need to CAS that whole snapshot when moving between states.
+#[derive(Debug)]
+struct AtomicFrameControl {
+    raw: AtomicU64,
+}
+
+/// Opaque raw residency-control snapshot used for validation and rollback.
+type FrameControlSnapshot = u64;
+
+impl AtomicFrameControl {
+    const LOADING_BIT: u64 = 1;
+    const EVICTING_BIT: u64 = 1 << 1;
+    const FLAGS_MASK: u64 = Self::LOADING_BIT | Self::EVICTING_BIT;
+
+    /// Creates one control word for generation zero with no transient flags set.
+    fn new() -> Self {
+        Self {
+            raw: AtomicU64::new(0),
+        }
+    }
+
+    /// Packs a generation and transient flags into the control word layout.
+    fn encode(generation: u64, loading: bool, evicting: bool) -> u64 {
+        (generation << 2)
+            | if loading { Self::LOADING_BIT } else { 0 }
+            | if evicting { Self::EVICTING_BIT } else { 0 }
+    }
+
+    /// Extracts the residency generation from a raw control snapshot.
+    fn generation_from(snapshot: FrameControlSnapshot) -> u64 {
+        snapshot >> 2
+    }
+
+    /// Returns whether a raw control snapshot has the loading flag set.
+    fn is_loading_raw(snapshot: FrameControlSnapshot) -> bool {
+        snapshot & Self::LOADING_BIT != 0
+    }
+
+    /// Returns whether a raw control snapshot has the evicting flag set.
+    fn is_evicting_raw(snapshot: FrameControlSnapshot) -> bool {
+        snapshot & Self::EVICTING_BIT != 0
+    }
+
+    /// Loads the current raw residency-control snapshot.
+    ///
+    /// The value should be interpreted only by helpers on this type or passed
+    /// back to `store_raw()` for rollback.
+    fn load_raw(&self) -> FrameControlSnapshot {
+        self.raw.load(Ordering::Acquire)
+    }
+
+    /// Restores one previously observed raw residency-control snapshot.
+    ///
+    /// This is used only for rollback after a later cold-state check fails.
+    fn store_raw(&self, snapshot: FrameControlSnapshot) {
+        self.raw.store(snapshot, Ordering::Release);
+    }
+
+    /// Returns the current residency generation used by directory validation.
+    fn generation(&self) -> u64 {
+        Self::generation_from(self.load_raw())
+    }
+
+    /// Returns whether the frame is currently in its non-pinnable loading phase.
+    fn is_loading(&self) -> bool {
+        Self::is_loading_raw(self.load_raw())
+    }
+
+    /// Returns whether the frame has been claimed for reuse by an evict/install path.
+    fn is_evicting(&self) -> bool {
+        Self::is_evicting_raw(self.load_raw())
+    }
+
+    /// Returns whether a raw control snapshot may be pinned for the given
+    /// directory generation.
+    ///
+    /// A resident pin is valid only when the frame still belongs to the same
+    /// residency generation and is not in a transient non-pinnable phase.
+    fn can_pin(snapshot: FrameControlSnapshot, residency_generation: u64) -> bool {
+        Self::generation_from(snapshot) == residency_generation && snapshot & Self::FLAGS_MASK == 0
+    }
+
+    /// Starts a new residency generation and marks it non-pinnable.
+    ///
+    /// Why both bits are set here: while a frame is being refilled, hits must
+    /// fail validation exactly as if the frame had already been claimed away.
+    fn begin_loading(&self) -> u64 {
+        loop {
+            let current = self.load_raw();
+            let generation = Self::generation_from(current).wrapping_add(1);
+            let next = Self::encode(generation, true, true);
+            if self
+                .raw
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return generation;
+            }
+        }
+    }
+
+    /// Clears the transient loading/evicting bits for the current generation.
+    ///
+    /// After this transition, ordinary resident pins may validate and proceed again.
+    fn finish_loading(&self) {
+        loop {
+            let current = self.load_raw();
+            let next = Self::encode(Self::generation_from(current), false, false);
+            if self
+                .raw
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Tries to mark the current generation as claimed for eviction.
+    ///
+    /// Returns the pre-claim state so the caller can restore it if a later
+    /// colder check under [`FrameMeta`] fails.
+    fn try_claim_for_eviction(&self, pin_count: usize) -> Option<FrameControlSnapshot> {
+        loop {
+            let current = self.load_raw();
+            if Self::is_loading_raw(current) || Self::is_evicting_raw(current) || pin_count > 0 {
+                return None;
+            }
+            let claimed = current | Self::EVICTING_BIT;
+            if self
+                .raw
+                .compare_exchange(current, claimed, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(current);
+            }
+        }
+    }
+}
+
+/// Conservative hot-path summary of frame flush state.
+///
+/// This is deliberately smaller than [`FlushState`]. The full dirty/writeback
+/// protocol remains in [`FrameMeta`]; this atomic only answers whether ordinary
+/// clean resident-hit pin/unpin accounting may skip the metadata mutex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameFastState {
+    /// Frame metadata is known to be clean for pin/unpin accounting.
+    Clean = 0,
+    /// Dirty, writeback, loading, or otherwise uncertain state: consult `FrameMeta`.
+    NeedsMeta = 1,
+}
+
+impl FrameFastState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Clean,
+            _ => Self::NeedsMeta,
+        }
+    }
+}
+
+/// Atomic wrapper around the conservative frame fast-path state.
+///
+/// Why this is separate from [`AtomicFrameControl`]: residency validation and
+/// flush/accounting summaries are different protocols. Keeping this as its own
+/// atomic avoids coupling dirty/writeback transitions to the generation/loading
+/// word used by directory OCC validation.
+#[derive(Debug)]
+struct AtomicFrameFastState {
+    raw: AtomicU8,
+}
+
+impl AtomicFrameFastState {
+    fn new() -> Self {
+        Self {
+            raw: AtomicU8::new(FrameFastState::Clean as u8),
+        }
+    }
+
+    /// Returns whether clean pin/unpin accounting may skip [`FrameMeta`].
+    fn is_clean(&self) -> bool {
+        FrameFastState::from_raw(self.raw.load(Ordering::Acquire)) == FrameFastState::Clean
+    }
+
+    /// Marks the fast path safe for clean pin/unpin accounting.
+    ///
+    /// Callers only do this after updating `FrameMeta` to `FlushState::Clean`.
+    fn mark_clean(&self) {
+        self.raw
+            .store(FrameFastState::Clean as u8, Ordering::Release);
+    }
+
+    /// Forces future pin/unpin accounting through [`FrameMeta`].
+    ///
+    /// This is cheap and conservative: false negatives only lose the fast path,
+    /// while false positives would break dirty/writeback accounting.
+    fn mark_needs_meta(&self) {
+        self.raw
+            .store(FrameFastState::NeedsMeta as u8, Ordering::Release);
     }
 }
 
@@ -465,38 +671,101 @@ impl IntrusiveNode for MutexGuard<'_, FrameMeta> {
 // BufferFrame
 // ============================================================================
 
+/// One stable slot in the buffer pool.
+///
+/// A frame owns three different kinds of state:
+/// - page bytes behind `RwLock<Page>`
+/// - cold metadata behind [`FrameMeta`]
+/// - hot per-frame access state in atomics
+///
+/// Why this split exists: resident hits touch pin count, policy bits, and
+/// residency-control flags far more often than they touch flush metadata or
+/// page contents. Keeping those hot fields on `BufferFrame` lets the common
+/// path avoid serializing on [`FrameMeta`].
 #[derive(Debug)]
 pub struct BufferFrame {
+    /// Storage interface used to read and write the page currently assigned to this frame.
     file_manager: SharedFS,
+    /// WAL manager used by writeback paths to preserve WAL-before-data ordering.
     log_manager: Arc<Mutex<LogManager>>,
+    /// Page bytes currently cached in this frame.
+    ///
+    /// This latch protects page contents only. Buffer pinning and residency
+    /// validation are handled separately.
     page: RwLock<Page>,
+    /// Cold per-frame metadata: block identity, flush protocol state, and
+    /// replacement-list links for list-based policies.
     meta: Mutex<FrameMeta>,
+    /// Hot pin count updated on every pin/unpin.
+    pin_count: AtomicUsize,
+    #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+    /// Hot policy reference bit used by Clock and SIEVE.
+    ref_bit: AtomicBool,
+    /// Packed residency-control word used by OCC validation.
+    ///
+    /// Holds residency generation plus transient `loading/evicting` flags.
+    control: AtomicFrameControl,
+    /// Conservative clean/dirty summary for resident-hit pin/unpin accounting.
+    ///
+    /// `FrameMeta` remains the source of truth; this field only lets clean pages
+    /// skip the metadata mutex on ordinary `0 -> 1 -> 0` traffic.
+    fast_state: AtomicFrameFastState,
 }
 
 impl BufferFrame {
+    /// Constructs one buffer frame with empty page bytes and zeroed hot-path state.
+    ///
+    /// Why this split exists: page bytes, cold metadata, and hot residency/pin
+    /// fields are initialized separately because later methods intentionally
+    /// touch them with different synchronization mechanisms.
     pub fn new(file_manager: SharedFS, log_manager: Arc<Mutex<LogManager>>, index: usize) -> Self {
         Self {
             file_manager,
             log_manager,
             page: RwLock::new(Page::new()),
             meta: Mutex::new(FrameMeta::new(index)),
+            pin_count: AtomicUsize::new(0),
+            #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
+            ref_bit: AtomicBool::new(false),
+            control: AtomicFrameControl::new(),
+            fast_state: AtomicFrameFastState::new(),
         }
     }
 
+    /// Locks cold per-frame metadata shared with flush and replacement code.
+    ///
+    /// This should stay off the uncontended resident-hit fast path as much as
+    /// possible; atomics on `BufferFrame` exist to avoid taking this lock there.
     pub(crate) fn lock_meta(&self) -> MutexGuard<'_, FrameMeta> {
         self.meta.lock().unwrap()
     }
 
+    /// Tries to lock cold metadata without blocking.
+    ///
+    /// Used by nonblocking paths such as `pin_fast()` where waiting behind page
+    /// or flush work would violate the caller contract.
     pub(crate) fn try_lock_meta(&self) -> Option<MutexGuard<'_, FrameMeta>> {
-        self.meta.try_lock().ok()
+        match self.meta.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(_)) => None,
+        }
     }
 
+    /// Returns the current resident block identity, if any.
+    ///
+    /// This consults cold metadata because block identity changes only on
+    /// install/evict paths, not on ordinary hits.
     pub fn block_id_owned(&self) -> Option<BlockId> {
         self.lock_meta().block_id_owned()
     }
 
+    /// Returns the live pin count from the hot atomic state.
+    ///
+    /// Pin count lives outside [`FrameMeta`] so resident hits can pin/unpin
+    /// without serializing on the metadata mutex.
     pub fn pin_count(&self) -> usize {
-        self.lock_meta().pin_count()
+        self.pin_count.load(Ordering::Acquire)
     }
 
     #[cfg(any(feature = "replacement_lru", feature = "replacement_sieve"))]
@@ -504,27 +773,176 @@ impl BufferFrame {
         self.lock_meta().index
     }
 
+    /// Returns the policy reference bit from hot state.
+    ///
+    /// Clock and SIEVE consult this frequently during hit/evict traffic, so it
+    /// stays out of [`FrameMeta`].
     #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
     pub fn ref_bit(&self) -> bool {
-        self.lock_meta().ref_bit
+        self.ref_bit.load(Ordering::Acquire)
     }
 
+    /// Updates the policy reference bit without touching cold metadata.
     #[cfg(any(feature = "replacement_clock", feature = "replacement_sieve"))]
     pub fn set_ref_bit(&self, value: bool) {
-        self.lock_meta().ref_bit = value;
+        self.ref_bit.store(value, Ordering::Release);
     }
 
+    /// Acquires a shared latch on the page bytes.
+    ///
+    /// This is intentionally separate from buffer pinning; pin protects
+    /// residency, while this lock protects page contents.
     pub fn read_page(&self) -> RwLockReadGuard<'_, Page> {
         self.page.read().unwrap()
     }
 
+    /// Acquires an exclusive latch on the page bytes.
     pub fn write_page(&self) -> RwLockWriteGuard<'_, Page> {
         self.page.write().unwrap()
     }
 
     #[cfg(test)]
     pub(crate) fn is_pinned(&self) -> bool {
-        self.lock_meta().pin_count() > 0
+        self.pin_count() > 0
+    }
+
+    /// Returns the current residency generation used by directory validation.
+    pub(crate) fn residency_generation(&self) -> u64 {
+        self.control.generation()
+    }
+
+    /// Returns whether the frame is currently being filled with a new page.
+    pub(crate) fn is_loading(&self) -> bool {
+        self.control.is_loading()
+    }
+
+    /// Returns whether the frame has been claimed for reuse.
+    pub(crate) fn is_evicting(&self) -> bool {
+        self.control.is_evicting()
+    }
+
+    /// Starts installing a specific block into this frame.
+    ///
+    /// This bumps the residency generation before the new contents become
+    /// pinnable so stale directory observations fail validation.
+    fn begin_loading_residency_locked(&self, meta: &mut FrameMeta, block_id: BlockId) -> u64 {
+        self.fast_state.mark_needs_meta();
+        meta.assign_resident(block_id);
+        self.control.begin_loading()
+    }
+
+    /// Marks the frame as reserved for an incoming block before bytes arrive.
+    ///
+    /// Prefetch uses this placeholder state so duplicate install attempts see a
+    /// transient non-pinnable generation instead of a reusable frame.
+    fn begin_loading_placeholder_locked(&self, meta: &mut FrameMeta) -> u64 {
+        self.fast_state.mark_needs_meta();
+        meta.clear_residency();
+        self.control.begin_loading()
+    }
+
+    /// Makes the current residency visible to ordinary pins again.
+    fn finish_loading_residency(&self) {
+        self.control.finish_loading();
+    }
+
+    /// Tries to claim the frame for eviction/reuse.
+    ///
+    /// The claim is two-stage:
+    /// - atomically set `evicting` so new pins fail OCC validation
+    /// - then lock [`FrameMeta`] to verify colder writeback constraints
+    fn try_claim_for_eviction(&self) -> Option<(FrameControlSnapshot, MutexGuard<'_, FrameMeta>)> {
+        let previous = self.control.try_claim_for_eviction(self.pin_count())?;
+
+        let mut meta = self.lock_meta();
+        if self.pin_count() > 0 || !meta.claim_for_eviction() {
+            self.control.store_raw(previous);
+            return None;
+        }
+        Some((previous, meta))
+    }
+
+    /// Restores the pre-claim control word when a caller abandons a claimed frame.
+    fn rollback_eviction_claim(&self, previous: FrameControlSnapshot) {
+        self.control.store_raw(previous);
+    }
+
+    /// Attempts one resident pin using directory-provided generation.
+    ///
+    /// This is the core OCC fast path:
+    /// - validate control word
+    /// - increment atomic pin count
+    /// - revalidate and roll back on race
+    ///
+    /// Clean `0 -> 1` transitions use the frame's hot clean summary; dirty or
+    /// uncertain transitions still consult [`FrameMeta`] for flush accounting.
+    fn pin_from_directory_entry(&self, residency_generation: u64) -> Option<PinTransition> {
+        let control = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(control, residency_generation) {
+            return None;
+        }
+
+        let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
+        let validated = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(validated, residency_generation) {
+            self.pin_count.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+
+        let transition = if previous_pin_count == 0 {
+            if self.fast_state.is_clean() {
+                return Some(PinTransition::BecamePinnedClean);
+            }
+            let meta = self.lock_meta();
+            meta.pin_transition(previous_pin_count)
+        } else {
+            PinTransition::StillPinned
+        };
+        Some(transition)
+    }
+
+    /// Attempts the same OCC resident pin as [`BufferFrame::pin_from_directory_entry()`], but
+    /// preserves the [`BufferManager::pin_fast()`] nonblocking contract.
+    ///
+    /// Why this helper exists: [`BufferManager::pin_fast()`] must distinguish
+    /// three cases without ever waiting on [`FrameMeta`]:
+    /// - the directory/generation was stale, so the caller should treat the
+    ///   page as not resident
+    /// - the frame was resident and the pin succeeded
+    /// - the only remaining step was a dirty/uncertain `0 -> 1` accounting
+    ///   transition, but that would have blocked on `FrameMeta`
+    ///
+    /// This method may speculatively increment `pin_count`; any stale-residency
+    /// or would-block outcome rolls that increment back before returning.
+    fn try_pin_from_directory_entry(
+        &self,
+        residency_generation: u64,
+    ) -> Result<Option<PinTransition>, ()> {
+        let control = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(control, residency_generation) {
+            return Ok(None);
+        }
+
+        let previous_pin_count = self.pin_count.fetch_add(1, Ordering::AcqRel);
+        let validated = self.control.load_raw();
+        if !AtomicFrameControl::can_pin(validated, residency_generation) {
+            self.pin_count.fetch_sub(1, Ordering::AcqRel);
+            return Ok(None);
+        }
+
+        let transition = if previous_pin_count == 0 {
+            if self.fast_state.is_clean() {
+                return Ok(Some(PinTransition::BecamePinnedClean));
+            }
+            let Some(meta) = self.try_lock_meta() else {
+                self.pin_count.fetch_sub(1, Ordering::AcqRel);
+                return Err(());
+            };
+            meta.pin_transition(previous_pin_count)
+        } else {
+            PinTransition::StillPinned
+        };
+        Ok(Some(transition))
     }
 
     /// Claims one dirty generation and snapshots stable page bytes for it.
@@ -536,13 +954,11 @@ impl BufferFrame {
         meta: &mut FrameMeta,
         require_unpinned: bool,
     ) -> Option<(BlockId, Lsn, u64, Page)> {
-        // Snapshot writeback is the current protocol choice because it lets the
-        // flusher release the page lock before waiting on I/O.
         let block_id = match meta.block_id() {
             Some(block_id) => block_id.clone(),
             _ => return None,
         };
-        let (lsn, generation) = meta.try_begin_writeback(require_unpinned)?;
+        let (lsn, generation) = meta.try_begin_writeback(self.pin_count(), require_unpinned)?;
 
         let mut page_guard = self.page.write().unwrap();
         set_page_lsn(page_guard.bytes_mut(), lsn);
@@ -577,13 +993,22 @@ impl BufferFrame {
     /// Stale completions are ignored so an older snapshot cannot clear newer
     /// dirty state after the frame has advanced.
     fn complete_writeback_locked(
+        &self,
         meta: &mut FrameMeta,
         block_id: &BlockId,
         generation: u64,
     ) -> Option<WritebackCompletion> {
-        meta.complete_writeback_transition(meta.block_id() == Some(block_id), generation)
+        meta.complete_writeback_transition(
+            meta.block_id() == Some(block_id),
+            generation,
+            self.pin_count(),
+        )
     }
 
+    /// Flushes the current dirty image synchronously if one is present.
+    ///
+    /// This remains a cold path helper used by install/evict logic. The point
+    /// is to keep the page snapshot and completion protocol in one place.
     fn flush_locked(&self, meta: &mut FrameMeta) -> Option<WritebackCompletion> {
         if let Some((block_id, lsn, generation, snapshot)) =
             self.claim_snapshot_for_writeback_locked(meta, true)
@@ -594,18 +1019,23 @@ impl BufferFrame {
             }];
             let pages = [&snapshot];
             self.file_manager.write_batch(&req, &pages);
-            return Self::complete_writeback_locked(meta, &block_id, generation);
+            return self.complete_writeback_locked(meta, &block_id, generation);
         }
         None
     }
 
+    /// Reuses the frame for a new block after reconciling any prior dirty state.
+    ///
+    /// Callers enter with eviction/install ownership already established. This
+    /// method performs the actual disk read and leaves the frame in
+    /// `loading+evicting` until the caller publishes the directory entry.
     fn assign_to_block_locked(
         &self,
         meta: &mut FrameMeta,
         block_id: &BlockId,
     ) -> Option<WritebackCompletion> {
         let completion = self.flush_locked(meta);
-        meta.assign_resident(block_id.clone());
+        self.begin_loading_residency_locked(meta, block_id.clone());
         let mut page_guard = self.page.write().unwrap();
         self.file_manager.read(block_id, &mut page_guard);
         match page_guard.peek_page_type().unwrap() {
@@ -652,8 +1082,8 @@ impl BufferFrame {
             }
             PageType::Free => {}
         }
-        meta.reset_pins();
         meta.mark_flush_clean();
+        self.fast_state.mark_clean();
         completion
     }
 }
@@ -713,54 +1143,189 @@ impl BufferStats {
     }
 }
 
-// ============================================================================
-// LatchTableGuard (NO Drop - latches persist)
-// Latch cleanup is intentionally avoided on the pin path to reduce contention.
-// If latch growth becomes an issue, prefer periodic/thresholded cleanup off
-// the hot path.
-// ============================================================================
-
-type LatchShards = [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>];
-
-struct LatchTableGuard {
-    latch: Arc<Mutex<()>>,
+#[derive(Debug, Clone)]
+enum DirectoryEntry {
+    /// A thread owns installation for this block, but no pinnable frame has
+    /// been published yet.
+    Installing,
+    /// A block is resident in `frame_idx` for the recorded residency generation.
+    ///
+    /// The generation is part of the lookup result so callers can validate the
+    /// frame after dropping the shard lock.
+    Resident { frame_idx: usize, generation: u64 },
 }
 
-impl LatchTableGuard {
-    pub fn new(latch_shards: &LatchShards, block_id: &BlockId, shard_index: usize) -> Self {
-        let latch = {
-            let mut guard = latch_shards[shard_index].lock().unwrap();
-            let block_latch_ptr = guard
-                .entry(block_id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())));
-            Arc::clone(block_latch_ptr)
+/// Fixed shard count for the resident directory.
+///
+/// Why this is constant: the directory is on the resident-hit path, so shard
+/// layout should be predictable and dependency-free. A power of two lets shard
+/// selection use a mask after hashing.
+const DIRECTORY_SHARD_COUNT: usize = 64;
+
+/// Sharded block-to-frame directory used before frame-local OCC validation.
+///
+/// Why this exists: resident hits need to find a candidate frame without the old
+/// global directory mutex or per-block latch path. Each shard protects only the
+/// `BlockId -> DirectoryEntry` map for that shard; correctness does not rely on
+/// holding the shard lock after lookup. Callers must validate the returned frame
+/// generation and transient loading/evicting bits before treating a lookup as a
+/// real pin.
+///
+/// Invariants:
+/// - at most one `DirectoryEntry` exists per `BlockId`
+/// - `Installing` reserves installation ownership for one miss path
+/// - `Resident` entries are advisory until frame generation validation succeeds
+#[derive(Debug)]
+struct ShardedDirectory {
+    /// Independent maps so disjoint resident hits do not serialize on one mutex.
+    shards: Vec<Mutex<HashMap<BlockId, DirectoryEntry>>>,
+    /// Shared hash builder keeps shard choice consistent across operations.
+    hash_builder: RandomState,
+}
+
+/// Nonblocking lookup result for `pin_fast()`.
+///
+/// The distinction between `Absent` and `Locked` is observable by B-tree
+/// latch-crabbing code: a real miss can be slow-pinned after releasing latches,
+/// while contention should restart without changing residency.
+enum DirectoryTryGet {
+    Present(DirectoryEntry),
+    Absent,
+    Locked,
+}
+
+impl ShardedDirectory {
+    /// Creates an empty directory with fixed independent shards.
+    fn new() -> Self {
+        let shards = (0..DIRECTORY_SHARD_COUNT)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        Self {
+            shards,
+            hash_builder: RandomState::new(),
+        }
+    }
+
+    /// Chooses the shard that owns `block_id`.
+    fn shard_idx(&self, block_id: &BlockId) -> usize {
+        (self.hash_builder.hash_one(block_id) as usize) & (self.shards.len() - 1)
+    }
+
+    /// Locks one shard on the blocking pin path.
+    fn lock_shard(&self, shard_idx: usize) -> MutexGuard<'_, HashMap<BlockId, DirectoryEntry>> {
+        self.shards[shard_idx].lock().unwrap()
+    }
+
+    /// Tries to lock one shard without waiting.
+    ///
+    /// Used by `pin_fast()` so callers can report internal contention instead of
+    /// blocking while holding higher-level page latches.
+    fn try_lock_shard(
+        &self,
+        shard_idx: usize,
+    ) -> Option<MutexGuard<'_, HashMap<BlockId, DirectoryEntry>>> {
+        match self.shards[shard_idx].try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(_)) => None,
+        }
+    }
+
+    /// Looks up a block entry on the blocking pin path.
+    fn get(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        let shard_idx = self.shard_idx(block_id);
+        self.lock_shard(shard_idx).get(block_id).cloned()
+    }
+
+    /// Looks up a block entry without waiting on the shard mutex.
+    fn try_get(&self, block_id: &BlockId) -> DirectoryTryGet {
+        let shard_idx = self.shard_idx(block_id);
+        let Some(directory) = self.try_lock_shard(shard_idx) else {
+            return DirectoryTryGet::Locked;
         };
-        Self { latch }
+        match directory.get(block_id).cloned() {
+            Some(entry) => DirectoryTryGet::Present(entry),
+            None => DirectoryTryGet::Absent,
+        }
     }
 
-    fn try_new(latch_shards: &LatchShards, block_id: &BlockId, shard_index: usize) -> Option<Self> {
-        let latch = {
-            let mut guard = latch_shards[shard_index].try_lock().ok()?;
-            let block_latch_ptr = guard
-                .entry(block_id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())));
-            Arc::clone(block_latch_ptr)
-        };
-        Some(Self { latch })
+    /// Removes a resident entry only if it still names the same frame generation.
+    ///
+    /// This prevents an eviction/install race from clearing a newer mapping that
+    /// reused the same `BlockId` after the caller observed an older generation.
+    fn remove_if_matches(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        let remove = matches!(
+            directory.get(block_id),
+            Some(DirectoryEntry::Resident {
+                frame_idx: existing_idx,
+                generation: existing_generation
+            }) if *existing_idx == frame_idx && *existing_generation == generation
+        );
+        if remove {
+            directory.remove(block_id);
+        }
     }
 
-    fn lock<'a>(&'a self) -> MutexGuard<'a, ()> {
-        self.latch.lock().unwrap()
+    /// Attempts to reserve installation ownership for a missing block.
+    ///
+    /// Returns the existing entry when another thread already owns installation
+    /// or has published residency. Returning `None` means the caller inserted
+    /// `Installing` and must either publish or clear it.
+    fn begin_install_if_absent(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        match directory.get(block_id).cloned() {
+            Some(existing) => Some(existing),
+            None => {
+                directory.insert(block_id.clone(), DirectoryEntry::Installing);
+                None
+            }
+        }
     }
 
-    fn try_lock<'a>(&'a self) -> Option<MutexGuard<'a, ()>> {
-        self.latch.try_lock().ok()
+    /// Publishes a frame generation after the page bytes and frame metadata are ready.
+    fn publish_resident(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
+        let shard_idx = self.shard_idx(block_id);
+        self.lock_shard(shard_idx).insert(
+            block_id.clone(),
+            DirectoryEntry::Resident {
+                frame_idx,
+                generation,
+            },
+        );
     }
+
+    /// Clears an abandoned installation reservation.
+    ///
+    /// The entry is removed only while it is still `Installing`, so a concurrent
+    /// successful publisher cannot be erased by a stale cleanup path.
+    fn clear_installing(&self, block_id: &BlockId) {
+        let shard_idx = self.shard_idx(block_id);
+        let mut directory = self.lock_shard(shard_idx);
+        if matches!(directory.get(block_id), Some(DirectoryEntry::Installing)) {
+            directory.remove(block_id);
+        }
+    }
+}
+
+enum PinAttempt {
+    /// Pin succeeded and returned the resident frame.
+    Ready(Arc<BufferFrame>),
+    /// Pin could succeed soon, but the caller observed a transient race such as
+    /// `Installing`, generation mismatch, or `loading/evicting`. Retry without
+    /// entering the global no-free-buffer wait path.
+    Retry,
+    /// Pin could not make progress because no frame was currently claimable for
+    /// installation. Caller should wait on the global free-buffer condition.
+    NeedWait,
 }
 
 struct PrefetchReservation {
     block_id: BlockId,
     frame_idx: usize,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -777,6 +1342,18 @@ struct FlushCoordinator {
     state: Mutex<FlushControl>,
     /// Wakes the flusher on new work, timeout expiry, or shutdown.
     cond: Condvar,
+}
+
+impl FlushCoordinator {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FlushControl {
+                oldest_dirty_signal: None,
+                shutdown: false,
+            }),
+            cond: Condvar::new(),
+        }
+    }
 }
 
 /// One claimed dirty generation plus its stable page snapshot.
@@ -800,18 +1377,6 @@ struct BackgroundFlusher {
     clean_unpinned: Arc<AtomicUsize>,
     dirty_queue: Arc<Mutex<VecDeque<usize>>>,
     flush_coordinator: Arc<FlushCoordinator>,
-}
-
-impl FlushCoordinator {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(FlushControl {
-                oldest_dirty_signal: None,
-                shutdown: false,
-            }),
-            cond: Condvar::new(),
-        }
-    }
 }
 
 impl BackgroundFlusher {
@@ -881,7 +1446,10 @@ impl BackgroundFlusher {
             let Some((block_id, lsn, generation, snapshot)) =
                 buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
             else {
-                if meta.try_queue_dirty_if_flushable().is_some() {
+                if meta
+                    .try_queue_dirty_if_flushable(buffer.pin_count())
+                    .is_some()
+                {
                     deferred.push(frame_idx);
                 }
                 continue;
@@ -943,10 +1511,13 @@ impl BackgroundFlusher {
         for pending in pending {
             let mut meta = pending.frame.lock_meta();
             let block_still_matches = meta.block_id() == Some(&pending.block_id);
-            if let Some(transition) =
-                meta.complete_writeback_transition(block_still_matches, pending.generation)
-            {
+            if let Some(transition) = meta.complete_writeback_transition(
+                block_still_matches,
+                pending.generation,
+                pending.frame.pin_count(),
+            ) {
                 if transition.became_clean_unpinned {
+                    pending.frame.fast_state.mark_clean();
                     self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
                 }
                 if let Some(frame_idx) = transition.enqueue_dirty {
@@ -993,8 +1564,7 @@ pub struct BufferManager {
     wait_mutex: Mutex<()>,
     cond: Condvar,
     stats: OnceLock<Arc<BufferStats>>,
-    latch_shards: [Mutex<HashMap<BlockId, Arc<Mutex<()>>>>; Self::SHARDS],
-    resident_shards: [Mutex<HashMap<BlockId, Weak<BufferFrame>>>; Self::SHARDS],
+    directory: ShardedDirectory,
     policy: PolicyState,
     /// Frames that transitioned into a flushable dirty state.
     dirty_queue: Arc<Mutex<VecDeque<usize>>>,
@@ -1004,10 +1574,8 @@ pub struct BufferManager {
 
 impl BufferManager {
     const MAX_TIME: u64 = 10;
-    const SHARDS: usize = 16;
     const FLUSH_BATCH_SIZE: usize = 32;
     const FLUSH_AGE_THRESHOLD: Duration = Duration::from_millis(2);
-    const _SHARDS_POWER_OF_TWO: () = assert!(Self::SHARDS.is_power_of_two());
 
     pub fn new(
         file_manager: SharedFS,
@@ -1048,8 +1616,7 @@ impl BufferManager {
             wait_mutex: Mutex::new(()),
             cond: Condvar::new(),
             stats: OnceLock::new(),
-            latch_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            resident_shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            directory: ShardedDirectory::new(),
             policy,
             dirty_queue,
             flush_coordinator,
@@ -1072,6 +1639,26 @@ impl BufferManager {
         self.notify_flusher();
     }
 
+    /// Wakes one thread waiting for a reusable buffer frame.
+    ///
+    /// Why this stays narrow: one returned frame can satisfy at most one waiter,
+    /// and waking every waiter turns ordinary last-unpin traffic into a global
+    /// futex storm when the pool is not actually exhausted.
+    fn notify_free_buffer_waiters_one(&self) {
+        self.cond.notify_one();
+    }
+
+    /// Returns one frame to the available-frame count and wakes one waiter.
+    ///
+    /// Why this notifies on every release: multiple callers may already be
+    /// asleep after observing `num_available == 0`. If two frames are released
+    /// back-to-back, each release can satisfy one waiter even when the second
+    /// release observes `num_available > 0`.
+    fn release_available_frame(&self) {
+        self.num_available.fetch_add(1, Ordering::AcqRel);
+        self.notify_free_buffer_waiters_one();
+    }
+
     /// Claims snapshot writeback work for one transaction during synchronous force-flush paths.
     fn collect_dirty_snapshots_for_txn(
         &self,
@@ -1090,7 +1677,7 @@ impl BufferManager {
                 continue;
             }
             if meta.txn() != Some(txn_num) {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
+                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable(buffer.pin_count()) {
                     self.enqueue_dirty_frame(frame_idx);
                 }
                 continue;
@@ -1098,7 +1685,7 @@ impl BufferManager {
             let Some((block_id, lsn, generation, snapshot)) =
                 buffer.claim_snapshot_for_writeback_locked(&mut meta, true)
             else {
-                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable() {
+                if let Some(frame_idx) = meta.try_queue_dirty_if_flushable(buffer.pin_count()) {
                     self.enqueue_dirty_frame(frame_idx);
                 }
                 continue;
@@ -1123,34 +1710,92 @@ impl BufferManager {
         })
     }
 
-    /// FNV-1a hash to select shard
-    fn shard_index(&self, block_id: &BlockId) -> usize {
-        let mut h = 0xcbf29ce484222325u64;
-        for &byte in block_id.filename.as_bytes() {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= block_id.block_num as u64;
-        h = h.wrapping_mul(0x100000001b3);
-        (h as usize) & (Self::SHARDS - 1)
+    fn directory_entry(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        self.directory.get(block_id)
     }
 
-    fn resident_frame_if_present(
+    fn remove_directory_entry_if_matches(
         &self,
         block_id: &BlockId,
-        shard_index: usize,
-    ) -> Option<Arc<BufferFrame>> {
-        let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
-        match resident_guard.get(block_id) {
-            Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
-                Some(frame_ptr) => Some(frame_ptr),
-                None => {
-                    resident_guard.remove(block_id);
-                    None
-                }
-            },
-            None => None,
+        frame_idx: usize,
+        generation: u64,
+    ) {
+        self.directory
+            .remove_if_matches(block_id, frame_idx, generation);
+    }
+
+    fn begin_install_if_absent(&self, block_id: &BlockId) -> Option<DirectoryEntry> {
+        self.directory.begin_install_if_absent(block_id)
+    }
+
+    fn publish_resident_entry(&self, block_id: &BlockId, frame_idx: usize, generation: u64) {
+        self.directory
+            .publish_resident(block_id, frame_idx, generation);
+    }
+
+    fn clear_installing_entry(&self, block_id: &BlockId) {
+        self.directory.clear_installing(block_id);
+    }
+
+    /// Claims any reusable victim frame and commits the replacement-policy removal.
+    ///
+    /// Replacement policies only suggest candidates. The buffer manager owns the
+    /// frame-level claim so `evicting` is set before the policy destructively
+    /// removes the frame from its tracking state.
+    fn claim_victim_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
+        for _ in 0..self.buffer_pool.len() {
+            let frame_idx = self.policy.select_victim(&self.buffer_pool)?;
+            let frame = &self.buffer_pool[frame_idx];
+            let Some((previous_control, mut meta_guard)) = frame.try_claim_for_eviction() else {
+                continue;
+            };
+            if self.policy.try_on_frame_claimed_for_reuse(
+                &self.buffer_pool,
+                frame_idx,
+                &mut meta_guard,
+            ) {
+                return Some((frame_idx, meta_guard));
+            }
+            frame.rollback_eviction_claim(previous_control);
         }
+        None
+    }
+
+    /// Claims a victim frame that is not resident in the given prefetch range.
+    ///
+    /// Prefetch is best-effort and should not evict pages it is about to request
+    /// again. The range check runs after the frame claim while [`FrameMeta`] is
+    /// locked, so the block identity being checked is stable.
+    fn claim_victim_frame_excluding_range(
+        &self,
+        file: &str,
+        start_block: usize,
+        end_block: usize,
+    ) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
+        for _ in 0..self.buffer_pool.len() {
+            let frame_idx = self.policy.select_victim(&self.buffer_pool)?;
+            let frame = &self.buffer_pool[frame_idx];
+            let Some((previous_control, mut meta_guard)) = frame.try_claim_for_eviction() else {
+                continue;
+            };
+            if meta_guard.block_id().is_some_and(|old| {
+                old.filename == file && old.block_num >= start_block && old.block_num < end_block
+            }) {
+                frame.rollback_eviction_claim(previous_control);
+                drop(meta_guard);
+                self.policy.on_victim_rejected(&self.buffer_pool, frame_idx);
+                continue;
+            }
+            if self.policy.try_on_frame_claimed_for_reuse(
+                &self.buffer_pool,
+                frame_idx,
+                &mut meta_guard,
+            ) {
+                return Some((frame_idx, meta_guard));
+            }
+            frame.rollback_eviction_claim(previous_control);
+        }
+        None
     }
 
     pub fn enable_stats(&self) {
@@ -1193,51 +1838,31 @@ impl BufferManager {
         }
 
         let end_block = start_block.saturating_add(count);
-
         let mut reservations: Vec<PrefetchReservation> = Vec::new();
         let mut reqs: Vec<BatchReadReq> = Vec::new();
 
         for block_num in start_block..start_block.saturating_add(count) {
             let block_id = BlockId::new(file.to_string(), block_num);
-            let shard_index = self.shard_index(&block_id);
-            let latch_table_guard =
-                LatchTableGuard::new(&self.latch_shards, &block_id, shard_index);
-            let _block_latch = latch_table_guard.lock();
-
-            if self
-                .resident_frame_if_present(&block_id, shard_index)
-                .is_some()
-            {
+            if self.begin_install_if_absent(&block_id).is_some() {
                 continue;
             }
 
-            let mut victim = None;
-            for _ in 0..self.buffer_pool.len() {
-                let Some((frame_idx, meta_guard)) = self.evict_frame() else {
-                    break;
+            let (frame_idx, mut meta_guard) =
+                match self.claim_victim_frame_excluding_range(file, start_block, end_block) {
+                    Some(victim) => victim,
+                    None => {
+                        self.clear_installing_entry(&block_id);
+                        break;
+                    }
                 };
-                let protects_target_range = meta_guard.block_id().is_some_and(|old| {
-                    old.filename == file
-                        && old.block_num >= start_block
-                        && old.block_num < end_block
-                });
-                if protects_target_range {
-                    drop(meta_guard);
-                    self.policy.on_frame_assigned(&self.buffer_pool, frame_idx);
-                    continue;
-                }
-                victim = Some((frame_idx, meta_guard));
-                break;
-            }
-            let (frame_idx, mut meta_guard) = match victim {
-                Some(victim) => victim,
-                None => break, // best-effort: do not block waiting for frames
-            };
             let frame = Arc::clone(&self.buffer_pool[frame_idx]);
 
             if let Some(old) = meta_guard.block_id_owned() {
-                let old_shard = self.shard_index(&old);
-                self.resident_shards[old_shard].lock().unwrap().remove(&old);
+                self.remove_directory_entry_if_matches(
+                    &old,
+                    frame_idx,
+                    frame.residency_generation(),
+                );
             }
             let flush_completion = frame.flush_locked(&mut meta_guard);
             if flush_completion
@@ -1246,23 +1871,29 @@ impl BufferManager {
             {
                 self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
             }
-            meta_guard.clear_residency();
+            let generation = frame.begin_loading_placeholder_locked(&mut meta_guard);
             meta_guard.mark_flush_clean();
+            frame.fast_state.mark_clean();
 
-            let transition = meta_guard.pin_transition();
+            let previous_pin_count = frame.pin_count.fetch_add(1, Ordering::AcqRel);
+            let transition = meta_guard.pin_transition(previous_pin_count);
             debug_assert!(
-                transition.became_pinned,
+                matches!(
+                    transition,
+                    PinTransition::BecamePinnedClean | PinTransition::BecamePinnedDirty
+                ),
                 "reserved prefetch frame must have zero pins"
             );
             drop(meta_guard);
             self.num_available.fetch_sub(1, Ordering::AcqRel);
-            if transition.left_clean_unpinned {
+            if matches!(transition, PinTransition::BecamePinnedClean) {
                 self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
             }
 
             reservations.push(PrefetchReservation {
                 block_id: block_id.clone(),
                 frame_idx,
+                generation,
             });
             reqs.push(BatchReadReq { block_id });
         }
@@ -1284,42 +1915,30 @@ impl BufferManager {
         let mut frames_to_release: Vec<Arc<BufferFrame>> = Vec::with_capacity(reservations.len());
 
         for (idx, reservation) in reservations.into_iter().enumerate() {
-            let shard_index = self.shard_index(&reservation.block_id);
-            let latch_table_guard =
-                LatchTableGuard::new(&self.latch_shards, &reservation.block_id, shard_index);
-            let _block_latch = latch_table_guard.lock();
             let frame = Arc::clone(&self.buffer_pool[reservation.frame_idx]);
-
-            let already_resident = self
-                .resident_frame_if_present(&reservation.block_id, shard_index)
-                .is_some();
-
-            if !already_resident {
-                {
-                    let mut meta_guard = frame.lock_meta();
-                    let mut page_guard = frame.write_page();
-                    *page_guard = std::mem::take(&mut pages[idx]);
-                    meta_guard.assign_resident(reservation.block_id.clone());
-                    meta_guard.mark_flush_clean();
+            {
+                let mut meta_guard = frame.lock_meta();
+                if frame.residency_generation() != reservation.generation || !frame.is_loading() {
+                    self.clear_installing_entry(&reservation.block_id);
+                    continue;
                 }
-                self.policy
-                    .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
-                self.resident_shards[shard_index]
-                    .lock()
-                    .unwrap()
-                    .insert(reservation.block_id.clone(), Arc::downgrade(&frame));
-                installed += 1;
-                if let Some(stats) = self.stats.get() {
-                    stats.prefetch_installed.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                // LRU/SIEVE remove victims from list during eviction. Reinsert free
-                // frames into replacement state even if this prefetch becomes redundant.
-                self.policy
-                    .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
-                if let Some(stats) = self.stats.get() {
-                    stats.prefetch_discarded.fetch_add(1, Ordering::Relaxed);
-                }
+                let mut page_guard = frame.write_page();
+                *page_guard = std::mem::take(&mut pages[idx]);
+                meta_guard.assign_resident(reservation.block_id.clone());
+                meta_guard.mark_flush_clean();
+                frame.fast_state.mark_clean();
+                self.publish_resident_entry(
+                    &reservation.block_id,
+                    reservation.frame_idx,
+                    reservation.generation,
+                );
+            }
+            frame.finish_loading_residency();
+            self.policy
+                .on_frame_assigned(&self.buffer_pool, reservation.frame_idx);
+            installed += 1;
+            if let Some(stats) = self.stats.get() {
+                stats.prefetch_installed.fetch_add(1, Ordering::Relaxed);
             }
 
             frames_to_release.push(frame);
@@ -1327,18 +1946,27 @@ impl BufferManager {
 
         for frame in frames_to_release {
             let transition = {
+                let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous_pin_count > 0, "prefetch release must hold a pin");
                 let mut meta_guard = frame.lock_meta();
-                meta_guard.unpin_transition()
+                let transition = meta_guard.unpin_transition(previous_pin_count - 1);
+                if matches!(transition, UnpinTransition::BecameUnpinnedClean) {
+                    frame.fast_state.mark_clean();
+                }
+                transition
             };
-            if transition.became_unpinned {
-                self.num_available.fetch_add(1, Ordering::AcqRel);
-                self.cond.notify_all();
-            }
-            if transition.became_clean_unpinned {
-                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
-            }
-            if let Some(frame_idx) = transition.enqueue_dirty {
-                self.enqueue_dirty_frame(frame_idx);
+            match transition {
+                UnpinTransition::StillPinned => {}
+                UnpinTransition::BecameUnpinnedClean => {
+                    self.release_available_frame();
+                    self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                }
+                UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
+                    self.release_available_frame();
+                    if let Some(frame_idx) = enqueue_dirty {
+                        self.enqueue_dirty_frame(frame_idx);
+                    }
+                }
             }
         }
 
@@ -1349,7 +1977,7 @@ impl BufferManager {
         assert!(
             !self.buffer_pool.iter().any(|buffer| {
                 let meta = buffer.lock_meta();
-                meta.txn() == Some(txn_num) && meta.is_dirty() && meta.pin_count() > 0
+                meta.txn() == Some(txn_num) && meta.is_dirty() && buffer.pin_count() > 0
             }),
             "flush_all assumes target transaction has released all page pins before forcing writeback"
         );
@@ -1377,73 +2005,33 @@ impl BufferManager {
         }
     }
 
-    /// Fast path for latch-crabbing callers.
+    /// Applies global availability bookkeeping for one successful pin transition.
     ///
-    /// This is resident-only and never performs replacement policy bookkeeping,
-    /// eviction, or blocking waits.
-    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
-        let shard_index = self.shard_index(block_id);
-        let Some(latch_table_guard) =
-            LatchTableGuard::try_new(&self.latch_shards, block_id, shard_index)
-        else {
-            return FastPinOutcome::Contended;
-        };
-        let Some(_block_latch) = latch_table_guard.try_lock() else {
-            return FastPinOutcome::Contended;
-        };
-
-        let frame_ptr = {
-            let Some(mut resident_guard) = self.resident_shards[shard_index].try_lock().ok() else {
-                return FastPinOutcome::Contended;
-            };
-            match resident_guard.get(block_id) {
-                Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
-                    Some(frame_ptr) => Some(frame_ptr),
-                    None => {
-                        resident_guard.remove(block_id);
-                        return FastPinOutcome::NotResident;
-                    }
-                },
-                None => None,
-            }
-        };
-
-        let Some(frame_ptr) = frame_ptr else {
-            return FastPinOutcome::NotResident;
-        };
-
-        {
-            // Use try_lock to avoid blocking while page latches are held
-            let Some(mut meta_guard) = frame_ptr.try_lock_meta() else {
-                return FastPinOutcome::Contended;
-            };
-            if !meta_guard
-                .block_id()
-                .is_some_and(|current| current == block_id)
-            {
-                if let Ok(mut resident_guard) = self.resident_shards[shard_index].try_lock() {
-                    resident_guard.remove(block_id);
-                }
-                return FastPinOutcome::NotResident;
-            }
-            let transition = meta_guard.pin_transition();
-            if transition.became_pinned {
-                self.num_available.fetch_sub(1, Ordering::AcqRel);
-                if transition.left_clean_unpinned {
-                    self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-                }
+    /// [`PinTransition`] tells us whether this pin consumed a reusable frame from
+    /// the buffer pool's slack accounting:
+    /// - [`PinTransition::StillPinned`]: no global counters change
+    /// - [`PinTransition::BecamePinnedClean`]: one available frame and one clean-slack frame were consumed
+    /// - [`PinTransition::BecamePinnedDirty`]: one available frame was consumed, but not from clean slack
+    fn apply_pin_transition_accounting(&self, transition: PinTransition) {
+        if !matches!(transition, PinTransition::StillPinned) {
+            self.num_available.fetch_sub(1, Ordering::AcqRel);
+            if matches!(transition, PinTransition::BecamePinnedClean) {
+                self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
             }
         }
-
-        FastPinOutcome::Ready(frame_ptr)
     }
 
     /// Full pin path with immediate replacement policy updates and eviction.
     pub fn pin(&self, block_id: &BlockId) -> Result<Arc<BufferFrame>, Box<dyn Error>> {
         let start = Instant::now();
         loop {
-            if let Some(buffer) = self.try_to_pin(block_id) {
-                return Ok(buffer);
+            match self.pin_once_without_free_wait(block_id) {
+                PinAttempt::Ready(buffer) => return Ok(buffer),
+                PinAttempt::Retry => {
+                    thread::yield_now();
+                    continue;
+                }
+                PinAttempt::NeedWait => {}
             }
 
             // Slow path: only use wait_mutex when pool is empty. num_available is
@@ -1465,60 +2053,59 @@ impl BufferManager {
         }
     }
 
-    fn try_to_pin(&self, block_id: &BlockId) -> Option<Arc<BufferFrame>> {
-        let shard_index = self.shard_index(block_id);
-        let latch_table_guard = LatchTableGuard::new(&self.latch_shards, block_id, shard_index);
-        let _block_latch = latch_table_guard.lock();
-
-        let frame_ptr = {
-            let mut resident_guard = self.resident_shards[shard_index].lock().unwrap();
-            match resident_guard.get(block_id) {
-                Some(weak_frame_ptr) => match weak_frame_ptr.upgrade() {
-                    Some(frame_ptr) => Some(frame_ptr),
-                    None => {
-                        resident_guard.remove(block_id);
-                        return None;
-                    }
-                },
-                None => None,
-            }
-        };
-
-        if let Some(frame_ptr) = frame_ptr {
-            {
-                let mut meta_guard = self.record_hit(&frame_ptr, block_id)?;
-                let transition = meta_guard.pin_transition();
-                if transition.became_pinned {
-                    self.num_available.fetch_sub(1, Ordering::AcqRel);
-                    if transition.left_clean_unpinned {
-                        self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
+    /// Attempts one full pin without sleeping on the global free-buffer condvar.
+    ///
+    /// The method has three phases:
+    /// - resident attempt: consult the directory and try the OCC resident-hit pin
+    /// - install attempt: if absent, try to become the sole installer for this block
+    /// - victim claim: if install ownership was acquired, try to claim and reuse one frame
+    ///
+    /// The return value tells `pin()` whether this call:
+    /// - succeeded immediately
+    /// - lost a transient race and should be retried soon
+    /// - or hit a real no-frame-available condition and should enter the global wait path
+    fn pin_once_without_free_wait(&self, block_id: &BlockId) -> PinAttempt {
+        match self.directory_entry(block_id) {
+            Some(DirectoryEntry::Resident {
+                frame_idx,
+                generation,
+            }) => {
+                let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
+                let transition = match frame_ptr.pin_from_directory_entry(generation) {
+                    Some(transition) => transition,
+                    None => return PinAttempt::Retry,
+                };
+                self.apply_pin_transition_accounting(transition);
+                self.policy.on_hit(&self.buffer_pool, frame_idx);
                 if let Some(stats) = self.stats.get() {
-                    stats
-                        .hits
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats.hits.fetch_add(1, Ordering::Relaxed);
                 }
+                return PinAttempt::Ready(frame_ptr);
             }
-            return Some(frame_ptr);
+            Some(DirectoryEntry::Installing) => return PinAttempt::Retry,
+            None => {}
         }
 
         if let Some(stats) = self.stats.get() {
-            stats
-                .misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        let (tail_idx, mut meta_guard) = match self.evict_frame() {
-            Some((idx, guard)) => (idx, guard),
-            None => return None,
+        if self.begin_install_if_absent(block_id).is_some() {
+            return PinAttempt::Retry;
+        }
+
+        let (frame_idx, mut meta_guard) = match self.claim_victim_frame() {
+            Some(victim) => victim,
+            None => {
+                self.clear_installing_entry(block_id);
+                return PinAttempt::NeedWait;
+            }
         };
+        let frame = Arc::clone(&self.buffer_pool[frame_idx]);
 
         if let Some(old) = meta_guard.block_id_owned() {
-            let old_shard = self.shard_index(&old);
-            self.resident_shards[old_shard].lock().unwrap().remove(&old);
+            self.remove_directory_entry_if_matches(&old, frame_idx, frame.residency_generation());
         }
-        let frame = Arc::clone(&self.buffer_pool[tail_idx]);
         let flush_completion = frame.assign_to_block_locked(&mut meta_guard, block_id);
         if flush_completion
             .as_ref()
@@ -1526,40 +2113,114 @@ impl BufferManager {
         {
             self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
         }
-        let transition = meta_guard.pin_transition();
+        let previous_pin_count = frame.pin_count.fetch_add(1, Ordering::AcqRel);
+        let transition = meta_guard.pin_transition(previous_pin_count);
+        let generation = frame.residency_generation();
+        self.publish_resident_entry(block_id, frame_idx, generation);
         debug_assert!(
-            transition.became_pinned,
+            matches!(
+                transition,
+                PinTransition::BecamePinnedClean | PinTransition::BecamePinnedDirty
+            ),
             "newly assigned frame must have zero pins"
         );
         drop(meta_guard);
 
-        self.policy.on_frame_assigned(&self.buffer_pool, tail_idx);
+        frame.finish_loading_residency();
+        self.policy.on_frame_assigned(&self.buffer_pool, frame_idx);
 
-        self.resident_shards[shard_index]
-            .lock()
-            .unwrap()
-            .insert(block_id.clone(), Arc::downgrade(&frame));
-        self.num_available.fetch_sub(1, Ordering::AcqRel);
-        if transition.left_clean_unpinned {
-            self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
-        }
-        Some(frame)
+        self.apply_pin_transition_accounting(transition);
+        PinAttempt::Ready(frame)
     }
 
+    /// Fast path for latch-crabbing callers.
+    ///
+    /// This is resident-only and never performs eviction or blocking waits.
+    ///
+    /// A directory miss is a real residency miss, not contention: callers use
+    /// [`FastPinOutcome::NotResident`] to slow-pin outside latch scope and then
+    /// retry traversal. Only failure to acquire an internal latch reports
+    /// [`FastPinOutcome::Contended`].
+    ///
+    /// The fast path still has to complete policy hit bookkeeping. If that
+    /// bookkeeping would block, the speculative pin is rolled back and the
+    /// caller sees [`FastPinOutcome::Contended`].
+    pub fn pin_fast(&self, block_id: &BlockId) -> FastPinOutcome<Arc<BufferFrame>> {
+        let entry = match self.directory.try_get(block_id) {
+            DirectoryTryGet::Present(entry) => entry,
+            DirectoryTryGet::Absent => return FastPinOutcome::NotResident,
+            DirectoryTryGet::Locked => return FastPinOutcome::Contended,
+        };
+        let (frame_idx, generation) = match entry {
+            DirectoryEntry::Resident {
+                frame_idx,
+                generation,
+            } => (frame_idx, generation),
+            DirectoryEntry::Installing => return FastPinOutcome::NotResident,
+        };
+        let frame_ptr = Arc::clone(&self.buffer_pool[frame_idx]);
+
+        let transition = match frame_ptr.try_pin_from_directory_entry(generation) {
+            Ok(Some(transition)) => transition,
+            Ok(None) => return FastPinOutcome::NotResident,
+            Err(()) => return FastPinOutcome::Contended,
+        };
+        if !self.policy.try_on_hit(&self.buffer_pool, frame_idx) {
+            let previous_pin_count = frame_ptr.pin_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(
+                previous_pin_count > 0,
+                "fast-path rollback must undo an existing speculative pin"
+            );
+            return FastPinOutcome::Contended;
+        }
+        self.apply_pin_transition_accounting(transition);
+
+        FastPinOutcome::Ready(frame_ptr)
+    }
+
+    /// Releases one buffer pin and applies any last-pin bookkeeping.
+    ///
+    /// The decrement itself is atomic, and clean `1 -> 0` transitions use the
+    /// frame's hot clean summary. Dirty or uncertain last-unpin transitions
+    /// still consult [`FrameMeta`] to answer colder protocol questions:
+    /// - did the frame become part of clean slack?
+    /// - should a dirty frame now enter the flush queue?
+    /// - should waiters be notified that one reusable frame is available?
+    ///
+    /// So the hot pin count and clean summary live on [`BufferFrame`], while
+    /// dirty/writeback transitions reconcile availability and flush state under
+    /// [`FrameMeta`].
     pub fn unpin(&self, frame: Arc<BufferFrame>) {
         let transition = {
+            let previous_pin_count = frame.pin_count.fetch_sub(1, Ordering::AcqRel);
+            assert!(previous_pin_count > 0, "BufferManager::unpin on zero pins");
+            if previous_pin_count > 1 {
+                return;
+            }
+            if frame.fast_state.is_clean() {
+                self.release_available_frame();
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             let mut meta = frame.lock_meta();
-            meta.unpin_transition()
+            let transition = meta.unpin_transition(0);
+            if matches!(transition, UnpinTransition::BecameUnpinnedClean) {
+                frame.fast_state.mark_clean();
+            }
+            transition
         };
-        if transition.became_unpinned {
-            self.num_available.fetch_add(1, Ordering::AcqRel);
-            self.cond.notify_all();
-        }
-        if transition.became_clean_unpinned {
-            self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
-        }
-        if let Some(frame_idx) = transition.enqueue_dirty {
-            self.enqueue_dirty_frame(frame_idx);
+        match transition {
+            UnpinTransition::StillPinned => {}
+            UnpinTransition::BecameUnpinnedClean => {
+                self.release_available_frame();
+                self.clean_unpinned.fetch_add(1, Ordering::AcqRel);
+            }
+            UnpinTransition::BecameUnpinnedDirty { enqueue_dirty } => {
+                self.release_available_frame();
+                if let Some(frame_idx) = enqueue_dirty {
+                    self.enqueue_dirty_frame(frame_idx);
+                }
+            }
         }
     }
 
@@ -1570,9 +2231,10 @@ impl BufferManager {
     /// Callers hand off the new txn/LSN pair here so queueing and clean-slack
     /// bookkeeping stay centralized with the rest of the frame-state machine.
     pub(crate) fn mark_modified(&self, frame: &Arc<BufferFrame>, txn_num: usize, lsn: usize) {
+        frame.fast_state.mark_needs_meta();
         let transition = {
             let mut meta = frame.lock_meta();
-            meta.mark_dirty_transition(txn_num, lsn)
+            meta.mark_dirty_transition(frame.pin_count(), txn_num, lsn)
         };
         if transition.left_clean_unpinned {
             self.clean_unpinned.fetch_sub(1, Ordering::AcqRel);
@@ -1580,24 +2242,6 @@ impl BufferManager {
         if let Some(frame_idx) = transition.enqueue_dirty {
             self.enqueue_dirty_frame(frame_idx);
         }
-    }
-
-    fn evict_frame(&self) -> Option<(usize, MutexGuard<'_, FrameMeta>)> {
-        self.policy.evict_frame(&self.buffer_pool)
-    }
-
-    fn record_hit<'a>(
-        &'a self,
-        frame_ptr: &'a Arc<BufferFrame>,
-        block_id: &BlockId,
-    ) -> Option<MutexGuard<'a, FrameMeta>> {
-        let shard_index = self.shard_index(block_id);
-        self.policy.record_hit(
-            &self.buffer_pool,
-            frame_ptr,
-            block_id,
-            &self.resident_shards[shard_index],
-        )
     }
 
     #[cfg(test)]

@@ -10,6 +10,9 @@ path = "src/bin/simpledb-cli.rs"
 [profile.bench]
 debug = 1
 
+[profile.release]
+debug = 1
+
 [[bench]]
 name = "simple_bench"
 harness = false
