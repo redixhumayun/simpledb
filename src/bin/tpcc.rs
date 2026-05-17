@@ -24,6 +24,14 @@ struct Config {
 }
 
 fn parse_args() -> Config {
+    fn require_next<'a>(args: &'a [String], i: usize, flag: &str) -> &'a str {
+        if i + 1 >= args.len() {
+            eprintln!("error: {flag} requires an argument");
+            std::process::exit(1);
+        }
+        &args[i + 1]
+    }
+
     let mut warehouses = 1i32;
     let mut items = 10_000i32;
     let mut cpd = 300i32; // customers per district
@@ -38,31 +46,41 @@ fn parse_args() -> Config {
     while i < args.len() {
         match args[i].as_str() {
             "--warehouses" => {
-                warehouses = args[i + 1].parse().expect("--warehouses <N>");
+                warehouses = require_next(&args, i, "--warehouses")
+                    .parse()
+                    .expect("--warehouses <N>");
                 i += 2;
             }
             "--items" => {
-                items = args[i + 1].parse().expect("--items <N>");
+                items = require_next(&args, i, "--items")
+                    .parse()
+                    .expect("--items <N>");
                 i += 2;
             }
             "--customers-per-district" | "--cpd" => {
-                cpd = args[i + 1].parse().expect("--cpd <N>");
+                cpd = require_next(&args, i, "--cpd").parse().expect("--cpd <N>");
                 i += 2;
             }
             "--duration" => {
-                duration_secs = args[i + 1].parse().expect("--duration <secs>");
+                duration_secs = require_next(&args, i, "--duration")
+                    .parse()
+                    .expect("--duration <secs>");
                 i += 2;
             }
             "--db" => {
-                db_path = Some(args[i + 1].clone());
+                db_path = Some(require_next(&args, i, "--db").to_string());
                 i += 2;
             }
             "--buffers" => {
-                buffers = args[i + 1].parse().expect("--buffers <N>");
+                buffers = require_next(&args, i, "--buffers")
+                    .parse()
+                    .expect("--buffers <N>");
                 i += 2;
             }
             "--lock-timeout" => {
-                lock_timeout_ms = args[i + 1].parse().expect("--lock-timeout <ms>");
+                lock_timeout_ms = require_next(&args, i, "--lock-timeout")
+                    .parse()
+                    .expect("--lock-timeout <ms>");
                 i += 2;
             }
             "--skip-load" => {
@@ -783,7 +801,7 @@ fn do_new_order(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
                     s_order_cnt + 1
                 ),
             )?;
-            if !all_local {
+            if supply_w_id != w_id {
                 exec_update(
                     db,
                     &txn,
@@ -845,8 +863,10 @@ fn do_payment(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
     } else {
         0
     };
+    // Clamp to loaded range: customers are named make_last_name(0..min(cpd,1000)-1).
+    let c_last_name_bound = (cfg.customers_per_district - 1).min(999);
     let c_last_input = if !by_id {
-        make_last_name(rng.uniform(0, 999) as usize)
+        make_last_name(rng.uniform(0, c_last_name_bound) as usize)
     } else {
         String::new()
     };
@@ -1018,8 +1038,9 @@ fn do_order_status(db: &SimpleDB, rng: &mut Rng, cfg: &Config) -> TxnOutcome {
     } else {
         0
     };
+    let c_last_name_bound = (cfg.customers_per_district - 1).min(999);
     let c_last_input = if !by_id {
-        make_last_name(rng.uniform(0, 999) as usize)
+        make_last_name(rng.uniform(0, c_last_name_bound) as usize)
     } else {
         String::new()
     };
